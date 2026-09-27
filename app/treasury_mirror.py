@@ -447,7 +447,17 @@ async def _fetch_page(before_lt: int | None = None) -> tuple[list[MirrorMove], s
                 client, url, params=params, headers=api_headers(api_key)
             )
             response.raise_for_status()
-            items = response.json().get("transactions") or []
+            payload = response.json()
+            items = payload.get("transactions") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                # 200 БЕЗ списка транзакций — это не «история пуста», а сбой формы
+                # ответа: честный пустой кошелёк приходит ключом с пустым
+                # списком. Иначе один битый ответ навсегда объявил бы зеркало
+                # выстроенным на нулевых строках, тождество показало бы
+                # расхождение на всю казну и ежедневная автосверка подняла бы
+                # тревогу до ручного /mirror reset. Считаем провайдера
+                # недоступным и пробуем следующего.
+                raise ValueError("в ответе нет списка transactions")
             moves: list[MirrorMove] = []
             for item in items:
                 move = (
