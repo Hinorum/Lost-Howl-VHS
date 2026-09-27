@@ -330,7 +330,7 @@ async def test_retry_held_when_history_unavailable(monkeypatch) -> None:
     transfer = AsyncMock(return_value="bcast:123")
 
     async def empty_markers() -> set[str]:
-        ton_pay._RECONCILE_HISTORY_OK = False  # оба провайдера реально упали
+        ton_pay.state._RECONCILE_HISTORY_OK = False  # оба провайдера реально упали
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
@@ -359,7 +359,7 @@ async def test_retry_proceeds_when_history_known(monkeypatch) -> None:
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", True)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", True)
 
     try:
         sent = await ton_pay.dispatch_pending_payouts(bot=None)
@@ -384,7 +384,7 @@ async def test_first_attempt_not_blocked_by_unknown_history(monkeypatch) -> None
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", False)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", False)
 
     try:
         sent = await ton_pay.dispatch_pending_payouts(bot=None)
@@ -539,7 +539,7 @@ async def test_blockchain_diagnostics_reports_pipeline(monkeypatch) -> None:
         return 5_000_000_000, "active", "tonapi"
 
     monkeypatch.setattr(ton_pay, "fetch_account_state", fake_state)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", True)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", True)
 
     async with SessionLocal() as session:
         for key, value in (
@@ -578,7 +578,7 @@ async def test_blockchain_diagnostics_flags_history_down(monkeypatch) -> None:
         return None, None, "none"
 
     monkeypatch.setattr(ton_pay, "fetch_account_state", silent)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", False)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", False)
 
     text = await ton_pay.blockchain_diagnostics()
     assert "НЕДОСТУПНА" in text

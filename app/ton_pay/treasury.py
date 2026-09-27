@@ -14,7 +14,6 @@ from sqlalchemy import func, or_, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.http_utils import get_http_client, http_get_with_retry
 from app.models import Income, Payout, Player, WatcherState
 from app.ton_codec import api_headers
 from app.ton_utils import friendly_address, from_nano, normalize_address
@@ -26,20 +25,27 @@ logger = logging.getLogger(__name__)
 
 
 async def _tonapi_account_raw(address: str) -> dict:
+    # Локальные импорты: get_http_client/http_get_with_retry и fetch_account_state
+    # ищутся через app.ton_pay, чтобы monkeypatch.setattr(ton_pay, ...) из тестов
+    # доходил до реального вызова (иначе тест ушёл бы в живую сеть).
+    import app.ton_pay as _tp
+
     url = f"{settings.active_ton_api_base}/v2/accounts/{address}"
     headers = api_headers(settings.ton_api_key)
-    client = get_http_client()
-    response = await http_get_with_retry(client, url, headers=headers)
+    client = _tp.get_http_client()
+    response = await _tp.http_get_with_retry(client, url, headers=headers)
     response.raise_for_status()
     return response.json()
 
 
 async def _toncenter_account(address: str) -> dict:
+    import app.ton_pay as _tp
+
     url = f"{settings.active_toncenter_api_base.rstrip('/')}/api/v3/accountInformation"
     headers = api_headers(settings.toncenter_api_key)
     # v3 ждёт query-параметр «account», а не «address» (как в /api/v3/transactions).
-    client = get_http_client()
-    response = await http_get_with_retry(client, url, params={"account": address}, headers=headers)
+    client = _tp.get_http_client()
+    response = await _tp.http_get_with_retry(client, url, params={"account": address}, headers=headers)
     response.raise_for_status()
     return response.json()
 
@@ -118,7 +124,9 @@ async def treasury_diagnostics() -> str:
             lines.append(f"Пара мнемоника/адрес: {treasury_pair_check_text()}")
         except Exception as exc:
             lines.append(f"Пара мнемоника/адрес: не проверена ({exc})")
-        balance, status, source = await fetch_account_state()
+        import app.ton_pay as _tp
+
+        balance, status, source = await _tp.fetch_account_state()
         if balance is None:
             lines.append("Баланс: недоступен (оба индексатора молчат) ⚠️")
         else:
@@ -362,7 +370,9 @@ async def blockchain_diagnostics() -> str:
     if waiting_dest:
         lines.append(f"  {waiting_dest} строк ждут кошелёк игрока (dest пустой) — уйдут после /wallet")
     lines.append(f"Кошельков verified: {verified_wallets}")
-    balance, _status, balance_source = await fetch_account_state()
+    import app.ton_pay as _tp
+
+    balance, _status, balance_source = await _tp.fetch_account_state()
     if balance is not None:
         lines.append(f"Баланс казначея: {balance / 1e9:.4f} Gram ({balance_source})")
     else:
