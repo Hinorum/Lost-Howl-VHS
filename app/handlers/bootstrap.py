@@ -55,7 +55,7 @@ def _register_error_handler(dispatcher: Dispatcher) -> None:
         return True
 
 
-_LAST_UPDATE_ERROR_ALERT = {"ts": 0.0}
+_LAST_UPDATE_ERROR_ALERT: dict[str, float] = {}
 
 
 _UPDATE_ERROR_ALERT_COOLDOWN = 3600.0
@@ -67,11 +67,52 @@ _PLAYER_ERROR_TEXT = (
 )
 
 
+def _describe_update(event) -> tuple[str, str]:
+    """Кто и что именно сломалось: (kind, описание для лога и тревоги).
+
+    kind («callback»/«message»/«update») держит троттлинг тревоги: при одном
+    счётчике на все сбои падение кнопки на час затыкало бы тревогу о падении
+    сообщения, и наоборот — второй инцидент выглядел бы как тишина.
+
+    Описание одно и то же в строке лога и в тексте тревоги: хранитель ищет в
+    логах ровно то, что ему показали. Раньше в лог уходила строка «Ошибка
+    обработки апдейта» без единого идентификатора, а тревога обещала найти по
+    ней нужный стек — при десяти одинаковых строках это было невозможно.
+    """
+    update = event.update
+    callback = getattr(update, "callback_query", None)
+    message = getattr(update, "message", None)
+    if callback is not None:
+        kind = "callback"
+    elif message is not None:
+        kind = "message"
+    else:
+        kind = "update"
+    parts = [f"kind={kind}"]
+    user = getattr(update, "from_user", None)
+    if user is not None:
+        parts.append(f"uid={user.id}")
+    chat = getattr(message, "chat", None) if message is not None else None
+    if chat is None and callback is not None:
+        chat = getattr(getattr(callback, "message", None), "chat", None)
+    if chat is None:
+        parts.append("chat=?")
+    else:
+        parts.append(f"chat={chat.id} ({getattr(chat, 'type', '?')})")
+    parts.append(f"update_id={getattr(update, 'update_id', '?')}")
+    if callback is not None:
+        # Обрезаем: в callback_data может быть пользовательский текст, а нужна
+        # лишь кнопка, на которой что-то отвалилось.
+        parts.append(f"data={str(getattr(callback, 'data', '') or '')[:40]!r}")
+    return kind, " ".join(parts)
+
+
 async def handle_update_error(bot: Bot | None, event) -> None:
     """Единая реакция на упавший апдейт: игроку, кнопке и хранителю."""
     import time as _time
 
-    logger.error("Ошибка обработки апдейта", exc_info=event.exception)
+    kind, detail = _describe_update(event)
+    logger.error("Ошибка обработки апдейта: %s", detail, exc_info=event.exception)
     update = event.update
     callback = update.callback_query
     chat_id = None
@@ -84,24 +125,20 @@ async def handle_update_error(bot: Bot | None, event) -> None:
         try:
             await callback.answer("Плёнка заело — перемотай и попробуй ещё.", show_alert=True)
         except Exception:
-            pass
+            logger.debug("Спиннер на кнопке снять не вышло: %s", detail, exc_info=True)
     if chat_id is not None and bot is not None:
         try:
             await bot.send_message(chat_id, _PLAYER_ERROR_TEXT)
         except Exception:
-            pass
+            logger.debug("Игроку %s не сообщили о сбое: %s", chat_id, detail, exc_info=True)
     now = _time.time()
+    last = _LAST_UPDATE_ERROR_ALERT.get(kind, 0.0)
     if (
         bot is not None
         and settings.admin_id_set
-        and now - _LAST_UPDATE_ERROR_ALERT["ts"] >= _UPDATE_ERROR_ALERT_COOLDOWN
+        and now - last >= _UPDATE_ERROR_ALERT_COOLDOWN
     ):
-        _LAST_UPDATE_ERROR_ALERT["ts"] = now
-        kind = (
-            "callback"
-            if callback is not None
-            else ("message" if update.message is not None else "update")
-        )
+        _LAST_UPDATE_ERROR_ALERT[kind] = now
         summary = f"{type(event.exception).__name__}: {event.exception}"[:350]
         from app.ops import notify_admins
 
@@ -109,10 +146,12 @@ async def handle_update_error(bot: Bot | None, event) -> None:
             await notify_admins(
                 bot,
                 f"⚠️ Сбой обработки апдейта ({kind}): {summary}\n"
-                "Полный стек — в логах сервиса по строке «Ошибка обработки апдейта».",
+                f"Идентификаторы: {detail}\n"
+                "Полный стек — в логах сервиса по строке с этими идентификаторами.",
             )
         except Exception:
-            pass
+            # Тревога о сбое, потерянная молча, — это инцидент без следа.
+            logger.exception("Тревога о сбое апдейта не доставлена (%s)", detail)
 
 
 async def create_bot() -> Bot:
