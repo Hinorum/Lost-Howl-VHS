@@ -527,7 +527,7 @@ async def test_wallet_uses_remote_liteserver_config(monkeypatch) -> None:
         fake_from_config.config = config
         raise Boom("доходим до построения провайдера")
 
-    monkeypatch.setattr(ton_pay, "_fetch_remote_json", fake_fetch)
+    monkeypatch.setattr(ton_pay.wallet, "fetch_remote_json", fake_fetch)
     monkeypatch.setattr("pytoniq.LiteBalancer.from_config", staticmethod(fake_from_config))
     monkeypatch.setattr(settings, "liteserver_config_url", "https://example.test/config.json")
 

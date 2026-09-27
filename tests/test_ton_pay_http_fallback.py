@@ -177,13 +177,13 @@ async def test_send_http_uses_local_seqno_when_batch_active(monkeypatch: pytest.
         seen["seqno"] = seqno
         return None
 
-    monkeypatch.setattr(ton_pay, "_http_get_wallet_seqno", fake_get_seqno)
+    monkeypatch.setattr(ton_pay.http_channel, "http_get_wallet_seqno", fake_get_seqno)
     monkeypatch.setattr(ton_pay, "_http_broadcast_external", fake_broadcast)
-    monkeypatch.setattr(ton_pay, "_batch_seqno", 40)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", 40)
     try:
         marker = await ton_pay._send_ton_transfer_http("0:" + "11" * 32, to_nano(1), comment="way:9:prize#1")
     finally:
-        monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
     assert marker and marker.startswith("bcast:")
     assert seen["seqno"] == 40
     assert fetched_seqno == 0  # локальный батч-счётчик не дублирует сетевой запрос
@@ -202,14 +202,14 @@ async def test_send_http_fetches_seqno_outside_batch(monkeypatch: pytest.MonkeyP
         seen["seqno"] = seqno
         return None
 
-    monkeypatch.setattr(ton_pay, "_http_get_wallet_seqno", fake_get_seqno)
+    monkeypatch.setattr(ton_pay.http_channel, "http_get_wallet_seqno", fake_get_seqno)
     monkeypatch.setattr(ton_pay, "_http_broadcast_external", fake_broadcast)
-    monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
     try:
         marker = await ton_pay._send_ton_transfer_http("0:" + "22" * 32, to_nano(1), comment="way:9:prize#2")
-        assert ton_pay._batch_seqno == 8
+        assert ton_pay.state._batch_seqno == 8
     finally:
-        monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
     assert marker and marker.startswith("bcast:")
     assert seen["seqno"] == 7
 
