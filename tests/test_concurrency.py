@@ -12,6 +12,8 @@
   4. ReferralPot UPDATE WHERE nanotons=amount — списание с копилки.
   5. claim_once с разными ключами не конфликтует.
   6. claim_once валидирует длину ключа (≤80).
+  7. claim_announcement (rounds/lifecycle) — объявление дня достаётся
+     ровно одному «процессу»: UPDATE WHERE announced_at IS NULL.
 
 ВАЖНО про среду:
   - aiosqlite сериализует записи в одном SQLite-файле через свой
@@ -40,6 +42,7 @@ from app.models import (
     WinRule,
 )
 from app.ops import claim_once
+from app.rounds.lifecycle import claim_announcement
 
 # ----- Утилиты -----------------------------------------------------------
 
@@ -261,6 +264,86 @@ async def test_claim_once_different_keys_all_succeed(tmp_path) -> None:
                 select(WatcherState).where(WatcherState.key.like("race:key:%"))
             )).scalars().all()
         assert len(rows) == 5, f"строк: {len(rows)}, ожидали 5"
+    finally:
+        await engine.dispose()
+
+
+# ----- Test 7: claim_announcement — право объявить день достаётся один раз ---
+
+
+def _round_row(day_index: int) -> Round:
+    now = datetime.now(UTC)
+    return Round(
+        day_index=day_index,
+        status=RoundStatus.OPEN,
+        win_rule=WinRule.MAJORITY,
+        chapter_title="t",
+        chapter_text="x",
+        opens_at=now - timedelta(hours=1),
+        voting_ends_at=now + timedelta(hours=1),
+        tally_ends_at=now + timedelta(hours=2),
+        winner_card=0,
+    )
+
+
+async def test_claim_announcement_is_atomic(tmp_path) -> None:
+    """Объявить день может ровно один «процесс».
+
+    claim_announcement — условный UPDATE Round SET announced_at=... WHERE
+    announced_at IS NULL, тот же примитив at-most-once, что close_voting.
+    Если бы он стал no-op'ом или read-modify-write, два инстанса бота
+    объявили бы один день дважды: второй вызов пошёл бы в send_announcement
+    повторно (лишний пост участникам, дважды запущенный таймер дня).
+    """
+    engine, maker = await _fresh_db(tmp_path)
+    try:
+        async with maker() as sess:
+            row = _round_row(11)
+            sess.add(row)
+            await sess.commit()
+            round_id = row.id
+
+        # Два независимых вызывающих, каждый со своей сессией.
+        async with maker() as sess:
+            first = await claim_announcement(sess, await sess.get(Round, round_id))
+        async with maker() as sess:
+            second = await claim_announcement(sess, await sess.get(Round, round_id))
+        async with maker() as sess:
+            third = await claim_announcement(sess, await sess.get(Round, round_id))
+
+        assert first is True, "первый должен забрать право объявления"
+        assert second is False, "второй НЕ должен объявлять день заново"
+        assert third is False, "третий НЕ должен объявлять день заново"
+
+        async with maker() as sess:
+            r = await sess.get(Round, round_id)
+            assert r.announced_at is not None
+            stamped = r.announced_at
+        # Метка не перетиралась: победил именно первый вызов.
+        async with maker() as sess:
+            r = await sess.get(Round, round_id)
+            assert r.announced_at == stamped
+    finally:
+        await engine.dispose()
+
+
+async def test_claim_announcement_is_per_round(tmp_path) -> None:
+    """Claim относится к конкретному дню: объявление другого дня не блокируется."""
+    engine, maker = await _fresh_db(tmp_path)
+    try:
+        async with maker() as sess:
+            first_day, second_day = _round_row(12), _round_row(13)
+            sess.add_all([first_day, second_day])
+            await sess.commit()
+            first_id, second_id = first_day.id, second_day.id
+
+        async with maker() as sess:
+            assert await claim_announcement(sess, await sess.get(Round, first_id)) is True
+        async with maker() as sess:
+            assert await claim_announcement(sess, await sess.get(Round, second_id)) is True
+        async with maker() as sess:
+            r = await sess.get(Round, first_id)
+            assert r.announced_at is not None
     finally:
         await engine.dispose()
 

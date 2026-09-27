@@ -50,25 +50,52 @@ async def _toncenter_account(address: str) -> dict:
     return response.json()
 
 
+def _balance_of(data: dict | None) -> int | None:
+    """Баланс из ответа индексатора; None, если поля нет или оно не число.
+
+    Ответ 200 БЕЗ поля balance — это не «нулевой баланс», а «не знаю»:
+    индексаторы отдают так тело ошибки/смену формы ответа, а `int(... or 0)`
+    рисовал хранителю честные 0.0000 Gram, /blockchain то же самое, и сверка
+    зеркала получала chain_balance=0 → расхождение на всю казну и тревога
+    ежедневной автосверки. Настоящий ноль приходит строкой "0" — поле есть.
+    """
+    if not isinstance(data, dict) or "balance" not in data:
+        return None
+    try:
+        return int(str(data["balance"]))
+    except (TypeError, ValueError):
+        return None
+
+
 async def fetch_account_state() -> tuple[int | None, str | None, str]:
     """(баланс в нанотонах | None, статус аккаунта | None, источник данных).
 
-    TonAPI → фолбэк Toncenter v3; оба молчат — (None, None, "none").
+    TonAPI → фолбэк Toncenter v3; оба молчат ИЛИ ответили без числа в balance —
+    (None, None, "none"). «Не знаю» обязано отличаться от нуля: по нулю
+    /treasury советует пополнить казну, а по None — «индексаторы недоступны».
     """
     address = settings.active_treasury_address
     try:
         data = await _tonapi_account_raw(address)
-        balance = int(str(data.get("balance") or 0))
-        status = str(data.get("status") or "")
-        return balance, (status or None), "tonapi"
     except Exception as exc:
         logger.warning("Баланс казначея через TonAPI недоступен: %s", exc)
+        data = None
+    balance = _balance_of(data)
+    if balance is not None:
+        status = str((data or {}).get("status") or "")
+        return balance, (status or None), "tonapi"
+    if data is not None:
+        logger.warning("Баланс казначея через TonAPI не прочитан: в ответе нет числового balance")
     try:
         data = await _toncenter_account(address)
-        return int(str(data.get("balance") or 0)), None, "toncenter"
     except Exception as exc:
         logger.warning("Баланс казначея через Toncenter недоступен: %s", exc)
-    return None, None, "none"
+        return None, None, "none"
+    balance = _balance_of(data)
+    if balance is None:
+        logger.warning("Баланс казначея через Toncenter не прочитан: в ответе нет числового balance")
+        return None, None, "none"
+    return balance, None, "toncenter"
 
 
 def treasury_pair_check_text() -> str:

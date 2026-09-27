@@ -589,6 +589,101 @@ async def test_mirror_anomaly_warns_when_bootstrapped_mirror_freezes(ton_mirror)
         await _wipe_mirror()
 
 
+# ---------- Реорганизация цепочки (reorg) ----------
+
+
+async def test_reorg_rewrites_moved_tx_in_place(ton_mirror, monkeypatch) -> None:
+    """Реорг переставил транзакцию (новый lt/utime/сальдо) — строка переписана,
+    а не продублирована. Иначе одна транзакция учитывалась бы дважды и Σ
+    balance_delta разошлась бы с цепочкой навсегда."""
+    moved = _tonapi_item("org", lt=50_000, value=1_000_000_000, fee=5_000_000)
+    other = _tonapi_item("keep", lt=49_990, value=500_000_000, fee=5_000_000)
+    ledger = [moved, other]
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        first = await treasury_mirror.sync_treasury_mirror()
+        assert first["added"] == 2 and first["exact"] is True
+        async with SessionLocal() as db:
+            before = (await db.execute(
+                select(TreasuryMove).where(TreasuryMove.tx_hash == _h64("org")))).scalar_one()
+        assert before.lt == 50_000
+
+        # Тот же хеш вернулся в цепочку с другой позицией и сальдо.
+        ledger[0] = _tonapi_item("org", lt=50_500, value=1_200_000_000, fee=5_000_000)
+        reorg_sum = _fake_chain_balance(ledger)
+        monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                            _fake_chain_balance_async(reorg_sum))
+        second = await treasury_mirror.sync_treasury_mirror()
+
+        assert second["added"] == 0, "перезапись, не новая строка"
+        assert second["updated"] == 1, "только что переехавшая транзакция"
+        assert second["exact"] is True, f"зеркало обязано сойтись с новой цепочкой: {second}"
+        assert await _count_moves() == 2
+        async with SessionLocal() as db:
+            after = (await db.execute(
+                select(TreasuryMove).where(TreasuryMove.tx_hash == _h64("org")))).scalar_one()
+        assert after.lt == 50_500
+        assert after.balance_delta_nanotons == 1_195_000_000
+    finally:
+        await _wipe_mirror()
+
+
+async def test_reorg_orphan_stays_phantom_and_breaks_identity(ton_mirror, monkeypatch) -> None:
+    """Известное ограничение зафиксировано тестом, а не спрятано.
+
+    Транзакция, которую реорг выкинул из цепочки, больше НЕ приходит ни в одну
+    страницу — зеркало не умеет её удалять (см. docstring reset_treasury_mirror),
+    и строка-фантом остаётся в Σ навсегда. Обязательное следствие: тождество
+    обязано врать (exact=False, diff = сальдо фантома) и ежедневная автосверка
+    поднять тревогу, а не рапортовать «сходится ±0» над мёртвой строкой.
+    Ни /mirror reset, ни пересборка фантом не лечат — см. конец теста.
+    """
+    kept = _tonapi_item("alive", lt=60_000, value=1_000_000_000, fee=5_000_000)
+    orphan = _tonapi_item("doomed", lt=59_000, value=400_000_000, fee=5_000_000)
+    ledger = [kept, orphan]
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        first = await treasury_mirror.sync_treasury_mirror()
+        assert first["exact"] is True
+        phantom_delta = _fake_chain_balance([orphan])
+
+        # Реорг: orphan исчез из цепочки, живой баланс упал на его сальдо.
+        ledger.remove(orphan)
+        monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                            _fake_chain_balance_async(_fake_chain_balance(ledger)))
+        second = await treasury_mirror.sync_treasury_mirror()
+
+        assert second["exact"] is False, "фантом обязан ломать тождество"
+        assert second["diff_nanotons"] == phantom_delta
+        assert await _count_moves() == 2, "строка-фантом остаётся в зеркале"
+        async with SessionLocal() as session:
+            note = await ops._treasury_mirror_anomaly(session)
+        assert note is not None and "расходится" in note
+
+        # Известно и по docstring reset_treasury_mirror: сброс НЕ удаляет
+        # строки, а выкинутой реоргом транзакции уже никто не принесёт — фантом
+        # переживает пересборку. Это осознанный размен: лучше постоянная тревога
+        # с внятной цифрой, чем тихо переписанная история; чинить вручную.
+        await reset_treasury_mirror()
+        third = await treasury_mirror.sync_treasury_mirror()
+        assert third["added"] == 0 and third["updated"] == 0
+        assert third["exact"] is False, "фантом остаётся после пересборки"
+        assert third["diff_nanotons"] == phantom_delta
+        assert await _count_moves() == 2
+        async with SessionLocal() as session:
+            assert await ops._treasury_mirror_anomaly(session) is not None
+    finally:
+        await _wipe_mirror()
+
+
 # ---------- Re-bootstrap по команде хранителя (/mirror reset confirm) ----------
 
 
