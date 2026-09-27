@@ -27,6 +27,7 @@ from app.core.registry import (
     ALERT_REFUND_KEY,
     ALERT_STAKE_KEY,
     ALERT_STUCK_KEY,
+    ALERT_TICK_FAIL_KEY,
     ALERT_TICK_KEY,
     ALERT_WATCHER_KEY,
     BEAT_KEY,
@@ -34,6 +35,8 @@ from app.core.registry import (
     PAUSE_KEY,
     PAUSE_REASON_KEY,
     STUCK_TX_KEY,
+    TICK_FAIL_KEY,
+    TICK_FAIL_LAST_KEY,
     TICK_KEY,
 )
 from app.db import SessionLocal
@@ -54,6 +57,10 @@ _REFUND_OLD_AFTER = timedelta(minutes=30)
 _STAKE_CONFIRM_STALE_MULT = 2
 # Тики идут каждые 15 секунд: тишина дольше пары минут — процесс болен.
 _TICK_STALE_AFTER = timedelta(minutes=5)
+# Столько тиков подряд должны упасть, прежде чем тревога полетит админу.
+# Один-два сбоя — обычная жизнь (гонка с закрытием дня, мигрантом БД), а
+# третье подряд означает, что расписание не работает вовсе.
+_TICK_FAIL_ALERT_AFTER = 3
 # Допуск сверки баланса казначея с БД: сгоревший газ исходящих переводов
 # и мелкий ручной вывод не должны будить админа ложной тревогой.
 _BALANCE_TOLERANCE_NANO = 50_000_000  # 0.05 Gram
@@ -128,9 +135,66 @@ async def claim_once(session, key: str) -> bool:
 
 
 async def mark_tick() -> None:
-    """Планировщик отмечается каждый тик: /health видит зависший процесс."""
+    """Планировщик отмечается УСПЕШНЫМ тиком: /health видит зависший процесс.
+
+    Смысл «после работы, а не до» — главный инцидент наблюдаемости: битие,
+    поставленное в начале тика, подтверждало живость того же цикла, который
+    тут же падал в лог. Дни не открывались, а /health отвечал «ok», и тревога
+    «планировщик не тикает» не могла сработать по построению. Теперь зависший
+    цикл честно старый, и его видит и мониторинг, и check_anomalies.
+    """
     async with SessionLocal() as session:
         await _set_state(session, TICK_KEY, _now().isoformat())
+        if await _get_state(session, TICK_FAIL_KEY) is not None:
+            # Успех стирает счётчик падений: иначе три разовые аварии за
+            # месяц накопились бы до «падает» и кричали бы вхолостую.
+            await session.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_([TICK_FAIL_KEY, TICK_FAIL_LAST_KEY])
+                )
+            )
+            await session.commit()
+
+
+async def mark_tick_failed(exc: BaseException | str, bot: Bot | None = None) -> int:
+    """Тик упал: счётчик подряд, текст ошибки, тревога при затяжном падении.
+
+    Отдельная точка входа вместо тихого `logger.exception` в теле тика. Сама
+    тревога идёт отсюда, а не из check_anomalies, потому что её единственный
+    носитель — тот же упавший цикл, и полагаться на него нельзя. Кулдаун
+    час, как у остальных тревог; biение при этом честно стареет и через
+    5 минут поднимает вторую, независимую сигнализацию.
+    """
+    detail = (
+        f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc)
+    )[:300]
+    count = 0
+    try:
+        async with SessionLocal() as session:
+            raw = await _get_state(session, TICK_FAIL_KEY)
+            try:
+                count = int(raw or "0") + 1
+            except ValueError:
+                logger.debug("Счётчик падений тика не парсится (%r) — начинаем с нуля", raw)
+                count = 1
+            await _set_state(session, TICK_FAIL_KEY, str(count))
+            await _set_state(session, TICK_FAIL_LAST_KEY, detail)
+            if count < _TICK_FAIL_ALERT_AFTER or not await _throttled(
+                session, ALERT_TICK_FAIL_KEY
+            ):
+                return count
+        await notify_admins(
+            bot,
+            f"🚨 Главный тик падает {count} раз подряд: {detail}\n"
+            "Дни не открываются и не закрываются, анонсы молчат — цикл повторяется "
+            "каждые 15 секунд и падает снова. Степень: /health last_tick_age.\n"
+            "Стоп-кран: /pause on (выплаты и watcher продолжат работать), "
+            "дальше — по логам планировщика.",
+        )
+    except Exception:
+        # Упавший тик не должен утащить за собой ещё и наблюдаемость.
+        logger.exception("Не удалось записать падение главного тика")
+    return count
 
 
 async def snapshot() -> dict:
@@ -191,10 +255,18 @@ async def snapshot() -> dict:
             )
         ).scalar_one()
         cursor_iso = await _get_state(session, BEAT_KEY)
+        # Счётчик падений главного тика: битие может быть свежим (сбой
+        # короче 5 минут), а цикл при этом не отработал ни разу. Текст
+        # последней ошибки в /health не отдаём — эндпоинт бывает без токена.
+        try:
+            tick_failures = int(await _get_state(session, TICK_FAIL_KEY) or "0")
+        except ValueError:
+            tick_failures = 0
         payload = {
             "status": "ok",
             "uptime_seconds": round(time.time() - PROCESS_START, 1),
             "last_tick_age": _age_seconds(await _get_state(session, TICK_KEY)),
+            "tick_failures": tick_failures,
             "round": None,
             "payout_queue": int(queue_count),
             "payout_pending_by_kind": pending_by_kind,

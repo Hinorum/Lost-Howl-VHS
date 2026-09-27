@@ -516,13 +516,34 @@ async def test_ton_maintenance_runs_services_in_order(monkeypatch) -> None:
     monkeypatch.setattr("app.ton_pay.settle_closed_rounds", settle)
     monkeypatch.setattr("app.leaderboard.settle_week_if_due", week)
     monkeypatch.setattr("app.leaderboard.settle_month_if_due", month)
-    monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=[]))
 
     await sched._ton_maintenance()
     assert order == ["confirm", "settle", "week", "month"]
-    # Наличие аномалий — только warning.
+
+
+async def test_ops_sweep_logs_anomalies(monkeypatch) -> None:
+    """Тревоги живут в своей джобе: список проблем — warning, не исключение."""
+    from app import scheduler as sched
+
+    monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=[]))
+    await sched._ops_sweep()
     monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=["фонд разошёлся"]))
-    await sched._ton_maintenance()
+    await sched._ops_sweep()
+
+
+async def test_ops_sweep_registered_without_ton(monkeypatch) -> None:
+    """Тревоги не зависят от TON_ENABLED: иначе при деньгах-выкл их нет вовсе."""
+    from app import scheduler as sched
+
+    registered: list[str] = []
+    monkeypatch.setattr(sched, "_register_job", lambda job_id, *a, **k: registered.append(job_id))
+    monkeypatch.setattr(sched, "scheduler", SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(settings, "ton_enabled", False)
+
+    sched.start_scheduler()
+
+    assert "ops-sweep" in registered
+    assert "ton-watch" not in registered
 
 
 async def test_ton_maintenance_isolates_failures(monkeypatch) -> None:
@@ -543,7 +564,6 @@ async def test_ton_maintenance_isolates_failures(monkeypatch) -> None:
     monkeypatch.setattr("app.ton_pay.settle_closed_rounds", settle)
     monkeypatch.setattr("app.leaderboard.settle_week_if_due", week)
     monkeypatch.setattr("app.leaderboard.settle_month_if_due", month)
-    monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=[]))
 
     await sched._ton_maintenance()
     assert rejected == ["settle", "week", "month"]

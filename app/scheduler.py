@@ -37,14 +37,15 @@ def set_bot(bot: Bot) -> None:
 
 async def tick(bot: Bot | None = None) -> None:
     bot = bot or _bot
-    from app.ops import is_game_paused, mark_tick
+    from app.ops import is_game_paused, mark_tick, mark_tick_failed
 
-    await mark_tick()
     # Стоп-кран: дни не открываются и не закрываются, анонсы молчат.
     # Watcher (отдельная джоба) продолжает возвращать входящие переводы,
     # а очередь выплат — разгребаться: чужие деньги зависнуть не должны.
+    # Битие здесь честное: игра стоит по команде, а не упала.
     async with SessionLocal() as session:
         if await is_game_paused(session):
+            await mark_tick()
             return
     async with SessionLocal() as session:
         try:
@@ -87,9 +88,18 @@ async def tick(bot: Bot | None = None) -> None:
                         _finalize_new_day_job(finished.id, wait_results=results_task),
                         "finalize_new_day",
                     )
-        except Exception:
+        except Exception as exc:
             logger.exception("тик закрытия дня упал — откат транзакции")
             await session.rollback()
+            # Битие НЕ обновляем: иначе падающий каждые 15 секунд цикл
+            # подтверждал бы собственную живость, /health отвечал бы «ok»,
+            # а тревога «планировщик не тикает» не срабатывала бы никогда.
+            # Счётчик падений и админский алерт — в mark_tick_failed; стирает
+            # их следующий успешный тик.
+            await mark_tick_failed(exc, bot)
+            return
+    # До сюда доходим только успешным тиком: сердцебиение = «цикл отработал».
+    await mark_tick()
 
 
 async def _announce_results_job(finished_id: int) -> None:
@@ -219,7 +229,6 @@ async def _treasury_mirror_guarded() -> None:
 async def _ton_maintenance() -> None:
     """Финализация дней, очередь выплат, ретраи, копилки недели и месяца."""
     from app.leaderboard import settle_month_if_due, settle_week_if_due
-    from app.ops import check_anomalies
     from app.ton_pay import confirm_broadcast_payouts, settle_closed_rounds
 
     try:
@@ -241,12 +250,28 @@ async def _ton_maintenance() -> None:
         await settle_month_if_due(bot=_bot)
     except Exception:
         logger.exception("settle_month_if_due упал")
-    try:
-        problems = await check_anomalies(_bot)
-        if problems:
-            logger.warning("Аномалии: %s", "; ".join(problems))
-    except Exception:
-        logger.exception("Проверка аномалий упала (не мешает обслуживанию)")
+    # Проверка аномалий уехала в отдельную джобу ops-sweep: она обязана
+    # работать и при TON_ENABLED=false, где раньше не запускалась вовсе.
+
+
+async def _ops_sweep() -> None:
+    """Тревоги по расписанию и данным — раз в 120с, при любой конфигурации.
+
+    Раньше проверка жила внутри ton-settle, а та регистрируется только при
+    TON_ENABLED=true. В текущем проде деньги выключены, значит не работали
+    ВСЕ тревоги разом: ни «очередь стоит», ни «безнадёжные выплаты», ни
+    «планировщик не тикает». Своя джоба честно отделена от денежного контура.
+    """
+    from app.ops import check_anomalies
+
+    problems = await check_anomalies(_bot)
+    if problems:
+        logger.warning("Аномалии: %s", "; ".join(problems))
+
+
+async def _ops_sweep_guarded() -> None:
+    """Обёртка _ops_sweep с алертом при падении."""
+    await _alert_guarded("ops-sweep", _ops_sweep)
 
 
 async def _ton_maintenance_guarded() -> None:
@@ -356,6 +381,9 @@ def start_scheduler() -> None:
     from app.backups import backup_job
 
     _register_job("way-tick", tick, "interval", seconds=15)
+    # Тревоги идут всегда, независимо от TON: при выключенных деньгах они
+    # всё равно нужны (очередь, dead-letter, зависший планировщик, бэкап).
+    _register_job("ops-sweep", _ops_sweep_guarded, "interval", seconds=120)
     # Суточный бэкап в «мёртвый» час: 04:17 MSK.
     _register_job(
         "db-backup",
