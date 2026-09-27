@@ -351,8 +351,15 @@ async def _deliver_chat(
     except TelegramRetryAfter as exc:
         logger.warning("Флуд-контроль в чате %s: пауза %d с", chat_id, exc.retry_after)
         await asyncio.sleep(exc.retry_after + 1)
-        await _deliver_day(bot, chat_id, round_row, finished, results_text, remember=remember)
-        return chat_id
+        # Повтор тоже может не пройти (флуд не прошёл и с паузой). Без try
+        # исключение улетало из worker'а в gather и отменяло рассылку дня
+        # ВООБЩЕ — из-за одного болтливого чата. Ответ симметричен ветке ниже.
+        try:
+            await _deliver_day(bot, chat_id, round_row, finished, results_text, remember=remember)
+            return chat_id
+        except Exception as exc2:
+            logger.warning("Анонс дня в чат %s не доставлен (после ретрая): %s", chat_id, exc2)
+            return None
     except TelegramForbiddenError:
         await deactivate_chat(chat_id)
         return None
