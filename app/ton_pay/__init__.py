@@ -49,54 +49,30 @@ from app.ton_utils import friendly_address, from_nano, normalize_address, to_nan
 
 logger = logging.getLogger(__name__)
 
-# Синглтон кошелька казначея: подключение к лайтсерверам дорогое, держим одно.
-_wallet_lock = asyncio.Lock()
-_provider = None
-_wallet = None
-_wallet_network: str | None = None
+# Глобальное состояние пакета: блокировки, кэши, флаги доступности истории.
+# Все обращения через `state.<имя>` (см. ниже). Этот шаг — первый шаг
+# рефакторинга ton_pay.py в пакет; wallet.py и http_channel.py используют
+# то же состояние через короткие псевдонимы внизу файла.
+from . import (  # noqa: E402,F401  (submodules exposed as `app.ton_pay.{state,wallet,...}`)
+    state,
+)
+from . import state as _state  # noqa: E402
+from . import wallet as _wallet_pkg  # noqa: E402,F401  (re-export as `app.ton_pay.wallet`)
 
-# Батч-контекст диспетчера: seqno кошелька, взятый ОДИН раз на цикл, и счётчик
-# локально наращиваемый на каждый перевод пачки. Без него каждый вызов
-# wallet.transfer() делал бы новый get_seqno() у сети: два перевода подряд
-# (приз + рейк одного дня) получали бы ОДИН seqno, в блок входил бы только
-# один, второй тихо терялся, хотя лайтсервер возвращал результат 1.
-_batch_seqno: int | None = None
-
-# Сериализация очереди выплат: dispatch_pending_payouts вызывают ЗАКРЫТИЕ дня
-# (кик в тике), ton-settle (каждые 120 с) и ручные /finalize, /return,
-# /refinalize. _reset_retriable оживляет строки sending → pending, поэтому
-# без лока второй цикл, стартовавший, пока первый вещает, задвоил бы платёж.
-_DISPATCH_LOCK = asyncio.Lock()
-
-# Размер страницы истории казначея: одна страница (128 tx) слишком мелкая для
-# анти-дубля в длинной очереди — memo «уже отправленного» уходит за окно, и
-# сверка думает «перевода нет». Глубина покрытия задаётся настройками
-# payout_reconcile_history_seconds / payout_reconcile_max_pages.
-_RECONCILE_PAGE_LIMIT = 128
-# Шаг пагинации: страница шагает НЕ на весь лимит, а с перекрытием хвоста
-# (16 записей). В живой казне между двумя запросами может прийти новая
-# транзакция, и граница ровно «128...256» сползут: memo на стыке уедет за край
-# недосчитанной страницы. Перекрытие перечитывает стык — карта memo→хеш
-# идемпотентна, лишнее перечтение безвредно, а дыры не бывает.
-_RECONCILE_PAGE_OVERLAP = 16
-# Доступна ли история казначея В ПОСЛЕДНЕМ опросе. Пусто set() в маркерах
-# означает и «транзакций нет вообще», и «провайдеры молчат»; диспетчеру при
-# повторе (>1 попытки) это различие критично: переотправка без возможности
-# проверить memo = риск задвоить уже ушедший перевод. Флаг ставится в
-# fetch_broadcast_tx_map реальными вызовами (True при успехе любого провайдера,
-# False когда оба упали). Стартовое True = «история доступна»: до первого цикла
-# диспетчер всё равно ходит за маркерами до ретраев.
-_RECONCILE_HISTORY_OK = True
-# Переключение казначея на HTTP-канал (лайтсерверы режутся окружением):
-# запоминаем момент первого включения в процессе и стучим хранителю об этом
-# не чаще раза в _HTTP_CHANNEL_ALERT_COOLDOWN, чтобы на появление канала в
-# логах не сосать глаза, а статус был виден в чате.
-_http_channel_engaged_at: datetime | None = None
-_last_http_channel_alert_at: datetime | None = None
-_HTTP_CHANNEL_ALERT_COOLDOWN = timedelta(hours=6)
-# TONCENTER_API_KEY отсутствует: канал работает под анонимным лимитом и может
-# получить 429. Кричать об этом в лог один раз за процесс, не каждую выплату.
-_warned_no_toncenter_key = False
+# Удобные алиасы внутри модуля (для краткости ссылок в __init__).
+_wallet_lock = _state._wallet_lock
+_provider = _state._provider
+_wallet = _state._wallet
+_wallet_network = _state._wallet_network
+_batch_seqno = _state._batch_seqno
+_DISPATCH_LOCK = _state._DISPATCH_LOCK
+_RECONCILE_HISTORY_OK = _state._RECONCILE_HISTORY_OK
+_http_channel_engaged_at = _state._http_channel_engaged_at
+_last_http_channel_alert_at = _state._last_http_channel_alert_at
+_HTTP_CHANNEL_ALERT_COOLDOWN = _state._HTTP_CHANNEL_ALERT_COOLDOWN
+_warned_no_toncenter_key = _state._warned_no_toncenter_key
+_RECONCILE_PAGE_LIMIT = _state._RECONCILE_PAGE_LIMIT
+_RECONCILE_PAGE_OVERLAP = _state._RECONCILE_PAGE_OVERLAP
 
 
 @asynccontextmanager
@@ -106,54 +82,23 @@ async def dispatch_lock():
     async with _DISPATCH_LOCK:
         yield
 
-# Глобальный идентификатор сети (конфиг #19 блокчейна): входит в wallet_id
-# контракта v5, поэтому с одной мнемоникой тестнет- и мейннет-v5-кошельки
-# имеют разные адреса.
-NETWORK_GLOBAL_IDS = {"mainnet": -239, "testnet": -3}
-# Поддерживаемые версии контракта казначея.
-WALLET_VERSIONS = ("v4r2", "v5r1")
+
+# Совместимость с тестами и старым кодом: алиасы для приватных имён из старого
+# ton_pay.py. Реальные реализации живут в wallet.py, здесь — тонкие обёртки.
+def _wallet_address(version, public_key, network_global_id, wc=0):  # noqa: ANN001,ANN201
+    from .wallet import wallet_address as _impl
+
+    return _impl(version, public_key, network_global_id, wc)
 
 
-def _wallet_address(version: str, public_key: bytes, network_global_id: int, wc: int = 0) -> str:
-    """Адрес кошелька данной версии для ключа — чистая локальная математика.
+def _detect_wallet_version(public_key, treasury_address, network_global_id):  # noqa: ANN001,ANN201
+    from .wallet import detect_wallet_version as _impl
 
-    Адрес = хеш StateInit(code + data), сеть не нужна. Data-ячейка v4 сеть не
-    задаёт (адрес одинаков в обеих сетях), у v5 network_global_id входит в
-    wallet_id внутри data.
-    """
-    from pytoniq.contract.wallets.wallet import WALLET_V4_R2_CODE, WalletV4R2
-    from pytoniq.contract.wallets.wallet_v5 import WALLET_V5_R1_CODE, WalletV5R1
-    from pytoniq_core.tlb.account import StateInit
-
-    if version == "v4r2":
-        data = WalletV4R2.create_data_cell(public_key=public_key, wc=wc)
-        code = WALLET_V4_R2_CODE
-    elif version == "v5r1":
-        data = WalletV5R1.create_data_cell(public_key=public_key, wc=wc, network_global_id=network_global_id)
-        code = WALLET_V5_R1_CODE
-    else:
-        raise ValueError(f"Неизвестная версия кошелька казначея: {version}")
-    state_init = StateInit(code=code, data=data)
-    return f"{wc}:{state_init.serialize().hash.hex()}"
+    return _impl(public_key, treasury_address, network_global_id)
 
 
-def _detect_wallet_version(
-    public_key: bytes, treasury_address: str, network_global_id: int
-) -> tuple[str | None, dict[str, str]]:
-    """Версия кошелька, чей производный адрес совпал с настроенным.
-
-    Возвращает (версия | None, {версия: адрес-кандидат}) — кандидаты идут в
-    текст ошибки, чтобы расхождение мнемоники и адреса было видно сразу.
-    """
-    target = normalize_address(treasury_address)
-    candidates = {
-        version: _wallet_address(version, public_key, network_global_id)
-        for version in WALLET_VERSIONS
-    }
-    for version, address in candidates.items():
-        if normalize_address(address) == target:
-            return version, candidates
-    return None, candidates
+# Алиас для константы из wallet.py (тесты используют ton_pay._V4R2_WALLET_ID).
+from .wallet import _V4R2_WALLET_ID  # noqa: E402,F401
 
 
 async def pending_payout_count(session) -> int:
@@ -198,91 +143,19 @@ async def resolve_dead_payout(session, payout_id: int, action: str) -> str | Non
 
 
 async def _fetch_remote_json(url: str) -> dict:
-    """Скачивает JSON (конфиг лайтсерверов) с редиректами."""
-    client = get_http_client()
-    response = await client.get(url)
-    response.raise_for_status()
-    return response.json()
+    """DEPRECATED: тонкая обёртка над wallet.fetch_remote_json для обратной
+    совместимости тестов; новый код импортирует из wallet напрямую."""
+    from .wallet import fetch_remote_json
+
+    return await fetch_remote_json(url)
 
 
 async def _get_wallet():
-    """Ленивая инициализация кошелька казначея для активной сети.
+    """DEPRECATED: тонкая обёртка над wallet.get_wallet для обратной совместимости
+    тестов и внутренних вызовов __init__. Новый код импортирует из wallet."""
+    from .wallet import get_wallet
 
-    Версия контракта — из TREASURY_WALLET_VERSION («auto» = детект по адресу).
-    Проверка пары мнемоника/адрес выполняется ДО подключения к сети: если
-    производный адрес не совпал, отправлять нельзя в принципе — падаем с
-    внятной ошибкой, а не молчаливыми неудачными выплатами. Источник
-    лайтсерверов: LITESERVER_CONFIG_URL (свежий JSON), иначе встроенный
-    конфиг pytoniq для сети.
-    """
-    global _provider, _wallet, _wallet_network
-    network = "testnet" if settings.is_testnet else "mainnet"
-    async with _wallet_lock:
-        if _wallet is not None and _wallet_network == network:
-            return _wallet
-        if not settings.active_treasury_mnemonic:
-            raise ValueError("Нет мнемоники казначея для активной сети")
-        if not settings.active_treasury_address:
-            raise ValueError("Нет адреса казначея для активной сети")
-        words = settings.active_treasury_mnemonic.replace("\n", " ").split()
-        if len(words) < 12:
-            raise ValueError("Мнемоника казначея неполная (нужно 24 слова)")
-
-        from pytoniq import LiteBalancer
-        from pytoniq.contract.wallets.wallet import WalletV4R2
-        from pytoniq.contract.wallets.wallet_v5 import WalletV5R1
-        from pytoniq_core.crypto.keys import mnemonic_to_private_key, private_key_to_public_key
-
-        _, private_key = mnemonic_to_private_key(words)
-        public_key = private_key_to_public_key(private_key)
-        network_global_id = NETWORK_GLOBAL_IDS[network]
-
-        requested = settings.treasury_wallet_version.strip().lower()
-        if requested in WALLET_VERSIONS:
-            derived = _wallet_address(requested, public_key, network_global_id)
-            if normalize_address(derived) != normalize_address(settings.active_treasury_address):
-                raise ValueError(
-                    f"Адрес казначея не совпадает с производным от мнемоники "
-                    f"(TREASURY_WALLET_VERSION={requested}): {derived}. "
-                    "Проверь пару мнемоника/адрес или верни auto."
-                )
-            version = requested
-        else:
-            version, candidates = _detect_wallet_version(
-                public_key, settings.active_treasury_address, network_global_id
-            )
-            if version is None:
-                raise ValueError(
-                    "Адрес казначея не совпадает ни с одной поддерживаемой версией "
-                    f"кошелька для этой мнемоники: {candidates}. Проверь адрес и "
-                    "мнемонику, либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
-                )
-
-        if _provider is not None:
-            try:
-                await _provider.close_all()
-            except Exception:
-                logger.warning("Не удалось закрыть старый провайдер лайтсерверов", exc_info=True)
-            _provider = None
-            _wallet = None
-        if settings.liteserver_config_url:
-            config = await _fetch_remote_json(settings.liteserver_config_url)
-            _provider = LiteBalancer.from_config(config)
-            logger.info("Лайтсерверы: конфиг из LITESERVER_CONFIG_URL")
-        elif network == "testnet":
-            _provider = LiteBalancer.from_testnet_config()
-        else:
-            _provider = LiteBalancer.from_mainnet_config()
-        await _provider.start_up()
-        if version == "v5r1":
-            _wallet = await WalletV5R1.from_private_key(
-                _provider, private_key=private_key, wc=0, network_global_id=network_global_id
-            )
-        else:
-            _wallet = await WalletV4R2.from_private_key(_provider, private_key, wc=0)
-        _wallet_network = network
-        logger.info("Кошелёк казначея готов (%s, контракт %s)", network, version)
-        return _wallet
+    return await get_wallet()
 
 
 def _comment_cell(text: str):
@@ -561,9 +434,6 @@ async def fetch_broadcast_markers() -> set[str]:
 # Жизненный цикл строки и анти-дубль по memo не меняются: диспетчер перед
 # повтором по-прежнему сверяется с историей исходящих.
 
-# Дефолтный wallet_id контракта v4r2 (константа pytoniq; в data-ячейке v4).
-_V4R2_WALLET_ID = 698983191
-
 
 def _is_liteserver_down(exc: BaseException) -> bool:
     """Сбой именно лайтсерверного канала, а не самой выплаты.
@@ -584,97 +454,18 @@ def build_offline_wallet(
     network_global_id: int,
     forced_version: str | None = None,
 ):
-    """Кошелёк БЕЗ провайдера по мнемонике: чистая локальная математика.
+    """DEPRECATED: обёртка над wallet.build_offline_wallet для обратной
+    совместимости (используется в тестах и сценариях e2e)."""
+    from .wallet import build_offline_wallet as _build
 
-    Общий строитель для HTTP-канала (лайтсерверы мертвы, сеть не нужна):
-    версия контракта детектится по привязанному адресу, StateInit собирается
-    из кода контракта и data ровно как в _get_wallet/_wallet_address (пара
-    мнемоника/адрес валидируется тем же детектом). Возвращает (wallet, version).
-    forced_version — «v4r2»|«v5r1» принудительно (как TREASURY_WALLET_VERSION);
-    иначе авто-детект.
-    """
-    from pytoniq.contract.wallets.wallet import WALLET_V4_R2_CODE, WalletV4R2
-    from pytoniq.contract.wallets.wallet_v5 import WALLET_V5_R1_CODE, WalletV5R1
-    from pytoniq_core import Address, StateInit
-    from pytoniq_core.crypto.keys import mnemonic_to_private_key, private_key_to_public_key
-
-    words = mnemonic.replace("\n", " ").split()
-    if len(words) < 12:
-        raise ValueError("Мнемоника неполная (нужно 24 слова)")
-    _, private_key = mnemonic_to_private_key(words)
-    public_key = private_key_to_public_key(private_key)
-
-    requested = (forced_version or "").strip().lower()
-    if requested in WALLET_VERSIONS:
-        derived = _wallet_address(requested, public_key, network_global_id)
-        if normalize_address(derived) != normalize_address(address):
-            raise ValueError(
-                f"Адрес не совпадает с производным от мнемоники "
-                f"(версия {requested}): {derived}. Проверь пару мнемоника/адрес "
-                "или верни auto."
-            )
-        version = requested
-    else:
-        version, candidates = _detect_wallet_version(public_key, address, network_global_id)
-        if version is None:
-            raise ValueError(
-                "Адрес не совпадает ни с одной поддерживаемой версией кошелька "
-                f"для этой мнемоники: {candidates}. Проверь адрес и мнемонику, "
-                "либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
-            )
-
-    if version == "v5r1":
-        data = WalletV5R1.create_data_cell(public_key=public_key, wc=0, network_global_id=network_global_id)
-        code = WALLET_V5_R1_CODE
-        wallet_class = WalletV5R1
-    else:
-        data = WalletV4R2.create_data_cell(public_key=public_key, wc=0, wallet_id=_V4R2_WALLET_ID)
-        code = WALLET_V4_R2_CODE
-        wallet_class = WalletV4R2
-    state_init = StateInit(code=code, data=data)
-    address_obj = Address((0, state_init.serialize().hash))
-    if version == "v5r1":
-        # wallet_id — свойство, читающее data из self.state; кода на аккаунте
-        # для этого не нужно, но self.state обязан быть заполнен.
-        wallet = wallet_class(
-            provider=None,
-            address=address_obj,
-            state_init=state_init,
-            private_key=private_key,
-        )
-        wallet.state = state_init
-    else:
-        # v4: wallet_id — read-only свойство, читающее data из self.state
-        # (константа контракта внутри data-ячейки); kwarg'ом задать нельзя.
-        wallet = wallet_class(
-            provider=None,
-            address=address_obj,
-            state_init=state_init,
-            private_key=private_key,
-        )
-        wallet.state = state_init
-    return wallet, version
+    return _build(mnemonic, address, network_global_id, forced_version)
 
 
 def _build_offline_treasury_wallet():
-    """Кошелёк казначея БЕЗ провайдера: build_offline_wallet от настроек.
+    """DEPRECATED: обёртка над wallet.build_offline_treasury_wallet."""
+    from .wallet import build_offline_treasury_wallet as _build
 
-    Вариант для HTTP-канала: лайтсерверы мертвы, поэтому экземпляр кошелька
-    создаётся без подключения (provider=None), а StateInit собирается из кода
-    контракта и data ровно как в _get_wallet/_wallet_address (пары мнемоника/
-    адрес валидируются тем же детектом версии). Сеть не трогается: seqno и
-    публичный ключ онлайн-путь берут у liteclient, здесь их читаем по HTTP.
-    Возвращает (wallet, version).
-    """
-    network = "testnet" if settings.is_testnet else "mainnet"
-    requested = settings.treasury_wallet_version.strip().lower() if settings.treasury_wallet_version else ""
-    forced = requested if requested in WALLET_VERSIONS else None
-    return build_offline_wallet(
-        settings.active_treasury_mnemonic,
-        settings.active_treasury_address,
-        NETWORK_GLOBAL_IDS[network],
-        forced_version=forced,
-    )
+    return _build()
 
 
 def _parse_run_method_seqno(data: dict) -> int | None:
@@ -1500,6 +1291,9 @@ def treasury_pair_check_text() -> str:
         return "мнемоника невалидна ⚠️"
     public_key = private_key_to_public_key(private_key)
     network = "testnet" if settings.is_testnet else "mainnet"
+    from .wallet import NETWORK_GLOBAL_IDS
+    from .wallet import detect_wallet_version as _detect_wallet_version
+
     version, _candidates = _detect_wallet_version(
         public_key, settings.active_treasury_address, NETWORK_GLOBAL_IDS[network]
     )
