@@ -421,8 +421,44 @@ def start_scheduler() -> None:
     scheduler.start()
 
 
+def _reminder_text(stake_mode: bool, rule_phrase: str, stakes: tuple[int, int]) -> str:
+    """Напоминание за час до конца с персональной строкой о ставке игрока.
+
+    stakes = (confirmed_nanotons, pending_nanotons) по СЕГОДНЯШНему дню.
+    Игрок в рассылку попадает только не выбравшим путь, поэтому «путь не
+    выбран» подразумевается; здесь главное — донести, сделана ли ставка и на
+    сколько, чтобы человек знал, чего ждать после закрытия.
+    """
+    body = f"🐺 Голосование закрывается через час.\n🎬 Сцена дня: {rule_phrase}."
+    if not stake_mode:
+        return f"{body}\nПуть ещё не выбран — жми «Сцена I/II/III» под постом дня."
+    confirmed, pending = stakes
+    if confirmed > 0:
+        words = (
+            f"Твоя ставка {confirmed / 1e9:.2f} Gram уже принята, но путь ещё "
+            "не выбран — жми «Сцена I/II/III» под постом дня."
+        )
+    elif pending > 0:
+        words = (
+            f"Твоя ставка {pending / 1e9:.2f} Gram подтверждается (обычно до минуты), "
+            "а путь ещё не выбран — жми «Сцена I/II/III» под постом дня."
+        )
+    else:
+        words = (
+            "Ставка не сделана и путь не выбран: переведи Gram казначею и жми "
+            "«Сцена I/II/III» под постом дня."
+        )
+    return f"{body}\n{words}"
+
+
 async def _vote_reminder_job() -> None:
-    """Напоминание игрокам проголосовать: DM тем, кто ещё не голосовал сегодня."""
+    """Напоминание за час до конца: DM ТОЛЬКО тем, кто ещё не выбрал путь.
+
+    Одна рассылка на дату (маркер в operations). Личная строка о ставке:
+    без неё игрок, поставивший Gram, но не выбравший кадр, лежит в неведении —
+    а игрок, сделавший всё, напоминание не получает вовсе (приоритет — тем,
+    кому ещё есть что сделать).
+    """
     bot = _bot
     if bot is None:
         return
@@ -460,6 +496,7 @@ async def _vote_reminder_job() -> None:
 
             if not unbotted:
                 return
+            unbotted_ids = {p.id for p in unbotted}
 
             stake_mode = (
                 settings.ton_enabled
@@ -470,16 +507,40 @@ async def _vote_reminder_job() -> None:
             rule_phrase = (RULE_PHRASES if stake_mode else VOTE_RULE_PHRASES)[
                 current.win_rule
             ]
-            text = (
-                f"🐺 Голосование закрывается через час.\n"
-                f"🎬 Сцена дня: {rule_phrase}."
-            )
+            # Суммы ставок по игрокам дня — одно чтение на всю рассылку:
+            # правим язык напоминания под фактическое состояние игрока.
+            stake_totals: dict[int, tuple[int, int]] = {}
+            if stake_mode:
+                from app.models import Stake
+
+                stake_rows = await session.execute(
+                    _select(Stake.player_id, Stake.amount_nanotons, Stake.status).where(
+                        Stake.round_id == current.id
+                    )
+                )
+                for pid, amount, status in stake_rows.all():
+                    confirmed, pending = stake_totals.get(pid, (0, 0))
+                    if status == "confirmed":
+                        stake_totals[pid] = (confirmed + int(amount), pending)
+                    else:
+                        stake_totals[pid] = (confirmed, pending + int(amount))
 
             from app.broadcast import _dm_send_all
 
             async def _deliver(pid: int) -> None:
+                # Рассылка идёт по всем подписанным (параллельный пул), но текст
+                # адресован только не выбравшим путь: для них и существуем.
+                if pid not in unbotted_ids:
+                    return
                 try:
-                    await bot.send_message(pid, text)
+                    await bot.send_message(
+                        pid,
+                        _reminder_text(
+                            stake_mode,
+                            rule_phrase,
+                            stake_totals.get(pid, (0, 0)),
+                        ),
+                    )
                 except Exception as exc:
                     logger.debug("Напоминание о голосовании игроку %s не доставлено: %s", pid, exc)
 

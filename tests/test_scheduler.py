@@ -15,6 +15,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Card, PreparedDay, Round, RoundStatus, WinRule
 from app.scheduler import tick
+from app.stakes import current_network
 
 
 @pytest.fixture(autouse=True)
@@ -652,12 +653,14 @@ async def test_vote_reminder_sends_dms_once_per_day(monkeypatch) -> None:
 
     try:
         await sched._vote_reminder_job()
-        assert sends.await_count == 2  # 501 и 502 получают напоминание
+        # 501 уже выбрал путь — напоминание ему не уходит; 502 получает.
+        assert sends.await_count == 1
+        assert sends.await_args.args[0] == 502
 
         # Повторный заход в тот же день — маркер job:vote-reminder:<дата>
         # закоммичен и занят, участники не спамятся повторно.
         await sched._vote_reminder_job()
-        assert sends.await_count == 2
+        assert sends.await_count == 1
 
         # Следующий день: маркер свеж, но все проголосовали — рассылка тихо
         # отменяется.
@@ -667,7 +670,92 @@ async def test_vote_reminder_sends_dms_once_per_day(monkeypatch) -> None:
             db.add(Vote(round_id=rid, player_id=502, card_position=1))
             await db.commit()
         await sched._vote_reminder_job()
+        assert sends.await_count == 1
+    finally:
+        await _clear_rounds()
+
+
+async def test_vote_reminder_stake_and_no_stake_lines(monkeypatch) -> None:
+    """Личная строка о ставке: сделана (сумма) / не сделана."""
+    from app import scheduler as sched
+    from app.models import Player, Stake
+
+    await _clear_rounds()
+    rid = await _make_round(9803, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    texts: dict[int, str] = {}
+    sends.side_effect = lambda pid, text: texts.update({pid: text})
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[521, 522]))
+    reminder_now = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
+    monkeypatch.setattr(sched, "_now", lambda: reminder_now)
+
+    async with SessionLocal() as db:
+        db.add(Player(id=521, username="staked", first_name="S", dm_subscribed=True))
+        db.add(Player(id=522, username="plain", first_name="P", dm_subscribed=True))
+        db.add(
+            Stake(
+                round_id=rid,
+                player_id=521,
+                amount_nanotons=500_000_000_000,
+                tx_hash="rm-stake-521",
+                memo="m9803",
+                network=current_network(),
+                status="confirmed",
+            )
+        )
+        await db.commit()
+
+    try:
+        await sched._vote_reminder_job()
         assert sends.await_count == 2
+        assert "500.00 Gram уже принята" in texts[521]
+        assert "путь ещё не выбран" in texts[521]
+        assert "не сделана и путь не выбран" in texts[522]
+    finally:
+        await _clear_rounds()
+
+
+async def test_vote_reminder_pending_stake_line(monkeypatch) -> None:
+    """Ставка ещё парится (pending): напоминание говорит про подтверждение."""
+    from app import scheduler as sched
+    from app.models import Player, Stake
+
+    await _clear_rounds()
+    rid = await _make_round(9804, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    texts: dict[int, str] = {}
+    sends.side_effect = lambda pid, text: texts.update({pid: text})
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[531]))
+    reminder_now = datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+    monkeypatch.setattr(sched, "_now", lambda: reminder_now)
+
+    async with SessionLocal() as db:
+        db.add(Player(id=531, username="pend", first_name="P", dm_subscribed=True))
+        db.add(
+            Stake(
+                round_id=rid,
+                player_id=531,
+                amount_nanotons=700_000_000_000,
+                tx_hash="rm-pend-531",
+                memo="m9804",
+                network=current_network(),
+                status="pending",
+            )
+        )
+        await db.commit()
+
+    try:
+        await sched._vote_reminder_job()
+        assert sends.await_count == 1
+        assert "700.00 Gram подтверждается" in texts[531]
     finally:
         await _clear_rounds()
 
