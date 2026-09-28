@@ -131,10 +131,14 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
         if getattr(round_row, "chapter_text", "")
         else ""
     )
-    text = (
-        f"{head}{story}{cards}\n\n{phase}{bank_line}\n{deadline}"
-    )
-    return text[:_MAX_TEXT_LEN]
+    # Хвост поста (правило дня, банк, дедлайн) неприкосновенен: при упоре в
+    # потолок режется «верх», а не обещание игроку сроков исхода голосования.
+    tail = f"\n\n{phase}{bank_line}\n{deadline}"
+    core = f"{head}{story}{cards}"
+    budget = _MAX_TEXT_LEN - len(tail)
+    if len(core) > budget:
+        core = _clamp(core, budget)
+    return core + tail
 
 
 def build_day_post(round_row: Round) -> list:

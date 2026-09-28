@@ -23,7 +23,7 @@ def _day(index: int, **overrides) -> dict:
         "day_index": index,
         "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
-        "chapter_text": "Стая собирается у котла и решает, куда идти.",
+        "chapter_text": "Стая собирается у котла. Огонь лижет бак, дождь трогает крыши. Пути ждут до рассвета.",
         "hook_text": None,
         "rule_hint": "any",
         "cards": [
@@ -186,6 +186,76 @@ def test_missing_attribution_is_soft_warning() -> None:
     assert result.cassette is not None
     assert not (result.cassette.attribution or "").strip()
     assert any("attribution" in warning for warning in result.warnings)
+
+
+def test_field_limits_tighten_to_display() -> None:
+    """Капы схемы = потолкам показа в app/broadcast.py: пост дня не режется «…»."""
+    assert FIELD_LIMITS["chapter_title"] == 80
+    assert FIELD_LIMITS["card_title"] == 80
+    assert FIELD_LIMITS["card_description"] == 260
+    assert FIELD_LIMITS["card_consequence"] == 220
+
+
+def test_style_vitrina_budget_warns() -> None:
+    """Три описания длиннее одного экрана витрины — мягкое замечание."""
+    payload = _payload("2026-04", 30)
+    for card in payload["days"][0]["cards"]:
+        card["description"] = "д" * 240
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("одним экраном" in warning for warning in result.warnings)
+
+
+def test_style_chapter_long_warns() -> None:
+    """Глава заметно выше канона (мягкий порог) — кадр тянется."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["chapter_text"] = "а" * 605
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("мягкий порог" in warning for warning in result.warnings)
+
+
+def test_style_chapter_single_sentence_warns() -> None:
+    """Глава одним предложением выглядит заголовком, а не кадром дня."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["chapter_text"] = "Стая молчит у котла."
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("одним предложением" in warning for warning in result.warnings)
+
+
+def test_style_tautology_warns() -> None:
+    """Заголовок, повторённый слово в слово в описании карты («вскрыть крышу»)."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["cards"][0]["title"] = "Вскрыть крышу"
+    payload["days"][0]["cards"][0]["description"] = "Снять обшивку, вскрыть крышу и подать свет."
+    result = validate_payload(payload)
+    assert result.ok
+    assert any(
+        "«Вскрыть крышу»" in warning and "масло масленое" in warning
+        for warning in result.warnings
+    )
+
+
+def test_style_object_repeat_not_flagged() -> None:
+    """Путь законно называет предмет сцены («Починить антенну»/«антенна») — не тавтология."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["cards"][0]["title"] = "Починить антенну"
+    payload["days"][0]["cards"][0]["description"] = "Антенна ловит шум, а не голос."
+    result = validate_payload(payload)
+    assert result.ok
+    assert not any("масло масленое" in warning for warning in result.warnings)
+
+
+def test_style_clean_payload_no_style_warnings() -> None:
+    """Свежий день без перегибов не тянет стилевых замечаний."""
+    result = validate_payload(_payload("2026-04", 30))
+    assert result.ok
+    assert not any(
+        word in warning
+        for word in ("одним экраном", "мягкий порог", "одним предложением", "масло масленое")
+        for warning in result.warnings
+    )
 
 
 def test_active_day_matches_calendar_day() -> None:

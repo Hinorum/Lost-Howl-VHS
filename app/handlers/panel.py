@@ -708,6 +708,23 @@ def _report_keyboard(scene_file: str | None, has_backup: bool) -> InlineKeyboard
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _report_text(head: str, lines: list[str]) -> str:
+    """Отчёт для Telegram: вердикт и финальный статус не теряются при обрезке.
+
+    Жёсткий потолок поста 4096 (тут 4000). Замечания могут быть длинными —
+    свёрнутым режется ТОЛЬКО их край, а не хвост с «Проверено — файл не изменён».
+    """
+    text = head + "\n".join(lines)
+    if len(text) <= 4000:
+        return text
+    status = lines[-1]
+    prefix = head + "\n".join(lines[:-1])
+    budget = 4000 - len(status) - 1
+    if len(prefix) > budget:
+        prefix = prefix[: budget - 1].rstrip() + "…"
+    return prefix + "\n" + status
+
+
 def _has_backup(file_name: str) -> bool:
     return (default_cassettes_dir() / (file_name + ".bak")).is_file()
 
@@ -1020,6 +1037,6 @@ async def on_cassette_document(message: Message) -> None:
     has_backup = bool(ok and not dry_run and scene_file and _has_backup(scene_file))
     head = "✅ " if ok else "❌ "
     await message.reply(
-        (head + "\n".join(lines))[:4000],
+        _report_text(head, lines),
         reply_markup=_report_keyboard(scene_file, has_backup),
     )

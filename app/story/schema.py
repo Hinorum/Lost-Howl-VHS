@@ -15,8 +15,9 @@
 Проверка делится на жёсткую (кассета отвергнута) и мягкую (warning):
 жёстко — структура, длины, позиции карт, уникальность дорог и пар
 (at_day, winner) перемоток, стоп-слова; мягко — бюджет режиссуры rule_hint
-(≈ N/3 дней на каждый закон по главной дороге) и мёртвые ключи prev на входе
-дороги перемотки.
+(≈ N/3 дней на каждый закон по главной дороге), мёртвые ключи prev на входе
+дороги перемотки и стилевые замечания (витрина одним экраном, кадр не тянется,
+заголовок карты не повторяет дословно своё описание).
 """
 
 from __future__ import annotations
@@ -32,14 +33,15 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 # Лимиты из движка (см. docs/story_world_manifest.md, раздел «Формат полей»).
 # Схема не выпускает текст, который рендер поста не сможет показать целиком:
-# лимиты равны (или ниже) обрезкам в app/broadcast.py (глава 1500 → мы жёстче:
-# канон обязан читаться без многоточия; карта description показывается до 260).
+# лимит равен обрезке в app/broadcast.py — глава до 1500 → мы жёстче 700,
+# description 260 == показу 260, заголовки 80 == показу 80 (ничего не режется
+# многоточием); consequence 220 — итог пути звучит коротко, а не пересказом дня.
 FIELD_LIMITS = {
-    "chapter_title": 300,
+    "chapter_title": 80,
     "chapter_text": 700,
-    "card_title": 120,
+    "card_title": 80,
     "card_description": 260,
-    "card_consequence": 300,
+    "card_consequence": 220,
     "hook_text": 700,
     "tie_note": 200,
     "attribution": 200,
@@ -58,6 +60,29 @@ RULE_HINT_VALUES = ("any", "majority", "minority", "median")
 # трёх законов ожидается ≈ N/3 дней месяца, отклонение в пределах toleration
 # допустимо.
 RULE_HINT_TOLERANCE = 2
+
+# Стилевые пороги (мягкие warning'и, не ошибки). Калибр — текущая библиотека
+# кассет (суммы описаний до ~500, главы до ~550 знаков), поэтому пороги ловят
+# ЗАМЕТНО более тяжёлый текст, а не нюансы «хорошего слога».
+_CARD_DESCRIPTION_BUDGET = 700  # сумма трёх описаний дня: витрина = один экран
+_CHAPTER_TOO_LONG = 600  # выше этого кадр тянется (жёсткий кап — 700 из FIELD_LIMITS)
+_CHAPTER_TOO_SHORT = 140  # короче и в одно предложение — «заголовок», не кадр
+
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?…]+")
+
+
+def _tautology_hit(title: str, description: str) -> str | None:
+    """Заголовок витрины, слово в слово повторённый в СВОЁМ описании карты —
+    буквальное «масло масленое». Повтор корней-предметов («крышу»/«крышей»)
+    умышленно не ловим: путь законно называет предмет сцены, там нужен
+    авторский глаз, а не автомат.
+    """
+    folded = title.casefold().strip()
+    if len(folded) < 8:
+        return None
+    if folded in description.casefold():
+        return title
+    return None
 
 # Стоп-слова: реальные бренды/криптобиржи/обещания дохода. Канон «Lost Dogs:
 # The Way» (Догтаун, имена персонажей) ДОЗВОЛЕН: кассеты — открытый фанфик,
@@ -339,6 +364,58 @@ class Cassette(BaseModel):
                 )
         return warnings
 
+    def style_warnings(self) -> list[str]:
+        """Стилевые замечания (warning, не ошибка): витрина и кадр читаются легко.
+
+        * Бюджет витрины: сумма трёх описаний дня > _CARD_DESCRIPTION_BUDGET —
+          развилка обязана влезать в один экран, а не три абзаца.
+        * Кадр дня: глава не растянута (жёсткий кап — FIELD_LIMITS, тут мягкий
+          порог) и не выглядит заголовком (короче порога одним предложением).
+        * Тавтология витрины: заголовок карты дословно повторён в её же описании —
+          «масло масленое»; заголовок должен звать действие, а не пересказывать сцену.
+        """
+        warnings: list[str] = []
+
+        def _sentence_count(text: str) -> int:
+            parts = [p for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+            return max(1, len(parts))
+
+        def _guard_day(day: DayModel, label: str) -> None:
+            descriptions = sum(len(card.description) for card in day.cards)
+            if descriptions > _CARD_DESCRIPTION_BUDGET:
+                warnings.append(
+                    f"{label}: описания трёх карт = {descriptions} знаков "
+                    f"(> {_CARD_DESCRIPTION_BUDGET}) — витрина дня должна читаться "
+                    "одним экраном, разведи карты по существу развилки"
+                )
+            chapter = len(day.chapter_text)
+            if chapter > _CHAPTER_TOO_LONG:
+                warnings.append(
+                    f"{label}: глава {chapter} знаков (мягкий порог "
+                    f"{_CHAPTER_TOO_LONG}, жёсткий — {FIELD_LIMITS['chapter_text']}) — "
+                    "кадр тянется, игрок читает пост дня целиком"
+                )
+            if chapter < _CHAPTER_TOO_SHORT and _sentence_count(day.chapter_text) == 1:
+                warnings.append(
+                    f"{label}: глава одним предложением — выглядит заголовком, "
+                    "добавь 1–3 предложения обстановки, чтобы кадр заработал"
+                )
+            for card in day.cards:
+                hit = _tautology_hit(card.title, card.description)
+                if hit is not None:
+                    warnings.append(
+                        f"{label}, карта {card.position}: заголовок «{hit}» повторён "
+                        "слово в слово в описании — масло масленое, назови карту как "
+                        "поступок, а не пересказ сцены"
+                    )
+
+        for day in self.days:
+            _guard_day(day, f"день {day.day_index}")
+        for fork in self.switch:
+            for day in fork.days:
+                _guard_day(day, f"перемотка «{fork.to}», день {day.day_index}")
+        return warnings
+
 
 @dataclass
 class ValidationResult:
@@ -396,6 +473,7 @@ def validate_payload(payload: dict) -> ValidationResult:
         )
     warnings.extend(cassette.rule_hint_budget_warnings())
     warnings.extend(cassette.dead_prev_warnings())
+    warnings.extend(cassette.style_warnings())
     if not (cassette.attribution or "").strip():
         warnings.append(
             "attribution не указано — клеймо плёнки-фанфика («по мотивам …») желательно"
