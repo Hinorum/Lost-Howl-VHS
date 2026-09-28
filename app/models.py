@@ -204,6 +204,37 @@ class Round(Base):
     cards: Mapped[list[Card]] = relationship(back_populates="round", cascade="all, delete-orphan")
 
 
+class StatusPost(Base):
+    """Где живёт пост-статус текущего дня (тот, что с кнопками выбора).
+
+    Пост дня уходит один раз при анонсе — с суммой подтверждённых ставок на тот
+    момент. Когда watcher подтверждает новые ставки, банк в отправленном посте
+    устаревает, и игроку приходится звать /today. Здесь храним точку доставки
+    (чат + message_id), чтобы отредактировать тот же пост; last_pot_nanotons
+    дедуплицирует правки — редактируем только когда сумма реально выросла.
+    Строки открытого раунда чистит проход refresh; строки прошлых дней убирает
+    тот же дедуп (правим лишь текущий OPEN раунд).
+    """
+
+    __tablename__ = "status_post"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    round_id: Mapped[int] = mapped_column(ForeignKey("rounds.id"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    # Отдельные чаты (группы) и личные дубликаты подписчиков редактируются
+    # одинаково, но метка нужна для диагностики и будущей разной риторики.
+    is_dm: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Последний показанный в посте банк (нанотоны Gram). Null — пост ещё ни разу
+    # не правился/банк не подсматривался; изменение числа — триггер правки.
+    last_pot_nanotons: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("round_id", "chat_id", name="uq_status_post_round_chat"),
+    )
+
+
 class Card(Base):
     __tablename__ = "cards"
 

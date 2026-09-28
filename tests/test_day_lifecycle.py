@@ -328,7 +328,7 @@ def test_every_round_foreign_key_table_is_wiped() -> None:
 
     from app.models import Base
 
-    wiped = {"payouts", "stakes", "votes", "revote_grants", "cards", "incomes", "prepared_days"}
+    wiped = {"payouts", "stakes", "votes", "revote_grants", "cards", "incomes", "prepared_days", "status_post"}
     referencing: set[str] = set()
     for table in Base.metadata.tables.values():
         for fk in table.foreign_keys:

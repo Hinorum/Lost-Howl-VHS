@@ -21,6 +21,7 @@ from app.models import (
     Round,
     RoundStatus,
     Stake,
+    StatusPost,
     StoryBeat,
     Vote,
     WatcherState,
@@ -154,6 +155,7 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
     await session.execute(delete(Payout))
     await session.execute(delete(Stake))
     await session.execute(delete(Vote))
+    await session.execute(delete(StatusPost))
     await session.execute(delete(RevoteGrant))
     await session.execute(delete(Income))
     await session.execute(delete(MemoryHit))

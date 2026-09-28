@@ -9,14 +9,14 @@ from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Chat, Round, RoundStatus
+from app.models import Chat, Round, RoundStatus, StatusPost
 from app.style import day_mark
 from app.tally import format_results
 
@@ -313,6 +313,7 @@ async def _deliver_day(
     finished: Round | None,
     results_text: str | None = None,
     remember: bool = False,
+    is_dm: bool = False,
 ) -> None:
     """Полный пакет дня в один чат. Итоги передаются готовым текстом:
     экономика дня считается один раз на рассылку, а не на каждый чат."""
@@ -332,12 +333,163 @@ async def _deliver_day(
         # вложений. Новый мир даёт один кадр дня — шлём обычным фото, иначе
         # анонс падал ПОСЛЕ обложки и статус с кнопками голосования не уходил.
         await bot.send_photo(chat_id, photo=media[0].media, caption=media[0].caption)
-    await bot.send_message(
+    sent = await bot.send_message(
         chat_id,
         await status_text(round_row, show_title=True),
         parse_mode=ParseMode.HTML,
         reply_markup=cards_keyboard(round_row.id, remember=remember, day_index=round_row.day_index),
     )
+    # Запоминаем, куда ушёл пост-статус дня: когда watcher подтвердит новые
+    # ставки, refresh_day_bank отредактирует этот пост с актуальным банком —
+    # без повторного /today. Точку доставки пишем защищённо: тесты и легаси
+    # вызовы без реального сообщения/раунда не должны ронять рассылку дня.
+    msg_id = getattr(sent, "message_id", 0)
+    if msg_id and isinstance(getattr(round_row, "id", None), int):
+        await remember_day_post(round_row.id, chat_id, msg_id, is_dm=is_dm)
+
+
+async def remember_day_post(round_id: int, chat_id: int, message_id: int, *, is_dm: bool) -> None:
+    """Записать/обновить точку доставки поста-статуса дня (upsert).
+
+    Повторный анонс того же дня (ретрай после флуд-контроля) просто
+    переписывает message_id; обнулённый last_pot_nanotons означает, что свежий
+    пост ещё не сверен с банком и refresh правил его не пропустит.
+    """
+    try:
+        async with SessionLocal() as session:
+            # Посты прошлых дней заморожены (банк не меняется) — точка доставки
+            # нового дня вытесняет устаревшие. От своих однораундовых строк не
+            # избавляемся: их правит refresh по мере роста банка этого дня.
+            from sqlalchemy import delete
+
+            await session.execute(delete(StatusPost).where(StatusPost.round_id != round_id))
+            row = (
+                await session.execute(
+                    select(StatusPost).where(
+                        StatusPost.round_id == round_id,
+                        StatusPost.chat_id == chat_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(
+                    StatusPost(
+                        round_id=round_id,
+                        chat_id=chat_id,
+                        message_id=int(message_id),
+                        is_dm=is_dm,
+                    )
+                )
+            else:
+                row.message_id = int(message_id)
+                row.is_dm = is_dm
+                row.last_pot_nanotons = None
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "Точка доставки поста дня не записана (round=%s chat=%s):",
+            round_id,
+            chat_id,
+            exc_info=True,
+        )
+
+
+async def refresh_day_bank(bot: Bot | None = None) -> None:
+    """Актуализировать банк дня в УЖЕ отправленных постах-статусах.
+
+    Пост дня уходит один раз при анонсе — с суммой подтверждённых ставок на тот
+    момент. Дальше банк живёт своей жизнью (watcher подтверждает новые ставки),
+    а текст поста замирает: игроки видят устаревший счёт, пока не позовут /today.
+    Здесь правим только посты ОТКРЫТОГО раунда и только в тех чатах, где число
+    подтверждённого банка МЕНЯЛОСЬ (last_pot_nanotons) — без правок-простыней
+    на каждый тик. Точки доставки прошлых дней (закрытые/подсчёт) вычищаются:
+    их банк заморожен, редактировать нечего.
+    """
+    if bot is None:
+        return
+    from app.rounds import get_active_round, round_pot
+
+    async with SessionLocal() as session:
+        current = await get_active_round(session)
+        if current is None or current.status != RoundStatus.OPEN:
+            return
+        if not (settings.ton_enabled and getattr(current, "money_mode", True) is not False):
+            return
+        nano, _bets = await round_pot(session, current.id)
+        rows = (
+            (
+                await session.execute(
+                    select(StatusPost).where(
+                        StatusPost.round_id == current.id,
+                        (
+                            (StatusPost.last_pot_nanotons.is_(None))
+                            | (StatusPost.last_pot_nanotons != nano)
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return
+        loaded = (
+            await session.execute(
+                select(Round).where(Round.id == current.id).options(selectinload(Round.cards))
+            )
+        ).scalar_one_or_none()
+        if loaded is None:
+            return
+        text = await status_text(loaded, show_title=True)
+        keyboard = cards_keyboard(loaded.id, remember=False, day_index=loaded.day_index)
+
+        for row in rows:
+            try:
+                await bot.edit_message_text(
+                    text,
+                    chat_id=row.chat_id,
+                    message_id=row.message_id,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+                row.last_pot_nanotons = nano
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 1)
+                try:
+                    await bot.edit_message_text(
+                        text,
+                        chat_id=row.chat_id,
+                        message_id=row.message_id,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                    )
+                    row.last_pot_nanotons = nano
+                except Exception as exc2:
+                    logger.warning(
+                        "Правка банка дня не удалась после ретрая (chat=%s): %s",
+                        row.chat_id,
+                        exc2,
+                    )
+                    await session.delete(row)
+            except TelegramBadRequest as exc:
+                lowered = str(exc).lower()
+                if "not modified" not in lowered:
+                    # Пост/чат исчезли (удалено, бот выгнан) — точка доставки мертва.
+                    await session.delete(row)
+                    continue
+                # Текст совпал (пост уже с этим банком) — фиксируем счёт, правка не нужна.
+                row.last_pot_nanotons = nano
+            except TelegramForbiddenError:
+                # Бот выгнан из чата: точка доставки мертва, дедуп не спасёт.
+                await session.delete(row)
+            except Exception as exc:
+                logger.warning(
+                    "Правка банка дня не удалась (round=%s chat=%s): %s",
+                    current.id,
+                    row.chat_id,
+                    exc,
+                )
+        await session.commit()
 
 
 async def _deliver_chat(
@@ -419,7 +571,7 @@ async def announce_new_day(
         delivered_dm = await _dm_send_all(
             bot,
             lambda pid: _deliver_day(
-                bot, pid, round_row, finished, results_text, remember=remember
+                bot, pid, round_row, finished, results_text, remember=remember, is_dm=True
             ),
             f"Личный пакет дня {round_row.day_index}",
         )
