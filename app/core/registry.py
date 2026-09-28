@@ -33,6 +33,14 @@ ALERT_REFUND_KEY = "alert_refund_ts"
 ALERT_STAKE_KEY = "alert_stake_ts"
 ALERT_STUCK_KEY = "alert_stuck_ts"
 
+# Снимок последнего вердикта check_anomalies: JSON-список строк-проблем и
+# время, когда он снят. Считает джоба ops-sweep раз в 120с; /health и /ops
+# читают кэш и не пересчитывают: опрос мониторинга не должен ходить в сеть,
+# а «что сейчас сломано» должно быть одним и тем же ответом везде.
+# Возраст снимка виден наружу — им видно, что сам sweeper перестал ходить.
+OPS_PROBLEMS_KEY = "ops_problems"
+OPS_PROBLEMS_AT_KEY = "ops_problems_at"
+
 # Пауза игры (стоп-кран) и режим «со ставками» / «без ставок».
 PAUSE_KEY = "game_paused_iso"
 PAUSE_REASON_KEY = "game_paused_reason"

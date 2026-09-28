@@ -32,6 +32,8 @@ from app.core.registry import (
     ALERT_WATCHER_KEY,
     BEAT_KEY,
     MONEY_MODE_KEY,
+    OPS_PROBLEMS_AT_KEY,
+    OPS_PROBLEMS_KEY,
     PAUSE_KEY,
     PAUSE_REASON_KEY,
     STUCK_TX_KEY,
@@ -267,6 +269,10 @@ async def snapshot() -> dict:
             "uptime_seconds": round(time.time() - PROCESS_START, 1),
             "last_tick_age": _age_seconds(await _get_state(session, TICK_KEY)),
             "tick_failures": tick_failures,
+            # Вердикт последней проверки аномалий из кэша sweeper'а, а не
+            # результат опроса мониторинга: /health не должен сам ходить в сеть.
+            "problems": _parse_problems(await _get_state(session, OPS_PROBLEMS_KEY)),
+            "problems_age": _age_seconds(await _get_state(session, OPS_PROBLEMS_AT_KEY)),
             "round": None,
             "payout_queue": int(queue_count),
             "payout_pending_by_kind": pending_by_kind,
@@ -338,6 +344,47 @@ def _load_only_stuck(raw: str | None) -> dict:
     except (ValueError, TypeError):
         logger.debug("Битый stuck-JSON (%r) — начинаем с чистого списка", (raw or "")[:128])
     return {}
+
+
+def _parse_problems(raw: str | None) -> list[str]:
+    """Снимок проблем из JSON. Мусор — пустой список: он не повод тревожить."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.debug("Битый JSON снимка аномалий (%r) — список пуст", (raw or "")[:128])
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item)]
+
+
+async def _store_problems(session, problems: list[str]) -> None:
+    """Кэш вердикта проверок для /health и /ops (одна транзакция на оба ключа)."""
+    for key, value in (
+        (OPS_PROBLEMS_KEY, json.dumps(problems, ensure_ascii=False)),
+        (OPS_PROBLEMS_AT_KEY, _now().isoformat()),
+    ):
+        row = await session.get(WatcherState, key)
+        if row is None:
+            session.add(WatcherState(key=key, value=value))
+        else:
+            row.value = value
+    await session.commit()
+
+
+async def problems_snapshot() -> tuple[list[str], float | None]:
+    """(проблемы, возраст снимка в секундах) из кэша sweeper'а.
+
+    Без сети и без пересчёта: /health опрашивают мониторингом постоянно, а
+    check_anomalies ходит в БД и (при TON) в зеркало. Возраст снимка —
+    отдельный сигнал: он растёт, если сам sweeper перестал ходить.
+    """
+    async with SessionLocal() as session:
+        raw = await _get_state(session, OPS_PROBLEMS_KEY)
+        age = _age_seconds(await _get_state(session, OPS_PROBLEMS_AT_KEY))
+    return _parse_problems(raw), age
 
 
 async def check_anomalies(bot: Bot | None) -> list[str]:
@@ -530,6 +577,9 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                 # рестарт посреди отправки не градит повторными алертами.
                 await _set_state(session, day_key, _now().isoformat())
                 await notify_admins(bot, mirror_note + " Разбор: /treasury")
+    # Снимок для /health и /ops. Кэш, а не пересчёт на каждый опрос: одно и то
+    # же «что сломано» отвечают и мониторинг, и команда хранителя.
+    await _store_problems(session, problems)
     return problems
 
 

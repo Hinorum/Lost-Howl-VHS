@@ -39,6 +39,7 @@ __all__ = [
     "_game_paused_now",
     "_human_claim_period",
     "_on_claim",
+    "_ops_diag_text",
     "_panel_keyboard",
     "_payouts_text",
     "_pct_text",
@@ -74,6 +75,7 @@ __all__ = [
     "cmd_help",
     "cmd_incoming",
     "cmd_invite",
+    "cmd_ops",
     "cmd_panel",
     "cmd_pause",
     "cmd_payout",
@@ -155,6 +157,7 @@ from .common import (
     router,
 )
 from .fallback import on_private_fallback, register_private_fallback
+from .ops_diag import _ops_diag_text, cmd_ops
 from .panel import (
     _admin_panel_text,
     _panel_keyboard,
