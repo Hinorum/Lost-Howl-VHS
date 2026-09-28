@@ -37,8 +37,19 @@ def set_bot(bot: Bot) -> None:
 
 async def tick(bot: Bot | None = None) -> None:
     bot = bot or _bot
+    from app.metrics import timed
+
+    # Тик ловит свой сбой сам, поэтому результат отмечается вручную (span.fail):
+    # проглоченное исключение не должно попасть в метрики как успех.
+    async with timed("way-tick") as span:
+        await _tick_body(bot, span)
+
+
+async def _tick_body(bot: Bot | None, span) -> None:
+    """Одно тело тика. Вынесено из tick(), чтобы обернуть его учётом времени."""
     from app.ops import is_game_paused, mark_tick, mark_tick_failed
 
+    # Стоп-кран: дни не открываются и не закрываются, анонсы молчат.
     # Стоп-кран: дни не открываются и не закрываются, анонсы молчат.
     # Watcher (отдельная джоба) продолжает возвращать входящие переводы,
     # а очередь выплат — разгребаться: чужие деньги зависнуть не должны.
@@ -91,6 +102,7 @@ async def tick(bot: Bot | None = None) -> None:
         except Exception as exc:
             logger.exception("тик закрытия дня упал — откат транзакции")
             await session.rollback()
+            span.fail()
             # Битие НЕ обновляем: иначе падающий каждые 15 секунд цикл
             # подтверждал бы собственную живость, /health отвечал бы «ok»,
             # а тревога «планировщик не тикает» не срабатывала бы никогда.
@@ -319,9 +331,16 @@ async def _alert_guarded(job_id: str, func) -> None:
     сломанный отчёт недели выглядит как «отчёта просто не было». Оборачиваем
     обслужку: исключение логируется и немедленно уходит админу, при этом
     наружу НЕ пробрасывается (одна сломанная джоба не роняет расписание).
+
+    Здесь же единственная точка учёта всех джоб в метриках: запуск, результат
+    и длительность. Оборачивать каждую джобу отдельно — значит забыть одну;
+    при max_instances=1 забытая джоба тихо съедает свои циклы.
     """
+    from app.metrics import timed
+
     try:
-        await func()
+        async with timed(job_id):
+            await func()
     except Exception as exc:
         logger.exception("Фоновая задача «%s» упала: %s", job_id, exc)
         try:

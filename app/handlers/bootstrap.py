@@ -113,6 +113,11 @@ async def handle_update_error(bot: Bot | None, event) -> None:
 
     kind, detail = _describe_update(event)
     logger.error("Ошибка обработки апдейта: %s", detail, exc_info=event.exception)
+    # Счётчик для /metrics: сколько сбоев и какого типа. Лог читают глазами,
+    # а у графика и алерта «рост сбоев message» не должно требовать grep'а.
+    from app.metrics import inc
+
+    inc("update_errors_total", {"kind": kind})
     update = event.update
     callback = update.callback_query
     chat_id = None

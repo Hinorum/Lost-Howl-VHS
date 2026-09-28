@@ -28,28 +28,35 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("way")
 
 
+def _authorized(request: web.Request) -> bool:
+    """Общая проверка доступа к диагностике (/health, /metrics).
+
+    Если задан HEALTH_TOKEN, снимок (очередь выплат, возраст тика, watcher,
+    метрики) доступен только с авторизацией: мониторинг Render/UptimeRobot
+    передаёт токен в заголовке Authorization: Bearer <token> либо в
+    ?token=. Требование токена без самого токена — отказ (fail closed).
+    """
+    if settings.health_require_token and not settings.health_token.strip():
+        return False
+    if not settings.health_token:
+        return True
+    expected = settings.health_token.strip()
+    supplied = (
+        (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+        or request.query.get("token", "").strip()
+    )
+    return bool(expected) and supplied == expected
+
+
 async def health(request: web.Request) -> web.Response:
     """Живость + операционный снимок: тик, очередь выплат, watcher, день.
-
-    Если задан HEALTH_TOKEN, снимок (очередь выплат, возраст тика, watcher)
-    доступен только с авторизацией: Render/UptimeRobot передают его в
-    заголовке Authorization: Bearer <token> либо в query-параметре ?token=.
-    Без живого токена — 401 и ничего о состоянии процесса.
 
     Сбой снимка (переходное окно миграции, деградация БД) не роняет
     эндпоинт — Render должен видеть процесс живым; но и «ok» без данных мы
     не притворяемся: честный статус degraded.
     """
-    if settings.health_require_token and not settings.health_token.strip():
+    if not _authorized(request):
         return web.Response(status=401, text="unauthorized")
-    if settings.health_token:
-        expected = settings.health_token.strip()
-        supplied = (
-            (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-            or request.query.get("token", "").strip()
-        )
-        if not expected or supplied != expected:
-            return web.Response(status=401, text="unauthorized")
     try:
         from app.ops import snapshot
 
@@ -58,6 +65,31 @@ async def health(request: web.Request) -> web.Response:
         log.warning("snapshot упал — отвечаем degraded: %s", exc)
         payload = {"status": "degraded", "detail": "snapshot unavailable"}
     return web.json_response(payload)
+
+
+async def metrics(request: web.Request) -> web.Response:
+    """Метрики процесса в текстовом формате Prometheus.
+
+    Основа для графиков и алертов: раньше длительность и успешность фоновых
+    задач не измерялись ничем, а при max_instances=1 долгий цикл тихо съедал
+    следующие. Снимок БД не обязателен: при его недоступности отдаём 200 с
+    way_snapshot_up 0 и счётчиками из памяти — частичные данные полезнее 500.
+    """
+    if not _authorized(request):
+        return web.Response(status=401, text="unauthorized")
+    from app.metrics import render
+    from app.ops import snapshot
+
+    try:
+        payload = await snapshot()
+    except Exception as exc:
+        log.warning("снимок для /metrics недоступен: %s", exc)
+        payload = None
+    # Content-Type с version=0.0.4 ставим заголовком: aiohttp не даёт указать
+    # charset в content_type иначе, а именно эта версия формата нужна сборщику.
+    response = web.Response(text=render(payload), content_type="text/plain")
+    response.headers["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8"
+    return response
 
 
 async def _self_ping_loop(stop: asyncio.Event) -> None:
@@ -204,6 +236,7 @@ async def run_webhook(bot, dispatcher) -> None:
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/metrics", metrics)
     SimpleRequestHandler(dispatcher=dispatcher, bot=bot, secret_token=secret).register(app, path=path)
     setup_application(app, dispatcher, bot=bot)
     runner = web.AppRunner(app)
