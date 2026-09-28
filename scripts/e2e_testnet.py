@@ -211,7 +211,8 @@ async def phase_stake() -> int:
     logger.info("Путь выбран: %d (день %s)", chosen, round_row.day_index)
 
     if existing_status is None:
-        from app.ton_pay import NETWORK_GLOBAL_IDS, build_offline_wallet, send_wallet_transfer_http
+        from app.ton_pay import build_offline_wallet, send_wallet_transfer_http
+        from app.ton_pay.wallet import NETWORK_GLOBAL_IDS
 
         async with SessionLocal() as session:
             player = await session.get(Player, _player_id())
