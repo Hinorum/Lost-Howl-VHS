@@ -502,6 +502,181 @@ async def announce_results(bot: Bot | None, finished: Round) -> int:
     return delivered
 
 
+def scene_label(cards: dict[int, str], position: int) -> str:
+    """Короткая подпись сцены: «I. «Вскрыть крышу»» — и в алерты, и в личные итоги."""
+    title = cards.get(position, "")
+    label = POSITIONS[position] if position < len(POSITIONS) else str(position + 1)
+    if title:
+        return f"{label}. «{html.escape(title)}»"
+    return label
+
+
+def _build_player_result_text(
+    round_row: Round,
+    cards: dict[int, str],
+    position: int,
+    stake=None,
+    payouts: list | None = None,
+) -> str:
+    """Персональный текст «за что голосовал и чем кончилось» для одного игрока.
+
+    Общий пост итогов не отвечает на вопрос «а я за что голосовал и выиграл ли»:
+    нужна строка про КОНКРЕТНЫЙ выбор игрока. Здесь: сцена дня, выбор игрока,
+    исход, судьба ставки (если день денежный).
+    """
+    from app.ton_utils import from_nano
+
+    payouts = payouts or []
+    won = position == round_row.winner_card
+    lines = [
+        f"📼 День {round_row.day_index} — твой итог",
+        "",
+        f"🏆 Сцена дня: {scene_label(cards, round_row.winner_card or 0)}",
+        f"🎯 Ты выбрал: {scene_label(cards, position)}",
+        "",
+    ]
+    if won:
+        lines.append("🎉 Ты угадал сцену дня!")
+    else:
+        lines.append("Твоя сцена не победила — но голос учтён в лидерборде.")
+    money = ""
+    if settings.ton_enabled and getattr(round_row, "money_mode", True) is not False:
+        if stake is not None:
+            stake_g = f"{from_nano(stake.amount_nanotons):g}"
+            prize = sum(p.amount_nanotons for p in payouts if p.kind == "prize")
+            refund = max((p.amount_nanotons for p in payouts if p.kind == "refund"), default=0)
+            if prize > 0:
+                money = f"💰 Ставка {stake_g} Gram в выигрыш: +{from_nano(prize):g} Gram (перевод уже в очереди)."
+            elif refund > 0:
+                money = f"💰 Ставка {stake_g} Gram возвращается: {from_nano(refund):g} Gram (минус газ сети) — перевод в очереди."
+            elif stake.status == "confirmed":
+                money = f"💰 Ставка {stake_g} Gram принята в банк дня."
+        else:
+            money = "💸 Ставки в этот день не было — выбор шёл голосом."
+        if money:
+            lines.extend(["", money])
+    return "\n".join(lines)
+
+
+async def _player_result_texts(finished: Round) -> list[tuple[int, str]]:
+    """Персональные итоги для каждого проголосовавшего подписчика: (player_id, текст).
+
+    Только dm_subscribed: тем, кто выключил личную рассылку, личный итог не
+    лезем. Карты дня перечитываем с selectinload, чтобы названия сцен были.
+    """
+    from app.models import Player, Stake, Vote
+
+    async with SessionLocal() as session:
+        loaded = (
+            await session.execute(
+                select(Round)
+                .where(Round.id == finished.id)
+                .options(selectinload(Round.cards))
+            )
+        ).scalar_one_or_none()
+        if loaded is None:
+            return []
+        cards = {card.position: card.title for card in loaded.cards}
+        votes = (
+            (
+                await session.execute(
+                    select(Vote)
+                    .join(Player, Player.id == Vote.player_id)
+                    .where(
+                        Vote.round_id == finished.id,
+                        Player.dm_subscribed.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        positions = {vote.player_id: vote.card_position for vote in votes}
+        if not positions:
+            return []
+        stakes = {
+            stake.player_id: stake
+            for stake in (
+                await session.execute(select(Stake).where(Stake.round_id == finished.id))
+            )
+            .scalars()
+            .all()
+        }
+        from app.models import Payout
+
+        payouts: dict[int, list] = {}
+        for payout in (
+            await session.execute(select(Payout).where(Payout.round_id == finished.id))
+        ).scalars().all():
+            payouts.setdefault(payout.player_id, []).append(payout)
+        return [
+            (
+                player_id,
+                _build_player_result_text(
+                    loaded,
+                    cards,
+                    positions[player_id],
+                    stakes.get(player_id),
+                    payouts.get(player_id, []),
+                ),
+            )
+            for player_id in sorted(positions)
+        ]
+
+
+async def announce_player_results(bot: Bot | None, finished: Round) -> int:
+    """Личные итоги дня каждому проголосовавшему подписчику (мой выбор → исход).
+
+    Дополняет групповой пост итогов: игрок видит, за какую сцену голосовал и
+    чем она кончилась для его ставки. Своя рассылка с флуд-контролем; провал
+    одному игроку не срывает остальных. Возвращает число доставленных.
+    """
+    if bot is None or not settings.player_dm:
+        return 0
+    try:
+        texts = await _player_result_texts(finished)
+    except Exception:
+        logger.exception(
+            "Персональные итоги дня %s не собраны",
+            getattr(finished, "day_index", "?"),
+        )
+        return 0
+    if not texts:
+        return 0
+    semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
+
+    async def worker(player_id: int, text: str) -> bool:
+        async with semaphore:
+            try:
+                await bot.send_message(player_id, text, parse_mode=ParseMode.HTML)
+                return True
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 1)
+                try:
+                    await bot.send_message(player_id, text, parse_mode=ParseMode.HTML)
+                    return True
+                except Exception as exc2:
+                    logger.warning(
+                        "Личный итог дня не доставлен игроку %s (после ретрая): %s",
+                        player_id,
+                        exc2,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning("Личный итог дня не доставлен игроку %s: %s", player_id, exc)
+                return False
+
+    outcomes = await asyncio.gather(*(worker(pid, text) for pid, text in texts))
+    delivered = sum(1 for ok in outcomes if ok)
+    logger.info(
+        "Личные итоги дня %s: доставлено %d из %d игроков",
+        getattr(finished, "day_index", "?"),
+        delivered,
+        len(texts),
+    )
+    return delivered
+
+
 async def whisper_to_chats(bot: Bot | None, text: str) -> int:
     """Полуденный шёпот мира: короткое сообщение во все живые чаты.
 

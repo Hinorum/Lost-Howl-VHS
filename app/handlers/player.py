@@ -19,7 +19,7 @@ from aiogram.types import (
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.broadcast import POSITIONS, cards_keyboard, status_text
+from app.broadcast import POSITIONS, cards_keyboard, scene_label, status_text
 from app.config import settings
 from app.db import SessionLocal
 from app.models import LeaderboardClaim, Player, RoundStatus
@@ -736,14 +736,23 @@ async def on_vote(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Некорректный выбор.", show_alert=True)
         return
+    label = POSITIONS[position]
     async with SessionLocal() as session:
         player = await upsert_player(session, callback.from_user)
         round_row = await get_active_round(session)
         if round_row is None or round_row.id != round_id:
             await callback.answer("Этот день уже закрыт.", show_alert=True)
             return
+        # Имя сцены выбора — чтобы игрок ВИДЕЛ, за что именно голосует
+        # («Выбор I. «Вскрыть крышу»»), а не абстрактную римскую цифру.
+        label = scene_label(
+            {card.position: card.title for card in round_row.cards}, position
+        )
         result = await cast_vote(session, round_row, player.id, position)
         outcome = ""
+        private_chat = (
+            callback.message is not None and callback.message.chat.type == ChatType.PRIVATE
+        )
         if result == "already":
             vote = await get_vote(session, round_row.id, player.id)
             current_position: int | None = vote.card_position if vote else None
@@ -755,12 +764,17 @@ async def on_vote(callback: CallbackQuery) -> None:
             ):
                 # Есть оплаченный грант — списываем и меняем путь прямо здесь.
                 outcome = await change_vote(session, round_row, player.id, position)
-        else:
-            current_position = None
+        elif result == "ok" and private_chat:
+            # Постоянное подтверждение в личке: алерт по кнопке исчезает, а
+            # «мой выбор дня» должно оставаться видимым до конца дня.
+            await callback.message.answer(
+                f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены.",
+                parse_mode=ParseMode.HTML,
+            )
     if result == "already":
         if outcome == "ok":
             await callback.answer(
-                f"Грант списан. Выбор изменён на {POSITIONS[position]}.",
+                f"Грант списан. Выбор изменён на {label}.",
                 show_alert=True,
             )
             return
@@ -773,7 +787,7 @@ async def on_vote(callback: CallbackQuery) -> None:
             await callback.answer(hint[:200], show_alert=True)
             return
     texts = {
-        "ok": f"{ok_mark(str(round_id))} Выбор {POSITIONS[position]} принят. Итоги скрыты до конца дня.",
+        "ok": f"{ok_mark(str(round_id))} Выбор {label} принят. Итоги скрыты до конца дня.",
         "already": f"{hint_mark('already')} Ты уже сделал выбор сегодня.",
         "closed": f"{warn_mark('closed')} День закрыт — кадр фиксируется, итоги скоро.",
         "invalid": f"{warn_mark('invalid')} Такого варианта нет в кадре дня.",

@@ -110,7 +110,7 @@ async def _announce_results_job(finished_id: int) -> None:
     его собственной транзакции.
     """
     try:
-        from app.broadcast import announce_results
+        from app.broadcast import announce_player_results, announce_results
         from app.models import Round
 
         async with SessionLocal() as session:
@@ -123,6 +123,9 @@ async def _announce_results_job(finished_id: int) -> None:
                 logger.warning("Итоги дня %s: раунд не найден", finished_id)
                 return
             await announce_results(_bot, finished)
+            # Личный доказ «за что голосовал и чем кончилось» — следом за общими
+            # итогами, чтобы игрок сначала увидел сводку дня, потом свой исход.
+            await announce_player_results(_bot, finished)
     except Exception:
         logger.exception("Рассылка итогов дня упала (id=%s)", finished_id)
 
