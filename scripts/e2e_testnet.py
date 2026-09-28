@@ -385,8 +385,9 @@ async def phase_mirror() -> int:
 def _mirror_summary(result: dict) -> str:
     try:
         return (
-            f"баланс {result.get('balance', '?')}, bootstrapped={result.get('bootstrapped')}, "
-            f"added={result.get('added')}, отчет={result.get('report', '')[:200]}"
+            f"зеркало={result.get('mirror_balance')}, цепочка={result.get('chain_balance')}, "
+            f"diff={result.get('diff_nanotons')}, bootstrapped={result.get('bootstrapped')}, "
+            f"added={result.get('added')}"
         )
     except Exception:
         return str(result)[:200]
