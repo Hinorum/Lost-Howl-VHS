@@ -442,3 +442,53 @@ async def test_send_wallet_transfer_http_success(monkeypatch: pytest.MonkeyPatch
     assert len(calls) == 1
     assert calls[0]["method"] == "sendBoc"
     assert calls[0]["params"]["boc"]
+
+
+# ---------- Пауза между переводами пачки (гонка двух быстрых переводов) ----------
+
+
+async def test_wait_for_broadcast_memo_found_on_first_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    """memo уже в истории — ожидание завершается сразу, без опросов."""
+    calls = []
+
+    async def fake_markers() -> set[str]:
+        calls.append(1)
+        return {"way:9:prize#1"}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=5.0) is True
+    assert len(calls) == 1
+
+
+async def test_wait_for_broadcast_memo_appears_after_polls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Перевод ложится в блок между опросами — дожидаемся и возвращаем True."""
+    state = {"count": 0}
+
+    async def fake_markers() -> set[str]:
+        state["count"] += 1
+        return {"way:9:prize#1"} if state["count"] >= 2 else set()
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    monkeypatch.setattr(ton_pay, "_BROADCAST_CONFIRM_POLL", 0.01)
+    assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=1.0) is True
+    assert state["count"] == 2
+
+
+async def test_wait_for_broadcast_memo_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Перевод за окно не пришёл — False: диспетчер сбросит батч-счётчик."""
+    async def fake_markers() -> set[str]:
+        return set()
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    monkeypatch.setattr(ton_pay, "_BROADCAST_CONFIRM_POLL", 0.01)
+    assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=0.03) is False
+
+
+async def test_wait_for_broadcast_memo_none_of_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """В истории есть чужие memo — свой не найден до таймаута."""
+    async def fake_markers() -> set[str]:
+        return {"way:9:rake#2"}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    monkeypatch.setattr(ton_pay, "_BROADCAST_CONFIRM_POLL", 0.01)
+    assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=0.03) is False

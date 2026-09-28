@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -660,6 +661,31 @@ async def dispatch_pending_payouts(limit: int = 50, bot: Bot | None = None) -> i
         return await _dispatch_pending_payouts_impl(limit=limit, bot=bot)
 
 
+_BROADCAST_CONFIRM_POLL = 2.0
+
+
+async def _wait_for_broadcast_memo(candidates: set[str], seconds: float) -> bool:
+    """Ждёт, пока memo перевода появится в истории исходящих казначея.
+
+    HTTP-канал подписывает переводы пачки последовательными seqno (+1 локально
+    после успеха). Следующий seqno МОЖНО использовать, только когда предыдущий
+    перевод реально лёг в блок: вслепую разосланные вплотную внешние месседжи
+    сражаются за место, и второй отбрасывается молча — «ok» от провайдера
+    значит лишь «мемпул принял», а не «транзакция в блоке». Пауза после
+    успешного вещания и до подписи следующего убирает гонку. Таймаут → False:
+    вызывающий сбрасывает батч-счётчик, и следующая отправка возьмёт свежий
+    живой seqno (переживший перевод дожмёт сверка confirm_broadcast_payouts).
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        markers = await fetch_broadcast_markers()
+        if any(c in markers for c in candidates):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(_BROADCAST_CONFIRM_POLL)
+
+
 async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
     sent = 0
     network = "testnet" if settings.is_testnet else "mainnet"
@@ -780,6 +806,11 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                 # сам получает seqno (а её тред-безопасность отдельная история).
                 _state._batch_seqno = None
                 logger.warning("Не удалось получить seqno для батч-отправки — отправлю по одному", exc_info=True)
+        # Известен ли уже разосланный на этом цикле перевод? Если да — ждём его
+        # memo в блоке перед подписью следующего (гонка двух быстрых переводов
+        # HTTP-канала: вплотную разосланные месседжи со следующими seqno
+        # сражаются за место, и второй молча отбрасывается).
+        prev_memo: set[str] | None = None
         try:
             for payout in payouts:
                 # Свободный комментарий (возвраты при паузе) дополняется
@@ -820,6 +851,30 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     )
                     logger.warning("Выплата %d: повтор отложен — история казначея недоступна", payout.id)
                     continue
+                if prev_memo and _state._http_channel_engaged_at is not None:
+                    # Гонка двух быстрых переводов: следующий seqno подписываем,
+                    # только когда предыдущий перевод этого цикла подтверждён в
+                    # блоке (HTTP-канал; лайтсерверный путь таких окон не знает).
+                    if await _wait_for_broadcast_memo(
+                        prev_memo, settings.payout_batch_confirm_seconds
+                    ):
+                        logger.debug(
+                            "Выплата %d: предыдущий перевод подтверждён в блоке — seqno актуален",
+                            payout.id,
+                        )
+                    else:
+                        # За окно подтверждения перевод не пришёл: он в пути или
+                        # потерян. Повторять сейчас НЕЛЬЗЯ (анти-дубль по memo),
+                        # а батч-счётчик уже протух. Сбрасываем: следующая
+                        # отправка заново прочитает живой seqno казначея, а судьбу
+                        # этого перевода дожмёт confirm_broadcast_payouts.
+                        logger.warning(
+                            "Выплата %d: предыдущий перевод не подтвердился за %d с — "
+                            "seqno для следующего будет взят из сети заново",
+                            payout.id,
+                            settings.payout_batch_confirm_seconds,
+                        )
+                        _state._batch_seqno = None
                 try:
                     tx_hash = await asyncio.wait_for(
                         send_ton_transfer(
@@ -853,6 +908,8 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     payout.attempts = 0
                     payout.last_error = None
                     sent += 1
+                    # Следующий перевод пачки дождётся подтверждения ЭТОГО в блоке.
+                    prev_memo = set(candidates)
                 elif payout.attempts >= settings.payout_max_attempts:
                     payout.status = "failed"
                 else:
