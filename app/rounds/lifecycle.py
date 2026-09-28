@@ -382,8 +382,10 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
                     f"(хеш …{root_hash[-4:]}): выпала сцена {chosen}. "
                     f"Проверка: {block_url}/block/-1:8000000000000000:{seqno}"
                 )
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                # Жребий по блоку — бонус к проверяемости, а не основа: без него
+                # ниже подставляется честная заметка без ссылки на блок.
+                logger.debug("Жребий блока не собран (%s) — без ссылки на блок", exc)
         if tie_note is None:
             tie_note = f"{head} ({path_names}) — {theater}"
         tie_note = tie_note[:200]

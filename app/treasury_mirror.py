@@ -96,8 +96,10 @@ def _derive_balance_delta(provider_delta: Any, in_value: int, out_value: int, fe
     if provider_delta is not None:
         try:
             return int(str(provider_delta))
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            # Сальдо из цепочки мусорное — считаем из своих чисел, но след
+            # оставляем: расхождение потом всплывёт в сверке «в ноль».
+            logger.debug("balance_delta %r не разобран (%s) — считаем сами", provider_delta, exc)
     return in_value - out_value - fee
 
 
@@ -942,8 +944,9 @@ async def treasury_mirror_block() -> str:
             if moment.tzinfo is None:
                 moment = moment.replace(tzinfo=_UTC)
             beat_age = max(0, int((datetime.now(_UTC) - moment).total_seconds()))
-        except ValueError:
-            pass
+        except ValueError as exc:
+            # Метка зеркала битая: возраст неизвестен, и /treasury так и скажет.
+            logger.debug("Метка времени зеркала не разобрана (%r): %s", stats.get("beat_iso"), exc)
     lag = None
     if stats["last_utime"] is not None:
         lag = max(0, int(datetime.now(_UTC).timestamp()) - int(stats["last_utime"]))

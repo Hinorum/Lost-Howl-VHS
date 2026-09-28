@@ -123,6 +123,8 @@ def _install_stop_handlers(stop: asyncio.Event) -> None:
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
+            # Windows и часть песочниц: обработчик не поддерживается, но
+            # остановку всё равно ловит внешний supervisor. Ожидаемо.
             pass
 
 
@@ -313,4 +315,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        # Ctrl+C — штатная остановка, а не сбой: тишина здесь уместна.
         pass

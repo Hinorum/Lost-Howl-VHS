@@ -142,8 +142,10 @@ def pick_winner(
     if len(parts) == 4:
         try:
             return candidates[int(parts[3][-1], 16) % len(candidates)]
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            # Хвост seed не похож на хеш блока — выбор всё равно детерминирован
+            # по строке ниже, но разбор стоит увидеть.
+            logger.debug("Хвост seed %r не разобран (%s) — выбор по строке", seed, exc)
     return random.Random(f"law:{seed}").choice(candidates)
 
 

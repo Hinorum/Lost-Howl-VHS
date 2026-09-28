@@ -341,8 +341,10 @@ async def on_dm_toggle(callback: CallbackQuery) -> None:
     if callback.message is not None:
         try:
             await callback.message.edit_reply_markup(reply_markup=keyboard)
-        except TelegramBadRequest:
-            pass
+        except TelegramBadRequest as exc:
+            # Клавиатуру могло не сменить (тот же набор) или сообщение устарело.
+            # Пользователь уже получил финальный ответ, повторять правку некуда.
+            logger.debug("Клавиатура подписок не обновилась: %s", exc)
     await callback.answer(
         "Итоги и анонсы снова приходят в личку." if subscribed
         else "Личные рассылки отключены — играем только в группе.",

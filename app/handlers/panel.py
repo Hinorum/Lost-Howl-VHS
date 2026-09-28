@@ -146,7 +146,9 @@ async def _build_panel_text(session) -> str:
                 "— снять: /resume. Входящие переводы возвращаются автоматически."
             )
     except Exception:
-        pass
+        # Молчание здесь врало бы: пульт без строки «ИГРА НА ПАУЗЕ» выглядит
+        # как работающая игра. Строка не показана — говорим в лог.
+        logger.warning("Пульт: не удалось прочитать паузу — строка не показана", exc_info=True)
     try:
         from app.ops import money_mode_enabled
 
@@ -157,7 +159,7 @@ async def _build_panel_text(session) -> str:
             else "🔰 Версия: <b>без ставок</b> (игра бесплатна, смена выбора закрыта)."
         )
     except Exception:
-        pass
+        logger.warning("Пульт: не удалось прочитать режим ставок", exc_info=True)
     rnd = snap.get("round") or {}
     closing = str(rnd.get("voting_ends_at", ""))[11:16]
     lines.append(
@@ -246,7 +248,9 @@ async def _build_panel_text(session) -> str:
                 "когда игрок привяжет адрес. Разбор: /payouts."
             )
     except Exception:
-        pass
+        # Счётчик исчез бы из пульта вместе с предупреждением о призах, которые
+        # не уйдут: молчащий пульт в этом месте опаснее шумного.
+        logger.warning("Пульт: не удалось посчитать призы без кошелька", exc_info=True)
     pending_stakes = snap.get("pending_stakes") or 0
     if settings.ton_enabled:
         stakes_note = f"⏳ Переводов не обработано: {pending_stakes}"
@@ -275,7 +279,9 @@ async def _build_panel_text(session) -> str:
                 f"{row.status}{reason}"
             )
     except Exception:
-        pass
+        # Застрявшие выплаты должны быть видны и когда запрос к ним сорвался:
+        # «пульт ничего не показал» здесь читается как «всё разослано».
+        logger.warning("Пульт: не удалось показать зависшие выплаты", exc_info=True)
     tick_age = snap.get("last_tick_age")
     if tick_age is not None and tick_age > 120:
         lines.append(f"⚠️ Тик отстаёт: {int(tick_age)} с — проверь логи.")
@@ -428,6 +434,8 @@ async def on_panel_action(callback: CallbackQuery) -> None:
                     )
                 except TelegramBadRequest as exc:
                     if "message is not modified" in str(exc).lower():
+                        # Повторное нажатие привело к тому же тексту: Telegram
+                        # отвечает ошибкой, а менять нечего. Молчание уместно.
                         pass
                     else:
                         raise
@@ -471,6 +479,8 @@ async def on_panel_action(callback: CallbackQuery) -> None:
                     )
                 except TelegramBadRequest as exc:
                     if "message is not modified" in str(exc).lower():
+                        # Повторное нажатие привело к тому же тексту: Telegram
+                        # отвечает ошибкой, а менять нечего. Молчание уместно.
                         pass
                     else:
                         raise
@@ -538,6 +548,8 @@ async def on_panel_action(callback: CallbackQuery) -> None:
                     )
                 except TelegramBadRequest as exc:
                     if "message is not modified" in str(exc).lower():
+                        # Повторное нажатие привело к тому же тексту: Telegram
+                        # отвечает ошибкой, а менять нечего. Молчание уместно.
                         pass
                     else:
                         raise

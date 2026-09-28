@@ -270,8 +270,11 @@ async def on_refunded_payment(message: Message) -> None:
             if not spent_at_refund
             else "↩️ Возврат проведён, но перемотка кадра уже была использована — напишу хранителю."
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Деньги уже возвращены и хранитель получит уведомление строкой ниже;
+        # не доставившийся ответ — не повод ронять обработчик. Но и не повод
+        # замолчать: причина может быть не блокировкой бота, а сбоем сети.
+        logger.debug("Возврат звёзд: ответ игроку не доставлен: %s", exc)
     bot = getattr(message, "bot", None)
     await notify_admins(
         bot,

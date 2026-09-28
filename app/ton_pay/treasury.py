@@ -262,8 +262,10 @@ async def treasury_diagnostics() -> str:
             if beat_moment.tzinfo is None:
                 beat_moment = beat_moment.replace(tzinfo=UTC)
             beat_age = int((now - beat_moment).total_seconds())
-        except ValueError:
-            pass
+        except ValueError as exc:
+            # Битая метка времени = «неизвестно», а не «только что»: ниже так и
+            # печатается. Значимое расхождение — повод его увидеть.
+            logger.debug("Метка времени успешного цикла не разобрана (%r): %s", beat_iso, exc)
     lines.append(
         f"  успешный цикл: {'never' if beat_age is None else f'{beat_age} с назад'}"
         + (f" · источник {source}" if source else "")
