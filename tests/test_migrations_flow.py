@@ -309,6 +309,33 @@ def _leftover_tx_hash_unique(path: Path) -> tuple[str | None, list[str]] | None:
     return found
 
 
+async def test_db_left_by_failed_reconcile_heals(app_db: Path):
+    """База, которую оставила УПАВШАЯ реконсиляция: create_all уже применился,
+    а история встала на якорь и не пошла дальше. Именно так выглядит база
+    бота, не смогшего стартовать, — следующий запуск обязан долечиться сам.
+
+    Плюс постусловие из README: после конвергенции оператору обещано чистое
+    `alembic check`. Проверяем именно ту команду, которой пользуются CI и
+    деплой, а не только внутреннее сравнение с моделями."""
+    from app.db import init_db
+
+    _alembic_ok(_async_url(app_db), "upgrade", "a7b8c9d0e1f2")
+    engine = create_async_engine(_async_url(app_db))
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await engine.dispose()
+    assert _leftover_tx_hash_unique(app_db) is not None, "фикстура не воспроизводит упавшую реконсиляцию"
+
+    await init_db()
+
+    assert _version(_sync_url(app_db)) == _alembic_head()
+    assert _leftover_tx_hash_unique(app_db) is None, "единичный unique по tx_hash остался"
+    assert _shape(_sync_url(app_db)) == _shape_of_models()
+    assert "No new upgrade operations detected" in _alembic_ok(
+        _async_url(app_db), "check"
+    ), "`alembic check` после долечивания не чист — README обещает обратное"
+
+
 async def test_orm_writes_rounds_without_server_default(db_path: Path):
     """Причина, по которой расхождение по referral_nanotons безобидно:
     ORM подставляет значение сам, поэтому цепочка-база и create_all-база
