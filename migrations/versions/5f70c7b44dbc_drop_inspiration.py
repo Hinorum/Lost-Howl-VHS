@@ -23,6 +23,11 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # Переигрываемость: на базе, собранной create_all по текущим моделям,
+    # колонки уже нет (см. 2f5a1c9d4e6b) — снимать нечего, no-op.
+    inspector = sa.inspect(op.get_bind())
+    if "inspiration" not in {column["name"] for column in inspector.get_columns("players")}:
+        return
     with op.batch_alter_table('players', schema=None) as batch_op:
         batch_op.drop_column('inspiration')
 

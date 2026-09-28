@@ -24,6 +24,12 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # Переигрываемость: базы create_all-эпохи приводятся к якорю и досыгрывают
+    # хвост (app.db._migrate), а create_all уже собрал им эту таблицу. Раньше
+    # такой путь падал на «table treasury_moves already exists» — то есть
+    # реконсиляция ломалась ровно на базах, ради которых написана.
+    if sa.inspect(op.get_bind()).has_table("treasury_moves"):
+        return
     op.create_table(
         'treasury_moves',
         sa.Column('id', sa.Integer(), nullable=False),

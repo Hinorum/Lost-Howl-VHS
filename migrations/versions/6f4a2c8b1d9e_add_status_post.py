@@ -24,6 +24,10 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # Переигрываемость: см. 2f5a1c9d4e6b — create_all-база приходит с готовой
+    # таблицей, и хвост не должен на ней падать.
+    if sa.inspect(op.get_bind()).has_table("status_post"):
+        return
     op.create_table(
         'status_post',
         sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
