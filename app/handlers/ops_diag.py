@@ -9,6 +9,7 @@
 
 Здесь — тот же список, что уходит в тревоги (снимок check_anomalies), плюс
 возраст этого снимка: растущий возраст означает, что перестал идти сам sweeper.
+Для затянувшихся тревог добавляется, сколько они уже держатся.
 """
 
 from __future__ import annotations
@@ -65,12 +66,22 @@ def _queue_line(by_kind: dict, dead_by_kind: dict, pending_stakes: int) -> str:
 async def _ops_diag_text() -> str:
     """Текст пульта: вердикт, список проблем, возраст проверок и опора."""
     data = await snapshot()
-    problems, age = await problems_snapshot()
+    problems, age, details = await problems_snapshot()
     lines: list[str] = []
 
     if problems:
         lines.append(f"{warn_mark('ops')} Пульт: тревог — {len(problems)}")
-        lines.extend(f"• {problem}" for problem in problems)
+        ages = {
+            str(item.get("text", "")): item.get("age") for item in (details or [])
+        }
+        for problem in problems:
+            held = ages.get(problem)
+            # «Очередь выплат стоит 42 мин» и «…(третий час)» — разная срочность:
+            # часы показывают, что минутный текст уже не про свежесть.
+            tail = ""
+            if held is not None and held >= 3600:
+                tail = f" — держится {_span(held)}"
+            lines.append(f"• {problem}{tail}")
     else:
         lines.append(f"{ok_mark('ops')} Пульт: тревог нет")
 

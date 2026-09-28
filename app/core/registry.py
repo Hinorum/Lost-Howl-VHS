@@ -29,6 +29,7 @@ ALERT_QUEUE_KEY = "alert_queue_ts"
 ALERT_DEAD_KEY = "alert_dead_ts"
 ALERT_TICK_KEY = "alert_tick_ts"
 ALERT_BALANCE_KEY = "alert_balance_ts"
+ALERT_MIRROR_KEY = "alert_mirror_ts"
 ALERT_REFUND_KEY = "alert_refund_ts"
 ALERT_STAKE_KEY = "alert_stake_ts"
 ALERT_STUCK_KEY = "alert_stuck_ts"
@@ -40,6 +41,10 @@ ALERT_STUCK_KEY = "alert_stuck_ts"
 # Возраст снимка виден наружу — им видно, что сам sweeper перестал ходить.
 OPS_PROBLEMS_KEY = "ops_problems"
 OPS_PROBLEMS_AT_KEY = "ops_problems_at"
+# Кто из тревог сколько держится: ключ проблемы -> {text, since, seen, alert}.
+OPS_ALERT_TRACK_KEY = "ops_alert_track"
+# Час, в который ушла сводка по затянувшимся тревогам.
+OPS_ALERT_DIGEST_KEY = "alert_digest_ts"
 
 # Пауза игры (стоп-кран) и режим «со ставками» / «без ставок».
 PAUSE_KEY = "game_paused_iso"

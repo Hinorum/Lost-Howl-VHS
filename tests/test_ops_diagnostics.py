@@ -80,7 +80,7 @@ async def test_check_anomalies_stores_its_verdict(monkeypatch) -> None:
     problems = await ops.check_anomalies(bot=SimpleNamespace(send_message=AsyncMock()))
 
     assert any("очередь выплат стоит" in p for p in problems)
-    cached, age = await ops.problems_snapshot()
+    cached, age, _details = await ops.problems_snapshot()
     assert cached == problems
     assert age is not None and age < 60
 
@@ -94,7 +94,7 @@ async def test_healthy_run_clears_stale_verdict(monkeypatch) -> None:
 
     assert await ops.check_anomalies(bot=None) == []
 
-    cached, _ = await ops.problems_snapshot()
+    cached, _, _details = await ops.problems_snapshot()
     assert cached == []
 
 
@@ -105,7 +105,7 @@ async def test_problems_snapshot_survives_garbage() -> None:
             await db.execute(delete_all := WatcherState.__table__.delete())
             db.add(WatcherState(key=OPS_PROBLEMS_KEY, value=raw))
             await db.commit()
-        problems, _ = await ops.problems_snapshot()
+        problems, _, _details = await ops.problems_snapshot()
         expected = ["1", "2"] if raw == "[1, 2]" else []
         assert problems == expected, raw
         assert delete_all is not None
