@@ -750,9 +750,6 @@ async def on_vote(callback: CallbackQuery) -> None:
         )
         result = await cast_vote(session, round_row, player.id, position)
         outcome = ""
-        private_chat = (
-            callback.message is not None and callback.message.chat.type == ChatType.PRIVATE
-        )
         if result == "already":
             vote = await get_vote(session, round_row.id, player.id)
             current_position: int | None = vote.card_position if vote else None
@@ -764,13 +761,20 @@ async def on_vote(callback: CallbackQuery) -> None:
             ):
                 # Есть оплаченный грант — списываем и меняем путь прямо здесь.
                 outcome = await change_vote(session, round_row, player.id, position)
-        elif result == "ok" and private_chat:
-            # Постоянное подтверждение в личке: алерт по кнопке исчезает, а
-            # «мой выбор дня» должно оставаться видимым до конца дня.
-            await callback.message.answer(
-                f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены.",
-                parse_mode=ParseMode.HTML,
-            )
+        elif result == "ok":
+            # Подтверждение выбора в личку отдельным сообщением: по кнопке
+            # (в группе или личке) алерт исчезает, а «мой выбор дня» должно
+            # оставаться видимым до конца дня. Молчим, если игрок ещё не
+            # открывал диалог с ботом — алерт был и так показан.
+            if settings.player_dm:
+                try:
+                    await callback.bot.send_message(
+                        callback.from_user.id,
+                        f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as exc:
+                    logger.debug("Личное подтверждение выбора игроку %s не доставлено: %s", callback.from_user.id, exc)
     if result == "already":
         if outcome == "ok":
             await callback.answer(
