@@ -47,16 +47,38 @@ async def _clean_global_db_per_module():
     Тесты не должны зависеть от порядка запуска файлов: любые сиды,
     оставшиеся в SessionLocal от предыдущего модуля (чаты, игроки,
     состояния watcher'а), затираются до первого теста модуля.
-    """
-    from sqlalchemy import delete
 
+    На Postgres чистим через TRUNCATE ... RESTART IDENTITY CASCADE: иначе
+    DELETE по таблицам упирается в внешние ключи, которые SQLite по
+    умолчанию не проверяет, и модуль падал бы на чужом сиде. TRUNCATE с
+    CASCADE не зависит от порядка таблиц и обнуляет счётчики.
+    """
     from app.db import SessionLocal
 
     async with SessionLocal() as db:
-        for table in reversed(Base.metadata.sorted_tables):
-            await db.execute(delete(table))
+        await truncate_all(db)
         await db.commit()
     yield
+
+
+async def truncate_all(db) -> None:
+    """Полная очистка глобальной БД тестов, безопасная по внешним ключам.
+
+    На Postgres идём через TRUNCATE ... RESTART IDENTITY CASCADE: DELETE по
+    таблицам упирается во внешние ключи, которые SQLite по умолчанию не
+    проверяет, и падал бы на сиде, оставшемся от другого модуля. TRUNCATE с
+    CASCADE не зависит от порядка таблиц и обнуляет счётчики. В SQLite (и во
+    всём, что не Postgres) остаётся прежний порядок «дети раньше родителей».
+    """
+    from sqlalchemy import delete, text
+
+    tables = Base.metadata.sorted_tables
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        names = ", ".join(f'"{table.name}"' for table in tables)
+        await db.execute(text(f"TRUNCATE TABLE {names} RESTART IDENTITY CASCADE"))
+        return
+    for table in reversed(tables):
+        await db.execute(delete(table))
 
 
 @pytest.fixture(autouse=True)
