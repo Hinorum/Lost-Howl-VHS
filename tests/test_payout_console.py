@@ -263,7 +263,15 @@ async def test_return_creates_refund_and_kicks_dispatcher(monkeypatch) -> None:
 
     await _wipe(Payout, Stake, Round, Player, PackFund)
     async with SessionLocal() as db:
-        db.add(Player(id=11, username="loser", first_name="Проигравший", wallet_address=WALLET))
+        db.add(
+            Player(
+                id=11,
+                username="loser",
+                first_name="Проигравший",
+                wallet_address=WALLET,
+                wallet_verified=True,
+            )
+        )
         day = _round(80_001, RoundStatus.TALLYING)
         db.add(day)
         await db.commit()
@@ -305,7 +313,7 @@ async def test_return_survives_dead_dispatcher(monkeypatch) -> None:
 
     await _wipe(Payout, Stake, Round, Player, PackFund)
     async with SessionLocal() as db:
-        db.add(Player(id=12, wallet_address=WALLET))
+        db.add(Player(id=12, wallet_address=WALLET, wallet_verified=True))
         day = _round(80_002, RoundStatus.TALLYING)
         db.add(day)
         await db.commit()
@@ -331,7 +339,7 @@ async def test_return_refuses_confirmed_and_unknown_stakes(monkeypatch) -> None:
     monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
     await _wipe(Payout, Stake, Round, Player, PackFund)
     async with SessionLocal() as db:
-        db.add(Player(id=13, wallet_address=WALLET))
+        db.add(Player(id=13, wallet_address=WALLET, wallet_verified=True))
         day = _round(80_003, RoundStatus.CLOSED)
         db.add(day)
         await db.commit()

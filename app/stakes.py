@@ -632,6 +632,16 @@ async def create_manual_refund(session, stake_id: int) -> str:
     wallet = player.wallet_address if player is not None else ""
     if not wallet:
         return "у игрока не привязан кошелёк — возврат невозможен"
+    if not player.wallet_verified:
+        # Тот же класс, что у приза (finalize_day_payouts: игроки с
+        # wallet_verified не попадают в очередь выплаты): адрес без
+        # bv:-подтверждения ещё не доказан как свой, возврат ушёл бы в
+        # необработанный bounce.
+        return (
+            "кошелёк игрока не подтверждён (bv:) — возврат невозможен: "
+            "привязанный адрес ещё не доказан микро-переводом. Пусть игрок "
+            "подтвердит кошелёк в /wallet."
+        )
     refund = refund_net_amount(stake.amount_nanotons)
     if refund <= 0:
         return "сумма ставки не покрывает газ сети — возвращать нечего"

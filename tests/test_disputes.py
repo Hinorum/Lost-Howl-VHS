@@ -45,7 +45,7 @@ async def test_reject_dispute(session: AsyncSession) -> None:
 
 
 async def test_compensate_creates_payout_for_wallet_player(session: AsyncSession) -> None:
-    session.add(Player(id=7, wallet_address="EQw"))
+    session.add(Player(id=7, wallet_address="EQw", wallet_verified=True))
     await session.commit()
     await mod.open_dispute(session, 5, 7, "недоплата")
     d = (await session.execute(select(Dispute))).scalars().one()
@@ -68,12 +68,29 @@ async def test_compensate_refuses_walletless_and_bad_amount(session: AsyncSessio
     d = (await session.execute(select(Dispute))).scalars().one()
     assert "кошелёк" in await mod.compensate_dispute(session, d.id, "0.5")
     # Сумма проверяется даже при наличии кошелька.
-    session.add(Player(id=9, wallet_address="EQv"))
+    session.add(Player(id=9, wallet_address="EQv", wallet_verified=True))
     await session.commit()
     await mod.open_dispute(session, 5, 9, "y")
     rows = list((await session.execute(select(Dispute))).scalars().all())
     d2 = next(r for r in rows if r.player_id == 9)
     assert "числом" in await mod.compensate_dispute(session, d2.id, "abc")
+
+
+async def test_compensate_refuses_unverified_wallet(session: AsyncSession) -> None:
+    """Привязанный, но не доказанный bv: адрес — не получатель. Компенсация
+    ушла бы в необработанный bounce, а спор при этом закрылся бы."""
+    session.add(Player(id=11, wallet_address="EQunverified"))
+    await session.commit()
+    await mod.open_dispute(session, 5, 11, "недоплата")
+    d = (await session.execute(select(Dispute))).scalars().one()
+
+    res = await mod.compensate_dispute(session, d.id, "0.5", "возврат части приза")
+
+    assert "bv:" in res
+    assert (await session.execute(select(Payout))).scalars().all() == []
+    # Спор остаётся открытым: деньги не ушли, решение не принято.
+    d2 = await session.get(Dispute, d.id)
+    assert d2.status == "open" and d2.resolved_at is None
 
 
 async def test_disputes_flag_gates_open(session: AsyncSession, monkeypatch) -> None:
