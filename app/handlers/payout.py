@@ -48,7 +48,7 @@ async def _payouts_text() -> str:
         )
     lines.append("")
     lines.append(
-        "Спам (пыль с рекламой): /payout <id> spam\n"
+        "Спам (пыль с рекламой, только refund): /payout <id> spam confirm\n"
         "Настоящий долг, отправить снова: /payout <id> retry"
     )
     return "\n".join(lines)
@@ -143,23 +143,44 @@ async def cmd_payouts(message: Message) -> None:
 
 @router.message(Command("payout"))
 async def cmd_payout(message: Message) -> None:
-    """Ручной разбор одной выплаты: /payout <id> spam|retry."""
+    """Ручной разбор одной выплаты: /payout <id> spam confirm|retry.
+
+    «spam» гасит выплату безвозвратно — только refund (входящий перевод с
+    рекламой, возврат которого не нужен), и только с явным словом confirm:
+    случайное/мгновенное списание чужого приза недопустимо.
+    """
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
         await message.answer("Команда только для хранителя игры.")
         return
     parts = (message.text or "").lower().split()
-    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in {"spam", "retry"}:
+    if (
+        len(parts) not in (3, 4)
+        or not parts[1].isdigit()
+        or parts[2] not in {"spam", "retry"}
+    ):
         await message.answer(
-            "Формат: <code>/payout &lt;id&gt; spam</code> — пометить спамом, "
-            "<code>/payout &lt;id&gt; retry</code> — вернуть в очередь.",
+            "Формат: <code>/payout &lt;id&gt; spam confirm</code> — безвозвратно погасить "
+            "пыльный входящий refund,\n"
+            "<code>/payout &lt;id&gt; retry</code> — вернуть выплату в очередь.",
             parse_mode=ParseMode.HTML,
         )
         return
     payout_id, action = int(parts[1]), parts[2]
+    if action == "spam" and parts[3:4] != ["confirm"]:
+        await message.answer(
+            f"{warn_mark('nopay')} Пометка спамом безвозвратна и возврата не создаёт: "
+            "подтверди явно <code>/payout &lt;id&gt; spam confirm</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     from app.ton_pay import resolve_dead_payout
 
     async with SessionLocal() as session:
-        new_status = await resolve_dead_payout(session, payout_id, action)
+        try:
+            new_status = await resolve_dead_payout(session, payout_id, action)
+        except ValueError as exc:
+            await message.answer(f"{warn_mark('nopay')} {exc}")
+            return
     if new_status == "dismissed":
         await message.answer(f"{ok_mark(str(payout_id))} Выплата #{payout_id} помечена как спам: из очереди ушла, сбросу больше не мешает.")
     elif new_status == "pending":

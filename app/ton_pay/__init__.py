@@ -137,6 +137,12 @@ async def resolve_dead_payout(session, payout_id: int, action: str) -> str | Non
     if payout is None or payout.status == "sent":
         return None
     if action == "spam":
+        if payout.kind != "refund":
+            raise ValueError(
+                f"Пометить спамом можно только refund-выплату (входящий перевод-реклама), "
+                f"а не {payout.kind}: игроку полагаются деньги. Такую строку разбирай "
+                "направленно, а не гаси."
+            )
         payout.status = "dismissed"
     elif action == "retry":
         payout.status = "pending"

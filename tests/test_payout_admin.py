@@ -54,6 +54,18 @@ async def test_resolve_dead_payout_actions(session: AsyncSession) -> None:
     assert await resolve_dead_payout(session, 101, "nuke") is None
 
 
+async def test_resolve_dead_payout_spam_guards_non_refund(session: AsyncSession) -> None:
+    """Спамом гасится только refund: деньги игрока (prize/weekly/…) списать нельзя."""
+    session.add(
+        Payout(id=201, kind="prize", amount_nanotons=100, dest_address="0:zz", status="failed", attempts=1)
+    )
+    await session.commit()
+    with pytest.raises(ValueError, match="только refund"):
+        await resolve_dead_payout(session, 201, "spam")
+    row = await session.get(Payout, 201)
+    assert row.status == "failed" and row.amount_nanotons == 100
+
+
 async def test_stash_refund_skips_ancient_transfers(
     session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

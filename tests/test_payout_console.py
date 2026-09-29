@@ -198,6 +198,10 @@ async def test_payout_spam_and_retry_paths(monkeypatch) -> None:
 
     spam = make_message(f"/payout {payout_id} spam")
     await cmd_payout(spam)
+    assert "подтверди явно" in said(spam)
+
+    spam = make_message(f"/payout {payout_id} spam confirm")
+    await cmd_payout(spam)
     assert "помечена как спам" in said(spam)
 
     retry = make_message(f"/payout {payout_id} RETRY")
@@ -219,9 +223,34 @@ async def test_payout_rejects_broken_arguments(monkeypatch) -> None:
 
 async def test_payout_missing_row_is_reported(monkeypatch) -> None:
     monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
-    message = make_message("/payout 424242 spam")
+    message = make_message("/payout 424242 spam confirm")
     await cmd_payout(message)
     assert "не найдена или уже отправлена" in said(message)
+
+
+async def test_payout_spam_refuses_player_money(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
+    await _wipe(Payout)
+    async with SessionLocal() as db:
+        db.add(
+            Payout(
+                kind="prize",
+                amount_nanotons=to_nano(1),
+                dest_address=WALLET,
+                status="failed",
+                attempts=2,
+            )
+        )
+        await db.commit()
+        payout_id = (await db.execute(select(Payout))).scalar_one().id
+
+    message = make_message(f"/payout {payout_id} spam confirm")
+    await cmd_payout(message)
+    assert "только refund" in said(message)
+
+    async with SessionLocal() as db:
+        row = await db.get(Payout, payout_id)
+        assert row is not None and row.status == "failed" and row.amount_nanotons == to_nano(1)
 
 
 async def test_return_creates_refund_and_kicks_dispatcher(monkeypatch) -> None:

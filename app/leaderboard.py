@@ -672,6 +672,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                 if (
                     player is not None
                     and player.wallet_address
+                    and player.wallet_verified
                     and pid in staked
                 ):
                     candidates.append((pid, score, gram, player.wallet_address))
@@ -679,7 +680,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                     skipped += 1
             if not candidates:
                 logger.warning(
-                    "Копилка %d нанотонов ждёт: у топ-%d лидеров нет кошелька/ставки",
+                    "Копилка %d нанотонов ждёт: у топ-%d лидеров нет подтверждённого кошелька/ставки",
                     total, top_k,
                 )
                 return False
@@ -719,6 +720,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                 if (
                     player is not None
                     and player.wallet_address
+                    and player.wallet_verified
                     and player_id in staked
                 ):
                     wallets[player_id] = player.wallet_address
@@ -727,7 +729,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             if not payable_ids:
                 # Платить некому: метку НЕ двигаем, копилка ждёт следующего цикла.
                 logger.warning(
-                    "Копилка %d нанотонов ждёт: у лидеров (%s) нет привязанного кошелька "
+                    "Копилка %d нанотонов ждёт: у лидеров (%s) нет подтверждённого кошелька "
                     "или ставки в этом месяце",
                     total,
                     [pid for pid, _ in winners] or "нет голосов",
@@ -994,7 +996,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
             if correct <= 0 or days < min_days or pid not in staked:
                 continue
             player = await session.get(Player, pid)
-            if player is None or not player.wallet_address:
+            if player is None or not player.wallet_address or not player.wallet_verified:
                 continue
             candidates.append((pid, correct, gram, player.wallet_address))
         # Полный порядок (с Claim-тайбрейком) нужен для поиска ничьей на
@@ -1005,8 +1007,8 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         if not places:
             # Достойных нет: метку НЕ двигаем, копилка ждёт следующей недели.
             logger.warning(
-                "Копилка недели %d нанотонов ждёт: нет игроков с кошельком, %s+ днями голосования "
-                "и ставкой за неделю%s",
+                "Копилка недели %d нанотонов ждёт: нет игроков с подтверждённым кошельком, "
+                "%s+ днями голосования и ставкой за неделю%s",
                 total,
                 min_days or settings.weekly_min_days,
                 " (короткая стартовая неделя — порог снят)" if relaxed else "",

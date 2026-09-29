@@ -468,7 +468,7 @@ async def _seed_leaderboard_month(session: AsyncSession) -> tuple[int, dict]:
     wallet1 = "0:" + os.urandom(32).hex()
     session.add_all(
         [
-            Player(id=pid1, username=f"u{pid1}", wallet_address=wallet1),
+            Player(id=pid1, username=f"u{pid1}", wallet_address=wallet1, wallet_verified=True),
             Player(id=pid2, username=f"u{pid2}"),
         ]
     )
@@ -564,8 +564,8 @@ async def test_monthly_pot_split_between_tied_leaders(monkeypatch: pytest.Monkey
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_a, username=f"u{pid_a}", wallet_address=wallet_a),
-                Player(id=pid_b, username=f"u{pid_b}", wallet_address=wallet_b),
+                Player(id=pid_a, username=f"u{pid_a}", wallet_address=wallet_a, wallet_verified=True),
+                Player(id=pid_b, username=f"u{pid_b}", wallet_address=wallet_b, wallet_verified=True),
             ]
         )
         prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
@@ -626,6 +626,76 @@ async def test_monthly_pot_split_between_tied_leaders(monkeypatch: pytest.Monkey
             await session.commit()
 
 
+async def test_monthly_pot_pays_verified_wallet_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Месячная копилка идёт только на подтверждённый (bv:) кошелёк лидера.
+
+    Топ верных путей с привязанным, но неподтверждённым адресом пропускается,
+    как и без кошелька: приз не должен уйти на чужой/недоказанный адрес, а
+    bounce без обработки сжёг бы горш молча.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    pid_shadow, pid_proven = 920_000, 920_001
+    wallet_proven = "0:" + os.urandom(32).hex()
+    prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                Player(id=pid_shadow, username="shadow", wallet_address="0:" + os.urandom(32).hex()),
+                Player(
+                    id=pid_proven, username="proven", wallet_address=wallet_proven, wallet_verified=True
+                ),
+            ]
+        )
+        rounds = [
+            _closed_round(703_001 + i, prev_month - timedelta(days=9 + i)) for i in range(5)
+        ]
+        session.add_all(rounds)
+        await session.flush()
+        # shadow — 5 верных из 5, proven — 3 из 5: без верификации лидер мимо.
+        plan = {pid_shadow: 5, pid_proven: 3}
+        for i, round_row in enumerate(rounds):
+            for pid, count in plan.items():
+                if i < count:
+                    session.add(Vote(round_id=round_row.id, player_id=pid, card_position=1))
+                session.add(
+                    Stake(
+                        round_id=round_row.id, player_id=pid,
+                        amount_nanotons=to_nano(1), tx_hash=f"tx_{i}_{pid}", status="confirmed",
+                    )
+                )
+        pot = LeaderboardPot(month=prev_month.strftime("%Y-%m"), nanotons=to_nano(1))
+        month_key = pot.month
+        session.add(pot)
+        session.add(WatcherState(key=MONTH_READY_KEY, value=previous_month_key()))
+        await session.commit()
+        try:
+            assert await settle_month_if_due(bot=None) is True
+            rows = (
+                (
+                    await session.execute(
+                        select(Payout).where(Payout.kind == "leaderboard").order_by(Payout.player_id.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert [p.player_id for p in rows] == [pid_proven]
+            assert rows[0].dest_address == wallet_proven and rows[0].amount_nanotons > 0
+        finally:
+            await session.execute(Payout.__table__.delete().where(Payout.kind == "leaderboard"))
+            await session.execute(LeaderboardPot.__table__.delete().where(LeaderboardPot.month == month_key))
+            await session.execute(WatcherState.__table__.delete().where(WatcherState.key == MARKER_KEY))
+            await session.execute(WatcherState.__table__.delete().where(WatcherState.key == MONTH_READY_KEY))
+            await session.execute(Vote.__table__.delete().where(Vote.player_id.in_([pid_shadow, pid_proven])))
+            await session.execute(Stake.__table__.delete().where(Stake.player_id.in_([pid_shadow, pid_proven])))
+            for round_row in rounds:
+                await session.delete(round_row)
+            for pid in (pid_shadow, pid_proven):
+                player = await session.get(Player, pid)
+                if player is not None:
+                    await session.delete(player)
+            await session.commit()
+
 async def test_monthly_pot_pays_top_k_by_weights(monkeypatch: pytest.MonkeyPatch) -> None:
     """Сглаживание дисперсии: топ-K месячной копилки делится по весам."""
     monkeypatch.setattr(settings, "ton_enabled", True)
@@ -644,8 +714,8 @@ async def test_monthly_pot_pays_top_k_by_weights(monkeypatch: pytest.MonkeyPatch
         rb = _closed_round(760_002, prev_month - timedelta(days=8))
         session.add_all(
             [
-                Player(id=pid_a, username=f"a{pid_a}", wallet_address=wallet_a),
-                Player(id=pid_b, username=f"b{pid_b}", wallet_address=wallet_b),
+                Player(id=pid_a, username=f"a{pid_a}", wallet_address=wallet_a, wallet_verified=True),
+                Player(id=pid_b, username=f"b{pid_b}", wallet_address=wallet_b, wallet_verified=True),
             ]
         )
         session.add_all([ra, rb])
@@ -734,7 +804,7 @@ async def test_monthly_pot_waits_when_leader_has_no_stake(monkeypatch: pytest.Mo
     async with SessionLocal() as session:
         pid = 950_000 + int.from_bytes(os.urandom(2), "big")
         session.add(
-            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex())
+            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True)
         )
         prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         round_row = _closed_round(706_001, prev_month - timedelta(days=3))
@@ -826,7 +896,7 @@ async def test_monthly_pot_not_burned_by_empty_weights(monkeypatch: pytest.Monke
     pid = 959_000 + int.from_bytes(os.urandom(2), "big")
     async with SessionLocal() as session:
         session.add(
-            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex())
+            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True)
         )
         prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         round_row = _closed_round(705_001, prev_month - timedelta(days=3))
@@ -875,7 +945,7 @@ async def test_monthly_pot_gram_tiebreak_at_third_place(monkeypatch: pytest.Monk
     wallets = {pid: "0:" + os.urandom(32).hex() for pid in pids}
     async with SessionLocal() as session:
         session.add_all(
-            Player(id=pid, username=f"p{i}", wallet_address=wallets[pid])
+            Player(id=pid, username=f"p{i}", wallet_address=wallets[pid], wallet_verified=True)
             for i, pid in enumerate(pids)
         )
         prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
@@ -948,7 +1018,7 @@ async def test_monthly_pot_ignores_already_settled_months(
         session.add_all(
             [
                 Player(id=pid_champ, username=f"u{pid_champ}"),
-                Player(id=pid_new, username=f"u{pid_new}", wallet_address=wallet_new),
+                Player(id=pid_new, username=f"u{pid_new}", wallet_address=wallet_new, wallet_verified=True),
             ]
         )
         # Чемпион: 2 верных в позапрошлом месяце (вне окна выплат).

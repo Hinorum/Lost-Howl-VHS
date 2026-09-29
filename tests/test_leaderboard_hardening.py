@@ -116,7 +116,7 @@ async def _seed_week_boundary_tie(
     plan = {base: 6, base + 1: 5, base + 2: 4, base + 3: 4}
     session.add_all(
         [
-            Player(id=pid, username=f"p{pid}", wallet_address=wallets[pid])
+            Player(id=pid, username=f"p{pid}", wallet_address=wallets[pid], wallet_verified=True)
             for pid in pids
         ]
     )
@@ -231,7 +231,7 @@ async def test_week_dust_place_rolls_to_next_week_pot(monkeypatch: pytest.Monkey
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid, username=f"p{pid}", wallet_address=wallets[pid])
+                Player(id=pid, username=f"p{pid}", wallet_address=wallets[pid], wallet_verified=True)
                 for pid in pids
             ]
         )
