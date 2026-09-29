@@ -350,3 +350,27 @@ async def test_results_post_stake_decided_text(session: AsyncSession) -> None:
     assert "Тропа B" in text
     assert "Кадр дня уцелел по счёту Gram" in text
     assert "на волоске" not in text
+    # Строки сцен пронумерованы римскими — как кнопки «Сцена I/II/III».
+    assert "I: Тропа A: 5" in text
+    assert "II: Тропа B: 1" in text
+    assert "III: Тропа C: 0" in text
+    assert "← 🏆 След" in text
+
+
+def test_results_post_scene_numbers_without_stakes() -> None:
+    # Голосовой день (без ставок): номера сцен всё равно проставлены.
+    rnd = Round(
+        day_index=6,
+        win_rule=WinRule.MAJORITY,
+        winner_card=1,
+        vote_counts_json='{"0": 1, "1": 4, "2": 2}',
+        stake_counts_json=None,
+    )
+    for pos, title in ((0, "Тропа A"), (1, "Тропа B"), (2, "Тропа C")):
+        rnd.cards.append(
+            Card(position=pos, title=title, description="d", consequence="к", image_path="")
+        )
+    text = format_results(rnd)
+    assert "I: Тропа A: 1" in text
+    assert "II: Тропа B: 4" in text
+    assert "III: Тропа C: 2" in text
