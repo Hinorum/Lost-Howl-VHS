@@ -220,6 +220,51 @@ async def test_register_stake_flow(session: AsyncSession, monkeypatch: pytest.Mo
     assert await stakes_mod.register_stake(session, round_row, fourth, to_nano(1), "tx7") == "closed"
 
 
+async def test_dust_refund_waits_for_unverified_wallet(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Пылевой возврат не уходит на недоказанный bv: адрес.
+
+    Привязка сама по себе не доказывает владение: после перепривязки на чужой
+    адрес пыль ушла бы в bounce. Поэтому dest пустой — сумма не теряется, её
+    подставит _hydrate_player_dests, когда игрок подтвердит кошелёк. Ставку
+    при этом не блокируем: это возврат, а не приём денег.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    now = datetime.now(UTC)
+    round_row = Round(
+        day_index=555,
+        status=RoundStatus.OPEN,
+        win_rule=WinRule.MAJORITY,
+        chapter_title="t",
+        chapter_text="x",
+        opens_at=now - timedelta(hours=1),
+        voting_ends_at=now + timedelta(hours=1),
+        tally_ends_at=now + timedelta(hours=2),
+    )
+    session.add(round_row)
+    player = Player(id=91, username="dust", wallet_address="EQforeign", wallet_verified=False)
+    session.add(player)
+    await session.commit()
+
+    assert await stakes_mod.register_stake(session, round_row, player, to_nano(0.01), "dust-1") == "too_small"
+    assert await stakes_mod.register_stake(session, round_row, player, to_nano(2), "dust-2") == "ok"
+
+    refund = (
+        await session.execute(
+            select(Payout).where(Payout.kind == "refund", Payout.player_id == 91)
+        )
+    ).scalar_one()
+    # Ждёт подтверждения, а не улетает на перепривязанный адрес.
+    assert refund.dest_address == ""
+    assert refund.amount_nanotons == stakes_mod.refund_net_amount(to_nano(0.01))
+    # Валидная ставка на месте — возврат не должен был её сломать.
+    stake_row = (
+        await session.execute(select(Stake).where(Stake.tx_hash == "dust-2"))
+    ).scalar_one()
+    assert stake_row.status == "pending" and stake_row.amount_nanotons == to_nano(2)
+
+
 def test_split_equal_dust_to_smallest_id() -> None:
     shares = stakes_mod.split_equal(to_nano(1), [5, 2, 9])
     assert shares == {2: 333_333_334, 5: 333_333_333, 9: 333_333_333}

@@ -192,7 +192,14 @@ async def register_stake(
                     player_id=previous.player_id,
                     kind="refund",
                     amount_nanotons=refund,
-                    dest_address=player.wallet_address or "",
+                    # Только подтверждённый bv: адрес, как в пустом dest приза:
+                    # недоказанный адрес после перепривязки увёл бы возврат в
+                    # bounce, а пустой dest дозаполнит _hydrate_player_dests,
+                    # когда игрок подтвердит кошелёк. Саму ставку это не
+                    # блокирует — сумма не теряется, она ждёт в очереди.
+                    dest_address=(
+                        player.wallet_address if player.wallet_verified else ""
+                    ),
                     network=current_network(),
                 )
             )
