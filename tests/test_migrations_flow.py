@@ -21,13 +21,30 @@ a7b8c9d0e1f2 добавила rounds.referral_nanotons с server_default=0, мо
 поведение одинаковое; rounds ради косметики не переписываем. Список не
 «у Allowance на будущее», а утверждение: новое расхождение тест не
 пропустит, а исчезновение закреплённого — заставит обновить список и README.
+
+Про диалект. SQLite-проверки выше — не «дешёвый задел»: прод живёт на
+Postgres (Supabase), и диалектные расхождения уже стоили инцидента
+(truncation в VARCHAR, жизненный цикл соединений пулера). Раньше flow целиком
+шёл по SQLite, поэтому в PG-джобе CI эти тесты тоже поднимали SQLite-файлы, а
+цепочка миграций на боевом диалекте не проверялась. Ниже тот же flow на
+Postgres — каждый тест получает свою одноразовую базу, снимается с сервера.
+
+Смешанная природа здесь не украшение, а требование драйвера: синхронного
+драйвера Postgres в проекте нет вообще (требования — asyncpg, как в проде),
+поэтому рефлексию и правки в PG-базе делаем через run_sync асинхронного
+движка. Это же означает «честно»: тест проверяет ровно тот драйвер, которым
+работает прод, а не второй, случайно оказавшийся в requirements.
 """
 
 import os
 import subprocess
 import sys
+import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import asyncpg
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -37,7 +54,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.config import settings
+from app.config import settings, sqlalchemy_url
 from app.models import Base
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,26 +98,11 @@ def _version(url: str) -> str | None:
 
 
 def _shape(url: str) -> dict:
-    """Отражённая форма схемы: таблицы, колонки, типы, nullability, PK,
+    """Отражённая форма схемы SQLite-базы: таблицы, колонки, типы, nullability, PK,
     уникальные ограничения и индексы. Server defaults сознательно НЕ в
     сравнении — их расхождение разбирает compare_models (см. KNOWN)."""
     engine = create_engine(url)
-    inspector = inspect(engine)
-    shape = {}
-    for table in sorted(inspector.get_table_names()):
-        if table.startswith("sqlite_") or table == "alembic_version":
-            continue
-        shape[table] = {
-            "columns": {
-                column["name"]: (column["type"].compile(dialect=engine.dialect), column["nullable"])
-                for column in inspector.get_columns(table)
-            },
-            "pk": sorted(inspector.get_pk_constraint(table)["constrained_columns"]),
-            "unique": sorted(
-                tuple(sorted(u["column_names"])) for u in inspector.get_unique_constraints(table)
-            ),
-            "indexes": sorted((i["name"], tuple(i["column_names"] or [])) for i in inspector.get_indexes(table)),
-        }
+    shape = _shape_of_connection(inspect(engine), engine.dialect)
     engine.dispose()
     return shape
 
@@ -402,14 +404,109 @@ def _shape_of_models() -> dict:
     engine: Engine = create_engine("sqlite://")
     with engine.begin() as conn:
         Base.metadata.create_all(conn)
-    inspector = inspect(engine)
+    shape = _shape_of_connection(inspect(engine), engine.dialect)
+    engine.dispose()
+    return shape
+
+
+# --- PostgreSQL: тот же flow на боевом диалекте ---------------------------
+#
+# Каждый тест берёт СВОЮ одноразовую базу и роняет её на финише: общая база
+# означала бы, что тесты зависят от порядка и от остатков чужих данных — а
+# flow как раз проверяет чистый старт. Имя с uuid освобождает параллельный
+# прогон (-n) и повторный прогон после падения.
+
+
+def _postgres_admin_dsn() -> dict | None:
+    """Реквизиты подключения к серверу из TEST_POSTGRES_URL.
+
+    Требуется суперпользователь: тест сам создаёт и удаляет базы. Если его нет
+    — тесты молча пропускаются, а не падают: без PG их просто некому выполнять.
+    """
+    url = os.environ.get("TEST_POSTGRES_URL") or os.environ.get("TEST_POSTGRES_ADMIN_URL")
+    if not url:
+        return None
+    parts = urlsplit(url)
+    if not parts.hostname or not parts.username:
+        return None
+    return {
+        "host": parts.hostname,
+        "port": parts.port or 5432,
+        "user": parts.username,
+        "password": parts.password or "",
+    }
+
+
+def _pg_engine(url: str):
+    """Асинхронный движок на asyncpg.
+
+    Схема драйвера берётся из app.config, а не пишется строкой: там же боевой
+    runtime нормализует URL, и тест обязан проверять ровно то подключение, чем
+    пользуется прод (asyncpg), а не случайный драйвер из requirements.
+    """
+    return create_async_engine(sqlalchemy_url(url))
+
+
+@pytest.fixture
+async def pg_url() -> AsyncIterator[str]:
+    """Одноразовая база на тест: создаётся, отдаётся URL, снимается с сервера."""
+    dsn = _postgres_admin_dsn()
+    if dsn is None:
+        pytest.skip("нужен TEST_POSTGRES_URL с суперпользователем: flow на Postgres")
+    name = f"the_way_flow_{uuid.uuid4().hex[:12]}"
+    admin = await asyncpg.connect(database="postgres", **dsn)
+    try:
+        await admin.execute(f'create database "{name}"')
+    finally:
+        await admin.close()
+    base = dsn["host"], dsn["port"], dsn["user"], dsn["password"]
+    try:
+        yield f"postgresql://{base[2]}:{base[3]}@{base[0]}:{base[1]}/{name}"
+    finally:
+        await _drop_pg_database(name, dsn)
+
+
+async def _drop_pg_database(name: str, dsn: dict) -> None:
+    """Снести базу, оборвав висящие соединения: DROP DATABASE не проходит,
+    пока к базе кто-то подключён (pool из прошлого теста, например)."""
+    admin = await asyncpg.connect(database="postgres", **dsn)
+    try:
+        await admin.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity "
+            "where datname = $1 and pid <> pg_backend_pid()",
+            name,
+        )
+        await admin.execute(f'drop database if exists "{name}"')
+    finally:
+        await admin.close()
+
+
+async def _pg_shape(url: str) -> dict:
+    """Форма схемы PG-базы: тот же снимок, что _shape, но через asyncpg."""
+    engine = _pg_engine(url)
+    try:
+        async with engine.connect() as conn:
+            return await conn.run_sync(
+                lambda sync_conn: _shape_of_connection(inspect(sync_conn), sync_conn.dialect)
+            )
+    finally:
+        await engine.dispose()
+
+
+def _shape_of_connection(inspector, dialect) -> dict:
+    """Отражённая форма схемы для ЛЮБОГО диалекта.
+
+    Вынесено из _shape: одна и та же форма сравнивается и SQLite, и Postgres, а
+    различаются только подключение и диалект. Server defaults сознательно не
+    в сравнении — их расхождение разбирает compare_models (см. KNOWN).
+    """
     shape = {}
     for table in sorted(inspector.get_table_names()):
         if table.startswith("sqlite_") or table == "alembic_version":
             continue
         shape[table] = {
             "columns": {
-                column["name"]: (column["type"].compile(dialect=engine.dialect), column["nullable"])
+                column["name"]: (column["type"].compile(dialect=dialect), column["nullable"])
                 for column in inspector.get_columns(table)
             },
             "pk": sorted(inspector.get_pk_constraint(table)["constrained_columns"]),
@@ -418,5 +515,290 @@ def _shape_of_models() -> dict:
             ),
             "indexes": sorted((i["name"], tuple(i["column_names"] or [])) for i in inspector.get_indexes(table)),
         }
-    engine.dispose()
     return shape
+
+
+async def _pg_version(url: str) -> str | None:
+    engine = _pg_engine(url)
+    try:
+        async with engine.connect() as conn:
+            return await conn.scalar(text("select version_num from alembic_version"))
+    finally:
+        await engine.dispose()
+
+
+async def _pg_compare_models(url: str) -> set[str]:
+    """Расхождения БД и моделей на PG. Опции те же, что у _compare_models:
+    на обоих диалектах мы обязаны ловить одно и то же, иначе «чисто на PG»
+    ничего не значит."""
+    engine = _pg_engine(url)
+    try:
+        async with engine.connect() as conn:
+            diffs = await conn.run_sync(
+                lambda sync_conn: _diffs_of(
+                    MigrationContext.configure(
+                        sync_conn,
+                        opts={"compare_type": True, "compare_server_default": True},
+                    )
+                )
+            )
+    finally:
+        await engine.dispose()
+    return diffs
+
+
+def _diffs_of(context) -> set[str]:
+    diffs = [item for group in compare_metadata(context, Base.metadata) for item in group]
+    found = set()
+    for diff in diffs:
+        op, _schema, table, *rest = diff
+        key = f"{op}:{table}"
+        if rest and isinstance(rest[0], str):
+            key = f"{key}.{rest[0]}"
+        found.add(key)
+    return found
+
+
+async def _pg_models_shape_url(admin_dsn: dict) -> str:
+    """Одноразовая база с чистым create_all: эталон «как выглядит прод-схема
+    без истории миграций». Создаётся моделями, а не цепочкой."""
+    name = f"the_way_models_{uuid.uuid4().hex[:12]}"
+    admin = await asyncpg.connect(database="postgres", **admin_dsn)
+    try:
+        await admin.execute(f'create database "{name}"')
+    finally:
+        await admin.close()
+    host, port, user, password = (
+        admin_dsn["host"], admin_dsn["port"], admin_dsn["user"], admin_dsn["password"]
+    )
+    url = f"postgresql://{user}:{password}@{host}:{port}/{name}"
+    engine = _pg_engine(url)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    finally:
+        await engine.dispose()
+    return url
+
+
+@pytest.fixture
+async def pg_app_db(pg_url: str, monkeypatch) -> AsyncIterator[str]:
+    """То же, что app_db для SQLite, но на Postgres: init_db обязан работать с
+    одноразовой PG-базой, а не с общей тестовой. Настройки перенаправлены и
+    внутри процесса pytest, и для alembic-subprocess'а — migrations/env.py берёт
+    URL из DATABASE_URL, а не из переданного аргумента."""
+    import app.db as db_module
+
+    engine = _pg_engine(pg_url)
+    monkeypatch.setenv("DATABASE_URL", pg_url)
+    monkeypatch.setattr(settings, "database_url", pg_url)
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(
+        db_module,
+        "SessionLocal",
+        async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession),
+    )
+    try:
+        yield pg_url
+    finally:
+        await engine.dispose()
+
+
+def test_postgres_chain_from_empty_matches_models(pg_url: str):
+    """Цепочка с нуля на Postgres даёт схему моделей, и `alembic check` —
+    команда из CI и деплоя — на ней чист.
+
+    Это ядро дыры, которую закрываем: джоба test-postgres гоняла drift-check,
+    но flow-тесты внутри неё поднимали SQLite, поэтому цепочка на боевом
+    диалекте не проверялась вообще."""
+    _alembic_ok(pg_url, "upgrade", "head")
+
+    assert _alembic_ok(pg_url, "check").find("No new upgrade operations") >= 0
+
+
+async def test_postgres_chain_shape_matches_models(pg_url: str):
+    """Форма PG-схемы после цепочки совпадает с формой create_all-базы.
+
+    Сравниваются две PG-базы, а не PG с SQLite: типы колонок отражаются
+    по-разному, и сравнение диалектов ничего бы не значило."""
+    _alembic_ok(pg_url, "upgrade", "head")
+
+    dsn = _postgres_admin_dsn()
+    models_url = await _pg_models_shape_url(dsn)
+    try:
+        chain_shape, models_shape = await _pg_shape(pg_url), await _pg_shape(models_url)
+    finally:
+        await _drop_pg_database(urlsplit(models_url).path.lstrip("/"), dsn)
+
+    assert chain_shape == models_shape
+
+
+async def test_postgres_downgrade_base_then_upgrade_head(pg_url: str):
+    """Вся цепочка откатывается до нуля и поднимается обратно на Postgres.
+
+    Downgrade на боевом диалекте — отдельный класс отказов: на PG есть
+    реальные DROP TABLE с зависимостями, и обрыв посередине оставляет базу,
+    из которой нельзя ни подняться, ни откатиться дальше."""
+    _alembic_ok(pg_url, "upgrade", "head")
+    head_shape = await _pg_shape(pg_url)
+
+    _alembic_ok(pg_url, "downgrade", "base")
+
+    engine = _pg_engine(pg_url)
+    try:
+        async with engine.connect() as conn:
+            leftover = await conn.run_sync(
+                lambda sync_conn: [
+                    name
+                    for name in inspect(sync_conn).get_table_names()
+                    if not name.startswith("sqlite_")
+                ]
+            )
+    finally:
+        await engine.dispose()
+    assert leftover == ["alembic_version"], f"после downgrade base остались таблицы: {leftover}"
+
+    _alembic_ok(pg_url, "upgrade", "head")
+    assert await _pg_version(pg_url) == _alembic_head()
+    assert await _pg_shape(pg_url) == head_shape
+
+
+async def test_postgres_repeat_upgrade_is_noop_and_keeps_data(pg_url: str):
+    """Повторный upgrade на уже мигрированной PG-базе — no-op, строки на месте."""
+    _alembic_ok(pg_url, "upgrade", "head")
+    before = await _pg_shape(pg_url)
+
+    engine = _pg_engine(pg_url)
+    async with engine.begin() as conn:
+        await conn.execute(text("insert into watcher_state (key, value) values ('k', 'v')"))
+    await engine.dispose()
+
+    _alembic_ok(pg_url, "upgrade", "head")
+
+    assert await _pg_version(pg_url) == _alembic_head()
+    assert await _pg_shape(pg_url) == before
+    engine = _pg_engine(pg_url)
+    async with engine.connect() as conn:
+        assert await conn.scalar(text("select value from watcher_state where key='k'")) == "v"
+    await engine.dispose()
+
+
+async def test_postgres_legacy_create_all_db_converges(pg_app_db: str):
+    """Легаси-база create_all-эпохи на Postgres обязана сойтись в таймлайн.
+
+    Именно этот сценарий боевой: прод вырос из create_all, и его пришлось
+    приводить к alembic-истории. Идём через init_db, а не сырым alembic:
+    сведение делает реконсиляция рантайма, и именно её надо проверить —
+    запуск `alembic upgrade head` по легаси-базе падает на 'table already
+    exists' на любом диалекте, это не баг."""
+    from app.db import init_db
+
+    engine = _pg_engine(pg_app_db)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("insert into watcher_state (key, value) values ('k', 'v')"))
+    await engine.dispose()
+
+    await init_db()
+
+    assert await _pg_version(pg_app_db) == _alembic_head()
+    assert await _pg_compare_models(pg_app_db) - KNOWN_DIVERGENCES == set()
+    engine = _pg_engine(pg_app_db)
+    async with engine.connect() as conn:
+        assert await conn.scalar(text("select value from watcher_state where key='k'")) == "v"
+    await engine.dispose()
+
+
+async def test_postgres_db_left_by_failed_reconcile_heals(pg_app_db: str):
+    """База, которую оставила УПАВШАЯ реконсиляция на Postgres, долечивается.
+
+    Состояние бота, не смогшего стартовать: create_all уже применился, а
+    история встала на якорь. Следующий запуск обязан довести базу до head и
+    оставить `alembic check` чистым — это постусловие из README."""
+    from app.db import init_db
+
+    _alembic_ok(pg_app_db, "upgrade", "a7b8c9d0e1f2")
+    engine = _pg_engine(pg_app_db)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await engine.dispose()
+    assert await _pg_leftover_tx_hash_unique(pg_app_db) is not None, (
+        "фикстура не воспроизводит упавшую реконсиляцию на PG"
+    )
+
+    await init_db()
+
+    assert await _pg_version(pg_app_db) == _alembic_head()
+    assert await _pg_leftover_tx_hash_unique(pg_app_db) is None, (
+        "единичный unique по stakes.tx_hash остался на PG"
+    )
+    assert await _pg_compare_models(pg_app_db) - KNOWN_DIVERGENCES == set()
+    assert "No new upgrade operations" in _alembic_ok(
+        pg_app_db, "check"
+    ), "`alembic check` после долечивания на PG не чист — README обещает обратное"
+
+
+async def _pg_leftover_tx_hash_unique(url: str) -> tuple[str | None, list[str]] | None:
+    """Мёртвый единичный unique по stakes.tx_hash глазами рефлексии PG."""
+    engine = _pg_engine(url)
+    try:
+        async with engine.connect() as conn:
+            return await conn.run_sync(
+                lambda sync_conn: _leftover_tx_hash_unique_conn(sync_conn)
+            )
+    finally:
+        await engine.dispose()
+
+
+def _leftover_tx_hash_unique_conn(conn) -> tuple[str | None, list[str]] | None:
+    found = None
+    for constraint in inspect(conn).get_unique_constraints("stakes"):
+        if constraint.get("column_names") == ["tx_hash"]:
+            found = (constraint.get("name"), constraint["column_names"])
+    return found
+
+
+async def test_postgres_orm_writes_rounds_without_server_default(pg_url: str):
+    """Расхождение по rounds.referral_nanotons безобидно и НА ПРОДЕ.
+
+    Ревизия добавила колонку с server_default=0, модель объявляет только
+    питоновский default. На SQLite это видно как modify_default, на Postgres
+    alembic неInteger-сравнение пропускает — то есть на боевом диалекте
+    расхождение просто НЕВИДИМО. Поэтому «невидимо» ничего не значит: проверяем
+    по-настоящему, что ORM пишет такую строку и на PG."""
+    from datetime import datetime
+
+    from app.models import Round
+
+    _alembic_ok(pg_url, "upgrade", "head")
+    engine = _pg_engine(pg_url)
+    maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with maker() as session:
+        session.add(
+            Round(
+                day_index=4242,
+                status="open",
+                win_rule="none",
+                chapter_title="t",
+                chapter_text="b",
+                opens_at=datetime(2026, 1, 1),
+                voting_ends_at=datetime(2026, 1, 2),
+                tally_ends_at=datetime(2026, 1, 3),
+                pot_nanotons=0,
+                rake_nanotons=0,
+                payouts_finalized=False,
+                epilogue_text="e",
+                weekly_nanotons=0,
+                money_mode=True,
+            )
+        )
+        await session.commit()
+    await engine.dispose()
+
+    engine = _pg_engine(pg_url)
+    async with engine.connect() as conn:
+        stored = await conn.scalar(
+            text("select referral_nanotons from rounds where day_index=4242")
+        )
+    await engine.dispose()
+    assert stored == 0

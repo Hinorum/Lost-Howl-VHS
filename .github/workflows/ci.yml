@@ -24,7 +24,11 @@ jobs:
       - name: Alembic drift check
         env:
           DATABASE_URL: "sqlite+aiosqlite:///./data/ci_drift.db"
+        # Папка data/ в .gitignore, поэтому в свежем checkout её нет, а SQLite
+        # не умеет создавать файл в несуществующей папке: «unable to open
+        # database file» валил этот шаг и весь джоб, и тесты не доходили.
         run: |
+          mkdir -p data
           python -m alembic upgrade head
           python -m alembic check
       - name: Tests (SQLite)
@@ -56,6 +60,9 @@ jobs:
     env:
       # Локальный хост -> postgres_connect_args не включает SSL (см. config.py).
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/the_way_ci
+      # Тот же URL для flow-тестов миграций: без него они молча уходят в
+      # SQLite-файлы, и цепочка на боевом диалекте снова остаётся непроверенной.
+      TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/the_way_ci
       BOT_TOKEN: "123456:ci-dummy-token"
       ADMIN_IDS: "1"
     steps:

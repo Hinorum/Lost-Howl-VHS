@@ -97,7 +97,7 @@ def downgrade() -> None:
     sa.Column('title', sa.VARCHAR(length=80), nullable=False),
     sa.Column('block', sa.TEXT(), nullable=False),
     sa.Column('is_ai_generated', sa.BOOLEAN(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('prologue_beats', schema=None) as batch_op:
@@ -110,7 +110,7 @@ def downgrade() -> None:
     sa.Column('day_index', sa.INTEGER(), nullable=False),
     sa.Column('title', sa.VARCHAR(length=80), nullable=False),
     sa.Column('description', sa.TEXT(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('season', 'beast_key', name=op.f('uq_bestiary_season_beast'))
     )
@@ -126,7 +126,7 @@ def downgrade() -> None:
     sa.Column('teaser_json', sa.TEXT(), nullable=False),
     sa.Column('guest', sa.TEXT(), nullable=False),
     sa.Column('is_ai_generated', sa.BOOLEAN(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('season_arcs', schema=None) as batch_op:
@@ -143,7 +143,7 @@ def downgrade() -> None:
     sa.Column('stage_text', sa.TEXT(), nullable=False),
     sa.Column('choices_json', sa.TEXT(), nullable=False),
     sa.Column('resolution', sa.TEXT(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('consequence_branches', schema=None) as batch_op:
@@ -156,7 +156,7 @@ def downgrade() -> None:
     sa.Column('phase', sa.VARCHAR(length=16), nullable=False),
     sa.Column('content_json', sa.TEXT(), nullable=False),
     sa.Column('is_ai_generated', sa.BOOLEAN(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('ai_generated_pools', schema=None) as batch_op:
@@ -172,7 +172,7 @@ def downgrade() -> None:
     sa.Column('locations_involved', sa.TEXT(), nullable=False),
     sa.Column('impact', sa.TEXT(), nullable=False),
     sa.Column('resolved', sa.BOOLEAN(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('world_events', schema=None) as batch_op:
@@ -185,7 +185,7 @@ def downgrade() -> None:
     sa.Column('motive_text', sa.TEXT(), nullable=False),
     sa.Column('action_text', sa.TEXT(), nullable=False),
     sa.Column('thought_pool_json', sa.TEXT(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('npc_motives', schema=None) as batch_op:
@@ -201,7 +201,7 @@ def downgrade() -> None:
     sa.Column('state', sa.VARCHAR(length=16), nullable=False),
     sa.Column('surfaced_day', sa.INTEGER(), nullable=True),
     sa.Column('healed_day', sa.INTEGER(), nullable=True),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('dog_memories', schema=None) as batch_op:
@@ -221,7 +221,7 @@ def downgrade() -> None:
     sa.Column('times_visited', sa.INTEGER(), nullable=False),
     sa.Column('is_active', sa.BOOLEAN(), nullable=False),
     sa.Column('metadata_json', sa.TEXT(), nullable=True),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('name')
     )
@@ -234,7 +234,7 @@ def downgrade() -> None:
     sa.Column('active_characters', sa.TEXT(), nullable=False),
     sa.Column('open_threads', sa.TEXT(), nullable=False),
     sa.Column('world_trend', sa.TEXT(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('day_index')
     )
@@ -248,7 +248,7 @@ def downgrade() -> None:
     sa.Column('location', sa.VARCHAR(length=120), nullable=True),
     sa.Column('votes_count', sa.INTEGER(), nullable=False),
     sa.Column('won', sa.BOOLEAN(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('world_choices', schema=None) as batch_op:
@@ -260,7 +260,7 @@ def downgrade() -> None:
     sa.Column('hope', sa.INTEGER(), nullable=False),
     sa.Column('paranoia', sa.INTEGER(), nullable=False),
     sa.Column('last_updated_day', sa.INTEGER(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('npc_profiles',
@@ -272,8 +272,8 @@ def downgrade() -> None:
     sa.Column('appearance', sa.TEXT(), nullable=False),
     sa.Column('default_mood', sa.VARCHAR(length=16), nullable=False),
     sa.Column('is_ai_generated', sa.BOOLEAN(), nullable=False),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
-    sa.Column('updated_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('npc_profiles', schema=None) as batch_op:
@@ -286,7 +286,7 @@ def downgrade() -> None:
     sa.Column('expires_day', sa.INTEGER(), nullable=True),
     sa.Column('strength', sa.INTEGER(), nullable=False),
     sa.Column('metadata_json', sa.TEXT(), nullable=True),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('world_scars', schema=None) as batch_op:
@@ -306,7 +306,7 @@ def downgrade() -> None:
     sa.Column('last_seen_day', sa.INTEGER(), nullable=True),
     sa.Column('is_alive', sa.BOOLEAN(), nullable=False),
     sa.Column('metadata_json', sa.TEXT(), nullable=True),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('name')
     )
