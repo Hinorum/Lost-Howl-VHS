@@ -88,7 +88,17 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
             headers=headers,
         )
         response.raise_for_status()
-        items = response.json().get("transactions") or []
+        data = response.json()
+        if not isinstance(data, dict) or "transactions" not in data:
+            # HTTP 200 без поля transactions — НЕ «пустая история», а аномалия
+            # провайдера (дроссель, ошибка-обёртка в 200): пустой {}-ответ
+            # заставил бы сверщика поверить, что memo в цепочке нет, и повтор
+            # уехал бы на уже ушедший платёж. Падаем — фолбэк на Toncenter,
+            # и при его молчании _RECONCILE_HISTORY_OK=False замораживает повторы.
+            raise RuntimeError(
+                f"TonAPI истории казначея: ответ без поля transactions: {str(data)[:120]}"
+            )
+        items = data.get("transactions") or []
         if not items:
             break
         page_first_hash = str(items[0].get("hash") or "")
@@ -145,7 +155,15 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
         }
         response = await _tp.http_get_with_retry(client, url, params=params, headers=headers)
         response.raise_for_status()
-        items = response.json().get("transactions") or []
+        data = response.json()
+        if not isinstance(data, dict) or "transactions" not in data:
+            # Тот же сторож, что в _tx_map_via_tonapi: 200 без transactions —
+            # «не знаем», история не считается здоровой. Иначе пустой {}-ответ
+            # резервного провайдера снял бы стопор повтора на основном.
+            raise RuntimeError(
+                f"Toncenter истории казначея: ответ без поля transactions: {str(data)[:120]}"
+            )
+        items = data.get("transactions") or []
         if not items:
             break
         page_first_hash = str(items[0].get("hash") or "")

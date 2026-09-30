@@ -13,6 +13,8 @@ import os
 import time
 from unittest.mock import AsyncMock
 
+import pytest
+
 from app import ton_pay
 from app.config import settings
 from app.core.registry import BEAT_KEY, CURSOR_KEY, SOURCE_KEY, STUCK_TX_KEY
@@ -290,6 +292,50 @@ async def test_fetch_broadcast_tx_map_passes_targets_to_fetchers(monkeypatch) ->
     result = await ton_pay.fetch_broadcast_tx_map(targets={"way:1:pr#1"})
     assert result == {}
     assert seen["api"] == {"way:1:pr#1"}
+
+
+async def test_empty_200_without_transactions_is_unknown(monkeypatch) -> None:
+    """HTTP 200 с телом БЕЗ transactions — аномалия провайдера, а не
+    «история пуста»: сверка остаётся «не знаем», повторы заморожены.
+
+    Именно такой ответ (дроссель/ошибка-обёртка в 200) молча превращался в
+    «memo в цепочке нет», и повтор уезжал на уже ушедший платёж.
+    """
+    from app.ton_pay import state as _st
+
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    empty = AsyncMock()
+    empty.get = AsyncMock(return_value=_FakeResp({}))
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: empty)
+    _st._RECONCILE_HISTORY_OK = True
+    try:
+        tx_map = await ton_pay.fetch_broadcast_tx_map(targets={"way:1:pr#1"})
+        assert tx_map == {}
+        assert _st._RECONCILE_HISTORY_OK is False
+    finally:
+        _st._RECONCILE_HISTORY_OK = True
+
+
+async def test_empty_200_without_transactions_on_tonapi_also_unknown(monkeypatch) -> None:
+    """То же на основном провайдере напрямую: без фолбэка его {}-ответ падает."""
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    empty = AsyncMock()
+    empty.get = AsyncMock(return_value=_FakeResp({}))
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: empty)
+    try:
+        await ton_pay._tx_map_via_tonapi(targets={"way:1:pr#1"})
+        pytest.fail("TonAPI с {} обязан падать, а не молчать")
+    except RuntimeError as exc:
+        assert "transactions" in str(exc)
+    # Валидная пустая история (transactions: []) остаётся честной пустотой.
+    empty.get = AsyncMock(return_value=_FakeResp({"transactions": []}))
+    assert await ton_pay._tx_map_via_tonapi(targets={"way:1:pr#1"}) == {}
 
 
 # ---------- Guard: повтор при недоступной истории ----------
