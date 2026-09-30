@@ -225,9 +225,20 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
     healed = 0
     from app.tally import award_points
 
-    for round_row in stale:
-        day = round_row.day_index
+    # Снимок до цикла: session.rollback() истекает ВСЕ инстансы в сессии, и
+    # read stale_row.status из списка после отката предыдущего дня падает
+    # MissingGreenlet (lazy load вне greenlet-контекста) — тик умирал, остальные
+    # застрявшие дни не лечились. Каждую итерацию берём свежую запись через
+    # await session.get (настоящий IO), а день держим простым int.
+    stale_ids = [(round_row.id, round_row.day_index) for round_row in stale]
+
+    for round_id, day in stale_ids:
         try:
+            round_row = await session.get(
+                Round, round_id, options=[selectinload(Round.cards)]
+            )
+            if round_row is None:
+                continue
             if round_row.status == RoundStatus.OPEN:
                 await close_voting(session, round_row)
             finished, closed_here = await finish_tally(session, round_row)
@@ -241,6 +252,9 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
                         "Финализация ставок вылеченного дня %s упала", day,
                         exc_info=True,
                     )
+                    # Частично вставленные Payout не должны «до-коммититься»
+                    # следующим успешным днём — откатываем их транзакционный хвост.
+                    await session.rollback()
                 try:
                     await write_epilogue(session, finished)
                 except Exception:
@@ -248,13 +262,16 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
                         "Эпилог вылеченного дня %s не удался", day,
                         exc_info=True,
                     )
+                    await session.rollback()
                 healed += 1
                 logger.info(
                     "Вылечен застрявший день %s: подсчёт завершён, "
                     "ставки финализированы", day,
                 )
         except Exception as exc:
-            logger.exception("Лечение застрявшего дня %s не удалось (повторится)", day, exc)
+            logger.exception(
+                "Лечение застрявшего дня %s не удалось (повторится): %s", day, exc
+            )
             await session.rollback()
     return healed
 

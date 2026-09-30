@@ -38,6 +38,7 @@ from app.models import (
 )
 from app.ops import PAUSE_KEY, set_game_paused
 from app.rounds import heal_stale_rounds
+from app.rounds import lifecycle as lifecycle_mod
 
 ADMIN_ID = 4242
 
@@ -129,6 +130,43 @@ async def test_heal_stale_rounds_closes_orphan_and_writes_canon(session) -> None
         assert beat.winning_text == "Канон дня."
     finally:
         await _wipe([700, 701])
+
+
+async def test_heal_stale_rounds_survives_midloop_failure(session, monkeypatch) -> None:
+    """Сбой одного застрявшего дня не убивает лечение следующих.
+
+    Иницидент: session.rollback() в except истёк ВСЕ инстансы, на следующей
+    итерации прямой read round_row.status дал MissingGreenlet (lazy load вне
+    greenlet-контекста) — heal падал целиком, остальные дни висели вечно."""
+    earliest = _round(712, RoundStatus.OPEN, voting_in_minutes=-30)
+    stuck = _round(713, RoundStatus.OPEN, voting_in_minutes=-30)
+    current = _round(714, RoundStatus.OPEN, voting_in_minutes=600)
+    session.add_all([earliest, stuck, current])
+    await session.commit()
+
+    real_finish = lifecycle_mod.finish_tally
+    calls = 0
+
+    async def flaky_finish(sess, round_row):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("симуляция сбоя подсчёта")
+        return await real_finish(sess, round_row)
+
+    monkeypatch.setattr(lifecycle_mod, "finish_tally", flaky_finish)
+    try:
+        healed = await heal_stale_rounds(session)
+        statuses = dict(
+            (await session.execute(select(Round.day_index, Round.status))).all()
+        )
+        # Первый день упал и откатился; ВТОРОЙ вылечен тем же прогоном.
+        assert healed >= 1
+        assert statuses[712] == RoundStatus.TALLYING  # сбой; повторится в тике
+        assert statuses[713] == RoundStatus.CLOSED    # пережил откат предшественника
+        assert statuses[714] == RoundStatus.OPEN      # актуальный не тронут
+    finally:
+        await _wipe([712, 713, 714])
 
 
 async def test_heal_skips_when_nothing_stuck(session) -> None:
