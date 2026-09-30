@@ -359,6 +359,7 @@ async def test_tick_closes_finished_day_and_kicks_background_jobs(monkeypatch) -
         "announce_results",
         "finalize_new_day",
         "retry_results",
+        "retry_new_day",
     ]
 
 
@@ -502,16 +503,34 @@ async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> Non
     async def fake_mark(session, finished):
         marks.append(finished.day_index)
     monkeypatch.setattr("app.leaderboard.mark_leaderboards_for_finished", fake_mark)
-    nxt = SimpleNamespace(id=5)
     created = []
+    announced: list[int] = []
+    async def fake_announce(bot, round_row):
+        announced.append(round_row.id)
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+
     async def fake_create(session, *, base_day_index):
         created.append(base_day_index)
+        # Реальный открытый день: джоба анонсит его под claim-меткой (свежая
+        # выборка из своей сессии — SimpleNamespace тут не маячит).
+        nxt = Round(
+            day_index=9713,
+            status=RoundStatus.OPEN,
+            win_rule=WinRule.MAJORITY,
+            chapter_title="День 9713",
+            chapter_text="Текст.",
+            opens_at=datetime.now(UTC) - timedelta(hours=1),
+            voting_ends_at=datetime.now(UTC) + timedelta(hours=9),
+            tally_ends_at=datetime.now(UTC) + timedelta(hours=10),
+            vote_counts_json="{}",
+        )
+        async with SessionLocal() as db:
+            db.add(nxt)
+            await db.commit()
+            await db.refresh(nxt)
         return nxt, True
+
     monkeypatch.setattr("app.rounds.create_next_round_detailed", fake_create)
-    announced = []
-    async def fake_announce(bot, round_row):
-        announced.append(round_row)
-    monkeypatch.setattr("app.broadcast.announce_new_day", fake_announce)
 
     waited: list[bool] = []
     async def wait_results():
@@ -521,7 +540,10 @@ async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> Non
         await sched._finalize_new_day_job(rid, wait_results=wait_results())
         assert epilogues and marks
         assert waited == [True]  # анонс ждёт доставку итогов
-        assert announced == [nxt]
+        assert announced and len(announced) == 1
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.day_index == 9713))).scalar_one()
+            assert row.announced_at is not None  # claim-метка стоит: дубля не будет
     finally:
         await _clear_rounds()
 
@@ -530,6 +552,107 @@ async def test_finalize_new_day_job_round_missing() -> None:
     from app import scheduler as sched
 
     await sched._finalize_new_day_job(-1)  # warning, без падения
+
+
+async def test_announce_round_releases_marker_on_failure(monkeypatch) -> None:
+    """Сбой вещания снимает claim-метку (at-least-once): восстановитель может
+    объявить день снова, а не потерять его пост навсегда."""
+    from app import scheduler as sched
+
+    did = 9724
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    async with SessionLocal() as db:
+        day = Round(
+            day_index=did,
+            status=RoundStatus.OPEN,
+            win_rule=WinRule.MAJORITY,
+            chapter_title=f"День {did}",
+            chapter_text="Текст.",
+            opens_at=datetime.now(UTC) - timedelta(hours=1),
+            voting_ends_at=datetime.now(UTC) + timedelta(hours=9),
+            tally_ends_at=datetime.now(UTC) + timedelta(hours=10),
+            vote_counts_json="{}",
+        )
+        db.add(day)
+        await db.commit()
+        row_id = day.id
+
+    async def boom(bot_, round_row):
+        raise RuntimeError("сеть легла в середине рассылки")
+
+    try:
+        monkeypatch.setattr(sched, "announce_new_day", boom)
+        async with SessionLocal() as db:
+            day = await db.get(Round, row_id)
+            with pytest.raises(RuntimeError):
+                await sched._announce_round(db, day, bot)
+            fresh = await db.get(Round, row_id)
+            assert fresh.announced_at is None  # метка снята — повтор возможен
+
+        # Повторный проход (следующий тик) доставляет и ставит метку.
+        seen = []
+        async def ok(bot_, round_row):
+            seen.append(round_row.id)
+        monkeypatch.setattr(sched, "announce_new_day", ok)
+        async with SessionLocal() as db:
+            day = await db.get(Round, row_id)
+            await sched._announce_round(db, day, bot)
+        assert seen == [row_id]
+        async with SessionLocal() as db:
+            assert (await db.get(Round, row_id)).announced_at is not None
+    finally:
+        await _cleanup(did)
+
+
+async def test_retry_new_day_job_announces_only_open_unannounced(monkeypatch) -> None:
+    """Восстановитель объявляет только OPEN-дни без метки; уже помеченные и
+    подсчитываемые не трогает, повторный прогон молчит."""
+    from app import scheduler as sched
+
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    missing = await _make_round(9725, RoundStatus.OPEN)
+    claimed = await _make_round(9726, RoundStatus.OPEN)
+    tallying = await _make_round(9727, RoundStatus.TALLYING)
+    async with SessionLocal() as db:
+        row = await db.get(Round, claimed)
+        row.announced_at = datetime.now(UTC)
+        await db.commit()
+
+    seen = []
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    try:
+        await sched._retry_new_day_job()
+        assert seen == [missing]  # день без поста объявлен, остальные нет
+        async with SessionLocal() as db:
+            assert (await db.get(Round, missing)).announced_at is not None
+        seen.clear()
+        await sched._retry_new_day_job()
+        assert seen == []  # идемпотентно: метки стоят
+    finally:
+        await _cleanup(missing, claimed, tallying)
+
+
+async def test_retry_new_day_job_respects_pause(monkeypatch) -> None:
+    """Стоп-кран: восстановитель молчит, пока игра на паузе."""
+    from app import scheduler as sched
+
+    missing = await _make_round(9728, RoundStatus.OPEN)
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=True))
+    seen = []
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    try:
+        await sched._retry_new_day_job()
+        assert seen == []
+    finally:
+        await _cleanup(missing)
 
 
 async def test_finalize_new_day_job_swallows_failures(monkeypatch) -> None:

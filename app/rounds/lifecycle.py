@@ -195,6 +195,23 @@ async def claim_announcement(session: AsyncSession, round_row: Round) -> bool:
     return result.rowcount > 0
 
 
+async def unclaim_announcement(session: AsyncSession, round_id: int) -> None:
+    """Освобождает право анонса неудачливому вещателю.
+
+    claim_announcement коммитит метку ДО реального анонса: сбой сети в
+    середине рассылки оставил бы день «объявленным», а пост так и не ушёл —
+    анонс нового дня потерялся бы навсегда (тик и /advance не повторяют уже
+    помеченное). Снятие метки возвращает право восстановителю
+    (_retry_new_day_job): анонс становится at-least-once вместо дыры.
+    """
+    await session.execute(
+        update(Round)
+        .where(Round.id == round_id, Round.announced_at.is_not(None))
+        .values(announced_at=None)
+    )
+    await session.commit()
+
+
 async def ensure_current_round(session: AsyncSession) -> Round:
     current = await get_active_round(session)
     if current is not None:

@@ -16,6 +16,7 @@ from .lifecycle import (  # noqa: F401
     heal_stale_rounds,
     public_round_view,
     reset_game,
+    unclaim_announcement,
 )
 from .materialization import _materialize_round, _stamp_day_money_mode  # noqa: F401
 from .narrative import write_epilogue  # noqa: F401
@@ -43,6 +44,7 @@ __all__ = [
     "default_anchor",
     "parse_anchor",
     "claim_announcement",
+    "unclaim_announcement",
     "close_voting",
     "create_next_round",
     "create_next_round_detailed",

@@ -78,8 +78,7 @@ async def _tick_body(bot: Bot | None, span) -> None:
 
             # Первый запуск или только что созданный день — анонсим без итогов.
             if previous is None or current.id > previous.id:
-                if await claim_announcement(session, current):
-                    await announce_new_day(bot, current)
+                await _announce_round(session, current, bot)
 
             now = _now()
             if current.status == RoundStatus.OPEN and now >= utc_aware(current.voting_ends_at):
@@ -117,6 +116,10 @@ async def _tick_body(bot: Bot | None, span) -> None:
             # коммитом закрытия и джобой рассылки, вылеченные дни тоже сюда) —
             # досылается фоном, claim-метка не даёт дублей.
             spawn(_retry_results_job(), "retry_results")
+            # Достраховка анонса нового дня: OPEN-день без метки announced_at
+            # (краш/сбой сети между claim_announcement и вещанием) объявляется
+            # восстановителем — новый день не теряется молча.
+            spawn(_retry_new_day_job(), "retry_new_day")
         except Exception as exc:
             logger.exception("тик закрытия дня упал — откат транзакции")
             await session.rollback()
@@ -185,6 +188,66 @@ async def _claim_results(session: AsyncSession, finished_id: int) -> bool:
     return claimed.rowcount == 1
 
 
+async def _announce_round(session: AsyncSession, round_row, bot: Bot | None) -> None:
+    """Объявляет новый день под claim-меткой announced_at.
+
+    claim_announcement коммитит метку ДО вещания (атомарно, ровно один
+    вещатель в гонке джоб/реплик). Если вещание падает — метка снимается
+    (unclaim), и _retry_new_day_job на ближайшем тике объявит день снова:
+    потеря поста нового дня хуже редкого дубля (at-least-once), а дубль всё
+    равно исключён, пока метка стоит.
+    """
+    if not await claim_announcement(session, round_row):
+        return
+    try:
+        await announce_new_day(bot, round_row)
+    except Exception:
+        from app.rounds import unclaim_announcement
+
+        await unclaim_announcement(session, round_row.id)
+        raise
+
+
+async def _retry_new_day_job() -> None:
+    """Досылка анонса новых дней, не доставленного прошлым циклом.
+
+    Краш или сбой сети между claim_announcement и announce_new_day (или анонс
+    day-1 при самом первом запуске) оставляют OPEN-день без поста: тик видит
+    только переход previous→current, а /advance помечает день навсегда. Здесь
+    открытые дни без announced_at объявляются заново (лимит 5 за тик).
+    """
+    try:
+        from app.models import Round
+        from app.ops import is_game_paused
+
+        async with SessionLocal() as session:
+            if await is_game_paused(session):
+                return
+            pending = (
+                await session.execute(
+                    select(Round.id)
+                    .where(Round.status == RoundStatus.OPEN, Round.announced_at.is_(None))
+                    .order_by(Round.day_index.asc())
+                    .limit(5)
+                )
+            ).all()
+            for (round_id,) in pending:
+                day = await session.get(Round, round_id)
+                if day is None:
+                    continue
+                try:
+                    await _announce_round(session, day, _bot)
+                except Exception as exc:
+                    # Метку _announce_round уже снял — день повторится завтрашним
+                    # тиком; больной день не должен обрушить остальные.
+                    logger.warning(
+                        "Повторный анонс дня %s упал (повторится): %s",
+                        day.day_index, exc,
+                    )
+    except Exception:
+        logger.exception("Повтор анонса нового дня упал")
+
+
 async def _retry_results_job() -> None:
     """Восстановитель рассылки итогов: CLOSED-дни без маркера results_at.
 
@@ -248,7 +311,6 @@ async def _finalize_new_day_job(
     from app.models import Round
 
     try:
-        from app.broadcast import announce_new_day
         from app.rounds import create_next_round_detailed, write_epilogue
 
         # 1. Эпилог подтверждает выбор и закрепляется в БД (идемпотентно).
@@ -284,7 +346,15 @@ async def _finalize_new_day_job(
             if wait_results is not None:
                 await wait_results
             # finished не передаём: итоги уже разосланы отдельным постом.
-            await announce_new_day(_bot, nxt)
+            # Анонс идёт ПОД claim-меткой: иначе восстановитель новых дней
+            # принял бы этот день за неанонсированный (announced_at IS NULL)
+            # и объявил бы его второй раз.
+            async with SessionLocal() as session:
+                fresh = await session.get(Round, nxt.id)
+                if fresh is None or fresh.status != RoundStatus.OPEN:
+                    logger.warning("День %s для анонса не найден или закрыт", nxt.id)
+                else:
+                    await _announce_round(session, fresh, _bot)
     except Exception:
         logger.exception("Финализация нового дня упала (id=%s)", finished_id)
 
