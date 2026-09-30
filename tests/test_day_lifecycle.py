@@ -386,6 +386,110 @@ async def test_resetgame_wipes_income_and_memory_links(offline_all) -> None:
     await _wipe([1])
 
 
+async def test_finalize_pending_payouts_recovers_crashed_closed_day(session) -> None:
+    """Краш между коммитом finish_tally и finalize_day_payouts оставляет день
+    CLOSED с payouts_finalized=false: догон создаёт возвраты и ставит маркер,
+    а копилки недели/месяца больше не ждут закрытый день вечно."""
+    from app.stakes import current_network, finalize_pending_payouts
+    from app.ton_utils import to_nano
+
+    player_id = 881_001
+    day = 901
+    round_row = _round(day, RoundStatus.CLOSED, voting_in_minutes=-40)
+    round_row.winner_card = 0
+    round_row.vote_counts_json = "{}"
+    session.add(
+        Player(id=player_id, username="crashed_p", wallet_address="0:" + "00" * 16)
+    )
+    session.add(round_row)
+    await session.flush()
+    session.add(
+        Stake(
+            round_id=round_row.id,
+            player_id=player_id,
+            amount_nanotons=to_nano(0.3),
+            tx_hash="crash-tx",
+            status="confirmed",
+            network=current_network(),
+        )
+    )
+    await session.commit()
+    try:
+        created = await finalize_pending_payouts(session)
+        assert created == 1
+        paid = (
+            await session.execute(select(Payout).where(Payout.round_id == round_row.id))
+        ).scalars().all()
+        assert len(paid) == 1 and paid[0].kind == "refund"
+        claimed = await session.get(Round, round_row.id)
+        assert claimed.payouts_finalized is True
+        # Идемпотентен: повторный тик ничего не создаёт (claim пройден).
+        assert await finalize_pending_payouts(session) == 0
+        assert (
+            len(
+                (
+                    await session.execute(
+                        select(Payout).where(Payout.round_id == round_row.id)
+                    )
+                ).scalars().all()
+            )
+            == 1
+        )
+    finally:
+        await _wipe([day])
+
+
+async def test_finalize_pending_payouts_survives_midloop_crash(session, monkeypatch) -> None:
+    """Упавшая финализация одного дня не обрушивает тик: её хвост откатывается,
+    остальные закрытые дни догоняются, а больной день честно остаётся
+    unfinalized и повторится следующим тиком."""
+    from app.stakes import current_network, finalize_pending_payouts
+    from app.ton_utils import to_nano
+
+    days = [902, 903]
+    for i, day in enumerate(days):
+        round_row = _round(day, RoundStatus.CLOSED, voting_in_minutes=-40)
+        round_row.winner_card = 0
+        round_row.vote_counts_json = "{}"
+        session.add(Player(id=881_010 + i))
+        session.add(round_row)
+        await session.flush()
+        session.add(
+            Stake(
+                round_id=round_row.id,
+                player_id=881_010 + i,
+                amount_nanotons=to_nano(0.2),
+                tx_hash=f"f-tx-{day}",
+                status="confirmed",
+                network=current_network(),
+            )
+        )
+    await session.commit()
+
+    import app.stakes as stakes_mod
+
+    boom_id = (await session.execute(select(Round.id).where(Round.day_index == days[0]))).scalar_one()
+    real = stakes_mod.finalize_day_payouts
+
+    async def flaky(_session, round_row):
+        if round_row.id == boom_id:
+            raise RuntimeError("synthetic crash")
+        return await real(_session, round_row)
+
+    monkeypatch.setattr(stakes_mod, "finalize_day_payouts", flaky)
+    try:
+        created = await finalize_pending_payouts(session)
+        assert created == len(days) - 1
+        rows = (
+            await session.execute(select(Round).where(Round.day_index.in_(days)))
+        ).scalars().all()
+        by_index = {row.day_index: row for row in rows}
+        assert by_index[days[0]].payouts_finalized is False
+        assert by_index[days[1]].payouts_finalized is True
+    finally:
+        await _wipe(days)
+
+
 def test_every_round_foreign_key_table_is_wiped() -> None:
     """Будущее-проф: любая новая таблица с FK на rounds обязана попасть в
     reset_game, иначе сброс снова молча откатится по ForeignKeyViolation."""

@@ -105,6 +105,14 @@ async def _tick_body(bot: Bot | None, span) -> None:
             # маркер awards_at догоняет такие дни идемпотентно (claim отсекает
             # двойное списание и параллельных финализаторов).
             await award_pending_points(session)
+            # То же для выплат: краш между коммитом finish_tally и
+            # finalize_day_payouts оставляет CLOSED-день без призов, и копилки
+            # недели/месяца ждут его вечно (leaderboard читает
+            # payouts_finalized). Догон идемпотентен — claim финализации
+            # пускает одного.
+            from app.stakes import finalize_pending_payouts
+
+            await finalize_pending_payouts(session)
             # Достраховка итогов: CLOSED-день без маркера results_at (краш между
             # коммитом закрытия и джобой рассылки, вылеченные дни тоже сюда) —
             # досылается фоном, claim-метка не даёт дублей.

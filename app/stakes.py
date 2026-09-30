@@ -612,6 +612,44 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
     return created
 
 
+async def finalize_pending_payouts(session: AsyncSession) -> int:
+    """Добирает выплаты дней, закрытых без финализации ставок.
+
+    Краш между коммитом finish_tally (lifecycle) и самокоммитом
+    finalize_day_payouts оставляет день CLOSED с payouts_finalized=false:
+    тик и heal закрывают только OPEN/TALLYING, award_pending_points чинит
+    очки, но не выплаты, а копилки недели/месяца ждут payouts_finalized
+    (leaderboard.ready_marker) — без этого призы зависли бы навсегда.
+    Идемпотентно: claim finalize_day_payouts (payouts_finalized=false)
+    пускает только одного, повторный тик ничего не создаёт.
+    """
+    rows = (
+        await session.execute(
+            select(Round.id).where(
+                Round.status == RoundStatus.CLOSED,
+                Round.payouts_finalized.is_(False),
+            )
+        )
+    ).all()
+    finalized = 0
+    for (round_id,) in rows:
+        round_row = await session.get(Round, round_id)
+        if round_row is None:
+            continue
+        try:
+            finalized += await finalize_day_payouts(session, round_row)
+        except Exception as exc:
+            logger.warning(
+                "Финализация ставок закрытого дня %s упала (повторится): %s",
+                round_id,
+                exc,
+            )
+            # Частичные вставки канувшей транзакции не должны «до-коммититься»
+            # следующим днём — свой хвост откатываем, чужие дни продолжаем.
+            await session.rollback()
+    return finalized
+
+
 async def refundable_stakes(session, limit: int = 25) -> list[tuple[Stake, Player | None, Round | None]]:
     """Ставки, которые можно вернуть вручную из /panel: ещё не «засчитанные»
     (pending/rejected) и не имеющие незакрытого refund-выплата. Возвращает
