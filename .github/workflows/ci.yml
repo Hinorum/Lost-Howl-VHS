@@ -35,7 +35,10 @@ jobs:
         env:
           BOT_TOKEN: "123456:ci-dummy-token"
           ADMIN_IDS: "1"
-        run: python -m pytest -q --cov=app --cov-report=term-missing --cov-fail-under=70
+        # 75% enforced; фактическое значение при последнем замере ~78-80% (см.
+        # README «Покрытие тестами»). Покрытие — это floor, не цель: качественные
+        # тесты важнее, чем число; конкретные сценарии описаны в docs/architecture.md.
+        run: python -m pytest -q --cov=app --cov-report=term-missing --cov-fail-under=75
 
   # Продакшен живет на Supabase Postgres, а основная джоба тестирует только
   # SQLite: прод-инциденты от дрейфа диалектов уже были (VARCHAR-длины
