@@ -188,6 +188,13 @@ class Round(Base):
     # для поста итогов. День без приведённых ставок или день возврата — 0.
     referral_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     payouts_finalized: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Момент начисления очков дня — единый маркер-claim: проставляет только
+    # тот, кто победил в гонке (scheduler, heal, админский /advance), и только
+    # в одной транзакции с самим начислением. Краш между finish_tally и
+    # award_points оставляет день CLOSED без очков, но целевой запрос по
+    # awards_at IS NULL добирает его; повторный вызов не удваивает score.
+    # Null — очки ещё не начислены (или день без победителя).
+    awards_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Денежная версия дня (ставки TON + платная смена выбора): снимок режима
     # на момент открытия дня. Хранитель переключает «версию со ставками/без»
     # из /panel — новая версия вступает со СЛЕДУЮЩЕГО дня, а этот флаг

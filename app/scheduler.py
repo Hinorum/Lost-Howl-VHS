@@ -23,7 +23,7 @@ from app.rounds import (
     get_latest_round,
     utc_aware,
 )
-from app.tally import award_points
+from app.tally import award_pending_points, award_points
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
@@ -99,6 +99,11 @@ async def _tick_body(bot: Bot | None, span) -> None:
                         _finalize_new_day_job(finished.id, wait_results=results_task),
                         "finalize_new_day",
                     )
+            # Краш между коммитом finish_tally и award_points оставляет день
+            # CLOSED без очков, а heal_stale_rounds лечит только OPEN/TALLYING:
+            # маркер awards_at догоняет такие дни идемпотентно (claim отсекает
+            # двойное списание и параллельных финализаторов).
+            await award_pending_points(session)
         except Exception as exc:
             logger.exception("тик закрытия дня упал — откат транзакции")
             await session.rollback()
