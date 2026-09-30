@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config import settings
 from app.core.registry import BEAT_KEY, CURSOR_KEY, SOURCE_KEY, STUCK_TX_KEY, WALLET_NORM_KEY
@@ -934,8 +934,16 @@ async def confirm_aged_pending(bot: Bot | None = None) -> int:
             round_row = await session.get(Round, stake.round_id)
             if round_row is None or round_row.status != RoundStatus.OPEN:
                 continue
-            stake.status = "confirmed"
-            stake.confirmed_at = now
+            # Условный UPDATE-claim: ручной возврат ставит refunded в ЯВНОЙ
+            # гонке со свипом; без WHERE pending свип перезаписал бы refunded
+            # на confirmed — ставка засчитана И игрок ещё получает возврат.
+            claimed = await session.execute(
+                update(Stake)
+                .where(Stake.id == stake.id, Stake.status == "pending")
+                .values(status="confirmed", confirmed_at=now)
+            )
+            if claimed.rowcount != 1:
+                continue  # уже не pending (возврат/дубль) — не трогаем
             confirmed += 1
             await _dm_stake(
                 bot,

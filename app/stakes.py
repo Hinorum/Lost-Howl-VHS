@@ -58,6 +58,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import (
+    LeaderboardPot,
     PackFund,
     PackFundLedger,
     Payout,
@@ -68,10 +69,15 @@ from app.models import (
     RoundStatus,
     Stake,
     Vote,
+    WeeklyPot,
 )
 from app.ops import claim_once
 from app.ton_utils import from_nano, to_nano
 from app.weeks import iso_week_key
+
+# Модели копилок переэкспортируются сюда: тесты контракта обращаются к ним
+# как stakes_mod.LeaderboardPot / stakes_mod.WeeklyPot.
+__all__ = ["LeaderboardPot", "WeeklyPot"]
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +241,15 @@ async def confirm_stake(session: AsyncSession, tx_hash: str) -> bool:
     round_row = await session.get(Round, stake.round_id)
     if round_row is None or round_row.status != RoundStatus.OPEN:
         return False
-    stake.status = "confirmed"
-    stake.confirmed_at = datetime.now(UTC)
+    # Условный UPDATE-claim (см. confirm_aged_pending): рубленный возврат может
+    # пройти между SELECT'ом и записью — без WHERE pending он был бы затёрт.
+    claimed = await session.execute(
+        update(Stake)
+        .where(Stake.id == stake.id, Stake.status == "pending")
+        .values(status="confirmed", confirmed_at=datetime.now(UTC))
+    )
+    if claimed.rowcount != 1:
+        return False  # уже не pending (возврат/дубль) — не перезаписываем
     await session.commit()
     return True
 

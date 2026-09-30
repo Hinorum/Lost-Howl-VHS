@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import stakes as stakes_mod
@@ -589,6 +589,59 @@ async def test_confirm_stake_respects_network(
     wrong.network = "testnet"
     await session.commit()
     assert await stakes_mod.confirm_stake(session, "tx-cross") is True
+
+
+async def test_confirm_stake_race_with_manual_refund_keeps_refunded(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Гонка «ручной возврат VS подтверждение»: возврат ставит refunded в ЯВНОМ
+    UPDATE между выборкой ставки и записью подтверждения. Без WHERE pending в
+    claim свип/конфирмация перезаписали бы refunded на confirmed — ставка
+    засчитана в банк удара И игрок получил возврат (двойной учёт)."""
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    player = Player(id=33, wallet_address="w")
+    session.add(player)
+    round_row = _open_round(33)
+    session.add(round_row)
+    await session.commit()
+    stake_row = Stake(
+        round_id=round_row.id,
+        player_id=player.id,
+        amount_nanotons=to_nano(1),
+        tx_hash="tx-race-refund",
+        memo="m",
+        network="testnet",
+        status="pending",
+    )
+    session.add(stake_row)
+    await session.commit()
+
+    real_execute = session.execute
+    race_done = False
+
+    async def racing_execute(stmt, *args, **kwargs):
+        nonlocal race_done
+        result = await real_execute(stmt, *args, **kwargs)
+        sql = str(stmt)
+        # Возврат прилетает ПОСЛЕ выборки pending-ставки, но ДО claim-апдейта:
+        # именно это окно — гонка, на которую должен реагировать conditional-update.
+        if not race_done and "FROM stakes" in sql.replace("\n", " "):
+            race_done = True
+            await real_execute(
+                update(Stake).where(Stake.id == stake_row.id).values(status="refunded"),
+                *args,
+                **kwargs,
+            )
+        return result
+
+    monkeypatch.setattr(session, "execute", racing_execute)
+
+    assert await stakes_mod.confirm_stake(session, "tx-race-refund") is False
+    stake_id = stake_row.id
+    await session.commit()
+    session.expire_all()
+    stake = (await session.execute(select(Stake).where(Stake.id == stake_id))).scalar_one()
+    assert stake.status == "refunded"
 
 
 def _open_round(day_index: int, status: RoundStatus = RoundStatus.OPEN) -> Round:
