@@ -30,6 +30,9 @@ from app.core.registry import (
 )
 from app.db import SessionLocal
 from app.leaderboard import (
+    is_last_day_of_month,
+    is_last_day_of_week,
+    mark_leaderboards_for_finished,
     previous_month_key,
     settle_month_if_due,
     settle_week_if_due,
@@ -49,6 +52,35 @@ from app.models import (
 )
 from app.ton_utils import to_nano
 from app.weeks import iso_week_key, previous_week_key, week_bounds
+
+
+def _sunday_last_of_month() -> datetime:
+    """Ближайшее воскресенье, которое одновременно последний день месяца."""
+    cursor = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+    for _ in range(370):
+        if is_last_day_of_week(cursor) and is_last_day_of_month(cursor):
+            return cursor
+        cursor += timedelta(days=1)
+    raise AssertionError("нет воскресенья в конце месяца в течение года")
+
+
+async def test_leaderboard_ready_flags_persist_without_caller_commit(session: AsyncSession) -> None:
+    """mark_leaderboards_for_finished коммитит СЕБЯ: флаги недели/месяца не теряются,
+    когда вызывающая сессия закрывается без коммита (_finalize_new_day_job закрывает
+    SessionLocal; /advance на раннем выходе «день уже создан»). Без этого копилка
+    недели/месяца (2% банка) оставалась невыплачиваемой навсегда и немо."""
+    from types import SimpleNamespace
+
+    moment = _sunday_last_of_month()
+    finished = SimpleNamespace(opens_at=moment, day_index=4242)
+    await mark_leaderboards_for_finished(session, finished)
+    # Осознанно НЕ коммитим вызвавший сеанс — ровно как _finalize_new_day_job.
+    flags = {
+        row.key: row.value
+        for row in (await session.execute(select(WatcherState))).scalars().all()
+    }
+    assert flags[WEEK_READY_KEY] == iso_week_key(moment)
+    assert flags[MONTH_READY_KEY] == moment.strftime("%Y-%m")
 
 
 @pytest.fixture(autouse=True)

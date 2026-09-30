@@ -527,21 +527,33 @@ def is_last_day_of_week(moment: datetime) -> bool:
 
 
 async def mark_month_leaderboard_ready(session, month_key: str) -> None:
-    """Отмечает, что эпилог последнего дня месяца написан — лидерборд может выплачиваться."""
+    """Отмечает, что эпилог последнего дня месяца написан — лидерборд может выплачиваться.
+
+    Коммитит СЕБЯ: вызывающие сессии (планировщик _finalize_new_day_job, /advance)
+    после этого шага могут закрыться откатом — иначе метка теряется, а копилка
+    месяца остаётся невыплачиваемой навсегда и без единой тревоги.
+    """
     marker = await session.get(WatcherState, MONTH_READY_KEY)
     if marker is None:
         session.add(WatcherState(key=MONTH_READY_KEY, value=month_key))
     else:
         marker.value = month_key
+    await session.commit()
 
 
 async def mark_week_leaderboard_ready(session, week_key: str) -> None:
-    """Отмечает, что эпилог последнего дня недели написан — лидерборд может выплачиваться."""
+    """Отмечает, что эпилог последнего дня недели написан — лидерборд может выплачиваться.
+
+    Коммитит СЕБЯ (см. mark_month_leaderboard_ready): планировщик закрывает свою
+    сессию без коммита после этого шага — без внутреннего commit флаг недели
+    исчезал бы, и недельная копилка (2% банка) зависала навсегда.
+    """
     marker = await session.get(WatcherState, WEEK_READY_KEY)
     if marker is None:
         session.add(WatcherState(key=WEEK_READY_KEY, value=week_key))
     else:
         marker.value = week_key
+    await session.commit()
 
 
 async def mark_leaderboards_for_finished(session, finished) -> None:
