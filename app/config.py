@@ -261,14 +261,17 @@ class Settings(BaseSettings):
     port: int = 10000
     webhook_base_url: str = ""
     webhook_secret: str = ""
-    # Токен доступа к /health (мониторинг). Пусто — /health открыт (совместимо
-    # с дефолтным чеком жизни Render). Задан — снимок (очередь выплат, возраст
-    # тика, watcher) доступен только с авторизацией.
+    # Токен доступа к /health (мониторинг). Пусто — снимок (очередь выплат,
+    # возраст тика, watcher) отдаётся, только если health_require_token=False.
+    # Аудит застал /health открытым, потому что токен «забыли» поставить:
+    # молчаливо публичный снимок с данными недопустим.
     health_token: str = ""
-    # Полностью закрыть /health БЕЗ токена (health_token пуст): без флага
-    # Render чинит процесс по дефолтному чеку, который токен не передаёт.
-    # True — эндпоинт отдаёт 401, пока мониторинг не научился авторизации.
-    health_require_token: bool = False
+    # Закрывать /health при пустом токене (fail closed). True по умолчанию:
+    # инстанс без HEALTH_TOKEN отвечает 401, и Render помечает его нездоровым —
+    # тревога конфигурации вместо открытого операционного снимка. Чек жизни
+    # Render на free-плане токен не передаёт: healthCheckPath в render.yaml уже
+    # ходит с ним в query (см. P0-1).
+    health_require_token: bool = True
     render_external_url: str = ""
     render_external_hostname: str = ""
     # Личные приглашения (?start=ref_<id>_<токен>): секрет подписывает токен,

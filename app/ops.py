@@ -281,8 +281,13 @@ async def snapshot() -> dict:
         problems = _parse_problems(problems_raw)
         track = _load_track(await _get_state(session, OPS_ALERT_TRACK_KEY))
         keys = {_problem_key(problem) for problem in problems}
+        # Честный статус: при живых проблемах (очередь выплат стоит, watcher
+        # молчит) или серии падений тика /health не притворяется «ok» — статус
+        # виден мониторингу и хранителю. HTTP-код остаётся 200: Render должен
+        # считать процесс живым (деградация лечится, а не рестартится).
+        health_status = "degraded" if (problems or tick_failures > 0) else "ok"
         payload = {
-            "status": "ok",
+            "status": health_status,
             "uptime_seconds": round(time.time() - PROCESS_START, 1),
             "last_tick_age": _age_seconds(await _get_state(session, TICK_KEY)),
             "tick_failures": tick_failures,

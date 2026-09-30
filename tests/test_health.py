@@ -6,6 +6,7 @@ from app import main as main_module
 
 
 async def test_health_returns_snapshot_payload(monkeypatch) -> None:
+    monkeypatch.setattr("app.config.settings.health_require_token", False)
     async def good_snapshot():
         return {"status": "ok", "last_tick_age": 1.5}
 
@@ -22,6 +23,7 @@ async def test_health_stays_green_and_honest_when_snapshot_fails(monkeypatch) ->
     async def broken_snapshot():
         raise RuntimeError("cached statement plan is invalid")
 
+    monkeypatch.setattr("app.config.settings.health_require_token", False)
     monkeypatch.setattr("app.ops.snapshot", broken_snapshot)
     response = await main_module.health(SimpleNamespace())
     assert response.status == 200

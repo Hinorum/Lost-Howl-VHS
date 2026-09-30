@@ -111,6 +111,7 @@ def test_validate_config_ok_when_minimal(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(settings, "bot_token", "123:token")
     monkeypatch.setattr(settings, "admin_ids", "42")
     monkeypatch.setattr(settings, "ton_enabled", False)
+    monkeypatch.setattr(settings, "health_token", "s3cret")
     assert main_module.validate_config() == []
 
 

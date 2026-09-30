@@ -1164,6 +1164,29 @@ async def test_snapshot_reports_unprocessed_and_payout_by_kind(
             await db.commit()
 
 
+async def test_snapshot_status_is_honest_about_problems(monkeypatch) -> None:
+    """/health не врёт «ok» при живых проблемах или серии падений тика."""
+    from app import ops
+
+    async with SessionLocal() as db:
+        await ops._store_problems(db, ["очередь выплат стоит"])
+    try:
+        payload = await ops.snapshot()
+        assert payload["status"] == "degraded"
+        assert payload["problems"]  # сам вердикт тоже виден
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_([ops.OPS_PROBLEMS_KEY, ops.OPS_PROBLEMS_AT_KEY])
+                )
+            )
+            await db.commit()
+    # Чистое состояние — снова честный «ok».
+    payload = await ops.snapshot()
+    assert payload["status"] == "ok"
+
+
 async def test_stuck_refund_alert_is_targeted(monkeypatch: pytest.MonkeyPatch) -> None:
     """Возврат ставки, что так и не ушёл, будит хранителя конкретным алертом."""
     from app import ops
