@@ -161,7 +161,6 @@ async def test_advance_auto_resumes_from_pause(offline_all, monkeypatch) -> None
         await cmd_advance(message)
     finally:
         await _wipe([stale_day])
-
     texts = [c.args[0] for c in message.answer.await_args_list if c.args]
     joined = "\n".join(texts)
     assert "Пауза снята автоматически" in joined
@@ -169,6 +168,34 @@ async def test_advance_auto_resumes_from_pause(offline_all, monkeypatch) -> None
     async with SessionLocal() as db:
         row = await db.get(WatcherState, PAUSE_KEY)
         assert bool(row and row.value) is False
+
+
+async def test_advance_refuses_fresh_open_day(offline_all) -> None:
+    """/advance не закрывает свежеоткрытый день.
+
+    Инцидент: тик уже закрыл N и открыл N+1, а /advance брал свежий день как
+    «актуальный» — закрывал его с нулём голосов и жребием, затем плодил N+2
+    (target по latest+1). Свежий день не трогаем: у застрявшего окно
+    голосования уже истекло."""
+    fresh_day = 721
+    round_row = _round(fresh_day, RoundStatus.OPEN, voting_in_minutes=600)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+    try:
+        message = _message("/advance")
+        await cmd_advance(message)
+        replies = [c.args[0] for c in message.answer.await_args_list if c.args]
+        assert any("ещё голосуется" in text for text in replies)
+        async with SessionLocal() as db:
+            status = (
+                await db.execute(
+                    select(Round.status).where(Round.day_index == fresh_day)
+                )
+            ).scalar_one()
+        assert status == RoundStatus.OPEN  # не закрыт, день живёт
+    finally:
+        await _wipe([fresh_day])
 
 
 async def test_resetgame_auto_resumes_from_pause(offline_all) -> None:
