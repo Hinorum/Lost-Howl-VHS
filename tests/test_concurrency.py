@@ -245,6 +245,56 @@ async def test_referral_pot_claim_is_atomic(tmp_path) -> None:
         await engine.dispose()
 
 
+# ----- Test 4b: начисление в копилки — атомарный upsert -------------------
+
+
+async def test_crediting_pots_is_atomic_upsert(tmp_path) -> None:
+    """Два «финализатора» (тик дня N и ton-maintenance дня N-1) начисляют долю
+    в одну и ту же копилку: ON CONFLICT ... DO UPDATE не даёт ни IntegrityError,
+    ни второй строки, ни потери суммы. Чтение-модификация-запись через ORM
+    при параллели теряло бы накопление (у обоих была бы копия 100 → одна запись
+    затирала другую); один атомарный UPDATE-с-INSERT не может прочитать старое
+    значение параллельного процесса."""
+    engine, maker = await _fresh_db(tmp_path)
+    try:
+        upserts = {
+            "referral_pots": text(
+                "INSERT INTO referral_pots (referrer_id, nanotons) VALUES (:k, :n) "
+                "ON CONFLICT (referrer_id) DO UPDATE SET "
+                "nanotons = referral_pots.nanotons + :n, updated_at = CURRENT_TIMESTAMP"
+            ),
+            "leaderboard_pots": text(
+                "INSERT INTO leaderboard_pots (month, nanotons) VALUES (:k, :n) "
+                "ON CONFLICT (month) DO UPDATE SET "
+                "nanotons = leaderboard_pots.nanotons + :n, updated_at = CURRENT_TIMESTAMP"
+            ),
+            "weekly_pots": text(
+                "INSERT INTO weekly_pots (week, nanotons) VALUES (:k, :n) "
+                "ON CONFLICT (week) DO UPDATE SET "
+                "nanotons = weekly_pots.nanotons + :n, updated_at = CURRENT_TIMESTAMP"
+            ),
+        }
+        keys = {"referral_pots": "7", "leaderboard_pots": "2026-06", "weekly_pots": "2026-W26"}
+        for table, statement in upserts.items():
+            async with maker() as sess:
+                await sess.execute(statement, {"k": keys[table], "n": 100})
+                await sess.commit()
+                await sess.execute(statement, {"k": keys[table], "n": 250})
+                await sess.commit()
+        async with maker() as sess:
+            refs = (await sess.execute(select(ReferralPot))).scalars().all()
+            count = (await sess.execute(text(
+                "SELECT (SELECT COUNT(*) FROM referral_pots) "
+                "+ (SELECT COUNT(*) FROM leaderboard_pots) "
+                "+ (SELECT COUNT(*) FROM weekly_pots)"
+            ))).scalar_one()
+        assert len(refs) == 1
+        assert refs[0].nanotons == 350
+        assert count == 3  # ровно по одной строке на каждую копилку
+    finally:
+        await engine.dispose()
+
+
 # ----- Test 5: claim_once с разными ключами не конфликтует ----------------
 
 

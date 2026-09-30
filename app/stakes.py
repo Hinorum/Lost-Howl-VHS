@@ -53,12 +53,11 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import (
-    LeaderboardPot,
     PackFund,
     PackFundLedger,
     Payout,
@@ -69,7 +68,6 @@ from app.models import (
     RoundStatus,
     Stake,
     Vote,
-    WeeklyPot,
 )
 from app.ops import claim_once
 from app.ton_utils import from_nano, to_nano
@@ -244,17 +242,25 @@ async def confirm_stake(session: AsyncSession, tx_hash: str) -> bool:
 
 
 async def _credit_referral(session: AsyncSession, referrer_id: int, amount: int) -> None:
-    """Каплет долю подтверждённой ставки приведённого игрока в накопитель."""
+    """Каплет долю подтверждённой ставки приведённого игрока в накопитель.
+
+    Атомарный upsert ОДНОЙ строкой: две параллельные финализации дней (тик
+    закрывает N, ton-maintenance закрывает N-1) тем же реферером не теряют
+    сумму и не ловят IntegrityError на уникальном referrer_id — покрыты и
+    INSERT первой строки, и последующие UPDATE.
+    """
     if amount <= 0:
         return
-    row = (
-        await session.execute(select(ReferralPot).where(ReferralPot.referrer_id == referrer_id))
-    ).scalar_one_or_none()
-    if row is None:
-        session.add(ReferralPot(referrer_id=referrer_id, nanotons=amount))
-    else:
-        row.nanotons += amount
-        row.updated_at = datetime.now(UTC)
+    await session.execute(
+        text(
+            "INSERT INTO referral_pots (referrer_id, nanotons) "
+            "VALUES (:referrer, :amount) "
+            "ON CONFLICT (referrer_id) DO UPDATE SET "
+            "nanotons = referral_pots.nanotons + :amount, "
+            "updated_at = CURRENT_TIMESTAMP"
+        ),
+        {"referrer": referrer_id, "amount": amount},
+    )
 
 
 async def _settle_referral_pots(session: AsyncSession) -> int:
@@ -502,23 +508,32 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                 created += add_treasury_payout("rake", house_cut)
             if board_cut > 0:
                 month = round_row.tally_ends_at.strftime("%Y-%m")
-                pot_row = (await session.execute(
-                    select(LeaderboardPot).where(LeaderboardPot.month == month)
-                )).scalar_one_or_none()
-                if pot_row is None:
-                    session.add(LeaderboardPot(month=month, nanotons=board_cut))
-                else:
-                    pot_row.nanotons += board_cut
+                # Атомарный upsert (см. _credit_referral): месяц уникален,
+                # без ON CONFLICT параллельные финализации задвоили бы row
+                # или перетёрли накопление.
+                await session.execute(
+                    text(
+                        "INSERT INTO leaderboard_pots (month, nanotons) "
+                        "VALUES (:m, :amount) "
+                        "ON CONFLICT (month) DO UPDATE SET "
+                        "nanotons = leaderboard_pots.nanotons + :amount, "
+                        "updated_at = CURRENT_TIMESTAMP"
+                    ),
+                    {"m": month, "amount": board_cut},
+                )
             week_total_cut = weekly_cut + dust_to_week
             if week_total_cut > 0:
                 week = iso_week_key(round_row.opens_at)
-                week_row = (await session.execute(
-                    select(WeeklyPot).where(WeeklyPot.week == week)
-                )).scalar_one_or_none()
-                if week_row is None:
-                    session.add(WeeklyPot(week=week, nanotons=week_total_cut))
-                else:
-                    week_row.nanotons += week_total_cut
+                await session.execute(
+                    text(
+                        "INSERT INTO weekly_pots (week, nanotons) "
+                        "VALUES (:w, :amount) "
+                        "ON CONFLICT (week) DO UPDATE SET "
+                        "nanotons = weekly_pots.nanotons + :amount, "
+                        "updated_at = CURRENT_TIMESTAMP"
+                    ),
+                    {"w": week, "amount": week_total_cut},
+                )
                 round_row.weekly_nanotons = week_total_cut
             # Фонд Стаи: неубывающее накопление без периода раздачи. Единственная
             # строка-накопитель; деньги остаются на кошельке казначея и забираются
@@ -526,13 +541,32 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             if fund_cut > 0:
                 from app.handlers.wallet import _pct_text
 
+                # Фонд Стаи — единственная строка-накопитель, уникального ключа
+                # для ON CONFLICT нет, поэтому: ряд-лок (на Postgres реальный,
+                # на SQLite no-op — там один процесс) + условная вставка первой
+                # строки. Итог — атомарное начисление и при параллельных
+                # финализациях разных дней.
                 fund_row = (
                     await session.execute(
-                        select(PackFund).order_by(PackFund.id).limit(1)
+                        select(PackFund)
+                        .order_by(PackFund.id)
+                        .limit(1)
+                        .with_for_update()
                     )
                 ).scalar_one_or_none()
                 if fund_row is None:
-                    session.add(PackFund(nanotons=fund_cut))
+                    await session.execute(
+                        text(
+                            "INSERT INTO pack_fund (nanotons) "
+                            "SELECT :amount WHERE NOT EXISTS (SELECT 1 FROM pack_fund)"
+                        ),
+                        {"amount": fund_cut},
+                    )
+                    fund_row = (
+                        await session.execute(
+                            select(PackFund).order_by(PackFund.id).limit(1)
+                        )
+                    ).scalar_one()
                 else:
                     fund_row.nanotons += fund_cut
                 # Аудит: каждое начисление пишется в прозрачный журнал фонда.
