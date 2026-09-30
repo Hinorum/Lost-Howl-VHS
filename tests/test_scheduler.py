@@ -358,6 +358,7 @@ async def test_tick_closes_finished_day_and_kicks_background_jobs(monkeypatch) -
         "payout_dispatch",
         "announce_results",
         "finalize_new_day",
+        "retry_results",
     ]
 
 
@@ -400,6 +401,92 @@ async def test_announce_results_job_round_missing() -> None:
     from app import scheduler as sched
 
     await sched._announce_results_job(-1)  # warning, без падения
+
+
+async def test_announce_results_job_marks_marker_after_delivery(monkeypatch) -> None:
+    """Доставил итоги — поставил results_at: восстановитель этот день не тронет."""
+    from app import scheduler as sched
+
+    rid = await _make_round(9721, RoundStatus.CLOSED)
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+
+    async def fake_announce(b, finished):
+        pass
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_announce)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_announce)
+        await sched._announce_results_job(rid)
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is not None
+    finally:
+        await _cleanup(9721)
+
+
+async def test_retry_results_job_redelivers_crashed_day(monkeypatch) -> None:
+    """CLOSED-день без маркера (краш между коммитом и рассылкой) досылается
+    восстановителем ровно один раз — повторный прогон молчит."""
+    from app import scheduler as sched
+
+    rid = await _make_round(9722, RoundStatus.CLOSED)
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    seen = []
+
+    async def fake_announce(b, finished):
+        seen.append(finished.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_announce)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_announce)
+        await sched._retry_results_job()
+        assert seen == [rid, rid]  # общий пост + личные итоги
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is not None
+        seen.clear()
+        await sched._retry_results_job()
+        assert seen == []
+    finally:
+        await _cleanup(9722)
+
+
+async def test_retry_results_rolls_back_marker_on_failure(monkeypatch) -> None:
+    """Крах в середине рассылки снимает маркер откатом — повтор доставляет
+    (at-least-once), а не теряет итоги навсегда."""
+    from app import scheduler as sched
+
+    rid = await _make_round(9723, RoundStatus.CLOSED)
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    tries = {"n": 0}
+
+    async def flaky(b, finished):
+        tries["n"] += 1
+        if tries["n"] == 1:
+            raise RuntimeError("крах посередине рассылки")
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", flaky)
+        monkeypatch.setattr("app.broadcast.announce_player_results", flaky)
+        await sched._retry_results_job()  # падение проглочено
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is None  # маркер снят откатом
+
+        async def ok(b, finished):
+            pass
+
+        monkeypatch.setattr("app.broadcast.announce_results", ok)
+        monkeypatch.setattr("app.broadcast.announce_player_results", ok)
+        await sched._retry_results_job()
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is not None  # повтор доставил
+    finally:
+        await _cleanup(9723)
 
 
 async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> None:

@@ -5,7 +5,8 @@ import logging
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.async_utils import spawn
@@ -104,6 +105,10 @@ async def _tick_body(bot: Bot | None, span) -> None:
             # маркер awards_at догоняет такие дни идемпотентно (claim отсекает
             # двойное списание и параллельных финализаторов).
             await award_pending_points(session)
+            # Достраховка итогов: CLOSED-день без маркера results_at (краш между
+            # коммитом закрытия и джобой рассылки, вылеченные дни тоже сюда) —
+            # досылается фоном, claim-метка не даёт дублей.
+            spawn(_retry_results_job(), "retry_results")
         except Exception as exc:
             logger.exception("тик закрытия дня упал — откат транзакции")
             await session.rollback()
@@ -139,12 +144,82 @@ async def _announce_results_job(finished_id: int) -> None:
             if finished is None:
                 logger.warning("Итоги дня %s: раунд не найден", finished_id)
                 return
-            await announce_results(_bot, finished)
+            if not await _claim_results(session, finished_id):
+                # Восстановитель уже взял этот день (гонка джоб) — дублей нет.
+                return
             # Личный доказ «за что голосовал и чем кончилось» — следом за общими
             # итогами, чтобы игрок сначала увидел сводку дня, потом свой исход.
-            await announce_player_results(_bot, finished)
+            try:
+                await announce_results(_bot, finished)
+                await announce_player_results(_bot, finished)
+            except Exception:
+                await session.rollback()  # маркер снят — восстановитель дошлёт
+                raise
+            await session.commit()
     except Exception:
         logger.exception("Рассылка итогов дня упала (id=%s)", finished_id)
+
+
+async def _claim_results(session: AsyncSession, finished_id: int) -> bool:
+    """Атомарная метка «итоги этого дня разношу я» (results_at = токен).
+
+    Ставится ДО бродкаста, в той же транзакции, что и сама рассылка: откат
+    транзакции снимает маркер (крах в середине разрешает повтор — at-least-once),
+    а прав на одну рассылку ровно один (гонка джоб/реплик — at-most-once).
+    """
+    from app.models import Round
+
+    claimed = await session.execute(
+        update(Round)
+        .where(Round.id == finished_id, Round.results_at.is_(None))
+        .values(results_at=_now())
+    )
+    return claimed.rowcount == 1
+
+
+async def _retry_results_job() -> None:
+    """Восстановитель рассылки итогов: CLOSED-дни без маркера results_at.
+
+    Краш между коммитом закрытия дня (finish_tally) и spawn'ом джобы итогов
+    оставлял день без единого поста навсегда — heal 'ли закрывает OPEN/TALLYING
+    и ничего не анонсирует. Здесь такие дни дохожу: общий пост + личные, откат
+    транзакции снимает маркер и повтор разрешён. Кап 3 дня за тик — налёт
+    заваленных деплоем дней не валит бота флудом.
+    """
+    try:
+        from app.broadcast import announce_player_results, announce_results
+        from app.models import Round
+
+        async with SessionLocal() as session:
+            missing = (
+                await session.execute(
+                    select(Round)
+                    .where(Round.status == RoundStatus.CLOSED, Round.results_at.is_(None))
+                    .order_by(Round.day_index.asc())
+                    .limit(3)
+                    .options(selectinload(Round.cards))
+                )
+            ).scalars().all()
+            for finished in missing:
+                if not await _claim_results(session, finished.id):
+                    continue
+                try:
+                    await announce_results(_bot, finished)
+                    await announce_player_results(_bot, finished)
+                except Exception:
+                    await session.rollback()
+                    logger.exception(
+                        "Восстановитель итогов дня %s упал — повторит в следующем тике",
+                        finished.day_index,
+                    )
+                    continue
+                await session.commit()
+                logger.info(
+                    "Итоги дня %s досланы восстановителем после краха",
+                    finished.day_index,
+                )
+    except Exception:
+        logger.exception("Восстановитель итогов упал целиком")
 
 
 async def _finalize_new_day_job(

@@ -180,6 +180,10 @@ class Round(Base):
     # Момент первой успешной рассылки дня: повторный анонс того же дня
     # невозможен даже при гонке двух процессов после деплоя.
     announced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Момент доставки итогов дня (общий пост + личные) — маркер at-least-once:
+    # ставится ПОСЛЕ успешного бродкаста; отсутствие у CLOSED-дня позади
+    # актуального включает восстановитель (_retry_results_job). Откат снимает.
+    results_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pot_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     rake_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     # Доля дня, ушедшая в копилку недели (2% фонда) — для поста итогов.
