@@ -30,6 +30,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import (  # noqa: F401  (re-export for tests via `ton_pay.{datetime,UTC,timedelta}`)
+    UTC,
+    datetime,
+    timedelta,
+)
 
 from sqlalchemy import func, select
 
