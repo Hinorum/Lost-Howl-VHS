@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app import config as app_config
 from app import main as main_module
 from app import metrics as metrics_mod
 from app.handlers import bootstrap as bootstrap_mod
@@ -177,6 +178,11 @@ def test_render_without_snapshot_marks_snapshot_down() -> None:
 
 
 async def test_metrics_endpoint_serves_text(monkeypatch) -> None:
+    # Тест проверяет формат ответа, а не доступ: по умолчанию /health и
+    # /metrics закрыты fail closed (health_require_token=True), поэтому
+    # явно открываем эндпоинт, иначе проверка упирается в 401.
+    monkeypatch.setattr("app.config.settings.health_require_token", False)
+
     async def good_snapshot():
         return {"status": "ok", "payout_queue": 1}
 
@@ -193,6 +199,7 @@ async def test_metrics_endpoint_serves_text(monkeypatch) -> None:
 async def test_metrics_endpoint_survives_snapshot_failure(monkeypatch) -> None:
     """Сборщик предпочитает частичные данные 500-ке: процесс жив, снимок
     недоступен — это way_snapshot_up 0, а счётчики памяти всё равно полезны."""
+    monkeypatch.setattr("app.config.settings.health_require_token", False)
 
     async def broken_snapshot():
         raise RuntimeError("cached statement plan is invalid")
@@ -225,8 +232,22 @@ async def test_metrics_endpoint_locked_when_require_token_without_secret(monkeyp
     assert (await main_module.metrics(_request())).status == 401
 
 
-async def test_health_still_serves_after_auth_extraction() -> None:
+async def test_health_still_serves_after_auth_extraction(monkeypatch) -> None:
     """Проверка доступа вынесена в общий _authorized — /health не должен был
     потерять ни одну из прежних мер."""
+    monkeypatch.setattr("app.config.settings.health_require_token", False)
     response = await main_module.health(_request())
     assert response.status == 200
+
+
+async def test_health_defaults_to_fail_closed() -> None:
+    """Дефолт — закрытый /health.
+
+    Аудит нашёл инстанс, где токен «забыли»: молчаливо публичный снимок с
+    очередью выплат и возрастом тика. Поэтому health_require_token по
+    умолчанию True, и инстанс без HEALTH_TOKEN отвечает 401, а не отдаёт
+    данные. Тесты на формат открывают эндпоинт явно — этот держит дефолт.
+    """
+    assert app_config.Settings().health_require_token is True
+    response = await main_module.health(_request())
+    assert response.status == 401
