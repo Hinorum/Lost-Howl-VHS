@@ -413,10 +413,20 @@ async def _set_state(session, key: str, value: str) -> None:
 # ---------- Чтение истории (TonAPI → фолбэк Toncenter) ----------
 
 
-async def _fetch_page(before_lt: int | None = None) -> tuple[list[MirrorMove], str, bool]:
+async def _fetch_page(
+    before_lt: int | None = None, offset: int | None = None
+) -> tuple[list[MirrorMove], str, bool]:
     """Страница истории казначея (новые сверху): (движения, источник, ok).
 
-    TonAPI — основной источник; при его сбое отдаём страницу Toncenter v3.
+    TonAPI — основной источник, его курсор `before_lt` режет выборку сам.
+    Toncenter v3 этот параметр ИГНОРИРУЕТ: проверено на testnet, что и
+    before_lt, и after_lt, и before не меняют страницу — по ним приходит одна
+    и та же свежая страница. Старый код слал before_lt обоим, поэтому при
+    упавшем TonAPI бутстрап от головы к генезису не двигался и max_pages раз
+    подряд перезапрашивал одну и ту же страницу, не доходя до генезиса.
+    У Toncenter свой курсор — смещение `offset` по сортировке desc, которое v3
+    режет честно (проверено: offset=0/100/200 дают непересекающиеся страницы).
+
     ok=False — оба провайдера молчат: цикл не двигает состояние зеркала
     (курсор не тронут, сердцебиение не ставится).
     """
@@ -443,7 +453,11 @@ async def _fetch_page(before_lt: int | None = None) -> tuple[list[MirrorMove], s
             if kind == "toncenter":
                 params["account"] = treasury
                 params["sort"] = "desc"
-            if before_lt is not None:
+                if offset is not None:
+                    params["offset"] = offset
+                # before_lt провайдеру не шлём: он его молча игнорирует, а
+                # стратегия «спускаться к генезису» на нём не работает вовсе.
+            elif before_lt is not None:
                 params["before_lt"] = str(before_lt)
             response = await http_get_with_retry(
                 client, url, params=params, headers=api_headers(api_key)
@@ -558,9 +572,15 @@ async def _apply_page(
     Идемпотентно по tx_hash: повторный проход окна (перекрытие курсора или
     реорганизация) не плодит строк — существующая строка обновляется под
     текущее состояние цепочки (лёгкая перезапись при reorg).
+
+    Адрес кошелька проставляется безусловно, в том числе на старых строках:
+    мы только что увидели этот хеш в истории АКТИВНОГО кошелька, значит строка
+    его и есть. Так миграция «проставила адрес всем подряд» и любые строки с
+    чужим адресом затягиваются в свой адрес при первом же касании синком.
     """
     if not moves:
         return 0, 0
+    address = settings.active_treasury_address
     hashes = [m.tx_hash for m in moves]
     rows = (
         await session.execute(select(TreasuryMove).where(TreasuryMove.tx_hash.in_(hashes)))
@@ -575,6 +595,7 @@ async def _apply_page(
                 TreasuryMove(
                     tx_hash=move.tx_hash,
                     network=move.network,
+                    address=address,
                     utime=move.utime,
                     lt=move.lt,
                     direction=move.direction,
@@ -595,9 +616,11 @@ async def _apply_page(
             or row.utime != move.utime
             or row.balance_delta_nanotons != move.balance_delta_nanotons
             or row.direction != move.direction
+            or row.address != address
         )
         row.lt = move.lt
         row.utime = move.utime
+        row.address = address
         row.balance_delta_nanotons = move.balance_delta_nanotons
         row.direction = move.direction
         row.kind = kind
@@ -619,6 +642,94 @@ async def _apply_page(
 
 def _active_network() -> str:
     return "testnet" if settings.is_testnet else "mainnet"
+
+
+async def _purge_moves_missing_from_chain(
+    session, network: str, address: str, seen_hashes: set[str]
+) -> int:
+    """Удалить строки этого кошелька, которых нет в цепочке. Возвращает счётчик.
+
+    Вызывается ровно в том цикле, где полный обход дошёл до генезиса, то есть
+    когда seen_hashes — это и есть вся история кошелька по мнению провайдера.
+    Всё остальное — фантомы реорга и строки прежнего кошелька, попавшие в сумму
+    из-за отсутствия адреса в строке. Именно их /mirror reset вычистить не мог.
+
+    Условие жёсткое: пустой seen_hashes означает «провайдер не показал ничего»,
+    и тогда мы бы вычистили всё — это не purge, а самоубийство зеркала.
+
+    NOT IN уходит в БД одним списком параметров, поэтому purge практичен пока
+    история кошелька меньше лимита параметров Postgres (65535). У казначея
+    тестовой сети 239 транзакций — запас трёх порядков; если казначея дойдёт до
+    десятков тысяч, этот запрос надо будет переписать на постраничное сличение.
+    """
+    if not seen_hashes:
+        logger.warning("Зеркало казны: пустой обход цепочки — чистка строк пропущена")
+        return 0
+    stale = (
+        (
+            await session.execute(
+                select(TreasuryMove).where(
+                    TreasuryMove.network == network,
+                    TreasuryMove.address == address,
+                    TreasuryMove.tx_hash.not_in(seen_hashes),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in stale:
+        await session.delete(row)
+    return len(stale)
+
+
+def _net_name(network: str) -> str:
+    """Имя сети в том виде, в каком оно лежит в базе: маленькими буквами."""
+    return network.strip().lower()
+
+
+def _address_for(network: str) -> str:
+    """Адрес кошелька зеркала для сети: у зеркала он один — активный.
+
+    Сравнение регистронезависимое намеренно. TON_NETWORK в окружении бывает
+    «Testnet», а строки в базе лежат с маленькой «testnet»: при строгом == мы бы
+    тихо отдали адрес mainnet на запрос по testnet-сети. Ошибка выглядела бы
+    правдоподобно — сумма зеркала посчиталась бы, но по чужому кошельку, и
+    расхождение выглядело бы как «где-то потерялось 0.0017».
+    """
+    if _net_name(network) == "testnet":
+        return settings.treasury_testnet_address
+    return settings.treasury_address
+
+
+def _advance_cursor(
+    source: str,
+    moves: list[MirrorMove],
+    before_lt: int | None,
+    offset: int | None,
+) -> tuple[int | None, int | None]:
+    """Курсор следующей страницы под источник `source`: (before_lt, offset).
+
+    TonAPI режет выборку курсором lt, поэтому следующая страница — «строго
+    старше» нижней lt предыдущей. Toncenter v3 курсор lt игнорирует и режет
+    выборку смещением offset, поэтому там следующая страница — сдвиг на
+    offset+limit.
+
+    Важно: offset считает ТРАНЗАКЦИИ, а не страницы. Сдвиг на единицу при
+    неполной странице вёл обход поштучно: кошелёк на 80 транзакций (одна
+    страница!) обходился за 81 цикл и бутстрап не завершался никогда.
+
+    Считаем по числу распарсенных движений. Если парсер отбросит что-то из
+    страницы, offset сдвинется чуть меньше фактического — страницы накроют
+    друг друга, но дырок в истории не останется: сдвиг всегда ≤ взятого
+    объёма, значит каждая транзакция будет прочитана, а перечитывание
+    безвредно — строки идемпотентны. Дырка возможна только при сдвиге больше
+    объёма, а такого здесь быть не может.
+    """
+    next_lt = min(move.lt for move in moves)
+    if source == "toncenter":
+        return next_lt, (offset or 0) + len(moves)
+    return next_lt, None
 
 
 async def sync_treasury_mirror() -> dict:
@@ -664,25 +775,59 @@ async def sync_treasury_mirror() -> dict:
 
         if not bootstrapped:
             # Спуск к генезису: продолжаем с достигнутого дна либо с головы.
+            # offset — курсор Toncenter (его before_lt не режет выборку),
+            # before_lt — курсор TonAPI. Провайдер сменился: чужой курсор
+            # обнуляем, страницы этого провайдера перезапишутся идемпотентно.
             before_lt = bottom_lt
+            offset = None
+            prev_window: tuple[int, int] | None = None
+            prev_source: str | None = None
+            # Хеши, реально встреченные в цепочке за этот спуск. Полный обход
+            # ограничен max_pages × limit, так что накопление bounded — в отличие
+            # от бесконечного «где-то там строки», которое purge не вычистит.
+            seen_hashes: set[str] = set()
             for _ in range(max_pages):
-                moves, source, ok = await _fetch_page(before_lt)
+                moves, source, ok = await _fetch_page(before_lt, offset=offset)
                 if not ok:
                     break
                 page_ok = True
                 pages += 1
                 if not moves:
                     bootstrapped = True
+                    purged = await _purge_moves_missing_from_chain(
+                        session, network, _address_for(network), seen_hashes
+                    )
                     await _set_state(session, TREASURY_MIRROR_BOOTSTRAP_KEY, "1")
                     await session.commit()
+                    logger.info(
+                        "Зеркало казны: бутстрап до генезиса завершён, вычищено "
+                        "строк вне цепочки: %d",
+                        purged,
+                    )
                     break
+                window = (min(move.lt for move in moves), max(move.lt for move in moves))
+                if window == prev_window and source == prev_source:
+                    # Тот же провайдер отдал то же окно: курсор не работает,
+                    # спуск к генезису не сдвинется. Молча крутить max_pages
+                    # раз и ждать, будто что-то изменится, — худший вариант.
+                    # Смена провайдера исключена: у нового курсор чужой, он
+                    # по закону начинает с головы и повторяет это же окно.
+                    logger.warning(
+                        "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
+                        "двигается, спуск к генезису остановлен",
+                        source, window[0], window[1],
+                    )
+                    break
+                prev_window = window
+                prev_source = source
                 if head_lt is None:
                     head_lt = moves[0].lt
+                seen_hashes.update(move.tx_hash for move in moves)
                 kinds = await _resolve_kinds_batch(session, moves)
                 part_added, part_updated = await _apply_page(session, moves, kinds)
                 added += part_added
                 updated += part_updated
-                before_lt = min(move.lt for move in moves)
+                before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
                 await _set_state(session, TREASURY_MIRROR_BOTTOM_KEY, str(before_lt))
                 if head_lt is not None:
                     await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
@@ -690,8 +835,11 @@ async def sync_treasury_mirror() -> dict:
         else:
             # Новое поверх головы; первая страница — самая свежая.
             before_lt = None
+            offset = None
+            prev_window = None
+            prev_source = None
             for _ in range(max_pages):
-                moves, source, ok = await _fetch_page(before_lt)
+                moves, source, ok = await _fetch_page(before_lt, offset=offset)
                 if not ok:
                     break
                 page_ok = True
@@ -701,6 +849,16 @@ async def sync_treasury_mirror() -> dict:
                 page_max = max(move.lt for move in moves)
                 if head_lt is not None and page_max <= head_lt:
                     break  # самая свежая уже учтена — ничего нового
+                window = (min(move.lt for move in moves), page_max)
+                if window == prev_window and source == prev_source:
+                    logger.warning(
+                        "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
+                        "двигается, догон головы остановлен",
+                        source, window[0], window[1],
+                    )
+                    break
+                prev_window = window
+                prev_source = source
                 kinds = await _resolve_kinds_batch(session, moves)
                 part_added, part_updated = await _apply_page(session, moves, kinds)
                 added += part_added
@@ -709,7 +867,7 @@ async def sync_treasury_mirror() -> dict:
                 head_lt = max(head_lt or 0, page_max)
                 await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
                 await session.commit()
-                before_lt = min(move.lt for move in moves)
+                before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
                 if prev_head is not None and before_lt <= prev_head:
                     # Страница пересекла известную границу — хвост под меткой,
                     # новые транзакции выше головы все учтены.
@@ -732,7 +890,10 @@ async def sync_treasury_mirror() -> dict:
             (
                 await session.execute(
                     select(func.coalesce(func.sum(TreasuryMove.balance_delta_nanotons), 0))
-                    .where(TreasuryMove.network == network)
+                    .where(
+                        TreasuryMove.network == network,
+                        TreasuryMove.address == _address_for(network),
+                    )
                 )
             ).scalar_one()
         )
@@ -787,9 +948,14 @@ async def reset_treasury_mirror() -> str:
     Сбрасывает состояние синка (голова/дно/флаг выстроенности/сверка), но
     НЕ трогает строки treasury_moves: следующий цикл синка пересканирует
     историю от головы к генезису и идемпотентно перезапишет движения под
-    текущую цепочку. Именно так лечатся глубокие реорганизации — строки,
-    изменившие баланс, перезапишутся, новые добавятся, а удалённые реоргом
-    транзакции останутся висеть как «фантом», если не подчищать их отдельно.
+    текущую цепочку. Так лечатся глубокие реорганизации: строки, изменившие
+    баланс, перезапишутся, новые добавятся.
+
+    Строкам заодно проставляется address активного кошелька (adopt), а на
+    финише полного обхода _purge_moves_missing_from_chain вычищает строки,
+    которых нет в цепочке, — фантомы реорга и остатки прежнего кошелька.
+    Именно они раздували сумму зеркала после ротации адреса, и раньше
+    /mirror reset их не убирал.
     """
     async with SessionLocal() as session:
         for key in (
@@ -806,17 +972,30 @@ async def reset_treasury_mirror() -> str:
         await session.commit()
     return (
         "Зеркало казны: состояние сброшено — следующий цикл синка перестроит "
-        "историю от головы к генезису и сверит тождество заново"
+        "историю от головы к генезису, перезапишет дельты и вычистит строки, "
+        "которых больше нет в цепочке"
     )
 
 
 async def mirror_balance(session, network: str) -> int:
-    """Сумма сальдо всех движений зеркала активного контура."""
+    """Сумма сальдо движений зеркала активного кошелька этой сети.
+
+    Считается по паре (network, address): строки прежнего кошелька казначея
+    после ротации адреса — чужие и в баланс активного не входят.
+
+    Сеть нормализуется: в базе она лежит маленькими буквами, а в окружении
+    TON_NETWORK написано «Testnet». Без нормализации сумма молча считалась бы
+    нулевой — и это выглядело бы как «зеркало пустое», а не как опечатка.
+    """
+    network = _net_name(network)
     return int(
         (
             await session.execute(
                 select(func.coalesce(func.sum(TreasuryMove.balance_delta_nanotons), 0))
-                .where(TreasuryMove.network == network)
+                .where(
+                    TreasuryMove.network == network,
+                    TreasuryMove.address == _address_for(network),
+                )
             )
         ).scalar_one()
     )
@@ -855,16 +1034,21 @@ async def treasury_mirror_stats(session) -> dict:
     beat_row = await session.get(WatcherState, TREASURY_MIRROR_BEAT_KEY)
     source_row = await session.get(WatcherState, TREASURY_MIRROR_SOURCE_KEY)
     check_row = await session.get(WatcherState, TREASURY_MIRROR_CHECK_KEY)
+    address = _address_for(network)
     move_count = int(
         (
             await session.execute(
-                select(func.count()).select_from(TreasuryMove).where(TreasuryMove.network == network)
+                select(func.count())
+                .select_from(TreasuryMove)
+                .where(TreasuryMove.network == network, TreasuryMove.address == address)
             )
         ).scalar_one()
     )
     last_utime = (
         await session.execute(
-            select(func.max(TreasuryMove.utime)).where(TreasuryMove.network == network)
+            select(func.max(TreasuryMove.utime)).where(
+                TreasuryMove.network == network, TreasuryMove.address == address
+            )
         )
     ).scalar_one()
     groups = {
@@ -883,7 +1067,7 @@ async def treasury_mirror_stats(session) -> dict:
                     func.sum(TreasuryMove.value_nanotons),
                     func.sum(TreasuryMove.fee_nanotons),
                 )
-                .where(TreasuryMove.network == network)
+                .where(TreasuryMove.network == network, TreasuryMove.address == address)
                 .group_by(TreasuryMove.kind)
             )
         ).all()

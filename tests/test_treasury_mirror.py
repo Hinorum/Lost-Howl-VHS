@@ -47,6 +47,8 @@ from app.treasury_mirror import (
 
 NET = "testnet"
 TREASURY = "0:" + "ab" * 32
+TREASURY_MAINNET = "0:" + "ef" * 32
+TREASURY_OLD = "0:" + "12" * 32
 PLAYER = "0:" + "cd" * 32
 
 
@@ -295,18 +297,50 @@ def test_mirror_balance_invariant_matches_chain_sum() -> None:
     assert total == expected
 
 
-async def test_mirror_balance_sums_deltas(session) -> None:
+async def test_mirror_balance_sums_deltas(session, ton_mirror) -> None:
     session.add_all([
-        TreasuryMove(tx_hash=_h64("x1"), network=NET, utime=1, lt=1, direction="in", kind="stake",
+        TreasuryMove(tx_hash=_h64("x1"), network=NET, address=TREASURY, utime=1, lt=1,
+                     direction="in", kind="stake",
                      value_nanotons=1_000_000_000, fee_nanotons=5_000_000, balance_delta_nanotons=995_000_000),
-        TreasuryMove(tx_hash=_h64("x2"), network=NET, utime=2, lt=2, direction="out", kind="payout:prize",
+        TreasuryMove(tx_hash=_h64("x2"), network=NET, address=TREASURY, utime=2, lt=2,
+                     direction="out", kind="payout:prize",
                      value_nanotons=300_000_000, fee_nanotons=5_000_000, balance_delta_nanotons=-305_000_000),
-        TreasuryMove(tx_hash=_h64("y1"), network="mainnet", utime=3, lt=3, direction="in", kind="stake",
+        TreasuryMove(tx_hash=_h64("y1"), network="mainnet", address=TREASURY_MAINNET, utime=3, lt=3,
+                     direction="in", kind="stake",
                      value_nanotons=999_000_000, fee_nanotons=1_000_000, balance_delta_nanotons=998_000_000),
     ])
     await session.flush()
     assert await mirror_balance(session, NET) == 690_000_000
     assert await mirror_balance(session, "mainnet") == 998_000_000
+
+
+async def test_mirror_balance_ignores_rows_of_previous_wallet(session, ton_mirror) -> None:
+    """Строки прежнего кошелька не суммируются в баланс активного.
+
+    Ротация TREASURY_*_ADDRESS без адреса в строке зеркала навсегда раздувала
+    сумму: /mirror reset перестраивает историю, но лишние строки не убирал.
+
+    Сеть приходит регистронезависимо: TON_NETWORK в окружении — «Testnet»,
+    а строки в базе — с маленькой буквы. Иначе по запросу testnet мы бы взяли
+    адрес mainnet и посчитали сумму по чужому кошельку.
+    """
+    session.add_all([
+        TreasuryMove(tx_hash=_h64("new"), network=NET, address=TREASURY, utime=1, lt=1,
+                     direction="in", kind="stake", value_nanotons=0, fee_nanotons=0,
+                     balance_delta_nanotons=5_317_070_159),
+        # та же сеть, но кошелёк прежний — его вклады в баланс нового не идут
+        TreasuryMove(tx_hash=_h64("old"), network=NET, address=TREASURY_OLD, utime=2, lt=2,
+                     direction="in", kind="stake", value_nanotons=0, fee_nanotons=0,
+                     balance_delta_nanotons=1_700_000),
+        # строка, которой ещё не проставлен адрес (миграция оставила пустым)
+        TreasuryMove(tx_hash=_h64("blank"), network=NET, address="", utime=3, lt=3,
+                     direction="in", kind="stake", value_nanotons=0, fee_nanotons=0,
+                     balance_delta_nanotons=999_000_000),
+    ])
+    await session.flush()
+    assert await mirror_balance(session, NET) == 5_317_070_159
+    assert await mirror_balance(session, "Testnet") == 5_317_070_159, "регистр не должен путать сеть"
+    assert await mirror_balance(session, "mainnet") == 0, "mainnet у нас пустой"
 
 
 # ---------- Синк: бутстрап и инкремент ----------
@@ -327,6 +361,12 @@ async def _count_moves() -> int:
             select(func.count()).select_from(TreasuryMove))).scalar_one())
 
 
+async def mirror_balance_for(network: str) -> int:
+    """Сумма сальдо зеркала по сети — то, что уходит в сверку с цепочкой."""
+    async with SessionLocal() as db:
+        return await mirror_balance(db, network)
+
+
 async def _wipe_mirror() -> None:
     async with SessionLocal() as db:
         await db.execute(delete(TreasuryMove))
@@ -335,14 +375,21 @@ async def _wipe_mirror() -> None:
 
 
 def _fake_page_serving(ledger: list[dict], ton_api: bool = True):
-    """Фабрика _fetch_page: страницы desc по 100, как у живого индексатора."""
+    """Фабрика _fetch_page: страницы desc по 100, как у живого индексатора.
 
-    async def fetch(before_lt: int | None = None):
-        items = sorted(
-            (i for i in ledger if before_lt is None or int(i["lt"]) < before_lt),
-            key=lambda i: -int(i["lt"]),
-        )
-        page = items[:100]
+    Для toncenter воспроизводит реальность v3: курсор lt он ИГНОРИРУЕТ, а
+    выборку режет только смещением offset. На этом и ловится пагинация —
+    раньше синк слал toncenter before_lt и получал одну и ту же страницу.
+    """
+
+    async def fetch(before_lt: int | None = None, offset: int | None = None):
+        # Сортируем на каждый вызов: ledger в тестах мутируется между циклами.
+        ordered = sorted(ledger, key=lambda i: -int(i["lt"]))
+        if ton_api:
+            items = [i for i in ordered if before_lt is None or int(i["lt"]) < before_lt]
+            page = items[:100]
+        else:
+            page = ordered[offset or 0:][:100]
         parsed = []
         for item in page:
             parsed.append(
@@ -369,7 +416,7 @@ def ton_mirror(monkeypatch):
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "ton_network", "testnet")
     monkeypatch.setattr(settings, "treasury_testnet_address", TREASURY)
-    monkeypatch.setattr(settings, "treasury_address", "")
+    monkeypatch.setattr(settings, "treasury_address", TREASURY_MAINNET)
 
 
 async def test_bootstrap_bounded_then_completes_then_idempotent(ton_mirror, monkeypatch) -> None:
@@ -449,6 +496,71 @@ async def test_bootstrap_against_toncenter_fallback(ton_mirror, monkeypatch) -> 
         result = await treasury_mirror.sync_treasury_mirror()
         assert result["bootstrapped"] is True and result["added"] == 80
         assert result["exact"] is True and result["source"] == "toncenter"
+    finally:
+        await _wipe_mirror()
+
+
+async def test_bootstrap_survives_tonapi_dying_midwalk(ton_mirror, monkeypatch) -> None:
+    """TonAPI дошёл до середины и умер — обход обязан доехать на Toncenter.
+
+    Тонкий момент: у нового провайдера курсор чужой, поэтому он начинает с головы
+    и возвращает то же окно, что TonAPI отдал секунду назад. Это НЕ зависание
+    курсора, а честный рестарт обхода, и такой обход обязан продолжаться.
+    """
+    ledger = [_tonapi_item(f"m{i}", lt=40_000 + i) for i in range(250)]
+    tonapi_page = _fake_page_serving(ledger, ton_api=True)
+    toncenter_page = _fake_page_serving(
+        [_to_toncenter(i) for i in ledger], ton_api=False
+    )
+    calls = {"n": 0}
+
+    async def flaky(before_lt=None, offset=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await tonapi_page(before_lt, offset=offset)
+        return await toncenter_page(before_lt, offset=offset)
+
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", flaky)
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        r = await treasury_mirror.sync_treasury_mirror()
+        assert r["bootstrapped"] is True, "обход обязан доехать до генезиса"
+        assert r["source"] == "toncenter"
+        assert r["added"] == 250, "вся история попала в зеркало"
+        assert r["exact"] is True, "и identity сходится"
+    finally:
+        await _wipe_mirror()
+
+
+async def test_bootstrap_stops_when_provider_repeats_itself(ton_mirror, monkeypatch) -> None:
+    """Провайдер, который не двигает курсор, обязан быть остановлен, а не
+    прокручен max_pages раз впустую — иначе зеркало вечно «не выстроено»."""
+    ledger = [_tonapi_item(f"s{i}", lt=50_000 + i) for i in range(150)]
+    ordered = sorted(ledger, key=lambda i: -int(i["lt"]))
+
+    async def stuck(before_lt=None, offset=None):
+        # игнорируем оба курсора и всегда отдаём свежую страницу — как было
+        # с before_lt у toncenter v3 до фикса
+        parsed = [parse_tonapi_move(i, NET, TREASURY) for i in ordered[:100]]
+        return [m for m in parsed if m is not None], "toncenter", True
+
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", stuck)
+    monkeypatch.setattr(settings, "treasury_mirror_max_pages_per_sync", 5)
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        r = await treasury_mirror.sync_treasury_mirror()
+        assert r["bootstrapped"] is False
+        # pages считает запрошенные страницы: вторая — та же самая, её отбросил
+        # guard. Главное — обход не израсходовал весь лимит вслепую.
+        assert r["pages"] == 2, "повтор вслепую не крутим"
+        assert r["pages"] < 5, "и не выдаём за полный обход"
+        assert r["added"] == 100
     finally:
         await _wipe_mirror()
 
@@ -632,15 +744,18 @@ async def test_reorg_rewrites_moved_tx_in_place(ton_mirror, monkeypatch) -> None
         await _wipe_mirror()
 
 
-async def test_reorg_orphan_stays_phantom_and_breaks_identity(ton_mirror, monkeypatch) -> None:
-    """Известное ограничение зафиксировано тестом, а не спрятано.
+async def test_reorg_orphan_breaks_identity_and_purge_heals_it(ton_mirror, monkeypatch) -> None:
+    """Реорг обязан ломать тождество, а полный обход — обязан его лечить.
 
     Транзакция, которую реорг выкинул из цепочки, больше НЕ приходит ни в одну
-    страницу — зеркало не умеет её удалять (см. docstring reset_treasury_mirror),
-    и строка-фантом остаётся в Σ навсегда. Обязательное следствие: тождество
-    обязано врать (exact=False, diff = сальдо фантома) и ежедневная автосверка
-    поднять тревогу, а не рапортовать «сходится ±0» над мёртвой строкой.
-    Ни /mirror reset, ни пересборка фантом не лечат — см. конец теста.
+    страницу, и до полного обхода строка-фантом остаётся в Σ: тождество врёт
+    (exact=False, diff = сальдо фантома), автосверка поднимает тревогу, а не
+    рапортует «сходится» над мёртвой строкой.
+
+    Раньше фантом переживал /mirror reset навсегда — чинить приходилось руками,
+    и ровно этим механизмом зеркало разъезжалось на +0.0017 Gram после ротации
+    кошелька. Теперь финиш полного обхода (purge) вычищает строки, которых нет
+    в цепочке, и тождество восстанавливается само.
     """
     kept = _tonapi_item("alive", lt=60_000, value=1_000_000_000, fee=5_000_000)
     orphan = _tonapi_item("doomed", lt=59_000, value=400_000_000, fee=5_000_000)
@@ -663,23 +778,91 @@ async def test_reorg_orphan_stays_phantom_and_breaks_identity(ton_mirror, monkey
 
         assert second["exact"] is False, "фантом обязан ломать тождество"
         assert second["diff_nanotons"] == phantom_delta
-        assert await _count_moves() == 2, "строка-фантом остаётся в зеркале"
+        assert await _count_moves() == 2, "до полного обхода фантом остаётся"
         async with SessionLocal() as session:
             note = await ops._treasury_mirror_anomaly(session)
         assert note is not None and "расходится" in note
 
-        # Известно и по docstring reset_treasury_mirror: сброс НЕ удаляет
-        # строки, а выкинутой реоргом транзакции уже никто не принесёт — фантом
-        # переживает пересборку. Это осознанный размен: лучше постоянная тревога
-        # с внятной цифрой, чем тихо переписанная история; чинить вручную.
+        # /mirror reset перестраивает историю с головы; на финише обхода purge
+        # сверяет множество хешей с цепочкой и удаляет осиротевшую строку.
         await reset_treasury_mirror()
         third = await treasury_mirror.sync_treasury_mirror()
-        assert third["added"] == 0 and third["updated"] == 0
-        assert third["exact"] is False, "фантом остаётся после пересборки"
-        assert third["diff_nanotons"] == phantom_delta
-        assert await _count_moves() == 2
+        assert third["bootstrapped"] is True
+        assert third["exact"] is True, "полный обход обязан вылечить фантом"
+        assert third["diff_nanotons"] == 0
+        assert await _count_moves() == 1, "фантом вычищен"
         async with SessionLocal() as session:
-            assert await ops._treasury_mirror_anomaly(session) is not None
+            assert await ops._treasury_mirror_anomaly(session) is None
+    finally:
+        await _wipe_mirror()
+
+
+async def test_purge_keeps_other_wallet_and_other_network(ton_mirror, monkeypatch) -> None:
+    """Purge не имеет права съесть чужое: только (network, address) активного.
+
+    Именно это и раздувало зеркало — строки прежнего кошелька той же сети были
+    неотличимы от активных, пока в строке не появился адрес.
+    """
+    live = _tonapi_item("live", lt=70_000, value=1_000_000_000, fee=5_000_000)
+    ledger = [live]
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    async with SessionLocal() as db:
+        db.add_all([
+            # прошлый кошелёк той же сети — его вклады в purge не попадают
+            TreasuryMove(tx_hash=_h64("old-wallet"), network=NET, address=TREASURY_OLD,
+                         utime=1, lt=1, direction="in", kind="stake", value_nanotons=0,
+                         fee_nanotons=0, balance_delta_nanotons=1_700_000),
+            # mainnet вообще
+            TreasuryMove(tx_hash=_h64("mainnet"), network="mainnet", address=TREASURY_MAINNET,
+                         utime=2, lt=2, direction="in", kind="stake", value_nanotons=0,
+                         fee_nanotons=0, balance_delta_nanotons=7),
+            # а вот это — наш же кошелёк, но транзакции нет в цепочке: фантом
+            TreasuryMove(tx_hash=_h64("phantom"), network=NET, address=TREASURY,
+                         utime=3, lt=3, direction="in", kind="stake", value_nanotons=0,
+                         fee_nanotons=0, balance_delta_nanotons=42),
+        ])
+        await db.commit()
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        await treasury_mirror.sync_treasury_mirror()
+        assert await _count_moves() == 3, "вычищен только фантом активного кошелька"
+        assert await mirror_balance_for(NET) == _fake_chain_balance(ledger)
+    finally:
+        await _wipe_mirror()
+
+
+async def test_purge_never_runs_on_partial_walk(ton_mirror, monkeypatch) -> None:
+    """Обход, упёршийся в лимит страниц, не имеет права ничего удалять.
+
+    seen_hashes при частичном спуске — не вся история кошелька. Удалять по нему
+    значило бы снести валидные строки, которых просто не успели прочитать.
+    """
+    ledger = [_tonapi_item(f"p{i}", lt=80_000 + i) for i in range(250)]
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    monkeypatch.setattr(settings, "treasury_mirror_max_pages_per_sync", 1)
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        r = await treasury_mirror.sync_treasury_mirror()
+        assert r["bootstrapped"] is False
+        assert r["added"] == 100, "прочитали только первую страницу"
+        async with SessionLocal() as db:
+            db.add(TreasuryMove(tx_hash=_h64("unseen"), network=NET, address=TREASURY,
+                                utime=1, lt=1, direction="in", kind="stake", value_nanotons=0,
+                                fee_nanotons=0, balance_delta_nanotons=123))
+            await db.commit()
+        r2 = await treasury_mirror.sync_treasury_mirror()
+        assert r2["added"] == 100
+        assert r2["bootstrapped"] is False
+        async with SessionLocal() as session:
+            left = await session.execute(
+                select(TreasuryMove).where(TreasuryMove.tx_hash == _h64("unseen")))
+            assert left.scalar_one_or_none() is not None, "недочитанные строки нельзя терять"
     finally:
         await _wipe_mirror()
 

@@ -562,6 +562,11 @@ class TreasuryMove(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tx_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     network: Mapped[str] = mapped_column(String(16), default="mainnet", index=True)
+    # Адрес кошелька, чей это транзакция. Сумма зеркала считается по паре
+    # (network, address), а не по одному network: после ротации адреса
+    # казначея строки прежнего кошелька суммировались бы в баланс нового
+    # навсегда, и ни один /mirror reset этого не отменил бы.
+    address: Mapped[str] = mapped_column(String(80), default="", index=True)
     utime: Mapped[int] = mapped_column(BigInteger, index=True)
     # Логическое время транзакции (lt): стабильный ключ пагинации индексаторов.
     lt: Mapped[int] = mapped_column(BigInteger, index=True)
@@ -586,6 +591,7 @@ class TreasuryMove(Base):
 
     __table_args__ = (
         Index("ix_treasury_moves_lt_id", "network", "lt", "id"),
+        Index("ix_treasury_moves_address_lt", "address", "lt"),
     )
 
 

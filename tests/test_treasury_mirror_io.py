@@ -388,7 +388,8 @@ async def test_mirror_stats_survives_broken_check_json(monkeypatch) -> None:
         async with SessionLocal() as db:
             db.add(WatcherState(key=TREASURY_MIRROR_CHECK_KEY, value="{не json"))
             db.add(WatcherState(key=TREASURY_MIRROR_BEAT_KEY, value="не дата"))
-            db.add(TreasuryMove(tx_hash=_h64("m"), network=NET, utime=now, lt=1,
+            db.add(TreasuryMove(tx_hash=_h64("m"), network=NET, address=TREASURY,
+                                utime=now, lt=1,
                                 direction="in", kind="stake", value_nanotons=to_nano(1),
                                 fee_nanotons=0, balance_delta_nanotons=to_nano(1)))
             await db.commit()
@@ -421,13 +422,16 @@ async def test_mirror_block_renders_traffic_fees_and_unknown(monkeypatch) -> Non
             db.add(WatcherState(key=TREASURY_MIRROR_CHECK_KEY, value=json.dumps(
                 {"exact": True, "diff_nanotons": 0, "mirror_balance": to_nano(5)})))
             db.add_all([
-                TreasuryMove(tx_hash=_h64("s"), network=NET, utime=now, lt=10,
+                TreasuryMove(tx_hash=_h64("s"), network=NET, address=TREASURY,
+                            utime=now, lt=10,
                             direction="in", kind="stake", value_nanotons=to_nano(3),
                             fee_nanotons=to_nano(0.001), balance_delta_nanotons=to_nano(3)),
-                TreasuryMove(tx_hash=_h64("u"), network=NET, utime=now, lt=11,
+                TreasuryMove(tx_hash=_h64("u"), network=NET, address=TREASURY,
+                            utime=now, lt=11,
                             direction="in", kind="unknown_in", value_nanotons=to_nano(0.5),
                             fee_nanotons=0, balance_delta_nanotons=to_nano(0.5)),
-                TreasuryMove(tx_hash=_h64("self"), network=NET, utime=now, lt=12,
+                TreasuryMove(tx_hash=_h64("self"), network=NET, address=TREASURY,
+                            utime=now, lt=12,
                             direction="self", kind="self", value_nanotons=to_nano(1),
                             fee_nanotons=0, balance_delta_nanotons=0),
             ])
@@ -456,7 +460,8 @@ async def test_mirror_block_flags_frozen_sync_and_missing_history(monkeypatch) -
 
         # Есть движения, но ни одного успешного цикла: синк встал.
         async with SessionLocal() as db:
-            db.add(TreasuryMove(tx_hash=_h64("z"), network=NET, utime=now, lt=7,
+            db.add(TreasuryMove(tx_hash=_h64("z"), network=NET, address=TREASURY,
+                                utime=now, lt=7,
                                 direction="in", kind="stake", value_nanotons=to_nano(1),
                                 fee_nanotons=0, balance_delta_nanotons=to_nano(1)))
             await db.commit()
@@ -487,7 +492,7 @@ async def test_mirror_block_counts_minutes_for_old_sync(monkeypatch) -> None:
             db.add(WatcherState(key=TREASURY_MIRROR_BOOTSTRAP_KEY, value="1"))
             db.add(WatcherState(key=TREASURY_MIRROR_BEAT_KEY,
                                 value=(datetime.now(UTC) - timedelta(minutes=7)).isoformat()))
-            db.add(TreasuryMove(tx_hash=_h64("old"), network=NET,
+            db.add(TreasuryMove(tx_hash=_h64("old"), network=NET, address=TREASURY,
                                 utime=int((datetime.now(UTC) - timedelta(hours=1)).timestamp()),
                                 lt=5, direction="in", kind="stake", value_nanotons=to_nano(1),
                                 fee_nanotons=0, balance_delta_nanotons=to_nano(1)))
