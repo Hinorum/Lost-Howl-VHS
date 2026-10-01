@@ -194,21 +194,27 @@ def validate_config() -> list[str]:
     return problems
 
 
-async def boot_game(bot) -> None:
-    """Стартовые шаги. Планировщик запускается ПЕРВЫМ делом: сетевой сбой
-    бэкапа или профиля не смеет оставлять игру без тиков навсегда (раньше
-    исключение до start_scheduler означало молчаливо мёртвое расписание)."""
-    set_bot(bot)
-    # Лок ПЕРЕД первым тиком, а не перед start_scheduler: стартовый tick тоже
-    # пишет в игру (анонсы, финализация, выплаты), поэтому второй инстанс не
-    # должен отработать даже один раз.
-    if not await acquire_scheduler_lock():
-        log.critical(
-            "База уже занята другим процессом — этот экземпляр уходит в фон: "
-            "/health работает, игру он не трогает. Если так не задумано, на "
-            "Render живут два сервиса с одним DATABASE_URL."
-        )
-        return
+# Интервал фоновой попытки перехватить лок планировщика. Согласован с ритмом
+# way-tick (15 с): как только старый инстанс отпустит advisory lock, новый
+# подхватит его в течение одного-двух циклов, без ручного рестарта на Render.
+_SCHEDULER_LOCK_RETRY_SECONDS = 15
+
+# Ссылка на фоновую задачу retry-а: нужна, чтобы корректно дождаться/отменить
+# её при shutdown. None до неудачного acquire_scheduler_lock().
+_lock_retry_task: asyncio.Task | None = None
+
+
+async def _boot_after_lock(bot) -> None:
+    """Шаги, которые выполняются только после успешного захвата лока планировщика.
+
+    Вынесено из boot_game(), чтобы и синхронный путь (первый acquire удался),
+    и фоновая retry-попытка (defer после освобождения лока старым инстансом
+    при Render rolling deploy) выполняли одну и ту же последовательность:
+    install_bay → tick → прогрев кэшей → start_scheduler → boot_maintenance →
+    apply_profile. Иначе пришлось бы дублировать шаги и рисковать расхождением
+    (например, один путь забудет вызвать boot_maintenance и пропустит свежий
+    бэкап после рестарта).
+    """
     # Сюжетный слой (необязателен): проигрыватель кассет включает себя, только
     # если есть каталог библиотеки; сбой установки не смеет ронять игру.
     try:
@@ -241,6 +247,85 @@ async def boot_game(bot) -> None:
             await step()
         except Exception:
             log.exception("Шаг старта «%s» не удался — игра продолжается без него", name)
+
+
+async def _retry_scheduler_lock_loop(bot) -> None:
+    """Фоновая попытка перехватить лок планировщика после его отпускания.
+
+    Инцидент: при Render rolling deploy новый инстанс поднимался, пока старый
+    ещё держал Postgres advisory lock. acquire_scheduler_lock() возвращал False,
+    boot_game() уходил в фон (без start_scheduler), и бот стоял без tick'ов
+    до ручного рестарта — дни не закрывались, лидерборд месяца не выплачивался.
+
+    Цикл пробует лок каждые _SCHEDULER_LOCK_RETRY_SECONDS: как только старый
+    инстанс закрыл соединение и pg_advisory_lock освободился, retry захватывает
+    его, прогоняет _boot_after_lock() и завершается. /health и webhook'и всё
+    это время работают — основной процесс не блокируется. Исключение внутри
+    цикла логируется, но не убивает задачу: один сбой БД не должен оставлять
+    бот без игрового движка.
+    """
+    from app.scheduler_lock import scheduler_lock_held
+
+    while True:
+        if scheduler_lock_held():
+            # Лок каким-то образом уже у процесса (гонка с основным boot_game
+            # невозможна: create_task срабатывает только после неудачного acquire,
+            # где _lock_conn остаётся None; защищаемся на всякий случай).
+            log.info("Фоновый retry лока: лок уже у процесса — выходим")
+            return
+        try:
+            if await acquire_scheduler_lock():
+                log.info(
+                    "Лок планировщика перехвачен фоновым retry — продолжаем запуск"
+                )
+                try:
+                    await _boot_after_lock(bot)
+                except Exception:
+                    log.exception(
+                        "Фоновый bootstrap после получения лока упал — игра стоит",
+                        exc_info=True,
+                    )
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Фоновая попытка взять лок планировщика упала")
+        await asyncio.sleep(_SCHEDULER_LOCK_RETRY_SECONDS)
+
+
+async def boot_game(bot) -> None:
+    """Стартовые шаги. Планировщик запускается ПЕРВЫМ делом: сетевой сбой
+    бэкапа или профиля не смеет оставлять игру без тиков навсегда (раньше
+    исключение до start_scheduler означало молчаливо мёртвое расписание).
+
+    Лок берётся синхронно: если БД занята другим процессом (Render rolling
+    deploy оставил старый инстанс, ещё не отдавший advisory lock), возвращаемся
+    немедленно, чтобы /health и webhook'и работали, и параллельно запускаем
+    фоновый retry — как только лок освободится, инициализация продолжится
+    без ручного рестарта. Один процесс — один путь загрузки: либо синхронный
+    (когда лок свободен сразу), либо фоновая retry-попытка (когда занят)."""
+    global _lock_retry_task
+    set_bot(bot)
+    # Лок ПЕРЕД первым тиком, а не перед start_scheduler: стартовый tick тоже
+    # пишет в игру (анонсы, финализация, выплаты), поэтому второй инстанс не
+    # должен отработать даже один раз.
+    if not await acquire_scheduler_lock():
+        log.critical(
+            "База уже занята другим процессом — этот экземпляр уходит в фон: "
+            "/health работает, игру он не трогает. Если так не задумано, на "
+            "Render живут два сервиса с одним DATABASE_URL. "
+            "Фоновый retry через %d с попробует перехватить лок после освобождения.",
+            _SCHEDULER_LOCK_RETRY_SECONDS,
+        )
+        # Один процесс — одна retry-таска: повторный create_task защищён от
+        # двойного фонового bootstrap (двух _boot_after_lock и двух start_scheduler).
+        if _lock_retry_task is None or _lock_retry_task.done():
+            _lock_retry_task = asyncio.create_task(
+                _retry_scheduler_lock_loop(bot),
+                name="scheduler-lock-retry",
+            )
+        return
+    await _boot_after_lock(bot)
 
 
 async def run_webhook(bot, dispatcher) -> None:
@@ -283,7 +368,16 @@ async def run_webhook(bot, dispatcher) -> None:
     stop.set()  # будим self-ping для корректного завершения
     boot_task.cancel()
     ping_task.cancel()
-    for task in (boot_task, ping_task):
+    # Фоновая retry-захвата лока: если она жива (новый инстанс не успел
+    # перехватить лок до shutdown), отменяем — пусть живёт ровно столько,
+    # сколько живёт процесс. Если уже успела завершиться (захватила лок и
+    # прогнала _boot_after_lock), cancel() будет no-op, а планировщик уже
+    # остановлен через shutdown_scheduler() выше.
+    if _lock_retry_task is not None and not _lock_retry_task.done():
+        _lock_retry_task.cancel()
+    for task in (boot_task, ping_task, _lock_retry_task):
+        if task is None:
+            continue
         with contextlib.suppress(asyncio.CancelledError):
             await task
     await runner.cleanup()

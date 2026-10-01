@@ -9,6 +9,7 @@ app/main.py — это код, который выполняется ровно 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import runpy
 import signal
@@ -167,8 +168,13 @@ async def test_boot_game_yields_to_holder_of_scheduler_lock(monkeypatch) -> None
     что стартовый tick тоже пишет в игру (анонсы, финализация, выплаты).
     Отказ не падает: /health обязан продолжать работать, иначе Render убьёт
     процесс и отметит сервис как неполадку.
+
+    Дополнительно проверяется, что boot_game НЕ остаётся в вечной слепой зоне:
+    при неудачном acquire запускается фоновая retry-таска, которая перехватит
+    лок после его освобождения без ручного рестарта.
     """
     scheduler = importlib.import_module("app.scheduler")
+    scheduler_lock = importlib.import_module("app.scheduler_lock")
     monkeypatch.setattr(main_module, "set_bot", Mock())
     monkeypatch.setattr(main_module, "start_scheduler", Mock())
     monkeypatch.setattr(main_module, "tick", AsyncMock())
@@ -176,14 +182,74 @@ async def test_boot_game_yields_to_holder_of_scheduler_lock(monkeypatch) -> None
     monkeypatch.setattr(
         main_module, "acquire_scheduler_lock", AsyncMock(return_value=False)
     )
+    monkeypatch.setattr(scheduler_lock, "scheduler_lock_held", Mock(return_value=False))
+    # Делаем retry-цикл «мгновенным», чтобы он не висел в asyncio.sleep
+    # и не предупреждал «Task was destroyed but it is pending!» после теста.
+    monkeypatch.setattr(main_module, "_SCHEDULER_LOCK_RETRY_SECONDS", 0)
     monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
 
-    await main_module.boot_game(SimpleNamespace())
+    # Сбрасываем глобальную ссылку на случай, если другой тест её оставил.
+    main_module._lock_retry_task = None
+    try:
+        await main_module.boot_game(SimpleNamespace())
 
-    main_module.start_scheduler.assert_not_called()
-    main_module.tick.assert_not_awaited()
-    scheduler.boot_maintenance.assert_not_awaited()
-    main_module.apply_profile.assert_not_awaited()
+        main_module.start_scheduler.assert_not_called()
+        main_module.tick.assert_not_awaited()
+        scheduler.boot_maintenance.assert_not_awaited()
+        main_module.apply_profile.assert_not_awaited()
+        # Фоновая retry-таска должна быть создана — это и есть средство
+        # восстановления после гонки при деплое.
+        assert main_module._lock_retry_task is not None
+        assert not main_module._lock_retry_task.done()
+    finally:
+        task = main_module._lock_retry_task
+        main_module._lock_retry_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+async def test_boot_game_retry_captures_lock_after_release(monkeypatch) -> None:
+    """Фоновая retry-таска должна перехватить лок, как только он освободится,
+    и выполнить bootstrap один раз — без повторного create_task и без двойного
+    start_scheduler. Это и есть починка инцидента, когда после Render rolling
+    deploy бот оставался без tick'ов до ручного рестарта.
+    """
+    scheduler = importlib.import_module("app.scheduler")
+    scheduler_lock = importlib.import_module("app.scheduler_lock")
+    monkeypatch.setattr(main_module, "set_bot", Mock())
+    monkeypatch.setattr(main_module, "start_scheduler", Mock())
+    monkeypatch.setattr(main_module, "tick", AsyncMock())
+    monkeypatch.setattr(main_module, "apply_profile", AsyncMock())
+    monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
+    monkeypatch.setattr(scheduler_lock, "scheduler_lock_held", Mock(return_value=False))
+    monkeypatch.setattr(main_module, "_SCHEDULER_LOCK_RETRY_SECONDS", 0)
+
+    # Сначала лок занят (первый acquire возвращает False), потом свободен.
+    acquire_results = iter([False, True])
+    acquire_mock = AsyncMock(side_effect=lambda: next(acquire_results))
+    monkeypatch.setattr(main_module, "acquire_scheduler_lock", acquire_mock)
+
+    main_module._lock_retry_task = None
+    try:
+        await main_module.boot_game(SimpleNamespace())
+
+        # Даём retry-циклу дойти до второго acquire и завершить bootstrap.
+        task = main_module._lock_retry_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2)
+
+        # acquire был вызван дважды: первый — синхронный в boot_game (False),
+        # второй — фоновый в retry-цикле (True).
+        assert acquire_mock.await_count == 2
+        # Bootstrap-шаги выполнены ровно по одному разу (без задвоения).
+        main_module.start_scheduler.assert_called_once()
+        main_module.tick.assert_awaited_once()
+        main_module.apply_profile.assert_awaited_once()
+        scheduler.boot_maintenance.assert_awaited_once()
+    finally:
+        main_module._lock_retry_task = None
 
 
 async def test_boot_game_takes_lock_before_first_tick(monkeypatch) -> None:
