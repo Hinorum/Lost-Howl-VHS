@@ -24,6 +24,10 @@ os.environ.setdefault("TON_NETWORK", "mainnet")
 os.environ.setdefault("BOT_TOKEN", "")
 os.environ.setdefault("TREASURY_ADDRESS", "")
 os.environ.setdefault("TREASURY_MNEMONIC", "")
+# /health закрыт по умолчанию (fail closed): пользовательский .env с
+# HEALTH_REQUIRE_TOKEN=false не смеет разблокировать снимок в прогоне —
+# тесты дефолта (test_metrics) строят Settings() из реального окружения.
+os.environ.setdefault("HEALTH_REQUIRE_TOKEN", "true")
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine

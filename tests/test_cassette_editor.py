@@ -362,9 +362,15 @@ async def test_today_road_main_without_engine_decisions(session) -> None:
 
 
 async def test_today_road_resolves_fork_with_engine_winner(session) -> None:
-    """Закрытый раунд движка в день перемотки — кассета сворачивает на ветку."""
-    today = datetime.now(UTC).date()
-    at_day = max(2, min(today.day, 27))
+    """Закрытый раунд движка в день перемотки — кассета сворачивает на ветку.
+
+    Опорная дата фиксирована внутри месяца, а не берётся «сегодня»: форк
+    учитывается только когда at_day <= today.day, поэтому на 1-м числе
+    месяца реальная дата (at_day не меньше 2) делала проверку
+    неисполнимой — прогон падал 1-го числа и зависел от календаря.
+    """
+    today = date(2026, 6, 15)
+    at_day = 10
     cassette = _mk_cassette(month=today.strftime("%Y-%m"), at_day=at_day)
     fork = cassette.switch[0]
     decision = datetime.combine(
