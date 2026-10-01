@@ -253,7 +253,7 @@
 ## 3. Архитектура: канон + кассеты (VCR), без изменения движка
 
 ### 3.1 Границы (что НЕ трогаем)
-`app/stakes.py`, `app/tally.py`, `app/ton_pay.py`, `app/ton_watch.py`,
+`app/stakes.py`, `app/tally.py`, `app/ton_pay/`, `app/ton_watch/`,
 `app/leaderboard.py`, `app/voting.py`, `app/handlers/*`, `app/models.py`,
 `app/db.py`, `app/scheduler.py` — **не меняются никак**. Их тексты — контракт,
 который движок сам порождает из данных: анонсы нового дня, посты итогов,

@@ -134,7 +134,7 @@ app/
    └─────────────┘                         │                                 │
           │                                ▼                                 │
           │                       ┌─────────────────┐                        │
-          │                       │ ton_pay.py      │                        │
+          │                       │ ton_pay/        │                        │
           │                       │  send_via_liteserver() ─► liteserver ► TON
           │                       │  send_via_toncenter() ─► https API   ─► TON
           │                       └─────────────────┘                        │
@@ -260,7 +260,7 @@ CI enforced: `--cov-fail-under=70`.
 
 | # | Что | Где | Сложность |
 |---|---|---|---|
-| 1 | Разнести `ton_pay.py` на `wallet/dispatch/reconcile/http_channel` | `app/ton_pay.py` | M |
+| 1 | ~~Разнести `ton_pay.py` на `wallet/dispatch/reconcile/http_channel`~~ — сделано, `dispatch/` тоже разнесён на листы | `app/ton_pay/` | ✔ |
 | 2 | Property-тесты на консервацию банка и казны | `tests/test_invariants.py` | S |
 | 3 | Тесты на конкурентные `claim_announcement` | `tests/test_race.py` | S |
 | 4 | Pre-commit hook на мнемоники в коммитах | `.pre-commit-config.yaml` | XS |
