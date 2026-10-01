@@ -65,7 +65,11 @@ async def test_guard_is_permissive_on_sqlite() -> None:
     обязан отпустить тикать, иначе встал бы весь тестовый прогон."""
     from app.db import engine
 
-    assert engine.dialect.name != "postgresql"
+    if engine.dialect.name == "postgresql":
+        pytest.skip(
+            "контракт про SQLite; на Postgres exclusivity проверяется "
+            "test_real_postgres_lock_is_exclusive"
+        )
     assert await slock.acquire_scheduler_lock() is True
     # Повторный захват того же «лока» тоже безопасен.
     assert await slock.acquire_scheduler_lock() is True
