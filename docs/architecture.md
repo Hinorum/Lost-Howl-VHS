@@ -229,7 +229,7 @@ property-тестом (`tests/test_invariants.py`).
 | E2E | `scripts/e2e_testnet.py` | Реальный testnet TON: пополнение, ставка, выплата |
 | Property | `tests/test_invariants.py` | Экономика: банки консервативны, нет отрицательных балансов |
 
-CI enforced: `--cov-fail-under=70`.
+CI enforced: `--cov-fail-under=85` (при последнем замере 87 %).
 
 ---
 
@@ -256,12 +256,13 @@ CI enforced: `--cov-fail-under=70`.
 
 ---
 
-## 9. Открытые TODO (приоритезированные)
+## 9. Открытые TODO
 
-| # | Что | Где | Сложность |
-|---|---|---|---|
-| 1 | ~~Разнести `ton_pay.py` на `wallet/dispatch/reconcile/http_channel`~~ — сделано, `dispatch/` тоже разнесён на листы | `app/ton_pay/` | ✔ |
-| 2 | ~~Property-тесты на консервацию банка и казны~~ — сделано | `tests/test_invariants.py`, `tests/test_treasury_mirror_invariants.py` | ✔ |
-| 3 | ~~Тесты на конкурентные `claim_announcement`~~ — сделано | `tests/test_concurrency.py` | ✔ |
-| 4 | ~~Pre-commit hook на мнемоники в коммитах~~ — сделано (`check_secrets` + `ruff check`) | `.pre-commit-config.yaml` | ✔ |
-| 5 | ~~Поднять enforced покрытие 70 → 85 %~~ — сделано, факт 87 % | `.github/workflows/ci.yml` | ✔ |
+Пусто: все пункты, стоявшие тут раньше, закрыты -- разбивка `ton_pay`
+на пакет листов (включая `dispatch/`), property-тесты на консервацию
+банка и казны, тесты на гонки `claim_announcement`, pre-commit с
+`check_secrets` и enforced-покрытие 85 % при факте 87 %.
+
+Новые пункты сюда не копятся: план на месяц живёт в трекере задач
+репозитория, а не в архитектурном документе -- здесь он успевает
+протухать и обманывать читателя.
