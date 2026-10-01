@@ -261,7 +261,7 @@ CI enforced: `--cov-fail-under=70`.
 | # | Что | Где | Сложность |
 |---|---|---|---|
 | 1 | ~~Разнести `ton_pay.py` на `wallet/dispatch/reconcile/http_channel`~~ — сделано, `dispatch/` тоже разнесён на листы | `app/ton_pay/` | ✔ |
-| 2 | Property-тесты на консервацию банка и казны | `tests/test_invariants.py` | S |
-| 3 | Тесты на конкурентные `claim_announcement` | `tests/test_race.py` | S |
-| 4 | Pre-commit hook на мнемоники в коммитах | `.pre-commit-config.yaml` | XS |
-| 5 | Поднять enforced покрытие 70 → 80 % | `.github/workflows/ci.yml` | XS |
+| 2 | ~~Property-тесты на консервацию банка и казны~~ — сделано | `tests/test_invariants.py`, `tests/test_treasury_mirror_invariants.py` | ✔ |
+| 3 | ~~Тесты на конкурентные `claim_announcement`~~ — сделано | `tests/test_concurrency.py` | ✔ |
+| 4 | ~~Pre-commit hook на мнемоники в коммитах~~ — сделано (`check_secrets` + `ruff check`) | `.pre-commit-config.yaml` | ✔ |
+| 5 | ~~Поднять enforced покрытие 70 → 85 %~~ — сделано, факт 87 % | `.github/workflows/ci.yml` | ✔ |
