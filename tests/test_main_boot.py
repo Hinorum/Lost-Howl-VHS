@@ -159,6 +159,59 @@ async def test_boot_game_survives_cache_warmup_failure(monkeypatch) -> None:
     main_module.start_scheduler.assert_called_once()
 
 
+async def test_boot_game_yields_to_holder_of_scheduler_lock(monkeypatch) -> None:
+    """Второй инстанс на общей базе не должен отработать НИ ОДНОГО шага.
+
+    Инцидент: проснувшийся сервис Render поднял старый билд с тем же
+    DATABASE_URL и раскатал историю дней. Лок берётся ДО первого тика, потому
+    что стартовый tick тоже пишет в игру (анонсы, финализация, выплаты).
+    Отказ не падает: /health обязан продолжать работать, иначе Render убьёт
+    процесс и отметит сервис как неполадку.
+    """
+    scheduler = importlib.import_module("app.scheduler")
+    monkeypatch.setattr(main_module, "set_bot", Mock())
+    monkeypatch.setattr(main_module, "start_scheduler", Mock())
+    monkeypatch.setattr(main_module, "tick", AsyncMock())
+    monkeypatch.setattr(main_module, "apply_profile", AsyncMock())
+    monkeypatch.setattr(
+        main_module, "acquire_scheduler_lock", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
+
+    await main_module.boot_game(SimpleNamespace())
+
+    main_module.start_scheduler.assert_not_called()
+    main_module.tick.assert_not_awaited()
+    scheduler.boot_maintenance.assert_not_awaited()
+    main_module.apply_profile.assert_not_awaited()
+
+
+async def test_boot_game_takes_lock_before_first_tick(monkeypatch) -> None:
+    """Порядок обязателен: лок берётся раньше любого тика."""
+    order: list[str] = []
+    scheduler = importlib.import_module("app.scheduler")
+    monkeypatch.setattr(main_module, "set_bot", Mock())
+    monkeypatch.setattr(main_module, "start_scheduler", Mock())
+
+    async def _lock():
+        order.append("lock")
+        return True
+
+    async def _tick(_bot):
+        order.append("tick")
+
+    monkeypatch.setattr(main_module, "acquire_scheduler_lock", _lock)
+    monkeypatch.setattr(main_module, "tick", _tick)
+    monkeypatch.setattr(main_module, "apply_profile", AsyncMock())
+    monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
+    story_bay = importlib.import_module("app.story.bay")
+    monkeypatch.setattr(story_bay, "install_bay", Mock())
+
+    await main_module.boot_game(SimpleNamespace())
+
+    assert order == ["lock", "tick"]
+
+
 async def test_run_webhook_lifecycle(monkeypatch) -> None:
     """Полный жизненный цикл вебхука: роуты, секрет, set_webhook, старт бота,
     затем по сигналу — глушение планировщика, отмена задач и закрытие сессий.

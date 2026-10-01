@@ -13,6 +13,7 @@ from app.handlers import build_dispatcher, create_bot
 from app.http_utils import close_http_client, get_http_client
 from app.profile import apply_profile
 from app.scheduler import set_bot, start_scheduler, tick
+from app.scheduler_lock import acquire_scheduler_lock, release_scheduler_lock
 from app.ton_utils import normalize_address
 
 
@@ -198,6 +199,16 @@ async def boot_game(bot) -> None:
     бэкапа или профиля не смеет оставлять игру без тиков навсегда (раньше
     исключение до start_scheduler означало молчаливо мёртвое расписание)."""
     set_bot(bot)
+    # Лок ПЕРЕД первым тиком, а не перед start_scheduler: стартовый tick тоже
+    # пишет в игру (анонсы, финализация, выплаты), поэтому второй инстанс не
+    # должен отработать даже один раз.
+    if not await acquire_scheduler_lock():
+        log.critical(
+            "База уже занята другим процессом — этот экземпляр уходит в фон: "
+            "/health работает, игру он не трогает. Если так не задумано, на "
+            "Render живут два сервиса с одним DATABASE_URL."
+        )
+        return
     # Сюжетный слой (необязателен): проигрыватель кассет включает себя, только
     # если есть каталог библиотеки; сбой установки не смеет ронять игру.
     try:
@@ -262,6 +273,13 @@ async def run_webhook(bot, dispatcher) -> None:
     from app.scheduler import shutdown_scheduler
 
     shutdown_scheduler()
+    # Лок отдаём явно: пока держим соединение, держим и лок, а Render может
+    # переиспользовать контейнер. Само закрытие соединения тоже освободило бы
+    # лок, но на shutdown полагаться на это не стоит.
+    try:
+        await release_scheduler_lock()
+    except Exception:
+        log.warning("Лок планировщика не отдан явно — освободится с соединением", exc_info=True)
     stop.set()  # будим self-ping для корректного завершения
     boot_task.cancel()
     ping_task.cancel()

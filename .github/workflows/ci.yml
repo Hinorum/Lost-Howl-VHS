@@ -98,3 +98,8 @@ jobs:
       # create_all. Каждый тест к тому же поднимает свою одноразовую базу.
       - name: Migration flow (Postgres)
         run: python -m pytest -q tests/test_migrations_flow.py
+      # advisory lock защиты от двух инстансов — механизм Postgres, на SQLite
+      # его проверить нельзя; без этого шага exclusivity лока не проверялась бы
+      # никогда.
+      - name: Scheduler lock exclusivity (Postgres)
+        run: python -m pytest -q tests/test_scheduler_lock.py
