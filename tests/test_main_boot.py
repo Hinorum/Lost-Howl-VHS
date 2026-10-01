@@ -218,6 +218,7 @@ async def test_boot_game_retry_captures_lock_after_release(monkeypatch) -> None:
     """
     scheduler = importlib.import_module("app.scheduler")
     scheduler_lock = importlib.import_module("app.scheduler_lock")
+    story_bay = importlib.import_module("app.story.bay")
     monkeypatch.setattr(main_module, "set_bot", Mock())
     monkeypatch.setattr(main_module, "start_scheduler", Mock())
     monkeypatch.setattr(main_module, "tick", AsyncMock())
@@ -225,6 +226,12 @@ async def test_boot_game_retry_captures_lock_after_release(monkeypatch) -> None:
     monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
     monkeypatch.setattr(scheduler_lock, "scheduler_lock_held", Mock(return_value=False))
     monkeypatch.setattr(main_module, "_SCHEDULER_LOCK_RETRY_SECONDS", 0)
+    # install_bay() подменяет _plan_and_render в rendering и lifecycle глобально и
+    # снимается только через uninstall_bay(). Этот тест доходит до реального
+    # шага установки, поэтому без мока monkeypatch он оставлял бы обёртку на
+    # модулях и ломал последующие тесты кассет (тест на порядок запускал
+    # install_bay по-настоящему).
+    monkeypatch.setattr(story_bay, "install_bay", Mock(return_value=True))
 
     # Сначала лок занят (первый acquire возвращает False), потом свободен.
     acquire_results = iter([False, True])
