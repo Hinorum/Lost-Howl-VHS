@@ -53,8 +53,10 @@ app/
 │   ├── editor.py        # Dry-run редактирование кассеты (preview)
 │   └── cassettes/       # Библиотека кассет (4 шт. на сегодня)
 │
-├── ton_pay.py           # Диспетчер выплат: ~1700 строк (TODO: разнести)
-├── ton_watch.py         # Watcher входящих: мемпул → Stake/WatcherState
+├── ton_pay/             # Диспетчер выплат (пакет: листы + оркестрация в __init__)
+├── ton_watch/           # Watcher входящих: мемпул → Stake/WatcherState
+│   │                    #   __init__ — оркестрация, листы: sources, state,
+│   │                    #   ledger, refunds, notify, revote
 ├── ton_codec.py         # Чистые кодеки: api_headers, extract_comment, norm_tx_hash
 ├── ton_utils.py         # TON-арифметика: nano/gram конверсии, форматы адресов
 ├── treasury_mirror.py   # Цепочечно-подтверждённое зеркало казны + ежедневная сверка
@@ -138,7 +140,7 @@ app/
           │                       └─────────────────┘                        │
           │                                │                                 │
           │                       ┌─────────────────┐                        │
-          │                       │ ton_watch.py    │◄── liteserver ◄────────│
+          │                       │ ton_watch/      │◄── liteserver ◄────────│
           │                       │  watcher_state  │                        │
           │                       │  → Stake(WATCHED)                        │
           │                       └─────────────────┘                        │
@@ -181,8 +183,8 @@ property-тестом (`tests/test_invariants.py`).
 | `handlers/` | aiogram, форматирование, клавиатуры | SQL, TON, схема раундов |
 | `rounds/` | SQL, состояние раундов, закон дня | Telegram API, конкретные кассеты |
 | `story/` | Кассеты, формат `YYYY-MM`, лор | БД, TON, состояние раундов (получает через патч `rendering._plan_and_render`) |
-| `ton_pay.py` | Активный/фоллбэк канал, seqno, memo | Что выплачивается и зачем |
-| `ton_watch.py` | Inbox, мемпул, идемпотентность по `tx_hash` | Payouts, UI |
+| `ton_pay/` | Активный/фоллбэк канал, seqno, memo | Что выплачивается и зачем |
+| `ton_watch/` | Inbox, мемпул, идемпотентность по `tx_hash` | Payouts, UI |
 | `treasury_mirror.py` | Цепочка, комиссии, эталонный баланс | Кто получает выплаты |
 
 **Правило добавления нового:** если фича меняет экономику — идёт в `rounds/` или
@@ -249,7 +251,7 @@ CI enforced: `--cov-fail-under=70`.
 3. Новая механика дня → `app/rounds/` (state-machine) + UI в `handlers/panel.py`.
 4. Новая кассета → JSON в `app/story/cassettes/` по контракту `docs/story_cassette_design.md`,
    валидация через `python -m scripts.cassette_tool.py lint path.json`.
-5. Любое изменение в `ton_pay.py` или `ton_watch.py` — обязательно
+5. Любое изменение в пакетах `ton_pay/` или `ton_watch/` — обязательно
    `scripts/e2e_testnet.py` на testnet перед мержем.
 
 ---

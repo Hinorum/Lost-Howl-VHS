@@ -283,8 +283,10 @@ app/
   handlers/      — Telegram-хендлеры по доменам (игрок, кошелёк, топ-ап, выплаты, панель)
   story/         — сюжетный слой LOST HOWL: контракт кассеты, бай (дороги и перемотки), кассеты-фанфики
   rounds/        — жизненный цикл дня: рендер развилки, голосование, подсчёт, игра
-  ton_watch.py   — watcher входящих переводов казначея (TonAPI → Toncenter)
-  ton_pay.py     — выплаты через pytoniq (очередь, ретраи, мемо)
+  ton_watch/     — watcher входящих переводов казначея (TonAPI → Toncenter);
+                   __init__ держит оркестрацию (process_transfer, watch_once),
+                   листы: sources, state, ledger, refunds, notify, revote
+  ton_pay/       — выплаты через pytoniq (очередь, ретраи, мемо)
   treasury_mirror.py — зеркало казны: независимая копия истории кошелька и сверка «в ноль»
   stakes.py      — ставки, фонд дня, копилки
   leaderboard.py — неделя/месяц: копилки, лидеры, выплаты
