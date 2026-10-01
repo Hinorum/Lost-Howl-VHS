@@ -439,6 +439,49 @@ async def test_finalize_pending_payouts_recovers_crashed_closed_day(session) -> 
         await _wipe([day])
 
 
+async def test_finalize_pending_payouts_skips_historical_day(session) -> None:
+    """Регрессия прода: payouts_finalized заводился с server_default=0, поэтому у
+    всей истории закрытых дней маркер false. finalize_day_payouts создаёт Payout
+    заново из ставок и НЕ проверяет уже существующие выплаты — без recency-гарда
+    первый же тик этой версии пересоздал бы выплаты за всю историю (дубли
+    призов/возвратов). Старый день догон не трогает."""
+    from app.stakes import current_network, finalize_pending_payouts
+    from app.ton_utils import to_nano
+
+    day = 904
+    round_row = _round(day, RoundStatus.CLOSED, voting_in_minutes=-40)
+    round_row.winner_card = 0
+    round_row.vote_counts_json = "{}"
+    # Уводим день за окно догона (100 дней назад — фиксировано, не выводится
+    # из настройки, иначе тест масштабировался бы вместе с гардом).
+    stale = datetime.now(UTC) - timedelta(days=100)
+    round_row.opens_at = stale
+    round_row.voting_ends_at = stale
+    round_row.tally_ends_at = stale
+    session.add(Player(id=881_020, username="old_p", wallet_address="0:" + "00" * 16))
+    session.add(round_row)
+    await session.flush()
+    session.add(
+        Stake(
+            round_id=round_row.id,
+            player_id=881_020,
+            amount_nanotons=to_nano(0.3),
+            tx_hash="old-tx",
+            status="confirmed",
+            network=current_network(),
+        )
+    )
+    await session.commit()
+    try:
+        assert await finalize_pending_payouts(session) == 0
+        paid = (
+            await session.execute(select(Payout).where(Payout.round_id == round_row.id))
+        ).scalars().all()
+        assert paid == []
+    finally:
+        await _wipe([day])
+
+
 async def test_finalize_pending_payouts_survives_midloop_crash(session, monkeypatch) -> None:
     """Упавшая финализация одного дня не обрушивает тик: её хвост откатывается,
     остальные закрытые дни догоняются, а больной день честно остаётся

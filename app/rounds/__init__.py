@@ -26,7 +26,14 @@ from .rendering import (  # noqa: F401
     PREPARED_PAYLOAD_VERSION,
     _plan_and_render,
 )
-from .time import _ROMAN, _day_window, _next_hour_slot, _now, utc_aware  # noqa: F401
+from .time import (  # noqa: F401
+    _ROMAN,
+    _day_window,
+    _next_hour_slot,
+    _now,
+    catchup_cutoff,
+    utc_aware,
+)
 from .voting import (  # noqa: F401
     _TIE_THEATER,
     _decisive_counts,
@@ -66,6 +73,7 @@ __all__ = [
     "_day_window",
     "_next_hour_slot",
     "_now",
+    "catchup_cutoff",
     "utc_aware",
     "_TIE_THEATER",
     "_decisive_counts",

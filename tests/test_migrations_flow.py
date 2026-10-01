@@ -41,6 +41,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -213,6 +214,120 @@ def test_repeat_upgrade_is_noop_and_keeps_data(db_path: Path):
     assert _shape(_sync_url(db_path)) == before
     with create_engine(_sync_url(db_path)).connect() as conn:
         assert conn.execute(text("select value from watcher_state where key='k'")).scalar_one() == "v"
+
+
+def _read_markers(conn) -> dict[int, tuple]:
+    """Маркеры доставки по дням. SQLite отдаёт datetime из raw text() строкой —
+    приводим к datetime, иначе сравнение строки с datetime всегда «разное»."""
+    out = {}
+    for row in conn.execute(
+        text(
+            "select day_index, announced_at, results_at, awards_at from rounds"
+            " order by day_index"
+        )
+    ):
+        out[row.day_index] = tuple(
+            datetime.fromisoformat(value) if isinstance(value, str) else value
+            for value in (row.announced_at, row.results_at, row.awards_at)
+        )
+    return out
+
+
+def test_backfill_marks_history_but_spares_fresh_days(db_path: Path):
+    """Бэкфилл маркеров доставки: старые дни помечаются обработанными,
+    СВЕЖИЕ остаются с NULL-маркером (их NULL — настоящий краш, живой догон
+    обязан их доставить), и выплаты миграция не трогает.
+
+    Сценарий прода: миграции добавили announced_at/results_at/awards_at без
+    бэкфилла, у всей истории маркеры NULL, и восстановители тика приняли
+    историю за недоставленную (27 постов флудом, двойные очки, пересозданные
+    выплаты). Бэкфилл чинит именно это, не подавляя свежий догон.
+    """
+    now = datetime.now(UTC).replace(microsecond=0)
+    old = now - timedelta(days=100)
+    fresh = now - timedelta(hours=2)
+
+    def _insert(conn) -> None:
+        rows = [
+            # (day, status, opens_at, voting_ends_at, winner_card)
+            (901, "closed", old, old, 0),  # история, закрытый, с победителем
+            (902, "closed", old, old, None),  # история, закрытый, без победителя
+            (903, "open", old, old, None),  # история, открытый
+            (904, "closed", fresh, fresh, 0),  # свежий закрытый: НЕ трогаем
+        ]
+        for day, status, opens_at, voting_ends_at, winner in rows:
+            conn.execute(
+                text(
+                    "insert into rounds (day_index, status, win_rule, chapter_title,"
+                    " chapter_text, opens_at, voting_ends_at, tally_ends_at,"
+                    " winner_card, vote_counts_json, pot_nanotons, rake_nanotons,"
+                    " weekly_nanotons, referral_nanotons, payouts_finalized, epilogue_text,"
+                    " money_mode)"
+                    " values (:d, :s, 'majority', 't', 'x', :o, :v, :v, :w, '{}',"
+                    " 0, 0, 0, 0, 0, '', 'ton')"
+                ),
+                {
+                    "d": day,
+                    "s": status,
+                    "o": opens_at,
+                    "v": voting_ends_at,
+                    "w": winner,
+                },
+            )
+        # Выплаты история уже имеет — миграция обязана их не трогать.
+        conn.execute(
+            text(
+                "insert into payouts (round_id, player_id, kind, amount_nanotons,"
+                " status, created_at, dest_address, network, attempts, alerted)"
+                " select id, 424242, 'refund', 1, 'pending', :now, '0:dead',"
+                " 'testnet', 0, 0 from rounds where day_index = 901"
+            ),
+            {"now": now},
+        )
+
+    # База доводится до предпоследней ревизии (маркеры есть, бэкфилла нет),
+    # туда кладются «исторические» строки — как на проде до фикса.
+    _alembic_ok(_async_url(db_path), "upgrade", "e5d6a7c8b901")
+    with create_engine(_sync_url(db_path)).begin() as conn:
+        _insert(conn)
+    with create_engine(_sync_url(db_path)).connect() as conn:
+        payouts_before = {
+            row.day_index: row.payouts_finalized
+            for row in conn.execute(text("select day_index, payouts_finalized from rounds"))
+        }
+
+    _chain_to_head(db_path)
+
+    with create_engine(_sync_url(db_path)).connect() as conn:
+        markers = _read_markers(conn)
+        payouts_finalized = {
+            row.day_index: row.payouts_finalized
+            for row in conn.execute(text("select day_index, payouts_finalized from rounds"))
+        }
+        payout_count = conn.execute(text("select count(*) from payouts")).scalar_one()
+
+    assert markers[901] == (old, old, old), "закрытый день с победителем помечен"
+    assert markers[902] == (old, old, old), (
+        "закрытый день без победителя тоже обработан: итоги объявлять было "
+        "что (ничья/без победителя), очки начислять нечего — долга нет"
+    )
+    assert markers[903][0] == old, "открытый исторический день помечен"
+    assert markers[903][1] is None, "у открытого дня итогов нет"
+    assert markers[904] == (None, None, None), (
+        "свежий день остаётся с NULL-маркерами — живой догон обязан его доставить"
+    )
+    assert payouts_finalized[901] == payouts_before[901], (
+        "миграция не трогает payouts_finalized: выплаты — денежная логика, "
+        "у них своя идемпотентность, и blanket-true скрыл бы реальные долги"
+    )
+    assert payout_count == 1, "существующие выплаты не тронуты и не продублированы"
+
+    # Повторный прогон (переигровка миграции на проде) — no-op.
+    _alembic_ok(_async_url(db_path), "upgrade", "e5d6a7c8b901")
+    _chain_to_head(db_path)
+    with create_engine(_sync_url(db_path)).connect() as conn:
+        again = _read_markers(conn)
+    assert again == markers
 
 
 def test_downgrade_base_then_upgrade_head(db_path: Path):

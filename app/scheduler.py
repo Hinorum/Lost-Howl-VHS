@@ -215,10 +215,15 @@ async def _retry_new_day_job() -> None:
     day-1 при самом первом запуске) оставляют OPEN-день без поста: тик видит
     только переход previous→current, а /advance помечает день навсегда. Здесь
     открытые дни без announced_at объявляются заново (лимит 5 за тик).
+
+    Ловим только НЕДАВНИЕ дни (catchup_cutoff): announced_at добавлен
+    миграцией без бэкфилла, так что у всей истории маркер NULL — без границы
+    первый же тик новой версии объявил бы заново каждый старый день.
     """
     try:
         from app.models import Round
         from app.ops import is_game_paused
+        from app.rounds import catchup_cutoff
 
         async with SessionLocal() as session:
             if await is_game_paused(session):
@@ -226,7 +231,11 @@ async def _retry_new_day_job() -> None:
             pending = (
                 await session.execute(
                     select(Round.id)
-                    .where(Round.status == RoundStatus.OPEN, Round.announced_at.is_(None))
+                    .where(
+                        Round.status == RoundStatus.OPEN,
+                        Round.announced_at.is_(None),
+                        Round.opens_at >= catchup_cutoff(),
+                    )
                     .order_by(Round.day_index.asc())
                     .limit(5)
                 )
@@ -256,16 +265,27 @@ async def _retry_results_job() -> None:
     и ничего не анонсирует. Здесь такие дни дохожу: общий пост + личные, откат
     транзакции снимает маркер и повтор разрешён. Кап 3 дня за тик — налёт
     заваленных деплоем дней не валит бота флудом.
+
+    Ловим только НЕДАВНИЕ дни (catchup_cutoff): results_at добавлен
+    миграцией без бэкфилла, поэтому у КАЖДОГО исторического закрытого дня
+    маркер NULL. Без границы первый же тик новой версии считал всю историю
+    игры недоставленной и рассылал её заново — 27 закрытых дней флудом в
+    чат за пару минут. Догон нужен только для свежих крашей.
     """
     try:
         from app.broadcast import announce_player_results, announce_results
         from app.models import Round
+        from app.rounds import catchup_cutoff
 
         async with SessionLocal() as session:
             missing = (
                 await session.execute(
                     select(Round)
-                    .where(Round.status == RoundStatus.CLOSED, Round.results_at.is_(None))
+                    .where(
+                        Round.status == RoundStatus.CLOSED,
+                        Round.results_at.is_(None),
+                        Round.voting_ends_at >= catchup_cutoff(),
+                    )
                     .order_by(Round.day_index.asc())
                     .limit(3)
                     .options(selectinload(Round.cards))

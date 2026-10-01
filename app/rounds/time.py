@@ -30,6 +30,22 @@ def _next_hour_slot(after: datetime, hour: int) -> datetime:
     return candidate
 
 
+def catchup_cutoff() -> datetime:
+    """Граница «догоняем только недавние дни».
+
+    Восстановители по маркерам (awards_at / results_at / announced_at /
+    payouts_finalized) ищут дни с NULL-маркером. Такой отбор без границы
+    после миграции, добавившей колонку без бэкфилла, находит ВСЮ историю
+    закрытых дней: первый же тик новой версии заново рассылает их итоги,
+    начисляет очки и пересоздаёт выплаты. Прошёл день — его маркер «не
+    обработан» больше не значит «нужно догнать».
+
+    Догон существует ради крашей и рестартов (час-дни), поэтому ловим дни,
+    чья граница (закрытие/открытие) попала в последние catchup_window_hours.
+    """
+    return _now() - timedelta(hours=settings.catchup_window_hours)
+
+
 def _day_window(opens_at: datetime) -> tuple[datetime, datetime]:
     """Границы голосования и подсчёта дня на сетке UTC.
 

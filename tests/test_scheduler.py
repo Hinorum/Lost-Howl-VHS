@@ -655,6 +655,83 @@ async def test_retry_new_day_job_respects_pause(monkeypatch) -> None:
         await _cleanup(missing)
 
 
+async def test_retry_jobs_skip_history(monkeypatch) -> None:
+    """Регрессия прода: дни за пределами окна догона НЕ переигрываются.
+
+    Маркеры доставки добавлялись миграциями без бэкфилла, поэтому у всей
+    истории маркер NULL. Без recency-гарда первый же тик новой версии считал
+    всю историю недоставленной и заново рассылал закрытые дни и анонсы.
+
+    Данные здесь намеренно «древние» (100 дней) и НЕ выводятся из настройки
+    окна: иначе тест масштабировался бы вместе с гардом и ловил бы ровно
+    то, что нужно — отсутствие фильтра по времени.
+    """
+    from app import scheduler as sched
+
+    ancient = datetime.now(UTC) - timedelta(days=100)
+    stale = await _make_round(9729, RoundStatus.CLOSED, voting_in=timedelta(days=-100))
+    stale_open = await _make_round(9730, RoundStatus.OPEN)
+    async with SessionLocal() as db:
+        row = await db.get(Round, stale_open)
+        row.opens_at = ancient
+        await db.commit()
+
+    monkeypatch.setattr(sched, "_bot", object())
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    results: list[int] = []
+    new_days: list[int] = []
+
+    async def fake_results(b, finished):
+        results.append(finished.id)
+
+    async def fake_announce(bot_, round_row):
+        new_days.append(round_row.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_results)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_results)
+        monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+        await sched._retry_results_job()
+        await sched._retry_new_day_job()
+        # Проверяем именно свои дни: в общей тестовой БД остаются OPEN/CLOSED
+        # строки от других тестов, их догон не входит в предмет проверки.
+        assert stale not in results
+        assert stale_open not in new_days
+        async with SessionLocal() as db:
+            assert (await db.get(Round, stale)).results_at is None
+            assert (await db.get(Round, stale_open)).announced_at is None
+    finally:
+        await _cleanup(9729, 9730)
+
+
+async def test_retry_jobs_window_is_load_bearing(monkeypatch) -> None:
+    """Гард — не декорация: сузив окно, свежий день перестаёт догоняться,
+    а расширив — догоняется. Это доказывает, что фильтр по времени реально
+    решает, а не «случайно проходит» на тестовых данных."""
+    from app import scheduler as sched
+
+    fresh = await _make_round(9731, RoundStatus.CLOSED, voting_in=timedelta(hours=-1))
+    monkeypatch.setattr(sched, "_bot", object())
+    seen: list[int] = []
+
+    async def fake_results(b, finished):
+        seen.append(finished.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_results)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_results)
+        monkeypatch.setattr(settings, "catchup_window_hours", 0)
+        await sched._retry_results_job()
+        assert seen == []  # окно в 0 ч: час назад закрытый день уже «история»
+        monkeypatch.setattr(settings, "catchup_window_hours", 72)
+        await sched._retry_results_job()
+        assert seen == [fresh, fresh]  # окно 72 ч: свежий краш догоняется
+        async with SessionLocal() as db:
+            assert (await db.get(Round, fresh)).results_at is not None
+    finally:
+        await _cleanup(9731)
+
+
 async def test_finalize_new_day_job_swallows_failures(monkeypatch) -> None:
     """Сбой финализации дня не роняет планировщик."""
     from app import scheduler as sched

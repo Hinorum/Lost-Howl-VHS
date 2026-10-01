@@ -622,12 +622,22 @@ async def finalize_pending_payouts(session: AsyncSession) -> int:
     (leaderboard.ready_marker) — без этого призы зависли бы навсегда.
     Идемпотентно: claim finalize_day_payouts (payouts_finalized=false)
     пускает только одного, повторный тик ничего не создаёт.
+
+    Ловим только НЕДАВНИЕ дни (catchup_cutoff): finalize_day_payouts создаёт
+    Payout заново из ставок и НЕ проверяет уже существующие выплаты — всю
+    идемпотентность держит флаг. Колонка payouts_finalized заводилась с
+    server_default=0, так что у исторических закрытых дней маркер false, и
+    без границы первый же тик этой версии пересоздал бы выплаты за всю
+    историю (дубли призов/возвратов). Догон — только для свежих крашей.
     """
+    from app.rounds.time import catchup_cutoff
+
     rows = (
         await session.execute(
             select(Round.id).where(
                 Round.status == RoundStatus.CLOSED,
                 Round.payouts_finalized.is_(False),
+                Round.voting_ends_at >= catchup_cutoff(),
             )
         )
     ).all()

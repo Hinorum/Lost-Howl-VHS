@@ -99,13 +99,22 @@ async def award_pending_points(session: AsyncSession) -> int:
     """Добирает очки дней, закрытых без начисления: краш между коммитом
     finish_tally и award_points оставляет день CLOSED (heal_stale_rounds
     лечит только OPEN/TALLYING), и без этого никто очки не вернул бы.
-    Идемпотентно: claim по awards_at IS NULL пускает только одного."""
+    Идемпотентно: claim по awards_at IS NULL пускает только одного.
+
+    Ловим только НЕДАВНИЕ дни (catchup_cutoff): колонка awards_at добавлена
+    миграцией без бэкфилла, поэтому у всей истории закрытых дней маркер
+    NULL — без границы первый же тик новой версии начислил бы очки заново
+    за все дни, где они уже были начислены (двойные очки у игроков).
+    """
+    from app.rounds.time import catchup_cutoff
+
     rows = (
         await session.execute(
             select(Round.id).where(
                 Round.status == RoundStatus.CLOSED,
                 Round.winner_card.is_not(None),
                 Round.awards_at.is_(None),
+                Round.voting_ends_at >= catchup_cutoff(),
             )
         )
     ).all()

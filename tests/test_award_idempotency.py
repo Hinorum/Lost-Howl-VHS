@@ -126,6 +126,35 @@ async def test_award_pending_points_skips_closed_day_without_winner(session: Asy
     assert await _scores(session, [1, 2]) == {1: 0, 2: 0}
 
 
+async def test_award_pending_points_skips_historical_day(session: AsyncSession) -> None:
+    # Регрессия прода: awards_at добавлен миграцией без бэкфилла, поэтому у
+    # всей истории маркер NULL. Без recency-гарда первый же тик новой версии
+    # начислил бы очки заново за ВСЕ закрытые дни — двойные очки у игроков.
+    # Данные фиксированы (100 дней назад), а не выведены из настройки окна:
+    # иначе тест масштабировался бы вместе с гардом и ничего не проверял бы.
+    now = datetime.now(UTC)
+    ancient = now - timedelta(days=100)
+    stale = Round(
+        day_index=7004,
+        status=RoundStatus.CLOSED,
+        win_rule=WinRule.MAJORITY,
+        chapter_title="t",
+        chapter_text="text",
+        opens_at=ancient,
+        voting_ends_at=ancient,
+        tally_ends_at=ancient,
+        winner_card=0,
+        vote_counts_json="{}",
+    )
+    session.add(stale)
+    await session.commit()
+    await _seed_votes(session, stale.id, {0: [1, 2], 1: [3], 2: []})
+
+    assert await award_pending_points(session) == 0
+    assert await _scores(session, [1, 2, 3]) == {1: 0, 2: 0, 3: 0}
+    assert (await session.get(Round, stale.id)).awards_at is None
+
+
 async def test_award_points_sets_marker_only_with_winner(session: AsyncSession) -> None:
     # День без победителя: award_points не ставит marker и не пишет очки.
     round_row = _tallying_day(7004)

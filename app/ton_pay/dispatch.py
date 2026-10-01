@@ -741,12 +741,23 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
 
 
 async def settle_closed_rounds(bot: Bot | None = None) -> int:
-    """Финализирует фонды закрытых дней и разбирает очередь выплат."""
+    """Финализирует фонды закрытых дней и разбирает очередь выплат.
+
+    Финализация ловит только НЕДАВНИЕ закрытые дни (catchup_cutoff):
+    finalize_day_payouts не проверяет уже созданные выплаты (идемпотентность
+    только по флагу), а у исторических дней payouts_finalized=false с
+    server_default=0 — без границы джоба пересоздавала бы выплаты за всю
+    историю. Отправка внизу не ограничена по возрасту: уже созданные
+    выплаты (kind=pending) должны уйти независимо от давности дня.
+    """
+    from app.rounds.time import catchup_cutoff
+
     async with SessionLocal() as session:
         result = await session.execute(
             select(Round.id).where(
                 Round.status == RoundStatus.CLOSED,
                 Round.payouts_finalized.is_(False),
+                Round.voting_ends_at >= catchup_cutoff(),
             )
         )
         round_ids = [row[0] for row in result.all()]
