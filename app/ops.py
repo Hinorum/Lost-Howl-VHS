@@ -27,6 +27,7 @@ from app.core.registry import (
     ALERT_MIRROR_KEY,
     ALERT_QUEUE_KEY,
     ALERT_REFUND_KEY,
+    ALERT_SCAN_GAP_KEY,
     ALERT_STAKE_KEY,
     ALERT_STUCK_KEY,
     ALERT_TICK_FAIL_KEY,
@@ -429,6 +430,18 @@ def _humanize(seconds: float) -> str:
     return f"{int(seconds // 3600)} ч {int((seconds % 3600) // 60)} мин"
 
 
+def _human_ts(utime: object) -> str:
+    """Unix-время в местном виде для тревоги: «12.10 21:34».
+
+    Нужен для дыры окна входящих: границы читает человек, а не код.
+    """
+    try:
+        moment = datetime.fromtimestamp(int(utime), tz=UTC)
+    except (TypeError, ValueError, OSError):
+        return "?"
+    return moment.astimezone().strftime("%d.%m %H:%M")
+
+
 async def _store_track(session, track: dict) -> None:
     raw = json.dumps(track, ensure_ascii=False)
     row = await session.get(WatcherState, OPS_ALERT_TRACK_KEY)
@@ -658,6 +671,32 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                     ALERT_WATCHER_KEY,
                     watcher_note,
                     f"⚠️ TON-watcher отстаёт: {watcher_note}. Ставки копятся необработанными.",
+                )
+        # 1b. Проход не вычитал окно входящих целиком — бюджет страниц кончился
+        # раньше курсора. Цикл при этом «здоровый» (сердцебиение стоит, новые
+        # переводы обработаны), поэтому без этой проверки дыра была бы видна
+        # только в логах. Курсор при этом встаёт на дно прочитанного, то есть
+        # непрочитанная часть окна догоняется следующими циклами; если backlog
+        # не тает — нужен либо больший WATCH_MAX_PAGES, либо ручной разбор.
+        if settings.ton_enabled:
+            from app.ton_watch import _read_scan_gap
+
+            gap = await _read_scan_gap(session)
+            if gap and gap.get("floor") is not None and gap.get("since") is not None:
+                gap_note = (
+                    f"непрочитанное окно входящих: курсор {_human_ts(gap['since'])} → "
+                    f"прочитано до {_human_ts(gap['floor'])}"
+                )
+                await _raise(
+                    session,
+                    bot,
+                    ALERT_SCAN_GAP_KEY,
+                    gap_note,
+                    "⚠️ Входящие в окне не дочитаны: ниже прочитанной границы переводы "
+                    f"ещё не обработаны (окно {_human_ts(gap['since'])} — "
+                    f"{_human_ts(gap['floor'])}). Курсор стоит на границе покрытия, бюджет "
+                    "страниц поднят; если так дольше 15 минут — подними WATCH_MAX_PAGES "
+                    "или разбери окно через /incoming и /adjust.",
                 )
         # 2. Очередь выплат старше получаса — казначей застрял или сеть лежит.
         oldest = (

@@ -25,6 +25,7 @@ TICK_FAIL_KEY = "tick_fail_count"
 TICK_FAIL_LAST_KEY = "tick_fail_last"
 ALERT_TICK_FAIL_KEY = "alert_tick_fail_ts"
 ALERT_WATCHER_KEY = "alert_watcher_ts"
+ALERT_SCAN_GAP_KEY = "alert_scan_gap_ts"
 ALERT_QUEUE_KEY = "alert_queue_ts"
 ALERT_DEAD_KEY = "alert_dead_ts"
 ALERT_TICK_KEY = "alert_tick_ts"
@@ -84,6 +85,15 @@ WALLET_NORM_KEY = "wallet_norm_v1"
 # fails < минимума, а исчерпавшие лимит — пропускаем, НЕ двигая курсор за них
 # с потерей: админ видит их в watcher_state и может разобрать вручную.
 STUCK_TX_KEY = "ton_watch_stuck_tx"
+# Проход watcher'а не вычитал окно входящих целиком: бюджет страниц кончился
+# раньше, чем пагинация дошла до курсора. JSON: {since, floor, pages, boost,
+# at}. Пока запись жива, курсор стоит на границе покрытия (floor) и бюджет
+# страниц поднят вдвое, а ops.py держит тревогу: непрочитанное окно не должно
+# исчезать молча.
+SCAN_GAP_KEY = "ton_watch_scan_gap"
+# Во сколько раз поднят бюджет страниц поверх watch_max_pages (1 = базовый).
+# Сбрасывается в 1 полным проходом.
+SCAN_BOOST_KEY = "ton_watch_scan_boost"
 
 # --- Зеркало казны (app/treasury_mirror.py) ---
 

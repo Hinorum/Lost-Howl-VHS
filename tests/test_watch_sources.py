@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -139,14 +141,14 @@ async def test_tonapi_pagination_walks_by_lt(monkeypatch: pytest.MonkeyPatch) ->
         {_HISTORY: [_Response(200, {"transactions": page_one}), _Response(200, {"transactions": page_two})]},
     )
 
-    transfers, complete = await ton_watch._deep_collect(
+    result = await ton_watch._deep_collect(
         ton_watch._tonapi_page,
         lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
-    assert complete is True
-    assert len(transfers) == limit + 1
+    assert result.complete is True
+    assert len(result.transfers) == limit + 1
     v2_calls = [params for url, params in calls if "/v2/blockchain/" in url]
     assert len(v2_calls) == 2
     assert "before_lt" not in v2_calls[0] and "offset" not in v2_calls[0]
@@ -162,9 +164,10 @@ async def test_tonapi_http_error_falls_back(monkeypatch) -> None:
             _V3: [_Response(200, {"transactions": [_v3_tx(1500, to_nano(0.03))]})],
         },
     )
-    transfers, ok, source = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
     assert ok is True
     assert source == "toncenter"
+    assert gap is None
     assert len(transfers) == 1
 
 
@@ -225,7 +228,7 @@ async def test_stale_index_404_is_degraded_and_toncenter_serves(
             _V3: [_Response(200, {"transactions": [_v3_tx(1500, to_nano(1.67))]})],
         },
     )
-    transfers, ok, source = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
     assert ok is True and source == "toncenter"
     assert len(transfers) == 1
     assert transfers[0].value_nanotons == to_nano(1.67)
@@ -247,7 +250,7 @@ async def test_tonapi_network_error_also_falls_back(monkeypatch: pytest.MonkeyPa
             ],
         },
     )
-    transfers, ok, source = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
     assert ok is True and source == "toncenter"
     assert transfers[0].comment == "привет"
 
@@ -262,8 +265,104 @@ async def test_both_sources_down_means_failed_cycle(monkeypatch: pytest.MonkeyPa
             _V3: [RuntimeError("toncenter молчит")],
         },
     )
-    transfers, ok, source = await ton_watch._collect_transfers(1000)
-    assert transfers == [] and ok is False and source == "none"
+    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    assert transfers == [] and ok is False and source == "none" and gap is None
+
+
+# ---------- Бюджет страниц кончился раньше курсора ----------
+
+
+def _deep_pages(make_tx, top: int, count: int) -> tuple[list, int]:
+    """count страниц строго новее курсора: проход упрётся в бюджет страниц.
+
+    Страницы непустые и не повторяются (хеши случайные), каждая глубже
+    предыдущей, но ни одна не достигает курсора — то есть проход физически
+    не может завершиться, кроме как исчерпанием бюджета. Возвращает
+    (ответы, ожидаемое дно дыры).
+    """
+    limit = ton_watch._PAGE_LIMIT
+    pages = [
+        _Response(
+            200,
+            {
+                "transactions": [
+                    make_tx(top - page * limit - index, to_nano(0.01)) for index in range(limit)
+                ]
+            },
+        )
+        for page in range(count)
+    ]
+    return pages, top - (count - 1) * limit - (limit - 1)
+
+
+def _fast_pace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Убрать паузу между страницами: тест гоняет десятки страниц.
+
+    Пауза 0.12 с между страницами нужна живому циклу, чтобы не словить лимит
+    индексатора; в тесте она превратила бы прогон в десятки секунд ожидания.
+    """
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+
+async def test_page_budget_exhausted_is_not_a_complete_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Полные страницы всё глубже курсора, бюджет исчерпан — проход НЕ полный.
+
+    Именно этот случай раньше возвращал complete=True, и цикл двигал курсор
+    вперёд по utime самой нижней увиденной транзакции: окно между ней и старым
+    курсором выпадало из чтения навсегда — тихо, без записи и без тревоги.
+    Теперь дыра возвращается наружу, а курсор за неё не двигается.
+    """
+    limit = ton_watch._PAGE_LIMIT
+    budget = ton_watch._MAX_PAGES
+    _fast_pace(monkeypatch)
+    history, history_floor = _deep_pages(_api_tx, 7000, budget)
+    fallback, _ = _deep_pages(_v3_tx, 7000, budget)
+    calls = install_http(monkeypatch, {_HISTORY: history, _V3: fallback})
+
+    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+
+    assert ok is True  # провайдеры живы, прочитанное обработано
+    assert source == "tonapi"
+    assert len(transfers) == 2 * budget * limit
+    assert gap == history_floor  # дно дыры — самая старая увиденная
+    v2_calls = [params for url, params in calls if "/v2/blockchain/" in url]
+    assert len(v2_calls) == budget  # бюджет честно исчерпан
+
+
+async def test_page_budget_truncation_keeps_deepest_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Оба прохода усечены — дыра называется по самой глубокой достигнутой границе."""
+    budget = ton_watch._MAX_PAGES
+    _fast_pace(monkeypatch)
+    history, _ = _deep_pages(_api_tx, 7000, budget)
+    fallback, fallback_floor = _deep_pages(_v3_tx, 6500, budget)
+    install_http(monkeypatch, {_HISTORY: history, _V3: fallback})
+
+    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+
+    assert ok is True
+    assert source == "tonapi"
+    assert gap == fallback_floor  # фолбэк зашёл дальше — дыра там
+    assert transfers
+
+
+async def test_full_pass_reports_no_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Проход, дошедший до курсора, дыры не возвращает — false positives не будет."""
+    install_http(
+        monkeypatch,
+        {
+            _HISTORY: [_Response(200, {"transactions": [_api_tx(1500, to_nano(0.02))]})],
+            _V3: [AssertionError("фолбэк не должен вызываться")],
+        },
+    )
+
+    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+
+    assert (ok, source, gap) == (True, "tonapi", None)
+    assert len(transfers) == 1
 
 
 # ---------- Парсер Toncenter v3 ----------
@@ -307,14 +406,14 @@ async def test_toncenter_pagination_walks_by_lt(monkeypatch: pytest.MonkeyPatch)
         {_V3: [_Response(200, {"transactions": page_one}), _Response(200, {"transactions": page_two})]},
     )
 
-    transfers, complete = await ton_watch._deep_collect(
+    result = await ton_watch._deep_collect(
         ton_watch._toncenter_page,
         lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
-    assert complete is True
-    assert len(transfers) == limit + 2
+    assert result.complete is True
+    assert len(result.transfers) == limit + 2
     v3_calls = [params for url, params in calls if _V3 in url]
     assert len(v3_calls) == 2
     assert v3_calls[0]["account"] == TREASURY

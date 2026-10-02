@@ -25,6 +25,8 @@ from sqlalchemy import select
 from app.config import settings
 from app.core.registry import BEAT_KEY as BEAT_KEY  # noqa: F401  (ре-экспорт ключей watcher_state)
 from app.core.registry import CURSOR_KEY as CURSOR_KEY  # noqa: F401
+from app.core.registry import SCAN_BOOST_KEY as SCAN_BOOST_KEY  # noqa: F401
+from app.core.registry import SCAN_GAP_KEY as SCAN_GAP_KEY  # noqa: F401
 from app.core.registry import SOURCE_KEY as SOURCE_KEY  # noqa: F401
 from app.core.registry import STUCK_TX_KEY, WALLET_NORM_KEY
 from app.db import SessionLocal
@@ -91,6 +93,7 @@ from app.ton_watch.sources import (  # noqa: F401
     _PAGE_LIMIT,
     _PAGE_OK,
     _TONCENTER_MAX_LIMIT,
+    PassResult,
     Transfer,
     _collect_transfers,
     _deep_collect,
@@ -108,13 +111,19 @@ from app.ton_watch.sources import (  # noqa: F401
 from app.ton_watch.state import (  # noqa: F401
     _CURSOR_FALLBACK_HOURS,
     _CURSOR_OVERLAP_SECONDS,
+    _MAX_SCAN_BOOST,
     _STUCK_MAX_FAILS,
+    _bump_scan_boost,
     _load_stuck,
     _read_cursor,
     _read_cursor_raw,
+    _read_scan_boost,
+    _read_scan_gap,
     _read_stuck,
+    _reset_scan_state,
     _write_beat,
     _write_cursor,
+    _write_scan_gap,
     _write_source,
     _write_stuck,
 )
@@ -597,7 +606,10 @@ async def watch_once(bot: Bot | None = None) -> None:
         since = await _read_cursor(session)
         raw_cursor = await _read_cursor_raw(session)
         stuck = await _read_stuck(session)
-    transfers, api_ok, source = await _collect_transfers(since)
+        scan_boost = await _read_scan_boost(session)
+    transfers, api_ok, source, gap_at = await _collect_transfers(
+        since, _MAX_PAGES * scan_boost
+    )
     processed_through = since
     # Сбойные транзакции попадают в stuck-список (watcher_state): они не должны
     # остаться за окном перекрытия навсегда (см. генерацию курсора ниже).
@@ -657,12 +669,17 @@ async def watch_once(bot: Bot | None = None) -> None:
         await refresh_day_bank(bot)
     except Exception:
         logger.exception("Актуализация банка дня в постах упала (не мешает циклу)")
-    # Курсор двигаем ТОЛЬКО по полному проходу (api_ok): частичная пачка при
-    # деградации обоих провайдеров содержит дыры по utime, и быстрый перевод
-    # курсора вперёд потерял бы те транзакции, до которых проход не дошёл.
-    # Следующий цикл начнётся с той же позиции и догонит пропущенное.
-    if api_ok and processed_through > raw_cursor:
-        # Стuck-защита: курсор не уходит дальше самой свежей ТАК И НЕ обработанной
+# Курсор — нижняя граница окна, прочитанного ЦЕЛИКОМ. Полный проход даёт
+    # processed_through (самая свежая обработанная транзакция). Усечённый по
+    # бюджету страниц проход даёт gap_at — дно прочитанного: всё выше него
+    # перечислено, а непрочитанное ниже догоняется следующими циклами, потому
+    # что курсор стоит на границе покрытия, а не на «непрочитанной» позиции.
+    # Раньше усечённый проход считался полным (complete=True), и курсор уезжал
+    # по processed_through — окно между gap_at и processed_through выпадало из
+    # чтения навсегда: тихо, без записи и без тревоги.
+    cursor_candidate = gap_at if gap_at is not None else processed_through
+    if api_ok and cursor_candidate > raw_cursor:
+        # Stuck-защита: курсор не уходит дальше самой свежей ТАК И НЕ обработанной
         # транзакции — иначе упавшая навсегда теряется за окном перекрытия.
         # max(raw_cursor, floor) хранит монотонность: сбойная в окне перекрытия
         # (ниже raw_cursor) не откатывает курсор, а просто не двигает его, и окно
@@ -672,7 +689,7 @@ async def watch_once(bot: Bot | None = None) -> None:
             default=None,
         )
         if fresh_floor is not None:
-            processed_through = min(processed_through, max(raw_cursor, fresh_floor))
+            cursor_candidate = min(cursor_candidate, max(raw_cursor, fresh_floor))
         expired = [
             r for r in stuck.values()
             if r.get("fails", 0) > _STUCK_MAX_FAILS and not r.get("reported")
@@ -686,7 +703,7 @@ async def watch_once(bot: Bot | None = None) -> None:
             for record in expired:
                 record["reported"] = True
         async with SessionLocal() as session:
-            await _write_cursor(session, processed_through)
+            await _write_cursor(session, cursor_candidate)
     if api_ok:
         async with SessionLocal() as session:
             # stuck-список фиксируем каждым полным проходом, когда в нём что-то
@@ -701,6 +718,25 @@ async def watch_once(bot: Bot | None = None) -> None:
             # переводов: тишина в цепочке это здоровье, а не простой.
             await _write_beat(session)
             await _write_source(session, source)
+    # Дыра окна (бюджет страниц исчерпан раньше курсора): запомнить границы,
+    # удвоить бюджет страниц на следующий цикл и НИКОГДА не терять её молча —
+    # тревогу поднимет ops.py по watcher_state[SCAN_GAP_KEY].
+    async with SessionLocal() as session:
+        if gap_at is not None and api_ok:
+            await _write_scan_gap(session, since, gap_at, _MAX_PAGES * scan_boost)
+            boosted = await _bump_scan_boost(session)
+            logger.error(
+                "Окно входящих прочитано не полностью: курсор с %s → %s (дно прочитанного), "
+                "ниже осталось непрочитанным. Бюджет страниц поднят x%s (база %s): следующий "
+                "цикл продолжит читать глубже. Если дыра не закрылась за несколько циклов — "
+                "подними WATCH_MAX_PAGES или разбери окно вручную через /incoming и /adjust.",
+                since,
+                gap_at,
+                boosted,
+                _MAX_PAGES,
+            )
+        elif api_ok:
+            await _reset_scan_state(session)
     try:
         # Авто-лечение брошенных сбойных переводов: не даём деньгам зависать
         # в казне до ручного разбора (инцидент Kote). Идемпотентно и не мешает
@@ -714,7 +750,7 @@ async def watch_once(bot: Bot | None = None) -> None:
         logger.info(
             "Цикл watcher: найдено %d переводов, курсор %d → %d, проход %s (источник %s), stuck %d",
             len(transfers), since, processed_through,
-            "полный" if api_ok else "ЧАСТИЧНЫЙ (курсор не сдвинут)",
+            "полный" if gap_at is None else "ЧАСТИЧНЫЙ (курсор встанет на дно прочитанного)",
             source,
             len(stuck),
         )

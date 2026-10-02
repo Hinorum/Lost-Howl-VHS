@@ -10,7 +10,14 @@ from datetime import UTC, datetime, timedelta
 
 from app import ton_watch as _pkg
 from app.config import settings
-from app.core.registry import BEAT_KEY, CURSOR_KEY, SOURCE_KEY, STUCK_TX_KEY
+from app.core.registry import (
+    BEAT_KEY,
+    CURSOR_KEY,
+    SCAN_BOOST_KEY,
+    SCAN_GAP_KEY,
+    SOURCE_KEY,
+    STUCK_TX_KEY,
+)
 from app.models import WatcherState
 
 logger = logging.getLogger(__name__)
@@ -74,6 +81,82 @@ async def _write_source(session, source: str) -> None:
     else:
         row.value = source
     await session.commit()
+
+
+# Во сколько раз бюджет страниц прохода может превысить watch_max_pages, пока
+# окно не вычитано целиком. Каждый усечённый проход удваивает множитель, полный —
+# сбрасывает в 1. Потолок ограничивает нагрузку на индексатор: страниц много,
+# а каждый цикл всё равно должен уложиться в интервал ton-watch.
+_MAX_SCAN_BOOST = 8
+
+
+async def _read_scan_boost(session) -> int:
+    """Текущий множитель бюджета страниц (1 = базовый watch_max_pages)."""
+    row = await session.get(WatcherState, SCAN_BOOST_KEY)
+    if row is None:
+        return 1
+    try:
+        return max(1, min(_MAX_SCAN_BOOST, int(row.value)))
+    except (TypeError, ValueError):
+        logger.warning("Множитель бюджета страниц повреждён (%r) — базовый", row.value)
+        return 1
+
+
+async def _bump_scan_boost(session) -> int:
+    """Удвоить бюджет страниц после усечённого прохода и вернуть новый."""
+    boost = min(await _read_scan_boost(session) * 2, _MAX_SCAN_BOOST)
+    row = await session.get(WatcherState, SCAN_BOOST_KEY)
+    if row is None:
+        session.add(WatcherState(key=SCAN_BOOST_KEY, value=str(boost)))
+    else:
+        row.value = str(boost)
+    await session.commit()
+    return boost
+
+
+async def _reset_scan_state(session) -> bool:
+    """Полный проход: сбросить множитель и тревогу о дыре. True, если было что чистить."""
+    touched = False
+    for key in (SCAN_BOOST_KEY, SCAN_GAP_KEY):
+        row = await session.get(WatcherState, key)
+        if row is not None:
+            await session.delete(row)
+            touched = True
+    if touched:
+        await session.commit()
+    return touched
+
+
+async def _write_scan_gap(session, since: int, floor_utime: int, max_pages: int) -> None:
+    """Записать границы непрочитанного окна: с них читает тревогу ops.py."""
+    row = await session.get(WatcherState, SCAN_GAP_KEY)
+    payload = json.dumps(
+        {
+            "since": int(since),
+            "floor": int(floor_utime),
+            "max_pages": int(max_pages),
+            "at": datetime.now(UTC).isoformat(),
+        },
+        ensure_ascii=False,
+    )
+    if row is None:
+        session.add(WatcherState(key=SCAN_GAP_KEY, value=payload))
+    else:
+        row.value = payload
+    await session.commit()
+
+
+async def _read_scan_gap(session) -> dict | None:
+    """Границы дыры последнего усечённого прохода (None — дыры нет)."""
+    row = await session.get(WatcherState, SCAN_GAP_KEY)
+    if row is None:
+        return None
+    try:
+        value = json.loads(row.value)
+    except (ValueError, TypeError):
+        logger.warning("Границы дыры watcher'а повреждены (%r)", row.value[:128])
+        return None
+    return value if isinstance(value, dict) else None
 
 _STUCK_MAX_FAILS = 5
 

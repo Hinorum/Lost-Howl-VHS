@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import ton_pay
 from app.config import settings
-from app.core.registry import MONTH_CLAIM_WINDOW_KEY
+from app.core.registry import CURSOR_KEY, MONTH_CLAIM_WINDOW_KEY
 from app.db import SessionLocal
 from app.leaderboard import MARKER_KEY, MONTH_READY_KEY, previous_month_key, settle_month_if_due
 from app.models import (
@@ -284,7 +284,7 @@ async def test_degraded_cycle_freezes_cursor(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     base = int(datetime.now(UTC).timestamp()) - 3_600
-    fetch = AsyncMock(return_value=([], False, "none"))
+    fetch = AsyncMock(return_value=([], False, "none", None))
     monkeypatch.setattr(ton_watch, "_collect_transfers", fetch)
     try:
         async with SessionLocal() as db:
@@ -299,6 +299,187 @@ async def test_degraded_cycle_freezes_cursor(monkeypatch: pytest.MonkeyPatch) ->
         async with SessionLocal() as db:
             await db.execute(
                 WatcherState.__table__.delete().where(WatcherState.key == ton_watch.CURSOR_KEY)
+            )
+            await db.commit()
+
+
+async def test_scan_gap_moves_cursor_to_coverage_front_and_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Проход упёрся в бюджет страниц раньше курсора — входящие не теряются.
+
+    Раньше такой цикл считался полным: курсор уезжал по самой свежей
+    обработанной транзакции, а окно между ней и границей прочитанного
+    выпадало из чтения навсегда — без записи, без тревоги, при зелёном
+    /health. Теперь курсор встаёт на дно прочитанного (границу покрытия),
+    границы дыры записаны, бюджет страниц удвоен, админ получает алерт.
+    """
+    from app import ops, ton_watch
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    bot = SimpleNamespace(send_message=AsyncMock())
+    base = int(datetime.now(UTC).timestamp()) - 3_600
+    fresh = ton_watch.Transfer("fresh-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 10)
+    # Прочитали до base+10, но окно от старого курсора до base+5 не вычитали.
+    collect = AsyncMock(return_value=([fresh], True, "tonapi", base + 5))
+    monkeypatch.setattr(ton_watch, "_collect_transfers", collect)
+    monkeypatch.setattr(ton_watch, "process_transfer", AsyncMock(return_value="refund_queued"))
+    try:
+        async with SessionLocal() as db:
+            db.add(WatcherState(key=ton_watch.CURSOR_KEY, value=str(base)))
+            await db.commit()
+
+        await ton_watch.watch_once()
+
+        # since — с учётом окна перекрытия (курсор минус 90 с), а не сам курсор.
+        scanned_from = collect.await_args.args[0]
+        assert scanned_from < base
+        async with SessionLocal() as db:
+            cursor = await db.get(WatcherState, CURSOR_KEY)
+            # Курсор встал на границу покрытия: выше неё всё прочитано, ниже
+            # догонится следующими циклами. Уехать выше (base+10) он не может —
+            # тогда окно base+5..base+10 потерялось бы навсегда.
+            assert cursor is not None and int(cursor.value) == base + 5
+            assert await db.get(WatcherState, ton_watch.BEAT_KEY) is not None  # цикл при этом здоров
+            gap = await ton_watch._read_scan_gap(db)
+            assert gap is not None and gap["floor"] == base + 5
+            assert gap["since"] == scanned_from
+            assert await ton_watch._read_scan_boost(db) == 2  # бюджет страниц удвоен
+
+        problems = await ops.check_anomalies(bot=bot)
+        assert problems and "непрочитанное окно" in problems[0]
+        assert bot.send_message.await_count == 1
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_(
+                        [
+                            CURSOR_KEY,
+                            ton_watch.BEAT_KEY,
+                            ton_watch.SCAN_GAP_KEY,
+                            ton_watch.SCAN_BOOST_KEY,
+                            ops.ALERT_SCAN_GAP_KEY,
+                            ton_watch.SOURCE_KEY,
+                        ]
+                    )
+                )
+            )
+            await db.commit()
+
+
+async def test_scan_gap_backlog_drains_over_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Дыра не копится: следующий цикл читает от границы покрытия вглубь.
+
+    Бэклог глубже бюджета страниц не должен ни теряться, ни стоять на месте.
+    Курсор при этом не откатывается (он монотонный): покрытие догоняет сам
+    проход — он стартует от границы и уходит глубже, обрабатывая то, что ниже.
+    """
+    from app import ton_watch
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    base = int(datetime.now(UTC).timestamp()) - 3_600
+    deeper = ton_watch.Transfer("deeper-1", "0:" + os.urandom(32).hex(), to_nano(0.1), "", base + 2)
+    collect = AsyncMock(
+        side_effect=[
+            # Цикл 1: прочитали до base+20, курсор должен встать на base+20.
+            ([], True, "tonapi", base + 20),
+            # Цикл 2: следующий проход идёт уже от границы покрытия и читает глубже.
+            ([deeper], True, "tonapi", base + 1),
+        ]
+    )
+    monkeypatch.setattr(ton_watch, "_collect_transfers", collect)
+    process = AsyncMock(return_value="refund_queued")
+    monkeypatch.setattr(ton_watch, "process_transfer", process)
+    try:
+        async with SessionLocal() as db:
+            db.add(WatcherState(key=ton_watch.CURSOR_KEY, value=str(base)))
+            await db.commit()
+
+        await ton_watch.watch_once()
+        async with SessionLocal() as db:
+            assert int((await db.get(WatcherState, CURSOR_KEY)).value) == base + 20
+            assert await ton_watch._read_scan_boost(db) == 2
+
+        await ton_watch.watch_once()
+        # Второй проход стартовал от границы покрытия минус окно перекрытия.
+        assert collect.await_args_list[1].args[0] <= base + 20
+        # Перевод из старого бэклога (ниже границы прошлого цикла) обработан.
+        assert [t.tx_hash for t in process.await_args_list[0].args[:1]] == ["deeper-1"]
+        async with SessionLocal() as db:
+            # Курсор не откатился назад, но граница покрытия уехала глубже.
+            assert int((await db.get(WatcherState, CURSOR_KEY)).value) == base + 20
+            gap = await ton_watch._read_scan_gap(db)
+            assert gap is not None and gap["floor"] == base + 1
+            assert await ton_watch._read_scan_boost(db) == 4
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_(
+                        [
+                            CURSOR_KEY,
+                            ton_watch.BEAT_KEY,
+                            ton_watch.SCAN_GAP_KEY,
+                            ton_watch.SCAN_BOOST_KEY,
+                            ton_watch.SOURCE_KEY,
+                        ]
+                    )
+                )
+            )
+            await db.commit()
+
+
+async def test_full_pass_clears_scan_gap_and_resets_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Окно дочитано — тревога гаснет, бюджет страниц возвращается к базовому."""
+    from app import ops, ton_watch
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    bot = SimpleNamespace(send_message=AsyncMock())
+    base = int(datetime.now(UTC).timestamp()) - 3_600
+    try:
+        async with SessionLocal() as db:
+            db.add(WatcherState(key=CURSOR_KEY, value=str(base)))
+            db.add(
+                WatcherState(
+                    key=ton_watch.SCAN_GAP_KEY,
+                    value=json.dumps({"since": base, "floor": base + 5, "at": "2024-01-01T00:00:00+00:00"}),
+                )
+            )
+            db.add(WatcherState(key=ton_watch.SCAN_BOOST_KEY, value="4"))
+            await db.commit()
+
+        # Полный проход без остаточной дыры.
+        monkeypatch.setattr(
+            ton_watch,
+            "_collect_transfers",
+            AsyncMock(return_value=([], True, "tonapi", None)),
+        )
+        await ton_watch.watch_once()
+
+        async with SessionLocal() as db:
+            assert await ton_watch._read_scan_gap(db) is None
+            assert await ton_watch._read_scan_boost(db) == 1
+
+        assert await ops.check_anomalies(bot=bot) == []
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_(
+                        [
+                            CURSOR_KEY,
+                            ton_watch.BEAT_KEY,
+                            ton_watch.SCAN_GAP_KEY,
+                            ton_watch.SCAN_BOOST_KEY,
+                            ton_watch.SOURCE_KEY,
+                        ]
+                    )
+                )
             )
             await db.commit()
 
