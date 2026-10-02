@@ -6,10 +6,10 @@ services:
     region: frankfurt
     buildCommand: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg && echo "deb http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg && apt-get update && apt-get install -y --no-install-recommends postgresql-client-17 && pip install -r requirements.txt
     startCommand: python -m app.main
-    # Токен защищает операционный снимок /health и /metrics (раньше был открыт).
-    # Render-проба — GET без заголовков, поэтому токен живёт прямо в пути и
-    # ДОЛЖЕН совпадать с HEALTH_TOKEN ниже (при ротации менять обе части).
-    healthCheckPath: /health?token=aAMO5HT2iNIVRD09yLs9x1iyh7tlH2KjWY7jW8Mrjsc
+    # Проба Render — GET без заголовков, поэтому она ходит на /alive: там нет
+    # ни снимка, ни секрета, и HEALTH_TOKEN не приходится держать в репозитории.
+    # Значение живёт в env Render (HEALTH_TOKEN ниже) и защищает /health + /metrics.
+    healthCheckPath: /alive
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"
@@ -37,12 +37,15 @@ services:
       - key: WEBHOOK_SECRET
         sync: false
       - key: HEALTH_TOKEN
-        # Доступ к /health и /metrics: мониторинг передаёт токен в
-        # Authorization: Bearer либо ?token=. Значение совпадает с
-        # healthCheckPath — ротация меняет обе части разом. Защищает только
-        # внутренний снимок (очередь выплат, возраст тика, watcher, тревоги),
-        # чей эндпоинт раньше был публичным.
-        value: "aAMO5HT2iNIVRD09yLs9x1iyh7tlH2KjWY7jW8Mrjsc"
+        # Доступ к операционному снимку: /health и /metrics принимают
+        # Authorization: Bearer <token> либо ?token=. Значение задаётся
+        # только в env Render и в репозитории не лежит: healthCheckPath
+        # смотрит на /alive, где секрета нет вовсе.
+        sync: false
+      # Явно, а не «как в коде по умолчанию»: /health и /metrics обязаны
+      # остаться закрытыми, даже если дефолт в app/config.py поменяют.
+      - key: HEALTH_REQUIRE_TOKEN
+        value: "true"
       - key: TON_ENABLED
         value: "false"
       - key: TON_NETWORK

@@ -49,6 +49,18 @@ def _authorized(request: web.Request) -> bool:
     return bool(expected) and supplied == expected
 
 
+async def alive(request: web.Request) -> web.Response:
+    """Живость процесса — без токена и без снимка, для health check Render.
+
+    Раньше проверка Render ходила на /health?token=<HEALTH_TOKEN>, и токен
+    приходилось держать в render.yaml открытым текстом (репозиторий публичный,
+    значение утекало всем желающим). Здесь нет ни секрета, ни данных: 200
+    значит только «процесс отвечает». Операционный снимок — на /health и
+    /metrics, они остаются под HEALTH_TOKEN.
+    """
+    return web.json_response({"status": "alive"})
+
+
 async def health(request: web.Request) -> web.Response:
     """Живость + операционный снимок: тик, очередь выплат, watcher, день.
 
@@ -333,6 +345,7 @@ async def run_webhook(bot, dispatcher) -> None:
     secret = settings.webhook_secret or None
     app = web.Application()
     app.router.add_get("/", health)
+    app.router.add_get("/alive", alive)
     app.router.add_get("/health", health)
     app.router.add_get("/metrics", metrics)
     SimpleRequestHandler(dispatcher=dispatcher, bot=bot, secret_token=secret).register(app, path=path)

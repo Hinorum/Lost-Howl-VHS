@@ -85,3 +85,25 @@ async def test_health_require_token_with_empty_token_locked(monkeypatch) -> None
     response = await main_module.health(_request())
     assert response.status == 401
     assert response.body == b"unauthorized"
+
+
+async def test_alive_open_without_token(monkeypatch) -> None:
+    """Проба Render ходит без заголовков: /alive отвечает и при пустом токене,
+    поэтому секрет не нужно держать в healthCheckPath репозитория."""
+    monkeypatch.setattr("app.config.settings.health_token", "")
+    monkeypatch.setattr("app.config.settings.health_require_token", True)
+    response = await main_module.alive(_request())
+    assert response.status == 200
+    assert b'alive' in response.body
+
+
+async def test_alive_never_leaks_snapshot(monkeypatch) -> None:
+    """Живость без данных: очередь выплат/тревоги в /alive попадать не должны."""
+    async def exploding_snapshot():
+        raise AssertionError("/alive не должен дёргать снимок БД")
+
+    monkeypatch.setattr("app.ops.snapshot", exploding_snapshot)
+    response = await main_module.alive(_request())
+    assert response.status == 200
+    for leaked in (b"problems", b"queue", b"last_tick_age", b"payout"):
+        assert leaked not in response.body
