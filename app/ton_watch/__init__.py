@@ -38,12 +38,20 @@ from app.ops import claim_once as claim_once  # noqa: F401  (тесты чист
 from app.ops import is_game_paused
 from app.payments import parse_bank_memo, parse_revote_memo, parse_verify_memo
 from app.stakes import confirm_stake, register_stake
-from app.ton_codec import api_headers, clean_comment, extract_comment, norm_tx_hash
+from app.ton_codec import (
+    api_headers,
+    clean_comment,
+    extract_comment,
+    norm_tx_hash,
+    tonapi_headers,
+)
 from app.ton_utils import from_nano, normalize_address, to_nano
 
 # Алиасы ton_codec живут в корне пакета: ими пользуются sources.py, а тесты
 # подменяют их через app.ton_watch. Приватное имя с подчёркиванием — историческое.
-_api_headers = api_headers
+_api_headers = api_headers  # Toncenter
+_tonapi_headers = tonapi_headers  # TonAPI (Bearer)
+_api_headers_tonapi = tonapi_headers  # устаревший алиас
 _norm_tx_hash = norm_tx_hash
 _clean_comment = clean_comment
 _decode_comment = extract_comment

@@ -88,12 +88,17 @@ async def fetch_recent_transfers(since_utime: int, before_lt: str | None = None)
         f"{settings.active_ton_api_base}/v2/blockchain/accounts/"
         f"{settings.active_treasury_address}/transactions"
     )
-    headers = _pkg._api_headers(settings.ton_api_key)
+    headers = getattr(_pkg, "_tonapi_headers", getattr(_pkg, "_api_headers_tonapi", _pkg._api_headers))(settings.ton_api_key)
     try:
         client = _pkg.get_http_client()
         response = await http_get_with_retry(
-            client, url,
-            params={"limit": _PAGE_LIMIT, "sort_order": "desc", **({"before_lt": before_lt} if before_lt else {})},
+            client,
+            url,
+            params={
+                "limit": _PAGE_LIMIT,
+                "sort_order": "desc",
+                **({"before_lt": before_lt} if before_lt else {}),
+            },
             headers=headers,
         )
         if response.status_code == 404:
@@ -147,7 +152,12 @@ async def _tonapi_account_info() -> dict | None:
     url = f"{settings.active_ton_api_base}/v2/accounts/{settings.active_treasury_address}"
     try:
         client = _pkg.get_http_client()
-        response = await http_get_with_retry(client, url, headers=_pkg._api_headers(settings.ton_api_key))
+        hdr = getattr(
+            _pkg,
+            "_tonapi_headers",
+            getattr(_pkg, "_api_headers_tonapi", _pkg._api_headers),
+        )(settings.ton_api_key)
+        response = await http_get_with_retry(client, url, headers=hdr)
     except Exception as exc:
         logger.warning("TonAPI не ответил на запрос карточки аккаунта: %s", exc)
         return None
@@ -268,7 +278,8 @@ async def _toncenter_page(since_utime: int, before_lt: str | None = None) -> tup
         params["before_lt"] = before_lt
     try:
         client = _pkg.get_http_client()
-        response = await http_get_with_retry(client, url, params=params, headers=_pkg._api_headers(settings.toncenter_api_key))
+        hdr = _pkg._api_headers(settings.toncenter_api_key)
+        response = await http_get_with_retry(client, url, params=params, headers=hdr)
         response.raise_for_status()
         items = response.json().get("transactions") or []
     except Exception as exc:

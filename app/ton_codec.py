@@ -27,8 +27,25 @@ _COMMENT_NOISE = str.maketrans(
 
 
 def api_headers(api_key: str) -> dict:
-    """Заголовок ключа для TonAPI/Toncenter; пустой ключ — без заголовка."""
+    """Заголовок ключа для Toncenter; пустой ключ — без заголовка.
+
+    Только Toncenter: v3 принимает `X-API-Key`. У TonAPI другой стандарт —
+    см. tonapi_headers.
+    """
     return {"X-API-Key": api_key} if api_key else {}
+
+
+def tonapi_headers(api_key: str) -> dict:
+    """Заголовок ключа для TonAPI; пустой ключ — без заголовка.
+
+    TonAPI авторизует по `Authorization: Bearer`, и `X-API-Key` вовсе не считает:
+    ключ, отправленный не тем заголовком, молча уходит в анонимный режим. На
+    практике это выглядит как «сломанный ключ», хотя он валиден — растолковывать
+    приходится по телу ответа. Признак анонимного режима — `limit must not
+    exceed 100: anonymous tier`: /v2/blockchain режет страницу до 100, тогда как
+    с ключом проходит и 1000, плюс снимается анонимный троттлинг 1 rps.
+    """
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
 def clean_comment(text: str) -> str:
