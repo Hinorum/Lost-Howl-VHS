@@ -1,6 +1,6 @@
 """Прозрачность для игроков: расписание суток, распределение фонда, /top."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from app.config import settings
@@ -10,11 +10,10 @@ async def test_start_explains_schedule_and_disclaimer(monkeypatch, tmp_path) -> 
     """Игрок с порога знает: когда итоги, куда уходит фонд и кто рискует."""
     from unittest.mock import AsyncMock as AM
 
+    from app import handlers as h
     from app.models import Card, Round, RoundStatus, WinRule
 
-    from app import handlers as h
-
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fake_round = Round(
         day_index=901,
         status=RoundStatus.OPEN,
@@ -51,7 +50,8 @@ async def test_start_explains_schedule_and_disclaimer(monkeypatch, tmp_path) -> 
     assert "час тайны урны" not in text
     assert "95%" in text
     assert "/top" in text
-    assert "не отвечают за утраченные средства" in text
+    assert "не отвечают" not in text
+    assert "утраченные средства" not in text
     assert "сам решаешь" in text
 
     # Без TON-экономики — ни фонда, ни /top, и дисклеймера про деньги нет:
@@ -66,7 +66,8 @@ async def test_start_explains_schedule_and_disclaimer(monkeypatch, tmp_path) -> 
     await h.cmd_start(message2)
     text2 = message2.answer.call_args_list[0].args[0]
     assert "/top" not in text2 and "95%" not in text2
-    assert "не отвечают за утраченные средства" not in text2
+    assert "не отвечают" not in text2
+    assert "утраченные средства" not in text2
 
 
 def test_format_top_lists_leaders_and_pot() -> None:
@@ -102,7 +103,7 @@ async def test_wallet_view_shows_distribution_and_dyor(session, monkeypatch) -> 
     for marker in ("95%", "1%", "2%", "0,5%", "Фонд Стаи", "копилка месяца", "пригласившим"):
         assert marker in text
     assert "возвращаются целиком" in text
-    assert "DYOR" in text and "не отвечают" in text
+    assert "DYOR" in text
 
 
 async def test_status_text_shows_results_time() -> None:
@@ -110,7 +111,7 @@ async def test_status_text_shows_results_time() -> None:
     from app.broadcast import status_text
     from app.models import Card, Round, RoundStatus, WinRule
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=3,
         status=RoundStatus.OPEN,

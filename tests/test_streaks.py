@@ -80,7 +80,7 @@ def test_streak_text_with_active_series():
     player = Player(current_streak=4, best_streak=6)
     text = streak_text(player)
     assert "Следопыт" in text
-    assert "Серия верных путей: 4" in text
+    assert "Серия верных сцен: 4" in text
     assert "Лучшая: 6" in text
     assert "Разведчик" in text
 
@@ -102,20 +102,20 @@ def test_streak_text_at_max_title():
 @pytest.mark.parametrize(
     "n,expected",
     [
-        (1, "путь"),
-        (21, "путь"),
-        (101, "путь"),
-        (2, "пути"),
-        (3, "пути"),
-        (4, "пути"),
-        (22, "пути"),
-        (0, "путей"),
-        (5, "путей"),
-        (11, "путей"),
-        (12, "путей"),
-        (13, "путей"),
-        (14, "путей"),
-        (25, "путей"),
+        (1, "сцена"),
+        (21, "сцена"),
+        (101, "сцена"),
+        (2, "сцены"),
+        (3, "сцены"),
+        (4, "сцены"),
+        (22, "сцены"),
+        (0, "сцен"),
+        (5, "сцен"),
+        (11, "сцен"),
+        (12, "сцен"),
+        (13, "сцен"),
+        (14, "сцен"),
+        (25, "сцен"),
     ],
 )
 def test_remaining_word_pluralization(n: int, expected: str):

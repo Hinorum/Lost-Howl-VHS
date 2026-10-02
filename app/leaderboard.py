@@ -32,13 +32,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import case, delete, func, or_, select, text
 
 from app.config import settings
+from app.core.registry import (
+    MARKER_KEY,
+    MONTH_CLAIM_WINDOW_KEY,
+    MONTH_READY_KEY,
+    WEEK_CLAIM_WINDOW_KEY,
+    WEEK_READY_KEY,
+    WEEKLY_MARKER_KEY,
+)
 from app.db import SessionLocal
 from app.models import (
     LeaderboardClaim,
@@ -51,14 +59,6 @@ from app.models import (
     Vote,
     WatcherState,
     WeeklyPot,
-)
-from app.core.registry import (
-    MARKER_KEY,
-    MONTH_CLAIM_WINDOW_KEY,
-    MONTH_READY_KEY,
-    WEEK_CLAIM_WINDOW_KEY,
-    WEEK_READY_KEY,
-    WEEKLY_MARKER_KEY,
 )
 from app.stakes import split_equal
 from app.ton_utils import to_nano
@@ -132,7 +132,7 @@ def _capped(expr, cap: int):
 
 def previous_month_key(now: datetime | None = None) -> str:
     """Ключ последнего ПОЛНОСТЬЮ прошедшего месяца («YYYY-MM»)."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return (first_of_month - timedelta(days=1)).strftime("%Y-%m")
 
@@ -176,7 +176,7 @@ async def _gram_contributions(
 ) -> dict[int, int]:
     """Проверенные суммы ставок игроков за период [period_start, period_end).
 
-    Тайбрейк при равенстве верных путей: выше тот, кто поставил больше (в
+    Тайбрейк при равенстве верных сцен: выше тот, кто поставил больше (в
     нанотонах). Считаем только confirmed — ставки, вернённые вручную (refunded)
     исключены: денежные средства были не в риске, и такие игроки не имеют
     права претендовать на лидербордные копилки. Ставка другого контура
@@ -256,12 +256,12 @@ async def _claim_times(session, kind: str, periods: list[str]) -> dict[int, date
     )
     claims: dict[int, datetime] = {}
     for pid, claimed in rows.all():
-        moment = claimed if claimed.tzinfo else claimed.replace(tzinfo=timezone.utc)
+        moment = claimed if claimed.tzinfo else claimed.replace(tzinfo=UTC)
         claims[int(pid)] = min(claims.get(int(pid), moment), moment)
     return claims
 
 
-_FAR_FUTURE = datetime(9999, 12, 31, tzinfo=timezone.utc)
+_FAR_FUTURE = datetime(9999, 12, 31, tzinfo=UTC)
 
 
 def _prize_tied_groups(
@@ -320,7 +320,7 @@ async def _open_claim_window(
     data = json.dumps({
         "period": period,
         "players": tied_player_ids,
-        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "opened_at": datetime.now(UTC).isoformat(),
     })
     row = await session.get(WatcherState, key)
     if row is None:
@@ -375,7 +375,7 @@ async def _notify_tied_players(
     )
     text = (
         f"🏆 Ничья за призовые места leaderboard {human}!\n\n"
-        "Ты и ещё кто-то набрали одинаковые верные пути и вклад Gram. "
+        "Ты и ещё кто-то набрали одинаковые верные сцены и вклад Gram. "
         "Чтобы решить, кто выше — нажми кнопку заявки ниже. "
         "Кто раньше нажал — тот выше. "
         f"Дедлайм: {settings.claim_window_hours}ч."
@@ -449,7 +449,7 @@ async def _resolve_claim_window(
     try:
         opened_at = datetime.fromisoformat(opened_at_str)
         if opened_at.tzinfo is None:
-            opened_at = opened_at.replace(tzinfo=timezone.utc)
+            opened_at = opened_at.replace(tzinfo=UTC)
     except (ValueError, TypeError):
         opened_at = now
     deadline_passed = (
@@ -527,21 +527,33 @@ def is_last_day_of_week(moment: datetime) -> bool:
 
 
 async def mark_month_leaderboard_ready(session, month_key: str) -> None:
-    """Отмечает, что эпилог последнего дня месяца написан — лидерборд может выплачиваться."""
+    """Отмечает, что эпилог последнего дня месяца написан — лидерборд может выплачиваться.
+
+    Коммитит СЕБЯ: вызывающие сессии (планировщик _finalize_new_day_job, /advance)
+    после этого шага могут закрыться откатом — иначе метка теряется, а копилка
+    месяца остаётся невыплачиваемой навсегда и без единой тревоги.
+    """
     marker = await session.get(WatcherState, MONTH_READY_KEY)
     if marker is None:
         session.add(WatcherState(key=MONTH_READY_KEY, value=month_key))
     else:
         marker.value = month_key
+    await session.commit()
 
 
 async def mark_week_leaderboard_ready(session, week_key: str) -> None:
-    """Отмечает, что эпилог последнего дня недели написан — лидерборд может выплачиваться."""
+    """Отмечает, что эпилог последнего дня недели написан — лидерборд может выплачиваться.
+
+    Коммитит СЕБЯ (см. mark_month_leaderboard_ready): планировщик закрывает свою
+    сессию без коммита после этого шага — без внутреннего commit флаг недели
+    исчезал бы, и недельная копилка (2% банка) зависала навсегда.
+    """
     marker = await session.get(WatcherState, WEEK_READY_KEY)
     if marker is None:
         session.add(WatcherState(key=WEEK_READY_KEY, value=week_key))
     else:
         marker.value = week_key
+    await session.commit()
 
 
 async def mark_leaderboards_for_finished(session, finished) -> None:
@@ -589,7 +601,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
     месяца. Это гарантирует, что лидерборд не сработает раньше завершения
     нарративной части дня.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     prev_key = previous_month_key(now)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
@@ -618,7 +630,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
         period_start = month_start
         if pots:
             year, mon = map(int, pots[0].month.split("-"))
-            period_start = datetime(year, mon, 1, tzinfo=timezone.utc)
+            period_start = datetime(year, mon, 1, tzinfo=UTC)
 
         # Последние дни месяца ещё не финализированы (долгий тик, сбой) —
         # их вклад в копилку может быть недолит. Как в неделе: платим только
@@ -672,6 +684,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                 if (
                     player is not None
                     and player.wallet_address
+                    and player.wallet_verified
                     and pid in staked
                 ):
                     candidates.append((pid, score, gram, player.wallet_address))
@@ -679,7 +692,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                     skipped += 1
             if not candidates:
                 logger.warning(
-                    "Копилка %d нанотонов ждёт: у топ-%d лидеров нет кошелька/ставки",
+                    "Копилка %d нанотонов ждёт: у топ-%d лидеров нет подтверждённого кошелька/ставки",
                     total, top_k,
                 )
                 return False
@@ -719,6 +732,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                 if (
                     player is not None
                     and player.wallet_address
+                    and player.wallet_verified
                     and player_id in staked
                 ):
                     wallets[player_id] = player.wallet_address
@@ -727,7 +741,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             if not payable_ids:
                 # Платить некому: метку НЕ двигаем, копилка ждёт следующего цикла.
                 logger.warning(
-                    "Копилка %d нанотонов ждёт: у лидеров (%s) нет привязанного кошелька "
+                    "Копилка %d нанотонов ждёт: у лидеров (%s) нет подтверждённого кошелька "
                     "или ставки в этом месяце",
                     total,
                     [pid for pid, _ in winners] or "нет голосов",
@@ -909,7 +923,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
     который ставится в _finalize_new_day_job() при записи эпилога последнего дня
     недели (воскресенья).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     prev_key = previous_week_key(now)
 
     async with SessionLocal() as session:
@@ -994,7 +1008,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
             if correct <= 0 or days < min_days or pid not in staked:
                 continue
             player = await session.get(Player, pid)
-            if player is None or not player.wallet_address:
+            if player is None or not player.wallet_address or not player.wallet_verified:
                 continue
             candidates.append((pid, correct, gram, player.wallet_address))
         # Полный порядок (с Claim-тайбрейком) нужен для поиска ничьей на
@@ -1005,8 +1019,8 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         if not places:
             # Достойных нет: метку НЕ двигаем, копилка ждёт следующей недели.
             logger.warning(
-                "Копилка недели %d нанотонов ждёт: нет игроков с кошельком, %s+ днями голосования "
-                "и ставкой за неделю%s",
+                "Копилка недели %d нанотонов ждёт: нет игроков с подтверждённым кошельком, "
+                "%s+ днями голосования и ставкой за неделю%s",
                 total,
                 min_days or settings.weekly_min_days,
                 " (короткая стартовая неделя — порог снят)" if relaxed else "",
@@ -1045,7 +1059,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
                 or (name_row.first_name if name_row else None)
                 or f"игрок {pid}"
             )
-            paid.append((_MEDALS[place - 1], f"{name} — {correct} верных путей", amount))
+            paid.append((_MEDALS[place - 1], f"{name} — {correct} верных сцен", amount))
 
         # Места без достойного игрока переносятся в копилку новой недели.
         if rolled > 0:
@@ -1076,7 +1090,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
     for medal, name, amount in paid:
         lines.append(f"{medal} {name} — {amount / 1e9:.2f} Gram")
     lines.append(
-        "При равенстве верных путей Стая смотрит на вклад Gram, а затем — "
+        "При равенстве верных сцен Стая смотрит на вклад Gram, а затем — "
         "кто раньше всех заявил о месте."
     )
     if nomination:

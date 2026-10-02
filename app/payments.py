@@ -65,3 +65,16 @@ def parse_verify_memo(memo: str | None) -> str | None:
     if match is None:
         return None
     return match.group(1).upper()
+
+
+def parse_bank_memo(memo: str | None) -> bool:
+    """Мемо капитала казны (bank:…) — внешнее пополнение, а не ставка.
+
+    Кошелёк может подмешать мусор (нулевые пробелы, перевод строки): принимаем
+    точное «bank» или слово после префикса bank:, без требований к остальному.
+    Деньги, пришедшие с этим мемо, watcher не возвращает и не считает ставкой
+    (банк дня не растёт), а пишет строкой входящего дохода — зеркало учитывает
+    их в тождестве «в ноль».
+    """
+    text = str(memo or "").replace(_ZERO_WIDTH, "").strip().lower()
+    return text == "bank" or text.startswith("bank:")

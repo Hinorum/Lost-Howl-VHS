@@ -1,6 +1,6 @@
 # Диалог привязки кошелька: следующее сообщение игрока — это адрес.
-# Регистрируется ПОСЛЕДНИМ (импортируется в __init__ последним), чтобы
-# команды перехватывались своими обработчиками раньше.
+# Хендлер вешается явно через register_private_fallback() в конце
+# app.handlers, после команд: isort иначе ставит этот модуль раньше player.
 from __future__ import annotations
 
 import logging
@@ -16,8 +16,23 @@ from .wallet import _bind_wallet
 
 logger = logging.getLogger(__name__)
 
+_FALLBACK_REGISTERED = False
 
-@router.message(F.chat.type == ChatType.PRIVATE)
+
+def register_private_fallback() -> None:
+    """Catch-all ЛС — строго после команд: иначе /help глотается молча.
+
+    Декоратор @router.message в этом модуле нельзя: isort поднимает
+    `from .fallback` раньше player/wallet, и первый подходящий хендлер
+    выигрывает. Регистрируем явно из пакета, когда все команды уже на роутере.
+    """
+    global _FALLBACK_REGISTERED
+    if _FALLBACK_REGISTERED:
+        return
+    router.message.register(on_private_fallback, F.chat.type == ChatType.PRIVATE)
+    _FALLBACK_REGISTERED = True
+
+
 async def on_private_fallback(message: Message) -> None:
     """Диалог привязки кошелька: следующее сообщение игрока — это адрес.
 

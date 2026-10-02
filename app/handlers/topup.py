@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
@@ -63,13 +64,13 @@ async def _revote_status(user) -> tuple[str, int | None]:
         player = await upsert_player(session, user)
         round_row = await get_active_round(session)
         if round_row is None or round_row.status != RoundStatus.OPEN:
-            return f"{warn_mark('revote-closed')} День закрыт — путь уже не сменить.", None
+            return f"{warn_mark('revote-closed')} Кадр уже записан — перемотать нельзя.", None
         vote = await get_vote(session, round_row.id, player.id)
         if vote is None:
-            return f"{hint_mark('revote-free')} Ты ещё не выбрал путь сегодня — первый выбор бесплатный.", None
+            return f"{hint_mark('revote-free')} Ты ещё не сделал выбор дня — первая запись бесплатная.", None
         return (
-            f"{path_mark('care', str(player.id))} Сегодня твой путь: {POSITIONS[vote.card_position]}. "
-            "Оплати смену и нажми другую карту. Грант действует до закрытия дня.",
+            f"{path_mark('care', str(player.id))} Сегодня твой выбор: {POSITIONS[vote.card_position]}. "
+            "Оплати перемотку кадра и нажми другой вариант. Грант действует до конца дня.",
             round_row.id,
         )
 
@@ -77,20 +78,20 @@ async def _revote_status(user) -> tuple[str, int | None]:
 @router.message(Command("change"))
 async def cmd_change(message: Message) -> None:
     if not settings.revote_enabled:
-        await message.answer(f"{warn_mark('revote-off')} Смена выбора сейчас недоступна.")
+        await message.answer(f"{warn_mark('revote-off')} Перемотка кадра сейчас недоступна.")
         return
-    # Бесплатная версия (TON выключен): смены пути нет — платить нечем и незачем.
+    # Бесплатная версия (TON выключен): перемотки нет — платить нечем и незачем.
     if not settings.ton_enabled:
         await message.answer(
-            f"{warn_mark('revote-off')} Смена выбора недоступна в бесплатной версии: "
+            f"{warn_mark('revote-off')} Перемотка кадра недоступна в бесплатной версии: "
             "игра идёт без ставок и платных действий."
         )
         return
-    # Версия без ставок: смена выбора за валюту/звёзды выключена целиком.
+    # Версия без ставок: перемотка за валюту/звёзды выключена целиком.
     if await _active_round_money_mode() is False:
         await message.answer(
             f"{warn_mark('revote-off')} Игра идёт в версии без ставок: "
-            "смена выбора недоступна — первый выбор и есть твой выбор."
+            "перемотка кадра недоступна — первая запись и есть твой кадр."
         )
         return
     status, round_id = await _revote_status(message.from_user)
@@ -98,12 +99,12 @@ async def cmd_change(message: Message) -> None:
         await message.answer(status)
         if round_id is not None:
             await message.answer(
-                "Выбери способ оплаты:\n\n"
+                "Выбери способ оплаты перемотки:\n\n"
                 "⭐ <b>Stars</b> — надёжно и мгновенно (кнопка оплаты в Telegram).\n"
                 "💎 <b>Gram</b> — перевод казначею: от "
                 f"{settings.revote_ton:g} до {_revote_gram_ceiling():g} Gram (строго меньше минимума ставки "
                 f"{settings.stake_min_ton:g} Gram). Мемо не обязателен: сумма из вилки "
-                "зачтётся сама как оплата смены. Если приложишь комментарий — "
+                "зачтётся сама как оплата перемотки кадра. Если приложишь комментарий — "
                 "бот найдёт `rv:день` в любой части текста, даже с подписью кошелька.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_revote_keyboard(round_id),
@@ -111,8 +112,8 @@ async def cmd_change(message: Message) -> None:
         return
     # В группе деталей не даём: только приватная кнопка — как у /score и /wallet.
     await message.answer(
-        "Смена пути видна только тебе — нажми кнопку.",
-        reply_markup=_personal_keyboard("change:view", "Сменить выбор"),
+        "Перемотка кадра видна только тебе — нажми кнопку.",
+        reply_markup=_personal_keyboard("change:view", "Перемотать кадр"),
     )
 
 
@@ -139,7 +140,7 @@ async def on_paystars(callback: CallbackQuery) -> None:
     # Версия без ставок: платная смена выбора не продаётся вовсе.
     if await _active_round_money_mode() is False:
         await callback.answer(
-            "Игра идёт в версии без ставок: смена выбора недоступна.",
+            "Игра идёт в версии без ставок: перемотка кадра недоступна.",
             show_alert=True,
         )
         return
@@ -150,11 +151,11 @@ async def on_paystars(callback: CallbackQuery) -> None:
         return
     await callback.bot.send_invoice(
         chat_id=callback.message.chat.id,
-        title="Смена пути",
-        description="Разовое право изменить выбор в сегодняшнем дне. Действует до закрытия дня.",
+        title="Перемотка кадра",
+        description="Разовое право переписать выбор в сегодняшнем кадре. Действует до конца дня.",
         payload=build_revote_payload(round_id),
         currency="XTR",
-        prices=[LabeledPrice(label="Смена пути", amount=settings.revote_stars)],
+        prices=[LabeledPrice(label="Перемотка кадра", amount=settings.revote_stars)],
     )
     await callback.answer()
 
@@ -176,7 +177,7 @@ async def on_pre_checkout(query: PreCheckoutQuery) -> None:
     if await _active_round_money_mode() is False:
         await query.answer(
             ok=False,
-            error_message="Игра перешла в версию без ставок — смена выбора отключена.",
+            error_message="Игра перешла в версию без ставок — перемотка кадра отключена.",
         )
         return
     await query.answer(ok=True)
@@ -221,7 +222,7 @@ async def on_successful_payment(message: Message) -> None:
         )
         await session.commit()
     if valid:
-        await message.answer(f"{ok_mark(str(round_id))} Оплачено ⭐ Нажми теперь на другую карту — выбор обновится.")
+        await message.answer(f"{ok_mark(str(round_id))} Оплачено ⭐ Нажми другой вариант — кадр перемотан.")
     else:
         await message.answer(
             f"{warn_mark('late-pay')} Оплата прошла, но день уже закрылся — грант сохранён. "
@@ -236,7 +237,7 @@ async def on_refunded_payment(message: Message) -> None:
     Если грант ещё не потрачен — он больше не даст сменить путь; если уже
     потрачен, смена пути остаётся, а хранитель получает алерт о расхождении.
     """
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime
 
     from app.ops import notify_admins
 
@@ -259,18 +260,21 @@ async def on_refunded_payment(message: Message) -> None:
             await session.execute(select(Income).where(Income.unit_ref == charge_id))
         ).scalar_one_or_none()
         if income is not None:
-            stamp = int(datetime.now(_tz.utc).timestamp())
+            stamp = int(datetime.now(UTC).timestamp())
             tail = f"refunded:{stamp}"
             income.note = (f"{income.note} | {tail}" if income.note else tail)[:200]
         await session.commit()
     try:
         await message.answer(
-            "↩️ Возврат звёзд проведён. Грант смены пути отозван."
+            "↩️ Возврат звёзд проведён. Грант на перемотку кадра отозван."
             if not spent_at_refund
-            else "↩️ Возврат проведён, но смена пути уже была использована — напишу хранителю."
+            else "↩️ Возврат проведён, но перемотка кадра уже была использована — напишу хранителю."
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Деньги уже возвращены и хранитель получит уведомление строкой ниже;
+        # не доставившийся ответ — не повод ронять обработчик. Но и не повод
+        # замолчать: причина может быть не блокировкой бота, а сбоем сети.
+        logger.debug("Возврат звёзд: ответ игроку не доставлен: %s", exc)
     bot = getattr(message, "bot", None)
     await notify_admins(
         bot,
@@ -299,10 +303,10 @@ async def on_payton(callback: CallbackQuery) -> None:
         f"Комментарий (memo) не обязателен — сумма из вилки зачтётся автоматически.\n"
         f"Можно приложить (бот распознает `rv:день` в любой части текста):\n<code>{revote_memo(int(raw))}</code>\n\n"
         "Эту сумму ставкой быть не может — потолок ниже минимума ставки. "
-        "Ровно 0.5 Gram не подойдёт: это уже минимальная ставка, а не оплата смены пути "
+        "Ровно 0.5 Gram не подойдёт: это уже минимальная ставка, а не оплата перемотки кадра "
         "(бот примет её как ставку дня). Если кошелёк приложит мемо — оплата привяжется "
         "мгновенно и любой суммой из вилки. Без мемо сумма из той же вилки зачтётся "
-        "автоматически. Грант придёт в течение минуты.\n\n"
+        "автоматически. Грант на перемотку придёт в течение минуты.\n\n"
         "💡 Надёжнее и без кошелька — Stars: кнопка оплаты прямо в Telegram.\n"
         "Кошелёк должен быть привязан: /wallet. Неиспользованный до конца дня грант сгорает.",
         parse_mode=ParseMode.HTML,

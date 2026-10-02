@@ -5,17 +5,16 @@ Revises: 2d4f3fbc1a33
 Create Date: 2026-09-17 08:37:58.627138
 
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = '4c9c12b66c56'
-down_revision: Union[str, Sequence[str], None] = '2d4f3fbc1a33'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = '2d4f3fbc1a33'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -69,7 +68,7 @@ def downgrade() -> None:
     sa.Column('earliest_day', sa.INTEGER(), nullable=False),
     sa.Column('status', sa.VARCHAR(length=16), nullable=False),
     sa.Column('surfaced_day', sa.INTEGER(), nullable=True),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('lore_echoes', schema=None) as batch_op:

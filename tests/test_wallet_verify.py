@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -29,7 +29,6 @@ from app.payments import parse_verify_memo
 from app.stakes import register_stake
 from app.ton_utils import friendly_address, normalize_address, to_nano
 from app.ton_watch import Transfer, process_transfer
-
 
 _uid = 920_000
 
@@ -84,7 +83,7 @@ async def _reset_player(uid: int) -> None:
 
 
 async def _open_round(day_index: int) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with SessionLocal() as session:
         # Идемпотентно: общая БД переживает прогоны, день открываем заново.
         await session.execute(delete(Round).where(Round.day_index == day_index))
@@ -168,7 +167,7 @@ async def test_watcher_verifies_and_refunds(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(0.2),
             comment="bv:abc123",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         ),
         bot=bot,
     )
@@ -212,7 +211,7 @@ async def test_watcher_verifies_bare_code(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(0.2),
             comment="ABC123",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         ),
         bot=bot,
     )
@@ -247,7 +246,7 @@ async def test_bare_code_ignores_spaces_and_zero_width(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(0.2),
             comment="   abc123\u200b  ",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         )
     )
     assert status.startswith("walletverify_")
@@ -282,7 +281,7 @@ async def test_wrong_code_refunds_and_explains_in_dm(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(0.2),
             comment="bv:XYZ789",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         ),
         bot=bot,
     )
@@ -322,7 +321,7 @@ async def test_dust_size_verify_mismatch_still_refunds(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(0.03),
             comment="bv:XYZ789",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         ),
         bot=bot,
     )
@@ -363,7 +362,7 @@ async def test_verification_kicks_dispatch_for_held(ton_on, monkeypatch) -> None
             source=raw,
             value_nanotons=to_nano(0.2),
             comment="ABC123",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         )
     )
     assert status.startswith("walletverify_")
@@ -393,7 +392,7 @@ async def test_watcher_ignores_wrong_code(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(0.2),
             comment="bv:XXXXXX",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         )
     )
     assert status == "refund_queued"
@@ -425,7 +424,7 @@ async def test_watcher_ignores_verify_from_foreign_address(ton_on) -> None:
             source=_raw(0xBEEF),
             value_nanotons=to_nano(0.2),
             comment="bv:ABC123",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         )
     )
     assert status == "refund_queued"
@@ -512,9 +511,9 @@ async def test_pending_verify_transfer_not_consumed_as_revote(ton_on) -> None:
             win_rule=WinRule.MAJORITY,
             chapter_title="t",
             chapter_text="x",
-            opens_at=datetime.now(timezone.utc),
-            voting_ends_at=datetime.now(timezone.utc) + timedelta(hours=20),
-            tally_ends_at=datetime.now(timezone.utc) + timedelta(hours=21),
+            opens_at=datetime.now(UTC),
+            voting_ends_at=datetime.now(UTC) + timedelta(hours=20),
+            tally_ends_at=datetime.now(UTC) + timedelta(hours=21),
         )
         session.add(round_row)
         await session.flush()
@@ -529,7 +528,7 @@ async def test_pending_verify_transfer_not_consumed_as_revote(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(settings.revote_ton),
             comment="ABC",  # не похоже на bv:ABC123 и не равно коду целиком
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         ),
         bot=bot,
     )
@@ -580,7 +579,7 @@ async def test_process_transfer_returns_stake_until_verified(ton_on) -> None:
             source=raw,
             value_nanotons=to_nano(0.5),
             comment="",
-            utime=int(datetime.now(timezone.utc).timestamp()),
+            utime=int(datetime.now(UTC).timestamp()),
         )
     )
     assert status == "refund_queued"

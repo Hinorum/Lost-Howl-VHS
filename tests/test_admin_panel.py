@@ -5,16 +5,17 @@
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+from sqlalchemy import select
 
 from app.config import settings
 from app.db import SessionLocal
 from app.handlers import _admin_panel_text, cmd_panel, on_panel_action
 from app.handlers import panel as panel_mod
 from app.models import Payout, Player, Round, RoundStatus, Stake, WinRule
-from sqlalchemy import select
 
 
 def make_message(uid: int) -> SimpleNamespace:
@@ -50,7 +51,7 @@ async def test_panel_builder_contains_core_sections(session, monkeypatch) -> Non
     """Панель читает ГЛОБАЛЬНУЮ базу (как прод): сеем туда и чистим после."""
     monkeypatch.setattr(settings, "admin_ids", "4242")
     monkeypatch.setattr(settings, "ton_enabled", True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with SessionLocal() as db:
         db.add(Round(
             day_index=97_500,
@@ -230,7 +231,7 @@ async def test_panel_shows_payout_breakdown_and_unprocessed(session, monkeypatch
 
     monkeypatch.setattr(settings, "admin_ids", "4242")
     monkeypatch.setattr(settings, "ton_enabled", True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     uid = 960_000 + int.from_bytes(os.urandom(2), "big")
     wallet = "0:" + "ef" * 32
     async with SessionLocal() as db:
@@ -274,7 +275,7 @@ async def test_panel_stakes_button_lists_unprocessed(monkeypatch) -> None:
     from sqlalchemy import delete as _d
 
     monkeypatch.setattr(settings, "admin_ids", "4242")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     uid = 961_000 + int.from_bytes(os.urandom(2), "big")
     async with SessionLocal() as db:
         db.add(Player(id=uid, username="staker"))
@@ -304,3 +305,19 @@ async def test_panel_stakes_button_lists_unprocessed(monkeypatch) -> None:
             await db.execute(_d(Round).where(Round.day_index == 97_601))
             await db.execute(_d(Player).where(Player.id == uid))
             await db.commit()
+
+
+def test_report_text_keeps_verdict_and_tail_when_overlong() -> None:
+    """Обрезка отчёта: вердикт «✅» и финальный статус переживают, режется середина."""
+    lines = [f"Замечание №{i}: " + "x" * 120 for i in range(60)]
+    lines.append("Проверено — файл не изменён.")
+    report = panel_mod._report_text("✅ ", lines)
+    assert len(report) <= 4000
+    assert report.startswith("✅ ")
+    assert report.endswith("Проверено — файл не изменён.")
+    assert "…" in report
+
+
+def test_report_text_short_report_untouched() -> None:
+    lines = ["Сценарий mel.json принят.", "Проверено — файл не изменён."]
+    assert panel_mod._report_text("✅ ", lines) == "✅ " + "\n".join(lines)

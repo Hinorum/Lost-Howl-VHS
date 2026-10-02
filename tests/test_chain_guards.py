@@ -9,7 +9,7 @@
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import delete as sa_delete
@@ -23,7 +23,7 @@ from app.ton_utils import to_nano
 
 
 def _closed_round(day_index: int) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Round(
         day_index=day_index,
         status=RoundStatus.CLOSED,
@@ -260,7 +260,8 @@ async def test_income_revotes_counted_in_expected_float(monkeypatch) -> None:
 
 async def test_treasury_diag_shows_watcher_aim_and_cursor(monkeypatch) -> None:
     """/treasury отвечает: куда смотрит watcher, курсор, жив ли цикл."""
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
 
     from app.db import SessionLocal
     from app.models import WatcherState
@@ -268,7 +269,7 @@ async def test_treasury_diag_shows_watcher_aim_and_cursor(monkeypatch) -> None:
     from app.ton_watch import BEAT_KEY, CURSOR_KEY, SOURCE_KEY
 
     async with SessionLocal() as db:
-        now = _dt.now(timezone.utc)
+        now = _dt.now(UTC)
         db.add(WatcherState(key=CURSOR_KEY, value=str(int((now - _td(seconds=30)).timestamp()))))
         db.add(WatcherState(key=BEAT_KEY, value=(now - _td(seconds=25)).isoformat()))
         db.add(WatcherState(key=SOURCE_KEY, value="tonapi"))
@@ -287,9 +288,9 @@ async def test_treasury_diag_shows_watcher_aim_and_cursor(monkeypatch) -> None:
 
     # Курсор в будущем — диагностикa обязана кричать.
     async with SessionLocal() as db:
-        future = int((_dt.now(timezone.utc) + _td(minutes=10)).timestamp())
+        future = int((_dt.now(UTC) + _td(minutes=10)).timestamp())
         db.add(WatcherState(key=CURSOR_KEY, value=str(future)))
-        db.add(WatcherState(key=BEAT_KEY, value=(_dt.now(timezone.utc) - _td(seconds=5)).isoformat()))
+        db.add(WatcherState(key=BEAT_KEY, value=(_dt.now(UTC) - _td(seconds=5)).isoformat()))
         await db.commit()
         try:
             text = await treasury_diagnostics()

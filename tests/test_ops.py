@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,10 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import ton_pay
 from app.config import settings
-from app.core.registry import MONTH_CLAIM_WINDOW_KEY
+from app.core.registry import CURSOR_KEY, MONTH_CLAIM_WINDOW_KEY
 from app.db import SessionLocal
 from app.leaderboard import MARKER_KEY, MONTH_READY_KEY, previous_month_key, settle_month_if_due
-from app.payments import parse_revote_memo
 from app.models import (
     LeaderboardPot,
     Payout,
@@ -30,6 +29,7 @@ from app.models import (
     WatcherState,
     WinRule,
 )
+from app.payments import parse_revote_memo
 from app.ton_utils import to_nano
 
 
@@ -52,7 +52,7 @@ def _closed_round(day_index: int, tally_at: datetime) -> Round:
 
 async def _seed_expired_month_window(session: AsyncSession, period: str, players: list[int]) -> None:
     """Окно месячного Claim с истёкшим дедлайном: выплата может идти сразу."""
-    opened_at = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
+    opened_at = (datetime.now(UTC) - timedelta(hours=200)).isoformat()
     session.add(
         WatcherState(
             key=MONTH_CLAIM_WINDOW_KEY,
@@ -168,7 +168,7 @@ async def test_watch_once_advances_cursor_and_dedupes(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     # Свежие метки времени: древние переводы watcher больше не возвращает.
-    base = int(datetime.now(timezone.utc).timestamp()) - 3_600
+    base = int(datetime.now(UTC).timestamp()) - 3_600
     transfers = [
         ton_watch.Transfer(f"c-{i}", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 1 + i)
         for i in range(3)
@@ -213,7 +213,7 @@ async def test_watch_cursor_stops_on_failure(monkeypatch: pytest.MonkeyPatch) ->
     from app import ton_watch
 
     monkeypatch.setattr(settings, "ton_enabled", True)
-    base = int(datetime.now(timezone.utc).timestamp()) - 3_600
+    base = int(datetime.now(UTC).timestamp()) - 3_600
     bad = ton_watch.Transfer("bad-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base)
     good = ton_watch.Transfer("good-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 1)
     monkeypatch.setattr(
@@ -245,7 +245,7 @@ async def test_overlap_window_recovers_same_second_transfer(monkeypatch: pytest.
     from app import ton_watch
 
     monkeypatch.setattr(settings, "ton_enabled", True)
-    base = int(datetime.now(timezone.utc).timestamp()) - 3_600
+    base = int(datetime.now(UTC).timestamp()) - 3_600
     tx_same = ton_watch.Transfer("same-1", "0:" + os.urandom(32).hex(), to_nano(0.3), "", base + 5)
     tx_later = ton_watch.Transfer("later-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 6)
     fetch = AsyncMock(return_value=([tx_same, tx_later], True))
@@ -283,8 +283,8 @@ async def test_degraded_cycle_freezes_cursor(monkeypatch: pytest.MonkeyPatch) ->
     from app import ton_watch
 
     monkeypatch.setattr(settings, "ton_enabled", True)
-    base = int(datetime.now(timezone.utc).timestamp()) - 3_600
-    fetch = AsyncMock(return_value=([], False, "none"))
+    base = int(datetime.now(UTC).timestamp()) - 3_600
+    fetch = AsyncMock(return_value=([], False, "none", None))
     monkeypatch.setattr(ton_watch, "_collect_transfers", fetch)
     try:
         async with SessionLocal() as db:
@@ -303,14 +303,194 @@ async def test_degraded_cycle_freezes_cursor(monkeypatch: pytest.MonkeyPatch) ->
             await db.commit()
 
 
+async def test_scan_gap_moves_cursor_to_coverage_front_and_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Проход упёрся в бюджет страниц раньше курсора — входящие не теряются.
+
+    Раньше такой цикл считался полным: курсор уезжал по самой свежей
+    обработанной транзакции, а окно между ней и границей прочитанного
+    выпадало из чтения навсегда — без записи, без тревоги, при зелёном
+    /health. Теперь курсор встаёт на дно прочитанного (границу покрытия),
+    границы дыры записаны, бюджет страниц удвоен, админ получает алерт.
+    """
+    from app import ops, ton_watch
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    bot = SimpleNamespace(send_message=AsyncMock())
+    base = int(datetime.now(UTC).timestamp()) - 3_600
+    fresh = ton_watch.Transfer("fresh-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 10)
+    # Прочитали до base+10, но окно от старого курсора до base+5 не вычитали.
+    collect = AsyncMock(return_value=([fresh], True, "tonapi", base + 5))
+    monkeypatch.setattr(ton_watch, "_collect_transfers", collect)
+    monkeypatch.setattr(ton_watch, "process_transfer", AsyncMock(return_value="refund_queued"))
+    try:
+        async with SessionLocal() as db:
+            db.add(WatcherState(key=ton_watch.CURSOR_KEY, value=str(base)))
+            await db.commit()
+
+        await ton_watch.watch_once()
+
+        # since — с учётом окна перекрытия (курсор минус 90 с), а не сам курсор.
+        scanned_from = collect.await_args.args[0]
+        assert scanned_from < base
+        async with SessionLocal() as db:
+            cursor = await db.get(WatcherState, CURSOR_KEY)
+            # Курсор встал на границу покрытия: выше неё всё прочитано, ниже
+            # догонится следующими циклами. Уехать выше (base+10) он не может —
+            # тогда окно base+5..base+10 потерялось бы навсегда.
+            assert cursor is not None and int(cursor.value) == base + 5
+            assert await db.get(WatcherState, ton_watch.BEAT_KEY) is not None  # цикл при этом здоров
+            gap = await ton_watch._read_scan_gap(db)
+            assert gap is not None and gap["floor"] == base + 5
+            assert gap["since"] == scanned_from
+            assert await ton_watch._read_scan_boost(db) == 2  # бюджет страниц удвоен
+
+        problems = await ops.check_anomalies(bot=bot)
+        assert problems and "непрочитанное окно" in problems[0]
+        assert bot.send_message.await_count == 1
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_(
+                        [
+                            CURSOR_KEY,
+                            ton_watch.BEAT_KEY,
+                            ton_watch.SCAN_GAP_KEY,
+                            ton_watch.SCAN_BOOST_KEY,
+                            ops.ALERT_SCAN_GAP_KEY,
+                            ton_watch.SOURCE_KEY,
+                        ]
+                    )
+                )
+            )
+            await db.commit()
+
+
+async def test_scan_gap_backlog_drains_over_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Дыра не копится: следующий цикл читает от границы покрытия вглубь.
+
+    Бэклог глубже бюджета страниц не должен ни теряться, ни стоять на месте.
+    Курсор при этом не откатывается (он монотонный): покрытие догоняет сам
+    проход — он стартует от границы и уходит глубже, обрабатывая то, что ниже.
+    """
+    from app import ton_watch
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    base = int(datetime.now(UTC).timestamp()) - 3_600
+    deeper = ton_watch.Transfer("deeper-1", "0:" + os.urandom(32).hex(), to_nano(0.1), "", base + 2)
+    collect = AsyncMock(
+        side_effect=[
+            # Цикл 1: прочитали до base+20, курсор должен встать на base+20.
+            ([], True, "tonapi", base + 20),
+            # Цикл 2: следующий проход идёт уже от границы покрытия и читает глубже.
+            ([deeper], True, "tonapi", base + 1),
+        ]
+    )
+    monkeypatch.setattr(ton_watch, "_collect_transfers", collect)
+    process = AsyncMock(return_value="refund_queued")
+    monkeypatch.setattr(ton_watch, "process_transfer", process)
+    try:
+        async with SessionLocal() as db:
+            db.add(WatcherState(key=ton_watch.CURSOR_KEY, value=str(base)))
+            await db.commit()
+
+        await ton_watch.watch_once()
+        async with SessionLocal() as db:
+            assert int((await db.get(WatcherState, CURSOR_KEY)).value) == base + 20
+            assert await ton_watch._read_scan_boost(db) == 2
+
+        await ton_watch.watch_once()
+        # Второй проход стартовал от границы покрытия минус окно перекрытия.
+        assert collect.await_args_list[1].args[0] <= base + 20
+        # Перевод из старого бэклога (ниже границы прошлого цикла) обработан.
+        assert [t.tx_hash for t in process.await_args_list[0].args[:1]] == ["deeper-1"]
+        async with SessionLocal() as db:
+            # Курсор не откатился назад, но граница покрытия уехала глубже.
+            assert int((await db.get(WatcherState, CURSOR_KEY)).value) == base + 20
+            gap = await ton_watch._read_scan_gap(db)
+            assert gap is not None and gap["floor"] == base + 1
+            assert await ton_watch._read_scan_boost(db) == 4
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_(
+                        [
+                            CURSOR_KEY,
+                            ton_watch.BEAT_KEY,
+                            ton_watch.SCAN_GAP_KEY,
+                            ton_watch.SCAN_BOOST_KEY,
+                            ton_watch.SOURCE_KEY,
+                        ]
+                    )
+                )
+            )
+            await db.commit()
+
+
+async def test_full_pass_clears_scan_gap_and_resets_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Окно дочитано — тревога гаснет, бюджет страниц возвращается к базовому."""
+    from app import ops, ton_watch
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    bot = SimpleNamespace(send_message=AsyncMock())
+    base = int(datetime.now(UTC).timestamp()) - 3_600
+    try:
+        async with SessionLocal() as db:
+            db.add(WatcherState(key=CURSOR_KEY, value=str(base)))
+            db.add(
+                WatcherState(
+                    key=ton_watch.SCAN_GAP_KEY,
+                    value=json.dumps({"since": base, "floor": base + 5, "at": "2024-01-01T00:00:00+00:00"}),
+                )
+            )
+            db.add(WatcherState(key=ton_watch.SCAN_BOOST_KEY, value="4"))
+            await db.commit()
+
+        # Полный проход без остаточной дыры.
+        monkeypatch.setattr(
+            ton_watch,
+            "_collect_transfers",
+            AsyncMock(return_value=([], True, "tonapi", None)),
+        )
+        await ton_watch.watch_once()
+
+        async with SessionLocal() as db:
+            assert await ton_watch._read_scan_gap(db) is None
+            assert await ton_watch._read_scan_boost(db) == 1
+
+        assert await ops.check_anomalies(bot=bot) == []
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_(
+                        [
+                            CURSOR_KEY,
+                            ton_watch.BEAT_KEY,
+                            ton_watch.SCAN_GAP_KEY,
+                            ton_watch.SCAN_BOOST_KEY,
+                            ton_watch.SOURCE_KEY,
+                        ]
+                    )
+                )
+            )
+            await db.commit()
+
+
 async def test_watch_beats_on_quiet_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     """Тишина в цепочке — здоровье: сердцебиение ставится и без переводов.
 
     Именно этот кейс раньше порождал ложный алерт «watcher ещё ни разу не
     отмечал курсор»: курсор двигался только переводами.
     """
-    from app import ops
-    from app import ton_watch
+    from app import ops, ton_watch
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(
@@ -341,8 +521,7 @@ async def test_watch_beats_on_quiet_chain(monkeypatch: pytest.MonkeyPatch) -> No
 
 async def test_api_outage_does_not_beat_and_alerts(monkeypatch: pytest.MonkeyPatch) -> None:
     """TonAPI и Toncenter лежат вместе — сердцебиения нет, админ узнает об этом."""
-    from app import ops
-    from app import ton_watch
+    from app import ops, ton_watch
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "admin_ids", "42")
@@ -456,8 +635,8 @@ def test_old_or_empty_transactions_are_skipped() -> None:
 
 
 def test_previous_month_key() -> None:
-    assert previous_month_key(datetime(2026, 8, 22, tzinfo=timezone.utc)) == "2026-07"
-    assert previous_month_key(datetime(2026, 1, 5, tzinfo=timezone.utc)) == "2025-12"
+    assert previous_month_key(datetime(2026, 8, 22, tzinfo=UTC)) == "2026-07"
+    assert previous_month_key(datetime(2026, 1, 5, tzinfo=UTC)) == "2025-12"
 
 
 # ---------- Копилка месяца ----------
@@ -470,11 +649,11 @@ async def _seed_leaderboard_month(session: AsyncSession) -> tuple[int, dict]:
     wallet1 = "0:" + os.urandom(32).hex()
     session.add_all(
         [
-            Player(id=pid1, username=f"u{pid1}", wallet_address=wallet1),
+            Player(id=pid1, username=f"u{pid1}", wallet_address=wallet1, wallet_verified=True),
             Player(id=pid2, username=f"u{pid2}"),
         ]
     )
-    prev_month = datetime.now(timezone.utc).replace(day=1) - timedelta(days=5)
+    prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
     round_a = _closed_round(700_001, prev_month - timedelta(days=10))
     round_b = _closed_round(700_002, prev_month - timedelta(days=9))
     session.add_all([round_a, round_b])
@@ -566,11 +745,11 @@ async def test_monthly_pot_split_between_tied_leaders(monkeypatch: pytest.Monkey
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_a, username=f"u{pid_a}", wallet_address=wallet_a),
-                Player(id=pid_b, username=f"u{pid_b}", wallet_address=wallet_b),
+                Player(id=pid_a, username=f"u{pid_a}", wallet_address=wallet_a, wallet_verified=True),
+                Player(id=pid_b, username=f"u{pid_b}", wallet_address=wallet_b, wallet_verified=True),
             ]
         )
-        prev_month = datetime.now(timezone.utc).replace(day=1) - timedelta(days=5)
+        prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         round_row = _closed_round(702_001, prev_month - timedelta(days=2))
         session.add(round_row)
         await session.flush()
@@ -628,6 +807,76 @@ async def test_monthly_pot_split_between_tied_leaders(monkeypatch: pytest.Monkey
             await session.commit()
 
 
+async def test_monthly_pot_pays_verified_wallet_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Месячная копилка идёт только на подтверждённый (bv:) кошелёк лидера.
+
+    Топ верных путей с привязанным, но неподтверждённым адресом пропускается,
+    как и без кошелька: приз не должен уйти на чужой/недоказанный адрес, а
+    bounce без обработки сжёг бы горш молча.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    pid_shadow, pid_proven = 920_000, 920_001
+    wallet_proven = "0:" + os.urandom(32).hex()
+    prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                Player(id=pid_shadow, username="shadow", wallet_address="0:" + os.urandom(32).hex()),
+                Player(
+                    id=pid_proven, username="proven", wallet_address=wallet_proven, wallet_verified=True
+                ),
+            ]
+        )
+        rounds = [
+            _closed_round(703_001 + i, prev_month - timedelta(days=9 + i)) for i in range(5)
+        ]
+        session.add_all(rounds)
+        await session.flush()
+        # shadow — 5 верных из 5, proven — 3 из 5: без верификации лидер мимо.
+        plan = {pid_shadow: 5, pid_proven: 3}
+        for i, round_row in enumerate(rounds):
+            for pid, count in plan.items():
+                if i < count:
+                    session.add(Vote(round_id=round_row.id, player_id=pid, card_position=1))
+                session.add(
+                    Stake(
+                        round_id=round_row.id, player_id=pid,
+                        amount_nanotons=to_nano(1), tx_hash=f"tx_{i}_{pid}", status="confirmed",
+                    )
+                )
+        pot = LeaderboardPot(month=prev_month.strftime("%Y-%m"), nanotons=to_nano(1))
+        month_key = pot.month
+        session.add(pot)
+        session.add(WatcherState(key=MONTH_READY_KEY, value=previous_month_key()))
+        await session.commit()
+        try:
+            assert await settle_month_if_due(bot=None) is True
+            rows = (
+                (
+                    await session.execute(
+                        select(Payout).where(Payout.kind == "leaderboard").order_by(Payout.player_id.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert [p.player_id for p in rows] == [pid_proven]
+            assert rows[0].dest_address == wallet_proven and rows[0].amount_nanotons > 0
+        finally:
+            await session.execute(Payout.__table__.delete().where(Payout.kind == "leaderboard"))
+            await session.execute(LeaderboardPot.__table__.delete().where(LeaderboardPot.month == month_key))
+            await session.execute(WatcherState.__table__.delete().where(WatcherState.key == MARKER_KEY))
+            await session.execute(WatcherState.__table__.delete().where(WatcherState.key == MONTH_READY_KEY))
+            await session.execute(Vote.__table__.delete().where(Vote.player_id.in_([pid_shadow, pid_proven])))
+            await session.execute(Stake.__table__.delete().where(Stake.player_id.in_([pid_shadow, pid_proven])))
+            for round_row in rounds:
+                await session.delete(round_row)
+            for pid in (pid_shadow, pid_proven):
+                player = await session.get(Player, pid)
+                if player is not None:
+                    await session.delete(player)
+            await session.commit()
+
 async def test_monthly_pot_pays_top_k_by_weights(monkeypatch: pytest.MonkeyPatch) -> None:
     """Сглаживание дисперсии: топ-K месячной копилки делится по весам."""
     monkeypatch.setattr(settings, "ton_enabled", True)
@@ -641,13 +890,13 @@ async def test_monthly_pot_pays_top_k_by_weights(monkeypatch: pytest.MonkeyPatch
     wallet_a = "0:" + os.urandom(32).hex()
     wallet_b = "0:" + os.urandom(32).hex()
     async with SessionLocal() as session:
-        prev_month = datetime.now(timezone.utc).replace(day=1) - timedelta(days=5)
+        prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         ra = _closed_round(760_001, prev_month - timedelta(days=9))
         rb = _closed_round(760_002, prev_month - timedelta(days=8))
         session.add_all(
             [
-                Player(id=pid_a, username=f"a{pid_a}", wallet_address=wallet_a),
-                Player(id=pid_b, username=f"b{pid_b}", wallet_address=wallet_b),
+                Player(id=pid_a, username=f"a{pid_a}", wallet_address=wallet_a, wallet_verified=True),
+                Player(id=pid_b, username=f"b{pid_b}", wallet_address=wallet_b, wallet_verified=True),
             ]
         )
         session.add_all([ra, rb])
@@ -706,7 +955,7 @@ async def test_monthly_pot_carried_when_leader_has_no_wallet(
         # Только игрок без кошелька угадывает.
         pid = 920_000 + int.from_bytes(os.urandom(2), "big")
         session.add(Player(id=pid, username=f"u{pid}"))
-        prev_month = datetime.now(timezone.utc).replace(day=1) - timedelta(days=5)
+        prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         round_row = _closed_round(701_001, prev_month - timedelta(days=3))
         session.add(round_row)
         await session.flush()
@@ -736,9 +985,9 @@ async def test_monthly_pot_waits_when_leader_has_no_stake(monkeypatch: pytest.Mo
     async with SessionLocal() as session:
         pid = 950_000 + int.from_bytes(os.urandom(2), "big")
         session.add(
-            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex())
+            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True)
         )
-        prev_month = datetime.now(timezone.utc).replace(day=1) - timedelta(days=5)
+        prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         round_row = _closed_round(706_001, prev_month - timedelta(days=3))
         session.add(round_row)
         await session.flush()
@@ -772,7 +1021,7 @@ async def test_monthly_pot_waits_until_last_day_finalized(monkeypatch: pytest.Mo
     """
     monkeypatch.setattr(settings, "ton_enabled", True)
     async with SessionLocal() as session:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         prev_month = now.replace(day=1) - timedelta(days=5)
         unfinished = Round(
             day_index=704_001,
@@ -828,9 +1077,9 @@ async def test_monthly_pot_not_burned_by_empty_weights(monkeypatch: pytest.Monke
     pid = 959_000 + int.from_bytes(os.urandom(2), "big")
     async with SessionLocal() as session:
         session.add(
-            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex())
+            Player(id=pid, username=f"u{pid}", wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True)
         )
-        prev_month = datetime.now(timezone.utc).replace(day=1) - timedelta(days=5)
+        prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         round_row = _closed_round(705_001, prev_month - timedelta(days=3))
         session.add(round_row)
         await session.flush()
@@ -877,10 +1126,10 @@ async def test_monthly_pot_gram_tiebreak_at_third_place(monkeypatch: pytest.Monk
     wallets = {pid: "0:" + os.urandom(32).hex() for pid in pids}
     async with SessionLocal() as session:
         session.add_all(
-            Player(id=pid, username=f"p{i}", wallet_address=wallets[pid])
+            Player(id=pid, username=f"p{i}", wallet_address=wallets[pid], wallet_verified=True)
             for i, pid in enumerate(pids)
         )
-        prev_month = datetime.now(timezone.utc).replace(day=1) - timedelta(days=5)
+        prev_month = datetime.now(UTC).replace(day=1) - timedelta(days=5)
         rounds: list[Round] = []
         for i in range(5):
             round_row = _closed_round(707_001 + i, prev_month - timedelta(days=9 + i))
@@ -941,7 +1190,7 @@ async def test_monthly_pot_ignores_already_settled_months(
     pid_champ = 940_000 + int.from_bytes(os.urandom(2), "big")
     pid_new = pid_champ + 1
     wallet_new = "0:" + os.urandom(32).hex()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     prev_first = (now.replace(day=1) - timedelta(days=1)).replace(
         day=1, hour=0, minute=0, second=0, microsecond=0
     )
@@ -950,7 +1199,7 @@ async def test_monthly_pot_ignores_already_settled_months(
         session.add_all(
             [
                 Player(id=pid_champ, username=f"u{pid_champ}"),
-                Player(id=pid_new, username=f"u{pid_new}", wallet_address=wallet_new),
+                Player(id=pid_new, username=f"u{pid_new}", wallet_address=wallet_new, wallet_verified=True),
             ]
         )
         # Чемпион: 2 верных в позапрошлом месяце (вне окна выплат).
@@ -1012,7 +1261,7 @@ async def test_monthly_pot_ignores_already_settled_months(
 
 
 def _open_round(day_index: int) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Round(
         day_index=day_index,
         status=RoundStatus.OPEN,
@@ -1028,10 +1277,9 @@ def _open_round(day_index: int) -> Round:
 
 async def _fresh_watcher_marks() -> None:
     """Свежие тик и сердцебиение: фоновые алерты watcher'а не спамят в тесте."""
-    from app import ops
-    from app import ton_watch
+    from app import ops, ton_watch
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     async with SessionLocal() as db:
         await db.execute(
             WatcherState.__table__.delete().where(
@@ -1057,7 +1305,7 @@ async def test_snapshot_reports_unprocessed_and_payout_by_kind(
     monkeypatch.setattr(settings, "ton_enabled", True)
     uid = 950_000 + int.from_bytes(os.urandom(2), "big")
     wallet = "0:" + os.urandom(16).hex()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old = now - timedelta(hours=2)
     async with SessionLocal() as db:
         db.add(Player(id=uid, username=f"u{uid}", wallet_address=wallet))
@@ -1097,6 +1345,29 @@ async def test_snapshot_reports_unprocessed_and_payout_by_kind(
             await db.commit()
 
 
+async def test_snapshot_status_is_honest_about_problems(monkeypatch) -> None:
+    """/health не врёт «ok» при живых проблемах или серии падений тика."""
+    from app import ops
+
+    async with SessionLocal() as db:
+        await ops._store_problems(db, ["очередь выплат стоит"])
+    try:
+        payload = await ops.snapshot()
+        assert payload["status"] == "degraded"
+        assert payload["problems"]  # сам вердикт тоже виден
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_([ops.OPS_PROBLEMS_KEY, ops.OPS_PROBLEMS_AT_KEY])
+                )
+            )
+            await db.commit()
+    # Чистое состояние — снова честный «ok».
+    payload = await ops.snapshot()
+    assert payload["status"] == "ok"
+
+
 async def test_stuck_refund_alert_is_targeted(monkeypatch: pytest.MonkeyPatch) -> None:
     """Возврат ставки, что так и не ушёл, будит хранителя конкретным алертом."""
     from app import ops
@@ -1112,7 +1383,7 @@ async def test_stuck_refund_alert_is_targeted(monkeypatch: pytest.MonkeyPatch) -
             Payout(round_id=None, player_id=uid, kind="refund",
                    amount_nanotons=to_nano(0.4), dest_address=wallet,
                    status="pending",
-                   created_at=datetime.now(timezone.utc) - timedelta(hours=3))
+                   created_at=datetime.now(UTC) - timedelta(hours=3))
         )
         await db.commit()
     try:
@@ -1152,7 +1423,7 @@ async def test_unprocessed_pending_stakes_alert(monkeypatch: pytest.MonkeyPatch)
         db.add(
             Stake(round_id=rnd.id, player_id=uid, amount_nanotons=to_nano(0.2),
                   tx_hash="pending-tx", status="pending",
-                  created_at=datetime.now(timezone.utc) - timedelta(minutes=15))
+                  created_at=datetime.now(UTC) - timedelta(minutes=15))
         )
         await db.commit()
     try:

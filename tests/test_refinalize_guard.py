@@ -5,10 +5,11 @@
 Повтор невозможен только пока ни одна строка раунда не ушла в сеть.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from sqlalchemy import select
 
 from app.config import settings
@@ -27,7 +28,7 @@ def make_message(uid: int, day: int) -> SimpleNamespace:
     )
 
 
-async def _seed_closed_round(session, day_index: int, *, has_sent: bool) -> int:
+async def _seed_closed_round(session, day_index: int, *, payout_status: str = "pending") -> int:
     round_row = Round(
         day_index=day_index,
         status=RoundStatus.CLOSED,
@@ -35,9 +36,9 @@ async def _seed_closed_round(session, day_index: int, *, has_sent: bool) -> int:
         chapter_title="Эхо",
         chapter_text="т",
 
-        opens_at=datetime.now(timezone.utc),
-        voting_ends_at=datetime.now(timezone.utc),
-        tally_ends_at=datetime.now(timezone.utc),
+        opens_at=datetime.now(UTC),
+        voting_ends_at=datetime.now(UTC),
+        tally_ends_at=datetime.now(UTC),
         payouts_finalized=True,
     )
     session.add(round_row)
@@ -49,7 +50,7 @@ async def _seed_closed_round(session, day_index: int, *, has_sent: bool) -> int:
             kind="prize",
             amount_nanotons=1_000_000_000,
             dest_address="0:" + "11" * 32,
-            status="sent" if has_sent else "pending",
+            status=payout_status,
         )
     )
     await session.commit()
@@ -59,7 +60,7 @@ async def _seed_closed_round(session, day_index: int, *, has_sent: bool) -> int:
 async def test_refinalize_refuses_when_anything_sent(monkeypatch) -> None:
     monkeypatch.setattr(settings, "admin_ids", "4242")
     async with SessionLocal() as session:
-        round_id = await _seed_closed_round(session, 420, has_sent=True)
+        round_id = await _seed_closed_round(session, 420, payout_status="sent")
 
     msg = make_message(4242, 420)
     await cmd_refinalize(msg)
@@ -83,7 +84,7 @@ async def test_refinalize_refuses_when_anything_sent(monkeypatch) -> None:
 async def test_refinalize_proceeds_when_nothing_sent(monkeypatch) -> None:
     monkeypatch.setattr(settings, "admin_ids", "4242")
     async with SessionLocal() as session:
-        round_id = await _seed_closed_round(session, 421, has_sent=False)
+        round_id = await _seed_closed_round(session, 421, payout_status="pending")
 
     msg = make_message(4242, 421)
     await cmd_refinalize(msg)
@@ -99,6 +100,34 @@ async def test_refinalize_proceeds_when_nothing_sent(monkeypatch) -> None:
     # (атомарный UPDATE ставит флаг True в начале повторной финализации).
     assert row.payouts_finalized is True
     assert [p.status for p in payouts] == ["dismissed"]
+    async with SessionLocal() as session:
+        await session.delete(await session.get(Round, round_id))
+        payout = (await session.execute(select(Payout).where(Payout.round_id == round_id))).scalar_one()
+        await session.delete(payout)
+        await session.commit()
+
+
+@pytest.mark.parametrize("payout_status", ["sending"])
+async def test_refinalize_refuses_when_any_payout_moved(monkeypatch, payout_status) -> None:
+    """sending (вещание ушло, коммит ещё нет) — деньги уже двинулись:
+    перефинализация должна отказываться, иначе — вторая выплата той же суммы
+    (другой payout.id, анти-дубль по memo слеп)."""
+    monkeypatch.setattr(settings, "admin_ids", "4242")
+    async with SessionLocal() as session:
+        round_id = await _seed_closed_round(session, 422, payout_status=payout_status)
+
+    msg = make_message(4242, 422)
+    await cmd_refinalize(msg)
+
+    body = msg.answer.call_args.args[0]
+    assert "отменена" in body
+    async with SessionLocal() as session:
+        row = await session.get(Round, round_id)
+        payout = (
+            await session.execute(select(Payout).where(Payout.round_id == round_id))
+        ).scalar_one()
+    assert row.payouts_finalized is True  # флаг не сброшен
+    assert payout.status == payout_status  # строка не пересоздана и не dismissed
     async with SessionLocal() as session:
         await session.delete(await session.get(Round, round_id))
         payout = (await session.execute(select(Payout).where(Payout.round_id == round_id))).scalar_one()

@@ -46,7 +46,7 @@ if settings.async_database_url.startswith("postgresql"):
         try:
             dbapi_conn.rollback()
         except Exception:
-            pass
+            logger.warning("Пул отдал подключение с зависшей транзакцией — rollback не удался", exc_info=True)
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -152,7 +152,7 @@ async def _stamp_alembic_head(conn) -> None:
     try:
         head = _alembic_head()
     except Exception:
-        logger.warning("alembic head не читается — stamp пропущен")
+        logger.warning("alembic head не читается — stamp пропущен", exc_info=True)
         return
     await conn.execute(
         text(

@@ -8,7 +8,7 @@
 - возвраты (никто не угадал / отклонённые ставки) остаются полными.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -22,7 +22,7 @@ from app.ton_utils import to_nano
 
 
 async def make_closed_round(session: AsyncSession, winner_card: int, day_index: int = 1) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=day_index,
         status=RoundStatus.CLOSED,

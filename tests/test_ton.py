@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import stakes as stakes_mod
 from app.config import settings
 from app.models import Payout, Player, Round, RoundStatus, Stake, Vote, WinRule
-from app.ton_utils import from_nano, friendly_address, is_valid_ton_address, normalize_address, to_nano
+from app.ton_utils import friendly_address, from_nano, is_valid_ton_address, normalize_address, to_nano
 from app.weeks import iso_week_key
-
 
 USER_FRIENDLY = "EQDKbjIcfM6ezt8KjKJJLshZJJSqX7XOA4ff-W72r5gqPrHF"
 RAW = "0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e"
@@ -140,7 +139,7 @@ def test_split_pot_edge_cases() -> None:
 async def make_closed_round(
     session: AsyncSession, winner_card: int, day_index: int = 1
 ) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=day_index,
         status=RoundStatus.CLOSED,
@@ -163,7 +162,7 @@ async def test_register_stake_flow(session: AsyncSession, monkeypatch: pytest.Mo
     monkeypatch.setattr(settings, "ton_enabled", True)
     player = Player(id=11, username="u")
     session.add(player)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=1,
         status=RoundStatus.OPEN,
@@ -219,6 +218,51 @@ async def test_register_stake_flow(session: AsyncSession, monkeypatch: pytest.Mo
     await session.commit()
     monkeypatch.setattr(settings, "ton_enabled", True)
     assert await stakes_mod.register_stake(session, round_row, fourth, to_nano(1), "tx7") == "closed"
+
+
+async def test_dust_refund_waits_for_unverified_wallet(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Пылевой возврат не уходит на недоказанный bv: адрес.
+
+    Привязка сама по себе не доказывает владение: после перепривязки на чужой
+    адрес пыль ушла бы в bounce. Поэтому dest пустой — сумма не теряется, её
+    подставит _hydrate_player_dests, когда игрок подтвердит кошелёк. Ставку
+    при этом не блокируем: это возврат, а не приём денег.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    now = datetime.now(UTC)
+    round_row = Round(
+        day_index=555,
+        status=RoundStatus.OPEN,
+        win_rule=WinRule.MAJORITY,
+        chapter_title="t",
+        chapter_text="x",
+        opens_at=now - timedelta(hours=1),
+        voting_ends_at=now + timedelta(hours=1),
+        tally_ends_at=now + timedelta(hours=2),
+    )
+    session.add(round_row)
+    player = Player(id=91, username="dust", wallet_address="EQforeign", wallet_verified=False)
+    session.add(player)
+    await session.commit()
+
+    assert await stakes_mod.register_stake(session, round_row, player, to_nano(0.01), "dust-1") == "too_small"
+    assert await stakes_mod.register_stake(session, round_row, player, to_nano(2), "dust-2") == "ok"
+
+    refund = (
+        await session.execute(
+            select(Payout).where(Payout.kind == "refund", Payout.player_id == 91)
+        )
+    ).scalar_one()
+    # Ждёт подтверждения, а не улетает на перепривязанный адрес.
+    assert refund.dest_address == ""
+    assert refund.amount_nanotons == stakes_mod.refund_net_amount(to_nano(0.01))
+    # Валидная ставка на месте — возврат не должен был её сломать.
+    stake_row = (
+        await session.execute(select(Stake).where(Stake.tx_hash == "dust-2"))
+    ).scalar_one()
+    assert stake_row.status == "pending" and stake_row.amount_nanotons == to_nano(2)
 
 
 def test_split_equal_dust_to_smallest_id() -> None:
@@ -496,7 +540,7 @@ async def test_register_stamps_active_network(session: AsyncSession, monkeypatch
     monkeypatch.setattr(settings, "ton_network", "testnet")
     player = Player(id=21, wallet_address="w")
     session.add(player)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=2,
         status=RoundStatus.OPEN,
@@ -547,8 +591,61 @@ async def test_confirm_stake_respects_network(
     assert await stakes_mod.confirm_stake(session, "tx-cross") is True
 
 
+async def test_confirm_stake_race_with_manual_refund_keeps_refunded(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Гонка «ручной возврат VS подтверждение»: возврат ставит refunded в ЯВНОМ
+    UPDATE между выборкой ставки и записью подтверждения. Без WHERE pending в
+    claim свип/конфирмация перезаписали бы refunded на confirmed — ставка
+    засчитана в банк удара И игрок получил возврат (двойной учёт)."""
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    player = Player(id=33, wallet_address="w")
+    session.add(player)
+    round_row = _open_round(33)
+    session.add(round_row)
+    await session.commit()
+    stake_row = Stake(
+        round_id=round_row.id,
+        player_id=player.id,
+        amount_nanotons=to_nano(1),
+        tx_hash="tx-race-refund",
+        memo="m",
+        network="testnet",
+        status="pending",
+    )
+    session.add(stake_row)
+    await session.commit()
+
+    real_execute = session.execute
+    race_done = False
+
+    async def racing_execute(stmt, *args, **kwargs):
+        nonlocal race_done
+        result = await real_execute(stmt, *args, **kwargs)
+        sql = str(stmt)
+        # Возврат прилетает ПОСЛЕ выборки pending-ставки, но ДО claim-апдейта:
+        # именно это окно — гонка, на которую должен реагировать conditional-update.
+        if not race_done and "FROM stakes" in sql.replace("\n", " "):
+            race_done = True
+            await real_execute(
+                update(Stake).where(Stake.id == stake_row.id).values(status="refunded"),
+                *args,
+                **kwargs,
+            )
+        return result
+
+    monkeypatch.setattr(session, "execute", racing_execute)
+
+    assert await stakes_mod.confirm_stake(session, "tx-race-refund") is False
+    stake_id = stake_row.id
+    await session.commit()
+    session.expire_all()
+    stake = (await session.execute(select(Stake).where(Stake.id == stake_id))).scalar_one()
+    assert stake.status == "refunded"
+
+
 def _open_round(day_index: int, status: RoundStatus = RoundStatus.OPEN) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Round(
         day_index=day_index,
         status=status,
@@ -626,7 +723,7 @@ async def test_unknown_sender_transfer_is_auto_refunded(monkeypatch: pytest.Monk
     source = "0:" + os.urandom(32).hex()
     tx_hash = "stray-" + os.urandom(8).hex()
     transfer = Transfer(
-        tx_hash=tx_hash, source=source, value_nanotons=to_nano(0.3), comment="", utime=int(datetime.now(timezone.utc).timestamp())
+        tx_hash=tx_hash, source=source, value_nanotons=to_nano(0.3), comment="", utime=int(datetime.now(UTC).timestamp())
     )
     async with SessionLocal() as db:
         try:
@@ -652,6 +749,76 @@ async def test_unknown_sender_transfer_is_auto_refunded(monkeypatch: pytest.Monk
             await db.commit()
 
 
+async def test_owner_bank_credit_is_kept_not_refunded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пополнение казны владельцем (мемо bank: с OWNER_WALLET_ADDRESS) не
+    возвращается и не становится ставкой: пишется строкой входящего дохода."""
+    import os
+
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.models import Income
+    from app.ton_watch import Transfer, process_transfer
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    owner = "0:" + os.urandom(32).hex()
+    monkeypatch.setattr(settings, "owner_wallet_address", owner)
+    tx_hash = "bank-" + os.urandom(8).hex()
+    transfer = Transfer(
+        tx_hash=tx_hash,
+        source=owner,
+        value_nanotons=to_nano(1.0),
+        comment="bank: депозит после тестов",
+        utime=int(datetime.now(UTC).timestamp()),
+    )
+    async with SessionLocal() as db:
+        try:
+            assert await process_transfer(transfer) == "bank_credit"
+            income = (
+                await db.execute(select(Income).where(Income.unit_ref == tx_hash))
+            ).scalar_one_or_none()
+            assert income is not None
+            assert income.player_id is None and income.round_id is None
+            assert "in:bank" in income.note
+            refund = (
+                await db.execute(select(Payout).where(Payout.tx_hash == tx_hash))
+            ).scalar_one_or_none()
+            assert refund is None
+            # Повторная обработка транзакции не плодит вторую строку дохода.
+            assert await process_transfer(transfer) == "bank_credit"
+            rows = (await db.execute(select(Income).where(Income.unit_ref == tx_hash))).scalars().all()
+            assert len(rows) == 1
+        finally:
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
+            await db.commit()
+
+
+async def test_stranger_bank_memo_is_still_refunded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """bank: с чужого кошелька — не привилегия: обычный неизвестный возврат."""
+    import os
+
+    from app.db import SessionLocal
+    from app.ton_watch import Transfer, process_transfer
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "owner_wallet_address", "0:" + os.urandom(32).hex())
+    source = "0:" + os.urandom(32).hex()
+    tx_hash = "bk-" + os.urandom(8).hex()
+    transfer = Transfer(
+        tx_hash=tx_hash,
+        source=source,
+        value_nanotons=to_nano(1.0),
+        comment="bank: капитан",
+        utime=int(datetime.now(UTC).timestamp()),
+    )
+    async with SessionLocal() as db:
+        try:
+            assert await process_transfer(transfer) == "refund_queued"
+        finally:
+            await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
+            await db.commit()
+
+
 async def test_dust_and_expired_transfers_reach_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
     """Пыль и древние переводы НЕ возвращаются, но пишут строку Income:
     деньги остаются в казне и обязан быть учтены в сверке с балансом."""
@@ -667,8 +834,8 @@ async def test_dust_and_expired_transfers_reach_ledger(monkeypatch: pytest.Monke
     monkeypatch.setattr(settings, "refund_min_gram", 0.05)
     monkeypatch.setattr(settings, "watch_refund_max_age_days", 14)
     source = "0:" + os.urandom(32).hex()
-    old_utime = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp())
-    dust = Transfer("dust-1", source, to_nano(0.01), "", int(datetime.now(timezone.utc).timestamp()))
+    old_utime = int((datetime.now(UTC) - timedelta(days=30)).timestamp())
+    dust = Transfer("dust-1", source, to_nano(0.01), "", int(datetime.now(UTC).timestamp()))
     expired = Transfer("exp-1", source, to_nano(0.2), "", old_utime)
     async with SessionLocal() as db:
         try:
@@ -712,7 +879,7 @@ async def test_self_transfer_does_not_refund_itself(monkeypatch: pytest.MonkeyPa
         source=treasury,
         value_nanotons=to_nano(0.5),
         comment="",
-        utime=int(datetime.now(timezone.utc).timestamp()),
+        utime=int(datetime.now(UTC).timestamp()),
     )
     async with SessionLocal() as db:
         try:
@@ -759,7 +926,7 @@ async def test_repeat_stake_and_closed_day_transfers_are_refunded(
         )
         await db.commit()
         try:
-            dup = Transfer(hash_dup, wallet, to_nano(2), "", int(datetime.now(timezone.utc).timestamp()))
+            dup = Transfer(hash_dup, wallet, to_nano(2), "", int(datetime.now(UTC).timestamp()))
             assert await process_transfer(dup) == "already_staked"
             row = (
                 await db.execute(Payout.__table__.select().where(Payout.tx_hash == hash_dup))
@@ -779,7 +946,7 @@ async def test_repeat_stake_and_closed_day_transfers_are_refunded(
                 .values(status=RoundStatus.CLOSED)
             )
             await db.commit()
-            late = Transfer(hash_late, wallet, to_nano(0.4), "", int(datetime.now(timezone.utc).timestamp()))
+            late = Transfer(hash_late, wallet, to_nano(0.4), "", int(datetime.now(UTC).timestamp()))
             assert await process_transfer(late) == "refund_queued"
             row = (
                 await db.execute(Payout.__table__.select().where(Payout.tx_hash == hash_late))
@@ -839,7 +1006,7 @@ async def test_submin_already_staked_is_refunded_with_revote_hint(
                 wallet,
                 to_nano(0.05),
                 "",  # мемо не приложилось
-                int(datetime.now(timezone.utc).timestamp()),
+                int(datetime.now(UTC).timestamp()),
             )
             assert await process_transfer(t, bot=bot) == "already_staked"
             row = (
@@ -864,6 +1031,7 @@ async def test_auto_grant_by_amount_when_memo_missing(
     """Известный игрок, уже выбравший путь, шлёт 0.1 (=revote_ton) без мемо —
     грант выдаётся по сумме, деньги не застревают и не возвращаются."""
     import os
+
     from sqlalchemy import select
 
     from app.db import SessionLocal
@@ -884,7 +1052,7 @@ async def test_auto_grant_by_amount_when_memo_missing(
         await db.commit()
         try:
             t = Transfer(
-                tx_hash, wallet, to_nano(0.1), "", int(datetime.now(timezone.utc).timestamp())
+                tx_hash, wallet, to_nano(0.1), "", int(datetime.now(UTC).timestamp())
             )
             assert await process_transfer(t) == "revote_ok"
             grants = (
@@ -931,7 +1099,7 @@ async def test_auto_grant_returns_refund_if_no_vote(
         await db.commit()
         try:
             t = Transfer(
-                tx_hash, wallet, to_nano(0.1), "", int(datetime.now(timezone.utc).timestamp())
+                tx_hash, wallet, to_nano(0.1), "", int(datetime.now(UTC).timestamp())
             )
             assert await process_transfer(t) == "revote_auto_no_vote"
             row = (
@@ -969,9 +1137,9 @@ async def test_failed_revote_payments_are_refunded(monkeypatch: pytest.MonkeyPat
         await db.flush()
         await db.commit()
         try:
-            small = Transfer(hash_small, wallet, to_nano(0.2), f"rv:{open_round.id}", int(datetime.now(timezone.utc).timestamp()))
+            small = Transfer(hash_small, wallet, to_nano(0.2), f"rv:{open_round.id}", int(datetime.now(UTC).timestamp()))
             assert await process_transfer(small) == "revote_too_small"
-            late = Transfer(hash_late, wallet, to_nano(2), f"rv:{closed_round.id}", int(datetime.now(timezone.utc).timestamp()))
+            late = Transfer(hash_late, wallet, to_nano(2), f"rv:{closed_round.id}", int(datetime.now(UTC).timestamp()))
             assert await process_transfer(late) == "revote_closed"
 
             rows = (

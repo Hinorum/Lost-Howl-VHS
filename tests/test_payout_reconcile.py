@@ -3,7 +3,7 @@
 Одна страница (128 tx) провайдера — слишком мелкое окно для анти-дубля:
 memo «уже отправленного» в длинной очереди уходит за край, сверка решает
 «перевода нет» и очередь плодит повторный перевод. Здесь проверяется
-пагинация вглубь (TonAPI offset / Toncenter offset), стоп-условия, стопор
+пагинация вглубь (TonAPI before_lt / Toncenter offset), стоп-условия, стопор
 повтора при недоступной истории (защита от double-pay при 2ч requeue) и
 /blockchain как точка входа в разбор «куда делось».
 """
@@ -13,13 +13,14 @@ import os
 import time
 from unittest.mock import AsyncMock
 
+import pytest
+
 from app import ton_pay
 from app.config import settings
 from app.core.registry import BEAT_KEY, CURSOR_KEY, SOURCE_KEY, STUCK_TX_KEY
 from app.db import SessionLocal
 from app.http_utils import http_get_with_retry
 from app.models import Payout, WatcherState
-
 
 # ---------- Пагинация истории казначея ----------
 
@@ -38,11 +39,13 @@ class _FakeResp:
 
 
 class _FakeClient:
-    """httpx.AsyncClient-замена: страница = клиентский срез данных (offset-пагинация).
+    """httpx.AsyncClient-замена: страница = клиентский срез данных.
 
-    Честно повторяет семантику провайдера: offset указывает старт окна в
-    непрерывном потоке транзакций. always_first_page — «сломанная пагинация»:
-    провайдер на любой offset отдаёт первые записи (для проверки стоп-условия).
+    Честно повторяет семантику обоих провайдеров: Toncenter срезает окно
+    параметром offset (старт в непрерывном потоке), TonAPI — курсором
+    before_lt (всё строго старше lt, «новые сверху»). always_first_page —
+    «сломанная пагинация»: провайдер на любой параметр отдаёт первые записи
+    (для проверки стоп-условия).
     """
 
     def __init__(
@@ -65,11 +68,16 @@ class _FakeClient:
     async def get(self, url: str, params: dict | None = None, headers: dict | None = None, **kwargs) -> _FakeResp:
         params = dict(params or {})
         self._capture.append(params)
-        offset = int(params.get("offset", 0))
         limit = int(params.get("limit", 128))
+        before_lt = params.get("before_lt")
         if self._always_first_page:
             page = self._items[:limit]
+        elif before_lt is not None:
+            # TonAPI: курсор ходит строго старше lt (список свёрнут «новые сверху»).
+            before = int(before_lt)
+            page = [it for it in self._items if int(it.get("lt") or 0) < before][:limit]
         else:
+            offset = int(params.get("offset", 0))
             page = self._items[offset : offset + limit]
         return _FakeResp({"transactions": page})
 
@@ -93,8 +101,13 @@ def _toncenter_item(lt: int, utime: int, memo: str) -> dict:
 
 
 def _build_stream(now: int, item_builder, count: int = 384) -> list[dict]:
-    """Непрерывный поток исходящих казначея: utime строго убывает, memo уникальны."""
-    return [item_builder(1_000_000 + i, now - i, f"way:1:pr#{i}") for i in range(count)]
+    """Непрерывный поток исходящих казначея (страницы «новые сверху»).
+
+    lt и utime убывают вдоль потока (как в реальном провайдере: свежие
+    записи — самые большие lt), memo уникальны. Числовые поля провайдеров
+    в статье трактуются строкой через str().
+    """
+    return [item_builder(1_000_000 + count - i, now - i, f"way:1:pr#{i}") for i in range(count)]
 
 
 async def test_toncenter_reconcile_pagination_goes_deep(monkeypatch) -> None:
@@ -117,13 +130,14 @@ async def test_toncenter_reconcile_pagination_goes_deep(monkeypatch) -> None:
     offsets = [p["offset"] for p in capture]
     # Страница (0) → шаг с перекрытием (112); следующая уже вне окна 200с — стоп.
     assert offsets == [0, 112]
-    assert tx_map["way:1:pr#160"] == "h1000160"  # в глубине, за пределами 128 tx
+    assert tx_map["way:1:pr#160"] == "h1000224"  # в глубине, за пределами 128 tx
     assert "way:1:pr#0" in tx_map  # первая страница тоже собрана
     assert len(tx_map) == 240  # 128 + (112 новых, стык 112..127 перечитан идемпотентно)
 
 
-async def test_tonapi_reconcile_pagination_uses_offset(monkeypatch) -> None:
-    """TonAPI тоже ходит вглубь через offset, а не только одной страницей."""
+async def test_tonapi_reconcile_pagination_walks_by_lt(monkeypatch) -> None:
+    """TonAPI ходит вглубь курсором before_lt, а не offset (offset в этом
+    эндпоинте нет) — окно истории при этом тоже покрывается без дыр."""
     now = int(time.time())
     monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 200)
     monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
@@ -134,9 +148,11 @@ async def test_tonapi_reconcile_pagination_uses_offset(monkeypatch) -> None:
     monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
 
     tx_map = await ton_pay._tx_map_via_tonapi()
-    offsets = [p["offset"] for p in capture]
-    assert offsets == [0, 112]
-    assert tx_map["way:1:pr#200"] == "h1000200"
+    cursors = [p.get("before_lt") for p in capture]
+    # Первая страница без курсора; вторая — строго старше lt её последней записи.
+    assert cursors == [None, "1000257"]
+    assert tx_map["way:1:pr#160"] == "h1000224"  # в глубине, за пределами 128 tx
+    assert len(tx_map) == 256  # 128 + 128 новых, без перечитывания стыка
 
 
 async def test_toncenter_breaks_when_offset_not_honored(monkeypatch) -> None:
@@ -174,8 +190,8 @@ async def test_toncenter_reconcile_overlap_covers_boundary(monkeypatch) -> None:
     tx_map = await ton_pay._tx_map_via_toncenter()
     offsets = [p["offset"] for p in capture]
     assert offsets == [0, 112, 224, 336]
-    assert tx_map["way:1:pr#200"] == "h1000200"  # внутри второй окна шага
-    assert tx_map["way:1:pr#340"] == "h1000340"  # хвост потока, частичная страница
+    assert tx_map["way:1:pr#200"] == "h1000184"  # внутри второй окна шага
+    assert tx_map["way:1:pr#340"] == "h1000044"  # хвост потока, частичная страница
     assert len(tx_map) == 384  # стыки перечитаны идемпотентно, дыр нет
 
 
@@ -229,7 +245,7 @@ async def test_toncenter_reconcile_stops_when_all_targets_found(monkeypatch) -> 
     tx_map = await ton_pay._tx_map_via_toncenter(targets={"way:1:pr#160"})
     offsets = [p["offset"] for p in capture]
     assert offsets == [0, 112]
-    assert tx_map["way:1:pr#160"] == "h1000160"  # найдена на второй странице
+    assert tx_map["way:1:pr#160"] == "h1000224"  # найдена на второй странице
 
 
 async def test_toncenter_reconcile_stops_at_first_page_when_target_clean(monkeypatch) -> None:
@@ -245,7 +261,7 @@ async def test_toncenter_reconcile_stops_at_first_page_when_target_clean(monkeyp
 
     tx_map = await ton_pay._tx_map_via_toncenter(targets={"way:1:pr#5"})
     assert [p["offset"] for p in capture] == [0]
-    assert tx_map["way:1:pr#5"] == "h1000005"
+    assert tx_map["way:1:pr#5"] == "h1000379"
 
 
 async def test_tonapi_reconcile_stops_at_first_page_when_target_clean(monkeypatch) -> None:
@@ -260,8 +276,8 @@ async def test_tonapi_reconcile_stops_at_first_page_when_target_clean(monkeypatc
     monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
 
     tx_map = await ton_pay._tx_map_via_tonapi(targets={"way:1:pr#5"})
-    assert [p["offset"] for p in capture] == [0]
-    assert tx_map["way:1:pr#5"] == "h1000005"
+    assert [p.get("before_lt") for p in capture] == [None]
+    assert tx_map["way:1:pr#5"] == "h1000379"
 
 
 async def test_fetch_broadcast_tx_map_passes_targets_to_fetchers(monkeypatch) -> None:
@@ -276,6 +292,50 @@ async def test_fetch_broadcast_tx_map_passes_targets_to_fetchers(monkeypatch) ->
     result = await ton_pay.fetch_broadcast_tx_map(targets={"way:1:pr#1"})
     assert result == {}
     assert seen["api"] == {"way:1:pr#1"}
+
+
+async def test_empty_200_without_transactions_is_unknown(monkeypatch) -> None:
+    """HTTP 200 с телом БЕЗ transactions — аномалия провайдера, а не
+    «история пуста»: сверка остаётся «не знаем», повторы заморожены.
+
+    Именно такой ответ (дроссель/ошибка-обёртка в 200) молча превращался в
+    «memo в цепочке нет», и повтор уезжал на уже ушедший платёж.
+    """
+    from app.ton_pay import state as _st
+
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    empty = AsyncMock()
+    empty.get = AsyncMock(return_value=_FakeResp({}))
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: empty)
+    _st._RECONCILE_HISTORY_OK = True
+    try:
+        tx_map = await ton_pay.fetch_broadcast_tx_map(targets={"way:1:pr#1"})
+        assert tx_map == {}
+        assert _st._RECONCILE_HISTORY_OK is False
+    finally:
+        _st._RECONCILE_HISTORY_OK = True
+
+
+async def test_empty_200_without_transactions_on_tonapi_also_unknown(monkeypatch) -> None:
+    """То же на основном провайдере напрямую: без фолбэка его {}-ответ падает."""
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    empty = AsyncMock()
+    empty.get = AsyncMock(return_value=_FakeResp({}))
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: empty)
+    try:
+        await ton_pay._tx_map_via_tonapi(targets={"way:1:pr#1"})
+        pytest.fail("TonAPI с {} обязан падать, а не молчать")
+    except RuntimeError as exc:
+        assert "transactions" in str(exc)
+    # Валидная пустая история (transactions: []) остаётся честной пустотой.
+    empty.get = AsyncMock(return_value=_FakeResp({"transactions": []}))
+    assert await ton_pay._tx_map_via_tonapi(targets={"way:1:pr#1"}) == {}
 
 
 # ---------- Guard: повтор при недоступной истории ----------
@@ -316,7 +376,7 @@ async def test_retry_held_when_history_unavailable(monkeypatch) -> None:
     transfer = AsyncMock(return_value="bcast:123")
 
     async def empty_markers() -> set[str]:
-        ton_pay._RECONCILE_HISTORY_OK = False  # оба провайдера реально упали
+        ton_pay.state._RECONCILE_HISTORY_OK = False  # оба провайдера реально упали
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
@@ -345,7 +405,7 @@ async def test_retry_proceeds_when_history_known(monkeypatch) -> None:
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", True)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", True)
 
     try:
         sent = await ton_pay.dispatch_pending_payouts(bot=None)
@@ -370,7 +430,7 @@ async def test_first_attempt_not_blocked_by_unknown_history(monkeypatch) -> None
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", False)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", False)
 
     try:
         sent = await ton_pay.dispatch_pending_payouts(bot=None)
@@ -485,7 +545,7 @@ async def test_http_retry_429_respects_retry_after(monkeypatch) -> None:
     client = _ThrottledClient(throttled=2, retry_after="7")
 
     response = await http_get_with_retry(
-        client, "https://ton.example/v2/accounts/x/transactions", max_retries=3,
+        client, "https://ton.example/v2/blockchain/accounts/x/transactions", max_retries=3,
         retry_delay=1.0, backoff_factor=2.0, max_delay=30.0,
     )
     assert response.status_code == 200
@@ -525,7 +585,7 @@ async def test_blockchain_diagnostics_reports_pipeline(monkeypatch) -> None:
         return 5_000_000_000, "active", "tonapi"
 
     monkeypatch.setattr(ton_pay, "fetch_account_state", fake_state)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", True)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", True)
 
     async with SessionLocal() as session:
         for key, value in (
@@ -564,7 +624,7 @@ async def test_blockchain_diagnostics_flags_history_down(monkeypatch) -> None:
         return None, None, "none"
 
     monkeypatch.setattr(ton_pay, "fetch_account_state", silent)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", False)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", False)
 
     text = await ton_pay.blockchain_diagnostics()
     assert "НЕДОСТУПНА" in text

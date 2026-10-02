@@ -1,12 +1,11 @@
 """Рассылка дня: падение одного чата не мешает дню открыться в остальных."""
 
-from datetime import datetime, timedelta, timezone
-
-from sqlalchemy import select
-from unittest.mock import AsyncMock
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramForbiddenError
+from sqlalchemy import select
 
 from app.broadcast import _deliver_day, announce_new_day
 from app.config import settings
@@ -26,9 +25,9 @@ def _round(day_index: int, media_dir) -> Round:
         chapter_text="Текст.",
 
 
-        opens_at=datetime.now(timezone.utc),
-        voting_ends_at=datetime.now(timezone.utc) + timedelta(hours=23),
-        tally_ends_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        opens_at=datetime.now(UTC),
+        voting_ends_at=datetime.now(UTC) + timedelta(hours=23),
+        tally_ends_at=datetime.now(UTC) + timedelta(hours=24),
     )
     for position in range(3):
         name = f"day{day_index}_card{position}.jpg"
@@ -182,6 +181,40 @@ async def test_status_carries_paths_and_media_is_empty(tmp_path) -> None:
     for position in range(3):
         assert f"{['I', 'II', 'III'][position]}. Путь {position} — описание" in status
     assert len(status) <= 4096
+
+
+async def test_status_carries_story_between_title_and_paths(tmp_path) -> None:
+    """Глава кассеты видна живым текстом: заголовок → проза → тропы."""
+    from app.broadcast import status_text
+
+    round_row = _round(9302, tmp_path)
+    for card in round_row.cards:
+        card.image_path = ""
+    status = await status_text(round_row)
+    assert "День проверки рассылки" in status
+    assert "Текст." in status
+    title_at = status.index("День проверки рассылки")
+    story_at = status.index("Текст.")
+    paths_at = status.index("I. Путь 0")
+    assert title_at < story_at < paths_at
+
+
+async def test_status_keeps_deadline_when_core_overflows(tmp_path, monkeypatch) -> None:
+    """При переполнении поста режется «верх», а дедлайн/правило дня всегда целы."""
+    from app import broadcast
+    from app.broadcast import status_text
+
+    round_row = _round(9303, tmp_path)
+    for card in round_row.cards:
+        card.description = "д" * 60
+    monkeypatch.setattr(broadcast, "_MAX_TEXT_LEN", 300)
+    status = await status_text(round_row)
+    vote = round_row.voting_ends_at.strftime("%H:%M")
+    tally = round_row.tally_ends_at.strftime("%H:%M")
+    assert status.endswith(
+        f"🗳 Голосование до: {vote} UTC · 🏁 Итоги и новый день: {tally} UTC"
+    )
+    assert len(status) <= 300
 
 
 def _finished(day_index: int, media_dir) -> Round:

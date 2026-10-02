@@ -18,30 +18,36 @@ from aiogram.types import (
 
 from app.config import settings
 
-# «О боте» в профиле — не больше 120 символов.
+# «О боте» в профиле — не больше 120 символов. Первая фраза сразу снимает
+# вопрос «это официально?»: архив неофициальный и фанатский.
 BOT_ABOUT = (
-    "The Way's — своя версия Пути: три тропы, один канон. "
-    "Голосуй — а в последний день месяца лабиринт взвесит суд."
+    "Неофициальный фанатский интерактивный VHS-архив по мотивам Lost Dogs. "
+    "Каждый день Стая решает, что останется на плёнке."
 )
 
 # Приветственный экран пустого чата («Что умеет этот бот?»), лимит 512.
 def _bot_description() -> str:
+    # Неофициальность вшита в первое предложение, а не вынесена дисклеймером
+    # вниз: «видеомагнитофон, собранный из хлама» — и так самодельная вещь,
+    # а «Lost Dogs» остаётся мотивом, а не источником.
     base = (
-        "Ты — голос стаи в лабиринте.\n"
-        "С тобой Баркод, Стежка, Вектор, Пиксель и Безымянная.\n"
-        "Дневник шепчет три тропы и объявляет правило дня.\n"
-        "Победивший путь впечатается в мир.\n"
-        "Крыса — память кругов. Анубис — судья месяца.\n"
+        "Это не мир, а видеомагнитофон LOST HOWL, собранный из хлама:\n"
+        "неофициальный фанатский VHS-архив по мотивам «Lost Dogs: The Way».\n"
+        "Раз в месяц хранитель ставит в лоток кассету: стая псов ищет дом\n"
+        "в разбитом городе.\n"
+        "Каждый день Стая решает, что останется на плёнке: один кадр в трёх\n"
+        "вариантах, голосом или ставкой Gram. Жребий дня (большинство, меньшинство,\n"
+        "середина) решает, какой кадр уцелеет;\n"
     )
     hints = []
     if settings.revote_enabled:
-        hints.append("Передумал — смени путь (/change).")
+        hints.append("Передумал — перемотай кадр (/change).")
     if settings.ton_enabled:
-        hints.append("Веришь в расклад — ставь Gram (/wallet).")
+        hints.append("Веришь в сценарий — поставь Gram на кадр (/stake).")
     tail = " ".join(hints)
     if tail:
         base += tail + "\n"
-    base += "Нажми START: Первый Лай уже ждёт."
+    base += "Нажми START: PLAY."
     return base
 
 
@@ -49,26 +55,42 @@ BOT_DESCRIPTION = _bot_description()
 
 
 def _build_commands() -> tuple[list[BotCommand], list[BotCommand]]:
-    """Меню отражает включённые механики: без ставок — без кошелька и /top."""
+    """Меню отражает включённые механики: без ставок — без кошелька и /top.
+
+    Порядок логичный: онбординг, ежедневная игра, счёт, экономика, стая,
+    справка. В группе день живёт через /today; полная памятка — в /help.
+    """
     private = [
-        BotCommand(command="start", description="Открыть Эхо Стаи"),
+        BotCommand(command="start", description="Как играть: PLAY кассеты"),
         BotCommand(command="today", description="Карты дня"),
-        BotCommand(command="score", description="Твои Следы"),
+        BotCommand(command="score", description="Карточка Стаи: титул и серия"),
     ]
     if settings.revote_enabled:
-        private.append(BotCommand(command="change", description="Сменить путь (⭐ или Gram)"))
+        private.append(
+            BotCommand(
+                command="change",
+                description=(
+                    "Перемотать кадр (⭐ или Gram)"
+                    if settings.ton_enabled
+                    else f"Перемотать кадр (⭐ {settings.revote_stars})"
+                ),
+            )
+        )
     if settings.ton_enabled:
         private += [
-            BotCommand(command="stake", description="Как поставить Gram на путь"),
             BotCommand(command="wallet", description="Привязать кошелёк Gram"),
+            BotCommand(command="stake", description="Как поставить Gram"),
             BotCommand(command="top", description="Копилки и лидеры"),
             BotCommand(command="fund", description="Фонд Стаи: баланс и журнал"),
         ]
+    private += [
+        BotCommand(command="invite", description="Позвать в стаю"),
+        BotCommand(command="help", description="Памятка команд"),
+    ]
     group = [
         BotCommand(command="today", description="Карты дня"),
+        BotCommand(command="help", description="Памятка команд"),
     ]
-    if settings.ton_enabled:
-        group.append(BotCommand(command="stake", description="Как поставить Gram"))
     return private, group
 
 

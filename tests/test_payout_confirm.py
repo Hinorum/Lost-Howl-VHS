@@ -8,7 +8,7 @@ bcast, отсутствующее дольше окна → обратно в о
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app import ton_pay
 from app.config import settings
@@ -26,7 +26,7 @@ async def _seed_sent_payout(kind: str = "prize", round_id: int | None = 64) -> i
             dest_address="0:" + os.urandom(32).hex(),
             status="sent",
             tx_hash="bcast:1789470019",
-            sent_at=datetime.now(timezone.utc) - timedelta(seconds=settings.payout_confirm_timeout_seconds + 60),
+            sent_at=datetime.now(UTC) - timedelta(seconds=settings.payout_confirm_timeout_seconds + 60),
         )
         session.add(payout)
         await session.flush()
@@ -89,7 +89,7 @@ async def test_confirm_leaves_fresh_broadcast_alone(monkeypatch) -> None:
     payout_id = await _seed_sent_payout()
     async with SessionLocal() as session:
         row = await session.get(Payout, payout_id)
-        row.sent_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+        row.sent_at = datetime.now(UTC) - timedelta(seconds=30)
         await session.commit()
 
     async def fake_tx_map(**kwargs) -> dict[str, str]:
@@ -166,7 +166,7 @@ async def test_confirm_ignores_other_networks(monkeypatch) -> None:
             network="testnet",
             status="sent",
             tx_hash="bcast:1789470019",
-            sent_at=datetime.now(timezone.utc) - timedelta(seconds=settings.payout_confirm_timeout_seconds + 60),
+            sent_at=datetime.now(UTC) - timedelta(seconds=settings.payout_confirm_timeout_seconds + 60),
         )
         session.add(payout)
         await session.flush()
@@ -195,7 +195,7 @@ async def test_confirm_skips_rows_with_real_hash(monkeypatch) -> None:
             dest_address="0:" + os.urandom(32).hex(),
             status="sent",
             tx_hash="3" * 64,
-            sent_at=datetime.now(timezone.utc) - timedelta(hours=5),
+            sent_at=datetime.now(UTC) - timedelta(hours=5),
         )
         session.add(payout)
         await session.flush()

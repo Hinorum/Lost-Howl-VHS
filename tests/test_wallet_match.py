@@ -7,7 +7,7 @@ TonAPI отдаёт source в raw-hex, а игроки присылают user-f
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import delete, select
@@ -24,7 +24,6 @@ from app.ton_watch import (
     process_transfer,
 )
 
-
 # Адреса уникальны в рамках прогона: players.wallet_address имеет UNIQUE,
 # а глобальная тестовая БД общая для всех модулей. Оба — валидные
 # user-friendly (CRC16 верный), сгенерированы friendly_address().
@@ -40,7 +39,7 @@ def ton_on(monkeypatch):
 
 
 async def _open_round(day_index: int) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with SessionLocal() as session:
         session.add(
             Round(
@@ -67,7 +66,7 @@ async def test_new_style_binding_matches_raw_source(ton_on) -> None:
         await session.commit()
 
     status = await process_transfer(
-        Transfer(tx_hash="raw-match-1", source=RAW, value_nanotons=500_000_000, comment="", utime=int(datetime.now(timezone.utc).timestamp()))
+        Transfer(tx_hash="raw-match-1", source=RAW, value_nanotons=500_000_000, comment="", utime=int(datetime.now(UTC).timestamp()))
     )
     assert status == "ok"
 
@@ -85,7 +84,7 @@ async def test_old_friendly_row_would_miss_and_migration_fixes_it(ton_on) -> Non
     # До миграции перевод не находит хозяина и уходит в возвраты — так выглядел баг.
     await _open_round(902)
     status_before = await process_transfer(
-        Transfer(tx_hash="mig-before-1", source=old_raw, value_nanotons=300_000_000, comment="", utime=int(datetime.now(timezone.utc).timestamp()) - 60)
+        Transfer(tx_hash="mig-before-1", source=old_raw, value_nanotons=300_000_000, comment="", utime=int(datetime.now(UTC).timestamp()) - 60)
     )
     assert status_before == "refund_queued"
 
@@ -133,7 +132,7 @@ async def test_confirmed_stake_notifies_player(ton_on) -> None:
     status = await process_transfer(
         # Старше stake_confirm_seconds (в фикстуре он 10 000 с) — ставка
         # подтвердится сразу с «принята», но свежее лимита авто-возвратов.
-        Transfer(tx_hash="dm-ok-1", source=raw, value_nanotons=500_000_000, comment="", utime=int(datetime.now(timezone.utc).timestamp()) - 11_000),
+        Transfer(tx_hash="dm-ok-1", source=raw, value_nanotons=500_000_000, comment="", utime=int(datetime.now(UTC).timestamp()) - 11_000),
         bot=bot,
     )
     assert status == "ok"
@@ -153,7 +152,7 @@ async def test_fresh_stake_waits_then_aged_pass_confirms_and_notifies(ton_on) ->
         await session.commit()
 
     bot = _RecorderBot()
-    fresh_utime = int(datetime.now(timezone.utc).timestamp())
+    fresh_utime = int(datetime.now(UTC).timestamp())
     status = await process_transfer(
         Transfer(tx_hash="dm-aged-1", source=raw, value_nanotons=750_000_000, comment="", utime=fresh_utime),
         bot=bot,
@@ -163,7 +162,7 @@ async def test_fresh_stake_waits_then_aged_pass_confirms_and_notifies(ton_on) ->
 
     async with SessionLocal() as session:
         stake = (await session.execute(select(Stake).where(Stake.tx_hash == "dm-aged-1"))).scalar_one()
-        stake.created_at = datetime.now(timezone.utc) - timedelta(seconds=settings.stake_confirm_seconds + 60)
+        stake.created_at = datetime.now(UTC) - timedelta(seconds=settings.stake_confirm_seconds + 60)
         await session.commit()
 
     assert await confirm_aged_pending(bot) == 1
@@ -182,7 +181,7 @@ async def test_rejected_stake_tells_the_reason(ton_on) -> None:
 
     bot = _RecorderBot()
     status = await process_transfer(
-        Transfer(tx_hash="dm-small-1", source=raw, value_nanotons=1, comment="", utime=int(datetime.now(timezone.utc).timestamp())),
+        Transfer(tx_hash="dm-small-1", source=raw, value_nanotons=1, comment="", utime=int(datetime.now(UTC).timestamp())),
         bot=bot,
     )
     assert status == "too_small"
@@ -199,7 +198,7 @@ async def test_dust_stake_does_not_block_real_stake(ton_on) -> None:
         session.add(Player(id=910_933, username="dusty", first_name="D", wallet_address=raw))
         await session.commit()
 
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     bot = _RecorderBot()
     assert await process_transfer(
         Transfer(tx_hash="dm-dust-1", source=raw, value_nanotons=to_nano(0.02), comment="", utime=now),

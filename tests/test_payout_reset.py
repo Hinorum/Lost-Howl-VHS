@@ -10,7 +10,7 @@ sending возвращается в очередь только когда кл�
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -37,7 +37,7 @@ def _payout(status: str, attempts: int = 1, claimed_at=None) -> Payout:
 
 
 async def test_sending_resets_only_when_stale() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fresh = _payout("sending", claimed_at=now)
     stale = _payout(
         "sending",

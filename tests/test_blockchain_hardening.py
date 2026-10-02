@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -32,7 +32,7 @@ from app.ton_utils import to_nano
 
 
 async def _closed_round(session: AsyncSession, winner_card: int = 0, day_index: int = 1) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=day_index,
         status=RoundStatus.CLOSED,
@@ -150,7 +150,7 @@ def test_cursor_overlap_default_nonnegative(monkeypatch: pytest.MonkeyPatch) -> 
 
 async def test_stuck_roundtrip(session: AsyncSession) -> None:
     """json-сериализация stuck-списка переживает чтение/запись (свежий utime)."""
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     await ton_watch._write_stuck(session, {"tx-1": {"utime": now, "fails": 2}})
     loaded = await ton_watch._read_stuck(session)
     assert loaded == {"tx-1": {"utime": now, "fails": 2}}
@@ -158,7 +158,7 @@ async def test_stuck_roundtrip(session: AsyncSession) -> None:
 
 async def test_stuck_retention_drops_old_entries(session: AsyncSession) -> None:
     """Врачующиеся записи старше stuck_retention_days уходят при записи."""
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     stale = now - (settings.stuck_retention_days + 1) * 86_400
     await ton_watch._write_stuck(
         session,
@@ -183,7 +183,7 @@ async def test_watch_stores_stuck_and_keeps_cursor(monkeypatch: pytest.MonkeyPat
     """Сбойная транзакция попадает в stuck-список, курсор стоит перед ней
     (а не уходит вперёд и не теряет перевод навсегда)."""
     monkeypatch.setattr(settings, "ton_enabled", True)
-    base = int(datetime.now(timezone.utc).timestamp()) - 3_600
+    base = int(datetime.now(UTC).timestamp()) - 3_600
     bad = ton_watch.Transfer("badx-1", "0:" + "aa" * 32, to_nano(0.2), "", base)
     good = ton_watch.Transfer("goodx-1", "0:" + "bb" * 32, to_nano(0.2), "", base + 1)
     monkeypatch.setattr(
@@ -219,10 +219,10 @@ async def test_watch_stores_stuck_and_keeps_cursor(monkeypatch: pytest.MonkeyPat
 async def test_stuck_clears_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """Повторный успешный проход вычищает транзакцию из stuck-списка."""
     monkeypatch.setattr(settings, "ton_enabled", True)
-    base = int(datetime.now(timezone.utc).timestamp()) - 3_600
+    base = int(datetime.now(UTC).timestamp()) - 3_600
     tx = ton_watch.Transfer("retry-1", "0:" + "cc" * 32, to_nano(0.2), "", base + 2)
 
-    async def fetch(_since, before_hash=None):
+    async def fetch(_since, before_lt=None):
         return ([tx], True)
 
     calls = {"fail": True}

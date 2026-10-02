@@ -15,31 +15,31 @@ logger = logging.getLogger(__name__)
 # остаётся паспортом для материализации.
 PREPARED_PAYLOAD_VERSION = 4
 
-# Шаблон дня: без нейросети и арта день жил бы пустым. Три постоянные дороги,
+# Шаблон дня: без нейросети и арта день жил бы пустым. Три постоянные сцены,
 # по которым стая голосует банком, — механика (счёт, жребий, выплаты) не
 # зависит от их названия.
 _TEMPLATE_CARDS: list[dict] = [
     {
         "position": 0,
-        "title": "Путь I",
-        "description": "Первая дорога для голоса стаи.",
-        "consequence": "Стая выбрала первую дорогу.",
+        "title": "Сцена I",
+        "description": "Первая сцена для голоса стаи.",
+        "consequence": "Стая выбрала первую сцену.",
         "tag": "care",
         "image_path": "",
     },
     {
         "position": 1,
-        "title": "Путь II",
-        "description": "Вторая дорога для голоса стаи.",
-        "consequence": "Стая выбрала вторую дорогу.",
+        "title": "Сцена II",
+        "description": "Вторая сцена для голоса стаи.",
+        "consequence": "Стая выбрала вторую сцену.",
         "tag": "care",
         "image_path": "",
     },
     {
         "position": 2,
-        "title": "Путь III",
-        "description": "Третья дорога для голоса стаи.",
-        "consequence": "Стая выбрала третью дорогу.",
+        "title": "Сцена III",
+        "description": "Третья сцена для голоса стаи.",
+        "consequence": "Стая выбрала третью сцену.",
         "tag": "care",
         "image_path": "",
     },
@@ -83,8 +83,9 @@ async def _plan_and_render(
         rule = rng.choice(rules)
     cards_payload = [dict(card) for card in _TEMPLATE_CARDS]
     chapter_text = (
-        f"День {day_index}. Племя собирается у костра — сегодня дорогу выбирает "
-        "голос стаи: каждый бросает свой голос за одну из трёх троп."
+        f"День {day_index}. ПЛЕЙ — плёнка шелестит: у кадра три варианта, "
+        "стая выбирает свой. Уцелеет один — его решит голос тех, кто "
+        "не промолчал."
     )
     return {
         "v": PREPARED_PAYLOAD_VERSION,

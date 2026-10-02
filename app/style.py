@@ -36,9 +36,6 @@ PATH_MARKS = {
     "cunning": ["🎭", "🗝️", "🃏", "🦊", "🕸️", "🎲", "🪙", "🧠", "🐍", "🪤"],
 }
 
-# Итоги дня и победители.
-RESULT_MARKS = ["🏆", "👑", "🌟", "🥇", "🎊", "🎖️", "🌅", "🔔", "📜", "⚖️"]
-
 # Деньги, ставки, кошельки.
 MONEY_MARKS = ["💎", "💸", "💰", "🪙", "🔗", "📈", "🏦", "🧾"]
 
@@ -64,10 +61,6 @@ def day_mark(key: str) -> str:
 def path_mark(tag: str, key: str) -> str:
     pool = PATH_MARKS.get(tag) or PATH_MARKS["care"]
     return _pick(pool, f"path:{tag}:{key}")
-
-
-def result_mark(key: str) -> str:
-    return _pick(RESULT_MARKS, f"result:{key}")
 
 
 def money_mark(key: str) -> str:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -19,8 +19,8 @@ from app.config import settings
 from app.core.registry import WEEK_CLAIM_WINDOW_KEY
 from app.db import SessionLocal
 from app.leaderboard import (
-    WEEKLY_MARKER_KEY,
     WEEK_READY_KEY,
+    WEEKLY_MARKER_KEY,
     _rank_window,
     _week_prize_amounts,
     settle_week_if_due,
@@ -58,7 +58,7 @@ async def _set_week_ready(session: AsyncSession, week_key: str) -> None:
 
 async def _seed_expired_week_window(session: AsyncSession, week_key: str, players: list[int]) -> None:
     """Ставит окно Claim, дедлайн которого давно прошёл: выплата может идти сразу."""
-    opened_at = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
+    opened_at = (datetime.now(UTC) - timedelta(hours=200)).isoformat()
     session.add(
         WatcherState(
             key=WEEK_CLAIM_WINDOW_KEY,
@@ -69,17 +69,17 @@ async def _seed_expired_week_window(session: AsyncSession, week_key: str, player
 
 
 def test_iso_week_key_and_bounds() -> None:
-    moment = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # понедельник
+    moment = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)  # понедельник
     assert iso_week_key(moment) == "2026-W35"
     assert iso_week_key(moment.replace(tzinfo=None)) == "2026-W35"
     start, end = week_bounds("2026-W35")
-    assert start == datetime(2026, 8, 24, 0, 0, tzinfo=timezone.utc)
-    assert end == datetime(2026, 8, 31, 0, 0, tzinfo=timezone.utc)
+    assert start == datetime(2026, 8, 24, 0, 0, tzinfo=UTC)
+    assert end == datetime(2026, 8, 31, 0, 0, tzinfo=UTC)
 
 
 def test_previous_week_key_across_year_boundary() -> None:
-    assert previous_week_key(datetime(2026, 8, 26, tzinfo=timezone.utc)) == "2026-W34"
-    assert previous_week_key(datetime(2026, 1, 1, tzinfo=timezone.utc)) == "2025-W52"
+    assert previous_week_key(datetime(2026, 8, 26, tzinfo=UTC)) == "2026-W34"
+    assert previous_week_key(datetime(2026, 1, 1, tzinfo=UTC)) == "2025-W52"
 
 
 def test_parse_prize_pcts_filters_garbage_and_caps_at_three() -> None:
@@ -154,10 +154,10 @@ async def test_settle_week_pays_top3_by_places(monkeypatch: pytest.MonkeyPatch) 
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_best, username="best", wallet_address=wallets[pid_best]),
-                Player(id=pid_second, username="second", wallet_address=wallets[pid_second]),
+                Player(id=pid_best, username="best", wallet_address=wallets[pid_best], wallet_verified=True),
+                Player(id=pid_second, username="second", wallet_address=wallets[pid_second], wallet_verified=True),
                 Player(id=pid_nowallet, username="nowallet"),  # лидер без кошелька — пропуск
-                Player(id=pid_lazy, username="lazy", wallet_address=wallets[pid_lazy]),  # 2 дня — мало
+                Player(id=pid_lazy, username="lazy", wallet_address=wallets[pid_lazy], wallet_verified=True),  # 2 дня — мало
             ]
         )
         rounds: list[Round] = []
@@ -224,6 +224,75 @@ async def test_settle_week_pays_top3_by_places(monkeypatch: pytest.MonkeyPatch) 
             await session.commit()
 
 
+async def test_settle_week_pays_verified_wallet_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Неподтверждённый кошелёк не получает копилку: платит только bv:-доказанный адрес.
+
+    Топ по верным путям с привязанным, но неподтверждённым кошельком — мимо,
+    как и без кошелька: приз не должен уйти на адрес, чьё владение не доказано.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 4)
+    base = 860_000
+    pid_unverified, pid_verified = base, base + 1
+    wallet_proven = "0:" + os.urandom(32).hex()
+    prev_start, _prev_end = week_bounds(previous_week_key())
+
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                # Лидер недели, но кошелёк не подтверждён (bv: не пройден).
+                Player(id=pid_unverified, username="shadow", wallet_address="0:" + os.urandom(32).hex()),
+                Player(id=pid_verified, username="proven", wallet_address=wallet_proven, wallet_verified=True),
+            ]
+        )
+        rounds: list[Round] = []
+        # shadow — 7 верных, proven — 5: без верификации лидер всё равно мимо.
+        plan = {pid_unverified: 7, pid_verified: 5}
+        day = 800_100
+        for offset in range(7):
+            round_row = await _seed_closed_round(
+                session, day + offset, prev_start + timedelta(days=offset, hours=11)
+            )
+            rounds.append(round_row)
+            for pid, count in plan.items():
+                if offset < count:
+                    session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+            if offset == 0:
+                for pid in (pid_unverified, pid_verified):
+                    _set_stake(session, round_row, pid)
+        pot_total = to_nano(10)
+        week_key = previous_week_key()
+        session.add(WeeklyPot(week=week_key, nanotons=pot_total))
+        await session.commit()
+        try:
+            await _set_week_ready(session, week_key)
+            assert await settle_week_if_due(bot=None) is True
+            rows = (
+                (
+                    await session.execute(
+                        select(Payout).where(Payout.kind == "weekly").order_by(Payout.player_id.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert [p.player_id for p in rows] == [pid_verified]
+            assert rows[0].dest_address == wallet_proven and rows[0].amount_nanotons > 0
+        finally:
+            await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
+            await session.execute(WatcherState.__table__.delete().where(WatcherState.key == WEEKLY_MARKER_KEY))
+            await session.execute(WeeklyPot.__table__.delete())
+            for round_row in rounds:
+                await session.execute(Vote.__table__.delete().where(Vote.round_id == round_row.id))
+                await session.execute(Stake.__table__.delete().where(Stake.round_id == round_row.id))
+                await session.delete(round_row)
+            for pid in (pid_unverified, pid_verified):
+                player = await session.get(Player, pid)
+                if player is not None:
+                    await session.delete(player)
+            await session.commit()
+
+
 async def test_settle_week_pays_top_three_individuals_not_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Места — топ-3 ИГРОКА по верным путям, а не ступени счёта: 7-7-5 платятся целиком.
 
@@ -242,10 +311,10 @@ async def test_settle_week_pays_top_three_individuals_not_tiers(monkeypatch: pyt
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_a7, username="alpha", wallet_address=wallets[pid_a7]),
-                Player(id=pid_b7, username="beta", wallet_address=wallets[pid_b7]),
-                Player(id=pid_c5, username="gamma", wallet_address=wallets[pid_c5]),
-                Player(id=pid_d3, username="delta", wallet_address=wallets[pid_d3]),
+                Player(id=pid_a7, username="alpha", wallet_address=wallets[pid_a7], wallet_verified=True),
+                Player(id=pid_b7, username="beta", wallet_address=wallets[pid_b7], wallet_verified=True),
+                Player(id=pid_c5, username="gamma", wallet_address=wallets[pid_c5], wallet_verified=True),
+                Player(id=pid_d3, username="delta", wallet_address=wallets[pid_d3], wallet_verified=True),
                 Player(id=pid_e6_lazy, username="lazy"),
             ]
         )
@@ -327,8 +396,8 @@ async def test_settle_week_two_tied_roll_third_place(monkeypatch: pytest.MonkeyP
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pids[0], username="one", wallet_address=wallets[pids[0]]),
-                Player(id=pids[1], username="two", wallet_address=wallets[pids[1]]),
+Player(id=pids[0], username="one", wallet_address=wallets[pids[0]], wallet_verified=True),
+                    Player(id=pids[1], username="two", wallet_address=wallets[pids[1]], wallet_verified=True),
             ]
         )
         rounds: list[Round] = []
@@ -434,7 +503,7 @@ async def test_settle_week_postponed_until_last_day_finalized(monkeypatch: pytes
             vote_counts_json="{}",
         )
         session.add(unfinished)
-        session.add(Player(id=base, username="u", wallet_address="0:" + os.urandom(32).hex()))
+        session.add(Player(id=base, username="u", wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True))
         done = await _seed_closed_round(session, 820_002, prev_start + timedelta(hours=11))
         session.add(Vote(round_id=done.id, player_id=base, card_position=0))
         session.add(WeeklyPot(week=previous_week_key(), nanotons=to_nano(1)))
@@ -459,7 +528,7 @@ async def test_rank_window_orders_ties_by_gram_then_id(session: AsyncSession) ->
 
     Дни участия больше не влияют на порядок — они лишь порог для стажа.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     steady, lucky = 900_001, 900_002
     session.add_all([Player(id=steady, username="steady"), Player(id=lucky, username="lucky")])
     # steady: 3 дня участия, из них 2 верных (в последний день промахнулся);
@@ -484,7 +553,7 @@ async def test_rank_window_orders_ties_by_gram_then_id(session: AsyncSession) ->
 
 async def test_rank_window_gram_breaks_tie(session: AsyncSession) -> None:
     """Тот же счёт верных: игрок с бОльшим вкладом Gram в неделе стоит выше."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     light, heavy = 900_101, 900_102  # heavy выше по id, но побеждать должен по Gram
     session.add_all([Player(id=light, username="light"), Player(id=heavy, username="heavy")])
     round_row = await _seed_closed_round(session, 830_500, now - timedelta(hours=5))
@@ -515,8 +584,8 @@ async def test_settle_week_excludes_player_without_stake(monkeypatch: pytest.Mon
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_staked, username="staked", wallet_address=wallets[pid_staked]),
-                Player(id=pid_no_stake, username="nostake", wallet_address=wallets[pid_no_stake]),
+                Player(id=pid_staked, username="staked", wallet_address=wallets[pid_staked], wallet_verified=True),
+                Player(id=pid_no_stake, username="nostake", wallet_address=wallets[pid_no_stake], wallet_verified=True),
             ]
         )
         rounds: list[Round] = []
@@ -572,9 +641,9 @@ async def test_settle_week_refunded_stake_counts_rejected_does_not(
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_refunded, username="refunded", wallet_address=wallets[pid_refunded]),
-                Player(id=pid_rejected, username="rejected", wallet_address=wallets[pid_rejected]),
-                Player(id=pid_confirmed, username="confirmed", wallet_address=wallets[pid_confirmed]),
+                Player(id=pid_refunded, username="refunded", wallet_address=wallets[pid_refunded], wallet_verified=True),
+                Player(id=pid_rejected, username="rejected", wallet_address=wallets[pid_rejected], wallet_verified=True),
+                Player(id=pid_confirmed, username="confirmed", wallet_address=wallets[pid_confirmed], wallet_verified=True),
             ]
         )
         rounds: list[Round] = []
@@ -677,8 +746,8 @@ async def test_settle_week_claim_breaks_tie(monkeypatch: pytest.MonkeyPatch) -> 
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_early, username="early", wallet_address=wallets[pid_early]),
-                Player(id=pid_late, username="late", wallet_address=wallets[pid_late]),
+                Player(id=pid_early, username="early", wallet_address=wallets[pid_early], wallet_verified=True),
+                Player(id=pid_late, username="late", wallet_address=wallets[pid_late], wallet_verified=True),
             ]
         )
         rounds: list[Round] = []
@@ -750,8 +819,8 @@ async def test_settle_week_claimer_beats_silent_rival(monkeypatch: pytest.Monkey
     async with SessionLocal() as session:
         session.add_all(
             [
-                Player(id=pid_quiet, username="quiet", wallet_address=wallets[pid_quiet]),
-                Player(id=pid_claimer, username="claimer", wallet_address=wallets[pid_claimer]),
+                Player(id=pid_quiet, username="quiet", wallet_address=wallets[pid_quiet], wallet_verified=True),
+                Player(id=pid_claimer, username="claimer", wallet_address=wallets[pid_claimer], wallet_verified=True),
             ]
         )
         rounds: list[Round] = []
@@ -835,8 +904,8 @@ async def _seed_week_tie_scene(
     wallets = {pid: "0:" + os.urandom(32).hex() for pid in pids}
     session.add_all(
         [
-            Player(id=pids[0], username="tie1", wallet_address=wallets[pids[0]]),
-            Player(id=pids[1], username="tie2", wallet_address=wallets[pids[1]]),
+            Player(id=pids[0], username="tie1", wallet_address=wallets[pids[0]], wallet_verified=True),
+            Player(id=pids[1], username="tie2", wallet_address=wallets[pids[1]], wallet_verified=True),
         ]
     )
     prev_start, _ = week_bounds(previous_week_key())
@@ -904,7 +973,7 @@ async def test_settle_week_tie_pays_after_all_claimed(monkeypatch: pytest.Monkey
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "weekly_min_days", 1)
     week_key = previous_week_key()
-    base_t = datetime.now(timezone.utc)
+    base_t = datetime.now(UTC)
     async with SessionLocal() as session:
         pid_one, pid_two, rounds = await _seed_week_tie_scene(session, 983_000, 2)
         try:

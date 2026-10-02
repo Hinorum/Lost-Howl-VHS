@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
@@ -24,31 +24,31 @@ class Base(DeclarativeBase):
     pass
 
 
-class RoundStatus(str, enum.Enum):
+class RoundStatus(StrEnum):
     OPEN = "open"
     TALLYING = "tallying"
     CLOSED = "closed"
 
 
-class WinRule(str, enum.Enum):
+class WinRule(StrEnum):
     MAJORITY = "majority"
     MINORITY = "minority"
     MEDIAN = "median"
 
 
 RULE_PHRASES = {
-    WinRule.MAJORITY: "побеждает путь, за который поставлено больше всех Gram",
-    WinRule.MINORITY: "побеждает путь, за который поставлено меньше всех Gram",
-    WinRule.MEDIAN: "побеждает путь со средним весом ставок (Gram)",
+    WinRule.MAJORITY: "уцелеет кадр с большей суммой Gram (день Большинства)",
+    WinRule.MINORITY: "уцелеет кадр с меньшей суммой Gram (день Меньшинства)",
+    WinRule.MEDIAN: "уцелеет кадр со средней суммой Gram (день Середины)",
 }
 
 # Формулировки для дней, исход которых решают бесплатные голоса:
 # fallback (на день не поставлено ни одного Gram) и легаси-режим
 # (winner_by_stakes=False / ставки не включены).
 VOTE_RULE_PHRASES = {
-    WinRule.MAJORITY: "побеждает путь, собравший больше всех голосов",
-    WinRule.MINORITY: "побеждает путь, собравший меньше всех голосов",
-    WinRule.MEDIAN: "побеждает путь со средним числом голосов",
+    WinRule.MAJORITY: "уцелеет кадр, собравший больше всех голосов (день Большинства)",
+    WinRule.MINORITY: "уцелеет кадр, собравший меньше всех голосов (день Меньшинства)",
+    WinRule.MEDIAN: "уцелеет кадр со средним числом голосов (день Середины)",
 }
 
 
@@ -72,9 +72,6 @@ class Player(Base):
     # совпадение «адрес + код» доказывает контроль. Null — ждать нечего.
     wallet_verify_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     wallet_verify_created: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Жетоны «Второго нюха»: за находки памяти и верные серии. Тратятся на
-    # личную микросцену дня; информации о законе не дают.
-    inspiration: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Подписка на личные дубликаты рассылок (итоги дня, новый день с обложкой,
     # вечерний пост и прочие анонсы) в личку бота. По умолчанию — да; игрок
     # может снять или вернуть её кнопкой в /start.
@@ -183,6 +180,10 @@ class Round(Base):
     # Момент первой успешной рассылки дня: повторный анонс того же дня
     # невозможен даже при гонке двух процессов после деплоя.
     announced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Момент доставки итогов дня (общий пост + личные) — маркер at-least-once:
+    # ставится ПОСЛЕ успешного бродкаста; отсутствие у CLOSED-дня позади
+    # актуального включает восстановитель (_retry_results_job). Откат снимает.
+    results_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pot_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     rake_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     # Доля дня, ушедшая в копилку недели (2% фонда) — для поста итогов.
@@ -191,6 +192,13 @@ class Round(Base):
     # для поста итогов. День без приведённых ставок или день возврата — 0.
     referral_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     payouts_finalized: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Момент начисления очков дня — единый маркер-claim: проставляет только
+    # тот, кто победил в гонке (scheduler, heal, админский /advance), и только
+    # в одной транзакции с самим начислением. Краш между finish_tally и
+    # award_points оставляет день CLOSED без очков, но целевой запрос по
+    # awards_at IS NULL добирает его; повторный вызов не удваивает score.
+    # Null — очки ещё не начислены (или день без победителя).
+    awards_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Денежная версия дня (ставки TON + платная смена выбора): снимок режима
     # на момент открытия дня. Хранитель переключает «версию со ставками/без»
     # из /panel — новая версия вступает со СЛЕДУЮЩЕГО дня, а этот флаг
@@ -205,6 +213,37 @@ class Round(Base):
     )
 
     cards: Mapped[list[Card]] = relationship(back_populates="round", cascade="all, delete-orphan")
+
+
+class StatusPost(Base):
+    """Где живёт пост-статус текущего дня (тот, что с кнопками выбора).
+
+    Пост дня уходит один раз при анонсе — с суммой подтверждённых ставок на тот
+    момент. Когда watcher подтверждает новые ставки, банк в отправленном посте
+    устаревает, и игроку приходится звать /today. Здесь храним точку доставки
+    (чат + message_id), чтобы отредактировать тот же пост; last_pot_nanotons
+    дедуплицирует правки — редактируем только когда сумма реально выросла.
+    Строки открытого раунда чистит проход refresh; строки прошлых дней убирает
+    тот же дедуп (правим лишь текущий OPEN раунд).
+    """
+
+    __tablename__ = "status_post"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    round_id: Mapped[int] = mapped_column(ForeignKey("rounds.id"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    # Отдельные чаты (группы) и личные дубликаты подписчиков редактируются
+    # одинаково, но метка нужна для диагностики и будущей разной риторики.
+    is_dm: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Последний показанный в посте банк (нанотоны Gram). Null — пост ещё ни разу
+    # не правился/банк не подсматривался; изменение числа — триггер правки.
+    last_pot_nanotons: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("round_id", "chat_id", name="uq_status_post_round_chat"),
+    )
 
 
 class Card(Base):
@@ -245,14 +284,14 @@ class StoryBeat(Base):
     day_index: Mapped[int] = mapped_column(Integer, unique=True)
     winning_title: Mapped[str] = mapped_column(String(120))
     winning_text: Mapped[str] = mapped_column(Text)
-    hook_text: Mapped[str | None] = mapped_column(String(700), default=None)  # Крючок главы дня
+    hook_text: Mapped[str | None] = mapped_column(String(700), default=None)  # (легаси) крючок главы: больше не пишется, кассеты самостоятельны
     win_rule: Mapped[str] = mapped_column(String(32))
     vote_counts: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Stake(Base):
-    """Ставка TON на путь в дне. Одна на игрока в раунде, идемпотентна по tx_hash.
+    """Ставка TON на выбор дня. Одна на игрока в раунде, идемпотентна по tx_hash.
 
     Жизненный цикл: pending (увидена в блокчейне) → confirmed (набрало
     «возраст» в блоках) → после итогов дня либо учтена в фонде победителям,
@@ -506,6 +545,56 @@ class Income(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class TreasuryMove(Base):
+    """Зеркало транзакций казначея: точная копия истории активного кошелька.
+
+    Каждая цепочечная транзакция (сторона казначея) — строка здесь.
+    Тождество «по построению»: баланс казны = сумма balance_delta от генезиса
+    до головы цепочки, поэтому сверка зеркала с живым балансом не знает
+    допуска на газ — реальный fee приходит из самой цепочки (total_fees), и
+    сходимость «тютелька в тютельку» не зависит от оценки payout_fee_gram.
+    Строки зеркала НЕ заменяют Income/Payout/Stake: это независимый дубликат
+    блокчейна для аудита, диагноза «куда делось» и ежедневной автосверки.
+    """
+
+    __tablename__ = "treasury_moves"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tx_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    network: Mapped[str] = mapped_column(String(16), default="mainnet", index=True)
+    # Адрес кошелька, чей это транзакция. Сумма зеркала считается по паре
+    # (network, address), а не по одному network: после ротации адреса
+    # казначея строки прежнего кошелька суммировались бы в баланс нового
+    # навсегда, и ни один /mirror reset этого не отменил бы.
+    address: Mapped[str] = mapped_column(String(80), default="", index=True)
+    utime: Mapped[int] = mapped_column(BigInteger, index=True)
+    # Логическое время транзакции (lt): стабильный ключ пагинации индексаторов.
+    lt: Mapped[int] = mapped_column(BigInteger, index=True)
+    # Куда двигался баланс казны: in — пришло, out — ушло, self — перевод
+    # казначея самому себе (рейк/доли копилки), other — без перевода сумм.
+    direction: Mapped[str] = mapped_column(String(8), default="in")
+    # Классификация после связки с БД: stake / revote / refund / payout:prize /
+    # unknown_in / unknown_out ... Импровизированная строка для отчёта.
+    kind: Mapped[str] = mapped_column(String(32), default="unknown", index=True)
+    # Абсолютная сумма перевода (для чтения); знак несёт balance_delta.
+    value_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Реальная комиссия транзакции из цепочки (total_fees) — не оценка.
+    fee_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Сальдо аккаунта от этой транзакции (со знаком): Σ по генезису = баланс.
+    balance_delta_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
+    counterparty: Mapped[str] = mapped_column(String(80), default="")
+    comment: Mapped[str] = mapped_column(String(200), default="")
+    # id связанной строки БД: Payout (out) / Income или Stake (in). None — нет.
+    linked_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_treasury_moves_lt_id", "network", "lt", "id"),
+        Index("ix_treasury_moves_address_lt", "address", "lt"),
+    )
+
+
 class WalletDialog(Base):
     """Диалог привязки кошелька в личке: игрок → ожидаем адрес следующим сообщением.
 
@@ -540,7 +629,7 @@ class MemoryHit(Base):
     """Отметка внимательности: игрок узнал тихий след давнего дня в каноне.
 
     Бот никогда не подтверждает и не опровергает догадку — только копит
-    счётчик «Память лабиринта», видимый в /score. Одна отметка на игрока в день.
+    счётчик «Память пути» на будущую прогрессию. Одна отметка на игрока в день.
     """
 
     __tablename__ = "memory_hits"

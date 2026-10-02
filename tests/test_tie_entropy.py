@@ -8,7 +8,7 @@
   жребий без энтропии — ничья не зависает на сетевой ошибке.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.config import settings
 from app.models import Card, Player, Round, RoundStatus, Vote, WinRule
@@ -17,7 +17,7 @@ from app.rounds.voting import tied_positions
 
 
 def _round(day_index: int) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=day_index,
         status=RoundStatus.OPEN,
@@ -76,6 +76,32 @@ def test_pick_winner_depends_on_entropy() -> None:
     assert outcomes == {0, 1}
 
 
+def test_pick_winner_uses_last_hash_digit() -> None:
+    """Пересчёт в уме: последняя цифра root_hash по модулю претендентов."""
+    counts = {0: 1, 1: 1, 2: 0}
+    rule = WinRule.MAJORITY
+    assert pick_winner(counts, rule, "7:majority:100:f0") == 0
+    assert pick_winner(counts, rule, "7:majority:100:f1") == 1
+    # Три претендента — модуль 3.
+    three = {0: 1, 1: 1, 2: 1}
+    rule = WinRule.MINORITY
+    assert tied_positions(three, rule) == [0, 1, 2]
+    assert pick_winner(three, rule, "5:minority:9:b") == 2  # 11 % 3
+    assert pick_winner(three, rule, "5:minority:9:c") == 0  # 12 % 3
+    assert pick_winner(three, rule, "5:minority:9:d") == 1  # 13 % 3
+
+
+def test_pick_winner_hex_and_bad_hash_fall_back() -> None:
+    """Верхний регистр хеша — как есть; неразборчивый «хеш» — легаси-сид."""
+    counts = {0: 1, 1: 1, 2: 0}
+    rule = WinRule.MAJORITY
+    assert int("F", 16) % 2 == pick_winner(counts, rule, "7:majority:100:0F")
+    a = pick_winner(counts, rule, "7:majority:100:zzz")
+    b = pick_winner(counts, rule, "7:majority:100:zzz")
+    assert a == b
+    assert a in (0, 1)
+
+
 async def test_tie_seed_embeds_entropy() -> None:
     round_row = Round(
         day_index=7,
@@ -83,9 +109,9 @@ async def test_tie_seed_embeds_entropy() -> None:
         status=RoundStatus.OPEN,
         chapter_title="t",
         chapter_text="t",
-        opens_at=datetime.now(timezone.utc),
-        voting_ends_at=datetime.now(timezone.utc),
-        tally_ends_at=datetime.now(timezone.utc),
+        opens_at=datetime.now(UTC),
+        voting_ends_at=datetime.now(UTC),
+        tally_ends_at=datetime.now(UTC),
     )
     assert tie_seed(round_row) == "7:majority"
     round_row.tie_entropy = "93123949:abcd1234"
@@ -146,7 +172,9 @@ async def test_heal_recomputes_same_winner(
         loaded = await session.get(Round, round_row.id)
         assert loaded.winner_card == winner_at_close
         assert loaded.tie_note is not None
-        assert "блоком TON №93123949" in loaded.tie_note  # проверяемо в эксплорере
+        assert "блока TON №93123949" in loaded.tie_note  # проверяемо в эксплорере
+        assert "tonviewer.com/block/" in loaded.tie_note
+        assert len(loaded.tie_note) <= 200
     finally:
         await session.rollback()
 
@@ -162,7 +190,7 @@ async def test_tie_without_ton_falls_back_to_legacy_seed(
         loaded = await session.get(Round, round_row.id)
         assert loaded.tie_entropy is None
         assert loaded.winner_card == await _win_without_entropy(loaded)
-        assert "блоком TON" not in (loaded.tie_note or "")
+        assert "блока TON" not in (loaded.tie_note or "")
     finally:
         await session.rollback()
 
@@ -188,7 +216,27 @@ async def test_tie_note_reaches_results_post(
         await finish_tally(session, loaded)
         closed = await session.get(Round, round_row.id)
         text = await results_message(closed, session)
-        assert "блоком TON №93123949" in text
+        assert "блока TON №93123949" in text
         assert "93123949" in text  # seqno блока виден игрокам — можно перепроверить
+        assert "tonviewer.com/block/" in text
+    finally:
+        await session.rollback()
+
+
+async def test_epilogue_escaped_in_results_html(session) -> None:
+    """Эпилог сюжетного слоя — не доверенный HTML: в пост итогов идёт экранированным."""
+    from app.broadcast import results_message
+
+    round_row = await _seed_tied_day(session, 860)
+    try:
+        loaded = await session.get(Round, round_row.id)
+        loaded.status = RoundStatus.CLOSED
+        loaded.winner_card = 0
+        loaded.epilogue_text = "<b>хитрость</b> & <i>вставка</i>"
+        await session.commit()
+
+        text = await results_message(loaded, session)
+        assert "<b>хитрость</b>" not in text  # сырой HTML не попадает в пост
+        assert "&lt;b&gt;хитрость&lt;/b&gt; &amp; &lt;i&gt;вставка&lt;/i&gt;" in text
     finally:
         await session.rollback()

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -165,12 +166,12 @@ async def test_send_uses_local_seqno_when_batch_active(monkeypatch: pytest.Monke
         return fake
 
     monkeypatch.setattr(ton_pay, "_get_wallet", fake_get)
-    monkeypatch.setattr(ton_pay, "_batch_seqno", 100)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", 100)
     try:
         await ton_pay.send_ton_transfer("0:" + "11" * 32, to_nano(1), comment="a")
         await ton_pay.send_ton_transfer("0:" + "22" * 32, to_nano(2), comment="b")
     finally:
-        monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
     assert fake.seqnos == [100, 101]
     # Батч-путь не ходит в wallet.transfer: каждый перевод — отдельный
     # подписанный external со своим seqno, вещается напрямую.
@@ -195,13 +196,39 @@ async def test_send_batch_aborts_on_failure(monkeypatch: pytest.MonkeyPatch) -> 
         return fake
 
     monkeypatch.setattr(ton_pay, "_get_wallet", fake_get)
-    monkeypatch.setattr(ton_pay, "_batch_seqno", 100)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", 100)
     try:
         with pytest.raises(RuntimeError, match="не приняли"):
             await ton_pay.send_ton_transfer("0:" + "11" * 32, to_nano(1), comment="a")
-        assert ton_pay._batch_seqno is None
+        assert ton_pay.state._batch_seqno is None
     finally:
-        monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
+
+
+async def test_send_batch_aborts_on_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """asyncio.wait_for-таймаут диспетчера рвёт корутину вещания CancelledError
+    (это НЕ Exception): батч-счётчик обязан сброситься и здесь, иначе следующий
+    перевод пачки переиспользует уже разосланный seqno и молча потеряется."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_mnemonic", " ".join(mnemonic_new(24)))
+
+    class _CancelledWallet(_BatchWallet):
+        async def send_external(self, body=None):
+            raise asyncio.CancelledError()
+
+    fake = _CancelledWallet()
+
+    async def fake_get():
+        return fake
+
+    monkeypatch.setattr(ton_pay, "_get_wallet", fake_get)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", 100)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await ton_pay.send_ton_transfer("0:" + "11" * 32, to_nano(1), comment="a")
+        assert ton_pay.state._batch_seqno is None
+    finally:
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
 
 
 # ---------- Регрессия формата внешнего сообщения v5 ----------
@@ -210,7 +237,7 @@ async def test_send_batch_aborts_on_failure(monkeypatch: pytest.MonkeyPatch) -> 
 def test_v5_external_body_matches_contract_spec() -> None:
     """Тело внешнего сообщения v5 обязано быть
     [op 'sign'|wallet_id|valid_until|seqno|флаги][подпись 512 бит] + ref на
-    цепочку OutList — сверено с реальной транзакцией Tonkeeper тестнета.
+    цепочку OutList — сверено с реальной транзакцией Keeper тестнета.
     Дрейф версий pytoniq-core ломал сборку молча; этот тест ловит такое.
 
     Контракт парсит ровно так: signature = последние 512 бит тела, подпись
@@ -270,7 +297,7 @@ def test_v5_external_body_matches_contract_spec() -> None:
 
 
 def test_v5_wallet_id_testnet_packing() -> None:
-    """wallet_id тестнета (Tonkeeper-казначей): 0x7FFFFFFD = 2147483645."""
+    """wallet_id тестнета (Keeper-казначей): 0x7FFFFFFD = 2147483645."""
     from pytoniq.contract.wallets.wallet_v5 import WalletV5WalletID
 
     packed = WalletV5WalletID(workchain=0, network_global_id=-3).pack()

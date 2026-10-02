@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
+    RULE_PHRASES,
+    VOTE_RULE_PHRASES,
     LeaderboardPot,
     PackFund,
-    Player,
     Payout,
+    Player,
     Round,
+    RoundStatus,
     Stake,
     Vote,
     WeeklyPot,
-    RULE_PHRASES,
-    VOTE_RULE_PHRASES,
 )
 from app.rounds import pick_winner
+from app.rounds.time import _ROMAN
 from app.stakes import current_network
 from app.ton_utils import from_nano
 from app.weeks import iso_week_key
@@ -42,6 +45,17 @@ def _chunks(ids: list[int], size: int = _CHUNK):
 async def award_points(session: AsyncSession, round_row: Round) -> int:
     if round_row.winner_card is None:
         return 0
+    # Маркер-claim в ОДНОЙ транзакции с начислением: победитель гонки
+    # (scheduler, heal, админский /advance) проставляет awards_at и пишет
+    # очки атомарно. Соперник ждёт на коммите и получает rowcount=0 —
+    # score не удваивается даже при одновременных финализациях.
+    claim = await session.execute(
+        update(Round)
+        .where(Round.id == round_row.id, Round.awards_at.is_(None))
+        .values(awards_at=datetime.now(UTC))
+    )
+    if claim.rowcount == 0:
+        return 0  # уже начислено (повторный тик / админское переигрывание)
     voters = await session.execute(select(Vote.player_id).where(Vote.round_id == round_row.id))
     voter_ids = [row[0] for row in voters.all()]
     for chunk in _chunks(voter_ids):
@@ -61,16 +75,6 @@ async def award_points(session: AsyncSession, round_row: Round) -> int:
             .where(Player.id.in_(chunk))
             .values(score=Player.score + 10, correct_picks=Player.correct_picks + 1)
         )
-    # Вдохновение («Второй нюх») за верную серию: каждый 7-й верный путь
-    # кладёт жетон. Жетон тратится только на личную микросцену — на механику
-    # дня он не влияет.
-    for chunk in _chunks(winner_ids):
-        await session.execute(
-            update(Player)
-            .where(Player.id.in_(chunk), (Player.correct_picks % 7) == 0, Player.correct_picks > 0)
-            .values(inspiration=Player.inspiration + 1)
-        )
-
     # Обновление стриков: победители увеличивают, проигравшие сбрасывают
     from app.streaks import update_streak
 
@@ -89,6 +93,37 @@ async def award_points(session: AsyncSession, round_row: Round) -> int:
 
     await session.commit()
     return len(winner_ids)
+
+
+async def award_pending_points(session: AsyncSession) -> int:
+    """Добирает очки дней, закрытых без начисления: краш между коммитом
+    finish_tally и award_points оставляет день CLOSED (heal_stale_rounds
+    лечит только OPEN/TALLYING), и без этого никто очки не вернул бы.
+    Идемпотентно: claim по awards_at IS NULL пускает только одного.
+
+    Ловим только НЕДАВНИЕ дни (catchup_cutoff): колонка awards_at добавлена
+    миграцией без бэкфилла, поэтому у всей истории закрытых дней маркер
+    NULL — без границы первый же тик новой версии начислил бы очки заново
+    за все дни, где они уже были начислены (двойные очки у игроков).
+    """
+    from app.rounds.time import catchup_cutoff
+
+    rows = (
+        await session.execute(
+            select(Round.id).where(
+                Round.status == RoundStatus.CLOSED,
+                Round.winner_card.is_not(None),
+                Round.awards_at.is_(None),
+                Round.voting_ends_at >= catchup_cutoff(),
+            )
+        )
+    ).all()
+    awarded = 0
+    for (round_id,) in rows:
+        round_row = await session.get(Round, round_id)
+        if round_row is not None:
+            awarded += await award_points(session, round_row)
+    return awarded
 
 
 _FLIP_SEARCH_CAP = 15  # отрыв больше этого уже не «на волоске» — строку не пишем
@@ -146,32 +181,14 @@ def format_results(
     multiplier: float | None = None,
 ) -> str:
     import json
-    from app.style import result_mark
 
     raw = json.loads(round_row.vote_counts_json or "{}")
     counts = {int(key): int(value) for key, value in raw.items()}
     stake_raw = json.loads(round_row.stake_counts_json or "{}")
     stake_counts = {int(key): int(value) for key, value in stake_raw.items()} if stake_raw else None
     names = {card.position: _tg_escape(card.title) for card in round_row.cards}
-    mark_key = str(getattr(round_row, "id", round_row.day_index))
-    lines = [f"{result_mark(mark_key)} День {round_row.day_index} закрыт"]
-    if stake_counts:
-        # «Запись на волоске» по решающему счёту: исход решили ставки, мерим
-        # средство перемещения (Gram) с дискретностью 0.01.
-        margin = flip_margin(
-            {position: int(round(value / 1e7)) for position, value in stake_counts.items()},
-            getattr(round_row, "win_rule", None),
-            round_row.winner_card,
-        )
-        if margin is not None:
-            k, alt = margin
-            alt_name = names.get(alt)
-            if alt_name:
-                lines.append(
-                    f"🩸 на волоске: ещё {k / 100:.2f} Gram за «{alt_name}» — "
-                    "и деньги повели тропу иначе."
-                )
-    else:
+    lines = [f"📼 День {round_row.day_index} — кадр записан"]
+    if not stake_counts:
         # «Запись на волоске»: сколько голосов отделяло мир от другого исхода.
         margin = flip_margin(counts, getattr(round_row, "win_rule", None), round_row.winner_card)
         if margin is not None:
@@ -181,12 +198,12 @@ def format_results(
                 word = _votes_word(k)
                 lines.append(
                     f"🩸 на волоске: ещё {k} {word} за «{alt_name}» — "
-                    "и тропа повела бы иначе."
+                    "и сцена повела бы иначе."
                 )
     day_phrases = RULE_PHRASES if stake_counts else VOTE_RULE_PHRASES
-    lines.append(f"⚖️ Правило дня: {day_phrases[round_row.win_rule]}")
+    lines.append(f"🎬 Сцена дня: {day_phrases[round_row.win_rule]}")
     if stake_counts:
-        lines.append("💰 Тропу выбрали ставки дня — голоса ведут лидерборд")
+        lines.append("💰 Кадр дня уцелел по счёту Gram — голоса ведут лидерборд")
     lines.append("")
     stakes = path_stakes or {}
     for position in range(3):
@@ -194,7 +211,9 @@ def format_results(
         stake_nano = stakes.get(position, 0)
         stake_str = f" ({from_nano(stake_nano):.2f} Gram)" if stake_nano > 0 else ""
 
-        lines.append(f"{names[position]}: {counts.get(position, 0)}{stake_str}{mark}")
+        lines.append(
+            f"{_ROMAN[position]}: {names[position]}: {counts.get(position, 0)}{stake_str}{mark}"
+        )
     # Коэффициент: если есть ставки на победивший путь
     if multiplier is not None and multiplier > 0:
         lines.append(f"🎯 Коэффициент: ×{multiplier:.2f}")
@@ -324,7 +343,7 @@ def format_economics(stats: dict) -> str:
     ton = from_nano
     lines.insert(0, f"💰 Банк дня: {ton(stats['pot']):.2f} Gram")
     if stats["refunded"]:
-        lines.append("🎯 На верный путь не поставил никто — все ставки возвращены игрокам")
+        lines.append("🎯 На верную сцену не поставил никто — все ставки возвращены игрокам")
     if stats["fund_total"] > 0:
         lines.append(f"🐾 В Фонде Стаи: {ton(stats['fund_total']):.2f} Gram")
     if stats.get("referral_today", 0) > 0:

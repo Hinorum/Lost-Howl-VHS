@@ -14,7 +14,7 @@
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import delete
@@ -72,7 +72,7 @@ async def test_heal_reprocesses_reported_transfer(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(settings, "stuck_heal_recheck_seconds", 0)
     source = "0:" + os.urandom(32).hex()
     tx_hash = "heal-" + os.urandom(8).hex()
-    utime = int(datetime.now(timezone.utc).timestamp())
+    utime = int(datetime.now(UTC).timestamp())
     stuck = {
         tx_hash: {
             "utime": utime,
@@ -123,7 +123,7 @@ async def test_heal_auto_refunds_after_repeated_failures(
 
     source = "0:" + os.urandom(32).hex()
     tx_hash = "healb-" + os.urandom(8).hex()
-    utime = int(datetime.now(timezone.utc).timestamp())
+    utime = int(datetime.now(UTC).timestamp())
     stuck = {
         tx_hash: {
             "utime": utime,
@@ -139,7 +139,7 @@ async def test_heal_auto_refunds_after_repeated_failures(
         await tw._write_stuck(db, stuck)
         try:
             # Провалы лечения копят heal_fails; авто-возврат срабатывает с лимита.
-            for attempt in range(tw._STUCK_HEAL_MAX_REFUND_FAILS):
+            for _ in range(tw._STUCK_HEAL_MAX_REFUND_FAILS):
                 await tw._heal_stuck_transfers()
             row = (await db.execute(Payout.__table__.select().where(Payout.tx_hash == tx_hash))).first()
             assert row is not None, "после лимита провалов авто-возврат не создан"

@@ -15,16 +15,16 @@ Revises: cf07bde2fcc2
 Create Date: 2026-09-17 22:05:00.000000
 
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = 'e7a1c4d90ab5'
-down_revision: Union[str, Sequence[str], None] = 'cf07bde2fcc2'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = 'cf07bde2fcc2'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

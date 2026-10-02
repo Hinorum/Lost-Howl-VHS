@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
@@ -28,6 +28,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Chat, Payout, Round, RoundStatus, Stake, Vote, WatcherState
 from app.rounds import (
+    _now,
     claim_announcement,
     close_voting,
     create_next_round_detailed,
@@ -35,6 +36,7 @@ from app.rounds import (
     finish_tally,
     get_active_round,
     reset_game,
+    utc_aware,
     write_epilogue,
 )
 from app.style import money_mark, ok_mark, warn_mark
@@ -107,6 +109,17 @@ async def cmd_advance(message: Message) -> None:
             else:
                 await message.answer(f"День {round_row.day_index} уже объявлен.")
             return
+        if utc_aware(round_row.voting_ends_at) > _now():
+            # Инцидент: тик уже закрыл N и открыл N+1, а /advance брал свежий
+            # день как «актуальный» и закрывал его с нулём голосов и жребием,
+            # плодя затем N+2 по latest+1. Свежеоткрытый день не трогаем: если
+            # день действительно застрял, его окно голосования уже истекло.
+            ends = utc_aware(round_row.voting_ends_at).strftime("%H:%M")
+            await message.answer(
+                f"День {round_row.day_index} ещё голосуется (до {ends}). "
+                "Свежий день не закрываю — /advance нужен застрявшим дням."
+            )
+            return
         if round_row.status.value == "open":
             await close_voting(session, round_row)
             round_row, closed_here = await finish_tally(session, round_row)
@@ -117,7 +130,9 @@ async def cmd_advance(message: Message) -> None:
                 await write_epilogue(session, round_row)
                 from app.leaderboard import mark_leaderboards_for_finished
                 await mark_leaderboards_for_finished(session, round_row)
-            nxt, created = await create_next_round_detailed(session)
+            nxt, created = await create_next_round_detailed(
+                session, base_day_index=round_row.day_index
+            )
         elif round_row.status.value == "tallying":
             round_row, closed_here = await finish_tally(session, round_row)
             if closed_here:
@@ -127,7 +142,9 @@ async def cmd_advance(message: Message) -> None:
                 await write_epilogue(session, round_row)
                 from app.leaderboard import mark_leaderboards_for_finished
                 await mark_leaderboards_for_finished(session, round_row)
-            nxt, created = await create_next_round_detailed(session)
+            nxt, created = await create_next_round_detailed(
+                session, base_day_index=round_row.day_index
+            )
         else:
             return
         if created:
@@ -209,6 +226,7 @@ async def cmd_resetgame(message: Message) -> None:
             from app.backups import backup_now
             await backup_now()
         except Exception:
+            logger.warning("Бэкап перед /resetgame не удался", exc_info=True)
             await message.answer(f"{warn_mark('queue')} Бэкап перед сбросом не удался, " "продолжаю без снимка.")
         new_round = await reset_game(session, keep_story=keep_story)
         first = await claim_announcement(session, new_round)
@@ -291,8 +309,8 @@ async def cmd_dispute(message: Message) -> None:
     # Публичная само-подача: жалоба игрока на его последний сыгранный день.
     if message.from_user is None:
         return
-    from app.models import Vote as _Vote
     from app.models import Round as _Round
+    from app.models import Vote as _Vote
 
     reason = message.text.split(maxsplit=1)[1] if " " in message.text else ""
     async with SessionLocal() as session:
@@ -514,7 +532,7 @@ async def on_adjust_action(callback: CallbackQuery) -> None:
     async with SessionLocal() as session:
         row = await session.get(WatcherState, confirm_key)
         pending = json.loads(row.value) if row is not None else None
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ready = False
         if pending is not None and pending.get("action") == action:
             try:
@@ -523,7 +541,7 @@ async def on_adjust_action(callback: CallbackQuery) -> None:
                 created = None
             if created is not None:
                 if created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
+                    created = created.replace(tzinfo=UTC)
                 ready = (now - created).total_seconds() <= _ADJ_CONFIRM_WINDOW
         if not ready:
             payload = json.dumps(
@@ -689,29 +707,31 @@ async def cmd_refinalize(message: Message) -> None:
             return
 
         async with dispatch_lock():
-            # Перефинализация может задвоить реальные деньги: строки sent уже
-            # ушли в блокчейн (или в пути), и пересоздание создаст ИХ ПОВТОРНО.
+            # Перефинализация может задвоить реальные деньги: строка, уже
+            # ушедшая в блокчейн (sent), либо улетевшая в вещание (sending —
+            # коммит отложен от отправки), двигала реальные монеты; пересоздание
+            # создаст её ПОВТОРНО (новый payout.id, анти-дубль по memo слеп).
             # Отказ внятным сообщением: пусть хранитель сам разберётся с уже
             # ушедшим (сверка /treasury, /adjust), а не плодит вторую выплату.
-            sent_q = await session.execute(
+            moved_q = await session.execute(
                 select(func.count()).select_from(Payout).where(
                     Payout.round_id == row.id,
-                    Payout.status == "sent",
+                    Payout.status.in_(["sent", "sending"]),
                 )
             )
-            sent_count = int(sent_q.scalar_one())
-            if sent_count:
+            moved_count = int(moved_q.scalar_one())
+            if moved_count:
                 await message.answer(
                     f"Round#{row.id} (день {target_day}): перефинализация отменена — "
-                    f"уже выполнено {sent_count} выплат (статус sent). Повторное "
-                    "создание задвоило бы реальные переводы в блокчейне. "
+                    f"уже двинуто денег: {moved_count} строк (sent/sending). "
+                    "Повторное создание задвоило бы реальные переводы в блокчейне. "
                     "Разберись с ушедшим через /treasury или /adjust."
                 )
                 return
             stale_q = await session.execute(
                 select(Payout).where(
                     Payout.round_id == row.id,
-                    Payout.status.notin_(["sent"]),
+                    Payout.status.notin_(["sent", "sending"]),
                 )
             )
             stale = list(stale_q.scalars().all())

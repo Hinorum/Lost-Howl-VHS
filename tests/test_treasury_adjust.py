@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from app import ops, ton_pay
 from app.config import settings
@@ -23,8 +23,8 @@ from app.handlers import (
     _panel_keyboard,
     cmd_adjust,
     cmd_advance,
-    cmd_payouts,
     cmd_pause,
+    cmd_payouts,
     cmd_resume,
     on_adjust_action,
     on_panel_action,
@@ -36,7 +36,6 @@ from app.models import Income, Payout, Player, Round, RoundStatus, Stake, Watche
 from app.stakes import register_stake
 from app.ton_utils import normalize_address, to_nano
 from app.ton_watch import Transfer, process_transfer
-
 
 RAW = normalize_address("UQpfcexKrlNjGFPF44W9am1o75Z6fs_QBdwVNzuhHVX2L4oo")
 STRANGER = "0:" + "9" * 62
@@ -165,7 +164,7 @@ async def test_single_stake_not_double_counted(ton_on, monkeypatch) -> None:
     monkeypatch.setattr(
         ton_pay, "fetch_account_state", AsyncMock(return_value=(balance, None, "tonapi"))
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     try:
         async with SessionLocal() as db:
             round_row = Round(
@@ -267,7 +266,7 @@ async def test_manual_refund_creates_net_payout_and_is_idempotent(ton_on) -> Non
     вычетом газа), ставка помечается возвращённой, повторный вызов не дублирует."""
     from app.stakes import create_manual_refund
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     try:
         async with SessionLocal() as db:
             round_row = Round(
@@ -285,6 +284,7 @@ async def test_manual_refund_creates_net_payout_and_is_idempotent(ton_on) -> Non
                 id=930_962,
                 username="refund_me",
                 wallet_address=RAW,
+                wallet_verified=True,
             )
             db.add_all([round_row, player])
             await db.flush()
@@ -314,6 +314,69 @@ async def test_manual_refund_creates_net_payout_and_is_idempotent(ton_on) -> Non
             await db.execute(delete(Stake).where(Stake.tx_hash == "ref-1g"))
             await db.execute(delete(Player).where(Player.id == 930_962))
             await db.execute(delete(Round).where(Round.day_index == 97_961))
+            await db.commit()
+
+
+async def test_manual_refund_refuses_unverified_wallet(ton_on) -> None:
+    """Адрес без bv:-подтверждения — не получатель: возврат ушёл бы в
+    необработанный bounce. И отказ обязан быть незалипающим: игрок подтвердил
+    кошелёк — повтор создаёт выплату."""
+    from app.stakes import create_manual_refund
+
+    now = datetime.now(UTC)
+    try:
+        async with SessionLocal() as db:
+            round_row = Round(
+                day_index=97_962,
+                status=RoundStatus.CLOSED,
+                win_rule=WinRule.MAJORITY,
+                chapter_title="t",
+                chapter_text="x",
+                opens_at=now - timedelta(hours=25),
+                voting_ends_at=now - timedelta(hours=1),
+                tally_ends_at=now,
+            )
+            player = Player(id=930_963, username="refund_unv", wallet_address=RAW)
+            db.add_all([round_row, player])
+            await db.flush()
+            stake = Stake(
+                round_id=round_row.id, player_id=player.id,
+                amount_nanotons=to_nano(1), tx_hash="ref-unv",
+                status="pending",
+                network="testnet" if settings.is_testnet else "mainnet",
+            )
+            db.add(stake)
+            await db.commit()
+            stake_id = stake.id
+            player_id = player.id
+        async with SessionLocal() as session:
+            refused = await create_manual_refund(session, stake_id)
+            assert "bv:" in refused
+            assert (
+                await session.execute(select(Payout).where(Payout.kind == "refund"))
+            ).scalars().all() == []
+            # Ставка не тронута: возврат не оформлен.
+            s2 = await session.get(Stake, stake_id)
+            assert s2.status == "pending"
+        async with SessionLocal() as session:
+            await session.execute(
+                update(Player).where(Player.id == player_id).values(wallet_verified=True)
+            )
+            await session.commit()
+        async with SessionLocal() as session:
+            again = await create_manual_refund(session, stake_id)
+            assert "поставлен в очередь" in again, again
+            rows = (
+                await session.execute(select(Payout).where(Payout.kind == "refund"))
+            ).scalars().all()
+        assert len([p for p in rows if p.round_id == round_row.id]) == 1
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(delete(Payout).where(Payout.kind == "refund"))
+            await db.execute(delete(Stake).where(Stake.tx_hash == "ref-unv"))
+            await db.execute(delete(Player).where(Player.id == 930_963))
+            await db.execute(delete(Round).where(Round.day_index == 97_962))
+            await db.execute(delete(WatcherState).where(WatcherState.key == f"manual_refund:{round_row.id}:{player_id}"))
             await db.commit()
 
 
@@ -482,13 +545,13 @@ async def test_process_transfer_refunds_everyone_during_pause(ton_on) -> None:
     try:
         status = await process_transfer(
             Transfer(tx_hash=tx_stranger, source=STRANGER, value_nanotons=to_nano(0.3),
-                     comment="", utime=int(datetime.now(timezone.utc).timestamp()))
+                     comment="", utime=int(datetime.now(UTC).timestamp()))
         )
         assert status == "paused_refund_queued"
 
         status2 = await process_transfer(
             Transfer(tx_hash=tx_player, source=RAW, value_nanotons=to_nano(0.7),
-                     comment="", utime=int(datetime.now(timezone.utc).timestamp())),
+                     comment="", utime=int(datetime.now(UTC).timestamp())),
             bot=bot,
         )
         assert status2 == "paused_refund_queued"
@@ -523,7 +586,7 @@ async def test_process_transfer_refunds_everyone_during_pause(ton_on) -> None:
 
 
 async def test_register_stake_blocked_while_paused(ton_on) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     round_row = Round(
         day_index=97_901,
         status=RoundStatus.OPEN,
@@ -629,7 +692,7 @@ async def test_resume_allows_tick_to_open_day(ton_on, monkeypatch) -> None:
                     select(Round).order_by(Round.day_index.desc()).limit(1)
                 )
             ).scalar_one()
-            moment = datetime.now(timezone.utc) - timedelta(minutes=5)
+            moment = datetime.now(UTC) - timedelta(minutes=5)
             current.voting_ends_at = moment
             current.tally_ends_at = moment
             await session.commit()
@@ -748,7 +811,9 @@ async def test_dispatch_sends_comment_override(monkeypatch) -> None:
             await db.commit()
             payout_id = payout.id
         assert await ton_pay.dispatch_pending_payouts() >= 1
-        assert captured["comment"] == "Игра приостановлена: идут технические работы"
+        assert captured["comment"].startswith("Игра приостановлена: идут технические работы")
+        # Анти-дубль опознаёт возврат по уникальному суффиксу way:…:refund#<id>
+        assert captured["comment"].endswith(f"refund#{payout_id}")
         assert captured["amount"] == to_nano(0.4)
         async with SessionLocal() as db:
             sent = await db.get(Payout, payout_id)

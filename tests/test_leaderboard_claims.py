@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -61,7 +61,7 @@ def test_order_by_ties_claim_time_beats_id_and_silence() -> None:
         (3, 5, 100, pts),
         (4, 4, 100, pts),  # ниже по верным — позади любой пятёрки
     ]
-    base = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
     # Кто раньше нажал Claim — выше; молчаливый уступает обоим заявившимся.
     rows = _order_by_ties(candidates, {2: base + timedelta(hours=5), 1: base + timedelta(hours=1)})
     assert [r[0] for r in rows] == [1, 2, 3, 4]
@@ -92,7 +92,7 @@ async def _clean_player(pid: int) -> None:
 async def _seed_claim_window(kind: str, period: str, players: list[int], opened_at: str | None = None) -> None:
     """Открывает окно Claim в watcher_state, как это делает settlement."""
     if opened_at is None:
-        opened_at = datetime.now(timezone.utc).isoformat()
+        opened_at = datetime.now(UTC).isoformat()
     key = WEEK_CLAIM_WINDOW_KEY if kind == "week" else MONTH_CLAIM_WINDOW_KEY
     async with SessionLocal() as db:
         db.add(WatcherState(key=key, value=json.dumps({"period": period, "players": players, "opened_at": opened_at})))

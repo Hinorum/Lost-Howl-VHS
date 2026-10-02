@@ -1,16 +1,15 @@
 """Личная рассылка (DM): итоги, новый день с обложкой и вечерний пост дублируются
 в личку подписанным игрокам; отписка в /start уважается, флаг player_dm глушит всё."""
 
-from datetime import datetime, timedelta, timezone
-
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from app.broadcast import (
     _deliver_day,
+    active_player_ids,
     announce_new_day,
     announce_results,
-    active_player_ids,
     whisper_to_chats,
 )
 from app.config import settings
@@ -31,9 +30,9 @@ def _round(day_index: int, media_dir) -> Round:
         chapter_text="Текст.",
 
 
-        opens_at=datetime.now(timezone.utc),
-        voting_ends_at=datetime.now(timezone.utc) + timedelta(hours=23),
-        tally_ends_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        opens_at=datetime.now(UTC),
+        voting_ends_at=datetime.now(UTC) + timedelta(hours=23),
+        tally_ends_at=datetime.now(UTC) + timedelta(hours=24),
     )
     for position in range(3):
         name = f"day{day_index}_card{position}.jpg"
@@ -132,7 +131,7 @@ async def test_results_reach_subscribed_players(tmp_path, monkeypatch) -> None:
         sent = {
             (call.args[0], call.args[1])
             for call in bot.send_message.await_args_list
-            if call.args and "закрыт" in str(call.args[1])
+            if call.args and "кадр записан" in str(call.args[1])
         }
         assert any(pid == subscribed for pid, _ in sent)
     finally:

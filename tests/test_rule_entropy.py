@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -26,7 +26,7 @@ from app.rounds import (
     create_next_round_detailed,
 )
 
-NOW = datetime.now(timezone.utc)
+NOW = datetime.now(UTC)
 
 
 def _expected_rule(root_hash: str) -> WinRule:
@@ -146,6 +146,6 @@ async def test_results_post_has_no_block_mention() -> None:
     round_row.winner_card = 0
     round_row.vote_counts_json = '{"0": 2, "1": 1, "2": 2}'
     text = format_results(round_row)
-    assert "Правило дня" in text
+    assert "Сцена дня" in text
     assert "блок TON" not in text
     assert "href=" not in text and "http" not in text

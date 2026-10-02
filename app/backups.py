@@ -15,7 +15,7 @@ import logging
 import shutil
 import sqlite3
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import settings
@@ -68,7 +68,7 @@ def _prune(directory: Path, keep: int) -> int:
 async def backup_now(keep: int = KEEP) -> Path | None:
     """Создаёт копию БД (SQLite или Postgres через pg_dump) и подрезает хвост."""
     directory = Path("data") / "backups"
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
     if is_postgres():
         if shutil.which("pg_dump") is None:
             logger.warning(

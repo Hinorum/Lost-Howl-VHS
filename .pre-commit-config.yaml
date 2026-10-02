@@ -1,0 +1,34 @@
+# Pre-commit hooks для The Ways / LOST HOWL.
+#
+# Установка (один раз на машине разработчика):
+#   pip install pre-commit
+#   pre-commit install
+#
+# Ручной прогон по всем файлам:
+#   pre-commit run --all-files
+#
+# Конфиг держит два хука:
+#   1. check_secrets — запрет утечки мнемоник/приватных ключей в коммит
+#      (обязателен; см. scripts/hooks/check_secrets.py).
+#   2. ruff — линтер; на уровне warning, чтобы не блокировать WIP-коммиты.
+#
+# Локальные хуки объявлены здесь, без отдельного репозитория плагинов —
+# путь указывается прямо в `repo: local`.
+repos:
+  - repo: local
+    hooks:
+      - id: check-secrets
+        name: Check for mnemonic/private keys in staged files
+        entry: python scripts/hooks/check_secrets.py --staged
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+        always_run: true
+
+      - id: ruff-check
+        name: Ruff (lint)
+        entry: python -m ruff check --output-format=concise
+        language: system
+        stages: [pre-commit]
+        types_or: [python]
+        pass_filenames: true

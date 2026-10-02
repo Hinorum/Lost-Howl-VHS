@@ -1,7 +1,7 @@
 """Версия игры: рубильник хранителя (WatcherState), снимок режима на день
 (Round.money_mode), скрытие банка и гейт открытого дня."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -33,9 +33,9 @@ def _round_row(money_mode: bool, day_index: int, _id: int, with_cards: bool = Fa
 
 
         money_mode=money_mode,
-        opens_at=datetime.now(timezone.utc),
-        voting_ends_at=datetime.now(timezone.utc) + timedelta(hours=23),
-        tally_ends_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        opens_at=datetime.now(UTC),
+        voting_ends_at=datetime.now(UTC) + timedelta(hours=23),
+        tally_ends_at=datetime.now(UTC) + timedelta(hours=24),
     )
     if with_cards:
         for position in range(3):
@@ -194,7 +194,7 @@ async def test_process_transfer_refunds_on_free_day(monkeypatch) -> None:
             player.wallet_address = raw
             session.add(player)
             await session.commit()
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
 
         status = await process_transfer(
             Transfer(

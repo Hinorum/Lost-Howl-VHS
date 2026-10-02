@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Player, Round, Vote
@@ -28,15 +29,15 @@ class Title:
 
 # Пороги титулов: от 3 до 50 правильных подряд
 TITLES: tuple[Title, ...] = (
-    Title("novice", "Щенок", "🐾", "Первые шаги на тропе", 0),
-    Title("tracking", "Следопыт", "🐾", "Три верных пути подряд", 3),
-    Title("scout", "Разведчик", "🦊", "Пять верных путей подряд", 5),
-    Title("ranger", "Следопыт Стаи", "🐺", "Семь верных путей подряд", 7),
-    Title("oracle", "Оракул", "🔮", "Десять верных путей подряд — стая помнит твой нюх", 10),
-    Title("sage", "Мудрец", "📜", "Пятнадцать верных путей — ты читаешь мир как папку", 15),
-    Title("elder", "Старейшина", "🏛️", "Двадцать верных путей — стая идёт за тобой", 20),
-    Title("legend", "Легенда Стаи", "⭐", "Тридцать верных путей — твой нюх стал легендой", 30),
-    Title("prophet", "Пророк", "🌟", "Пятьдесят верных путей — ты видишь завтра", 50),
+    Title("novice", "Щенок", "🐾", "Первые шаги на сцене", 0),
+    Title("tracking", "Следопыт", "🐾", "Три верные сцены подряд", 3),
+    Title("scout", "Разведчик", "🦊", "Пять верных сцен подряд", 5),
+    Title("ranger", "Следопыт Стаи", "🐺", "Семь верных сцен подряд", 7),
+    Title("oracle", "Оракул", "🔮", "Десять верных сцен подряд — стая помнит твой нюх", 10),
+    Title("sage", "Мудрец", "📜", "Пятнадцать верных сцен — ты читаешь мир как папку", 15),
+    Title("elder", "Старейшина", "🏛️", "Двадцать верных сцен — стая идёт за тобой", 20),
+    Title("legend", "Легенда Стаи", "⭐", "Тридцать верных сцен — твой нюх стал легендой", 30),
+    Title("prophet", "Пророк", "🌟", "Пятьдесят верных сцен — ты видишь завтра", 50),
 )
 
 
@@ -67,104 +68,81 @@ async def update_streak(session: AsyncSession, player: Player, was_correct: bool
         player.current_streak = 0
 
 
-def streak_text(player: Player) -> str:
-    """Форматирует текст стрика для /score."""
+def streak_lines(player: Player) -> list[str]:
+    """Строки серии без заголовка титула: серия, цель и память кадра."""
     current = player.current_streak
     best = player.best_streak
-    title = title_for_streak(current)
     nxt = next_title(current)
 
-    lines = [f"{title.emoji} <b>{title.name}</b>"]
+    lines: list[str] = []
     if current > 0:
-        lines.append(f"🔥 Серия верных путей: {current} · Лучшая: {best}")
+        lines.append(f"🔥 Серия верных сцен: {current} · Лучшая: {best}")
     else:
         lines.append(f"🔥 Лучшая серия: {best}")
 
     if nxt:
         remaining = nxt.correct_needed - current
-        lines.append(f"📈 До следующего титула: {nxt.emoji} {nxt.name} — ещё {remaining} {remaining_word(remaining)}")
+        lines.append(
+            f"📈 До следующего титула: {nxt.emoji} {nxt.name} — "
+            f"ещё {remaining} {remaining_word(remaining)}"
+        )
     elif current >= TITLES[-1].correct_needed:
         lines.append("🏆 Ты достиг вершины. Стая идёт за тобой.")
     if current >= 10:
-        lines.append("🧠 Ты помнишь дольше остальных — память лабиринта держится на тебе.")
+        lines.append("🧠 Ты помнишь дольше остальных — память кадра держится на тебе.")
 
-    return "\n".join(lines)
+    return lines
+
+
+def streak_text(player: Player) -> str:
+    """Форматирует текст стрика для /score."""
+    title = title_for_streak(player.current_streak)
+    return "\n".join([f"{title.emoji} <b>{title.name}</b>", *streak_lines(player)])
 
 
 def remaining_word(n: int) -> str:
-    """Склонение слова «путь/пути/путей» для числа."""
+    """Склонение слова «сцена/сцены/сцен» для числа."""
     if n % 10 == 1 and n % 100 != 11:
-        return "путь"
+        return "сцена"
     if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
-        return "пути"
-    return "путей"
+        return "сцены"
+    return "сцен"
 
 
 async def calc_rank(session: AsyncSession, player_id: int) -> dict:
-    """Вычисляет позицию игрока в рейтинге за текущую неделю и месяц.
+    """Счётчики игрока за текущую неделю и месяц.
 
-    Рейтинг = correct_picks за период + дни голосования за период.
+    Возвращает количество голосов и верных выборов (Vote.card_position
+    совпал с Round.winner_card) в днях недели и месяца. Лидербордов здесь
+    нет — карточка Стаи показывает только личные цифры.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     week_start = now - timedelta(days=now.weekday())
     week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-    # Подсчитываем для каждого игрока: верные голоса + дни голосования за период
-    # Используем подзапрос для подсчёта
-    week_stats = await session.execute(
-        select(
-            Vote.player_id,
-            func.count(Vote.id).label("votes"),
+    async def _counters(since: datetime) -> tuple[int, int]:
+        result = await session.execute(
+            select(
+                func.count(Vote.id).label("votes"),
+                func.sum(case((Vote.card_position == Round.winner_card, 1), else_=0)).label(
+                    "correct"
+                ),
+            )
+            .join(Round, Vote.round_id == Round.id)
+            .where(Round.opens_at >= since, Vote.player_id == player_id)
         )
-        .join(Round, Vote.round_id == Round.id)
-        .where(Round.opens_at >= week_start)
-        .group_by(Vote.player_id)
-    )
-    week_data = {row.player_id: row.votes for row in week_stats}
+        row = result.one()
+        return int(row.votes or 0), int(row.correct or 0)
 
-    month_stats = await session.execute(
-        select(
-            Vote.player_id,
-            func.count(Vote.id).label("votes"),
-        )
-        .join(Round, Vote.round_id == Round.id)
-        .where(Round.opens_at >= month_start)
-        .group_by(Vote.player_id)
-    )
-    month_data = {row.player_id: row.votes for row in month_stats}
-
-    # Получаем correct_picks для периода (из Round winner + Vote)
-    # Упрощённо: используем total correct_picks как приблизительный показатель
-    # для ранжирования (точный подсчёт за период требует сложного JOIN)
-    all_players = await session.execute(
-        select(Player.id, Player.correct_picks, Player.score)
-    )
-    players = {row.id: (row.correct_picks, row.score) for row in all_players}
-
-    # Сортируем по верным голосам (а потом по очкам)
-    ranked = sorted(
-        players.keys(),
-        key=lambda pid: (players[pid][0], players[pid][1]),
-        reverse=True,
-    )
-
-    week_ranked = sorted(
-        week_data.keys(),
-        key=lambda pid: week_data[pid],
-        reverse=True,
-    )
-
-    player_pos = ranked.index(player_id) + 1 if player_id in ranked else len(ranked) + 1
-    player_week_pos = week_ranked.index(player_id) + 1 if player_id in week_ranked else len(week_ranked) + 1
+    week_votes, week_correct = await _counters(week_start)
+    month_votes, month_correct = await _counters(month_start)
 
     return {
-        "overall_rank": player_pos,
-        "overall_total": len(ranked),
-        "week_rank": player_week_pos,
-        "week_total": len(week_ranked),
-        "week_votes": week_data.get(player_id, 0),
-        "month_votes": month_data.get(player_id, 0),
+        "week_votes": week_votes,
+        "week_correct": week_correct,
+        "month_votes": month_votes,
+        "month_correct": month_correct,
     }

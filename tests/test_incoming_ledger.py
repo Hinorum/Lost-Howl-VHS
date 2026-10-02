@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import delete, select
@@ -17,7 +17,6 @@ from app.db import SessionLocal
 from app.models import Income, Player, Round, RoundStatus, WinRule
 from app.ton_utils import normalize_address
 from app.ton_watch import Transfer, process_transfer
-
 
 RAW = normalize_address("UQpfcexKrlNjGFPF44W9am1o75Z6fs_QBdwVNzuhHVX2L4oo")
 STRANGER = "0:" + "9" * 62
@@ -30,7 +29,7 @@ def ton_on(monkeypatch):
 
 
 async def _open_round(day_index: int) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with SessionLocal() as session:
         session.add(
             Round(
@@ -65,7 +64,7 @@ async def test_unknown_sender_is_logged_with_source_tail(ton_on) -> None:
     try:
         status = await process_transfer(
             Transfer(tx_hash=tx, source=STRANGER, value_nanotons=300_000_000,
-                     comment="", utime=int(datetime.now(timezone.utc).timestamp()))
+                     comment="", utime=int(datetime.now(UTC).timestamp()))
         )
         assert status == "refund_queued"
         async with SessionLocal() as session:
@@ -91,7 +90,7 @@ async def test_stake_from_bound_wallet_is_logged(ton_on) -> None:
     try:
         status = await process_transfer(
             Transfer(tx_hash=tx, source=RAW, value_nanotons=500_000_000,
-                     comment="", utime=int(datetime.now(timezone.utc).timestamp()))
+                     comment="", utime=int(datetime.now(UTC).timestamp()))
         )
         assert status == "ok"
         async with SessionLocal() as session:
@@ -110,7 +109,7 @@ async def test_ledger_is_idempotent_by_tx_hash(ton_on) -> None:
     await _open_round(943)
     try:
         transfer = Transfer(tx_hash=tx, source=STRANGER, value_nanotons=100_000_000,
-                            comment="", utime=int(datetime.now(timezone.utc).timestamp()))
+                            comment="", utime=int(datetime.now(UTC).timestamp()))
         await process_transfer(transfer)
         await process_transfer(transfer)
         async with SessionLocal() as session:

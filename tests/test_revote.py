@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from sqlalchemy import delete, select
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+from sqlalchemy import delete, select
 
 from app.config import settings
 from app.models import Card, Player, RevoteGrant, Round, RoundStatus, Vote, WinRule
@@ -19,7 +20,7 @@ from app.voting import cast_vote, change_vote
 
 
 def _open_round(day_index: int = 5) -> Round:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Round(
         day_index=day_index,
         status=RoundStatus.OPEN,
@@ -53,7 +54,7 @@ def test_parse_revote_memo_tolerates_wallet_noise() -> None:
     assert parse_revote_memo("RV:17") == 17
     assert parse_revote_memo("rv : 17") == 17
     assert parse_revote_memo("rv:17\nподпись кошелька") == 17
-    assert parse_revote_memo("Tonkeeper\nrv:17") == 17
+    assert parse_revote_memo("Keeper\nrv:17") == 17
     assert parse_revote_memo("смена пути\nrv:17") == 17
     assert parse_revote_memo("rv:\u00a017") == 17
     assert parse_revote_memo("\u200brv\u200d:17") == 17
@@ -129,7 +130,7 @@ async def test_round_schedule_follows_utc_grid(session, monkeypatch) -> None:
 
     from app.rounds import create_next_round_detailed
 
-    base_opens = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=3)
+    base_opens = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=3)
     latest = Round(
         day_index=1,
         status=RoundStatus.CLOSED,

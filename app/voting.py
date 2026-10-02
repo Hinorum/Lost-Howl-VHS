@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -78,7 +78,7 @@ async def change_vote(session: AsyncSession, round_row: Round, player_id: int, p
                 .limit(1)
             ).scalar_subquery()
         )
-        .values(status="used", used_at=datetime.now(timezone.utc))
+        .values(status="used", used_at=datetime.now(UTC))
     )
     if claim_result.rowcount != 1:
         # Гранта нет (или его перехватил параллельный вызов). Пустой commit

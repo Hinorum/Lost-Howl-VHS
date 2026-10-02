@@ -1,6 +1,6 @@
 """Номинация «самый памятливый пёс недели»: подсчёт в окне, фолбэки текста."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.leaderboard import _memory_nomination
 from app.models import MemoryHit, Player, Round, RoundStatus, WinRule
@@ -22,7 +22,7 @@ def _round(day_index: int, opens_at: datetime) -> Round:
 
 
 async def test_nomination_counts_hits_in_window(session) -> None:
-    start = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    start = datetime(2026, 8, 17, tzinfo=UTC)
     end = start + timedelta(weeks=1)
     session.add(Player(id=80, username="owl"))
     for index in range(3):
@@ -43,6 +43,6 @@ async def test_nomination_counts_hits_in_window(session) -> None:
 
 
 async def test_no_nomination_without_hits(session) -> None:
-    start = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    start = datetime(2026, 8, 17, tzinfo=UTC)
     line = await _memory_nomination(session, start, start + timedelta(weeks=1))
     assert line is None

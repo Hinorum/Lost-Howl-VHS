@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
@@ -57,21 +57,22 @@ def _economy_text() -> str:
     m_pcts = "/".join(
         part.strip() for part in settings.monthly_prize_weights.split(",") if part.strip()
     )
-    pool_pct = int(
+    pool_pct = round(
         100
         - settings.owner_rake_pct
         - settings.leaderboard_rake_pct
         - settings.weekly_pot_pct
         - settings.pack_fund_pct
-        - settings.referral_pct
+        - settings.referral_pct,
+        2,
     )
 
     return (
         "\n\nРаспределение фонда дня:\n"
-        f"• {pool_pct}% — поставившим на верный путь, пропорционально ставкам "
+        f"• {_pct_text(pool_pct)}% — поставившим на верную сцену, пропорционально ставкам "
         f"(газ сети ~{settings.payout_fee_gram:g} Gram за перевод вычитается из пула заранее)\n"
         f"• {_pct_text(settings.pack_fund_pct)}% — Фонд Стаи: накопительный, разыгрывается хранителем\n"
-        f"• {_pct_text(settings.weekly_pot_pct)}% — копилка недели: в понедельник топ-3 по верным путям "
+        f"• {_pct_text(settings.weekly_pot_pct)}% — копилка недели: в понедельник топ-3 по верным сценам "
         f"делит её ({pcts}%: сильнейший — больше); нужны кошелёк, {settings.weekly_min_days}+ дней "
         f"голосования и ставка за неделю; ничья — больший вклад Gram, затем кто раньше заявил о месте\n"
         f"• {_pct_text(settings.leaderboard_rake_pct)}% — копилка месяца: топ-3 лидеров /top делят её "
@@ -80,7 +81,7 @@ def _economy_text() -> str:
         f"• {_pct_text(settings.referral_pct)}% — пригласившим: с подтверждённых ставок приведённых "
         f"игроков, копится до порога (см. /invite и /referral)\n"
         f"• {_pct_text(settings.owner_rake_pct)}% — налог «Децентрализованному Богу»\n"
-        "\nЕсли на верный путь не поставил никто — все ставки возвращаются целиком."
+        "\nЕсли на верную сцену не поставил никто — все ставки возвращаются целиком."
     )
 
 
@@ -115,7 +116,7 @@ async def _today_stake_line(session, player_id: int) -> str | None:
 
 
 _WALLET_FALLBACK_TEXT = (
-    f"{warn_mark('wallet-view')} Раздел кошелька временно не отвечает.\n"
+    f"{warn_mark('wallet-view')} Раздел кошелька временно недоступен.\n"
     "Привязать или сменить адрес можно прямо сейчас: отправь одной строкой\n"
     "<code>/wallet UQ…</code> (или EQ…).\n"
     "Привязанный раньше кошелёк никуда не делся — переводы с него засчитываются."
@@ -142,7 +143,7 @@ async def _stake_view_safe(user) -> str:
             f"{hint_mark('stake')} Ставка в три шага:\n"
             "1. Привяжи кошелёк: /wallet UQ…\n"
             "2. Переведи сумму казначею со своего кошелька (адрес появится здесь позже).\n"
-            "3. Нажми карту пути до закрытия голосования."
+            "3. Запиши свой выбор до закрытия голосования."
         )
 
 
@@ -157,24 +158,25 @@ def _win_calc_text() -> str:
         - settings.leaderboard_rake_pct
         - settings.weekly_pot_pct
         - settings.pack_fund_pct
+        - settings.referral_pct
     )
     fee = settings.payout_fee_gram
-    # Пример 1: банк 10 G, на верный путь 6 G двумя игроками (4 G и 2 G).
+    # Пример 1: банк 10 G, на верную сцену 6 G двумя игроками (4 G и 2 G).
     pool1 = 10 * pool_pct / 100 - fee * 2
-    # Пример 2: банк 5 G, верный путь собрал 0.5 G одного игрока.
+    # Пример 2: банк 5 G, верная сцена собрала 0.5 G одного игрока.
     pool2 = 5 * pool_pct / 100 - fee
     coef2 = pool2 / 0.5
     return (
         "\n\n🧮 Как считается выигрыш\n"
         f"Пул призов = {pool_pct:g}% фонда дня минус газ сети "
         f"(~{fee:g} G за перевод); он делится между поставившими "
-        "на верный путь пропорционально ставкам — каждый получает чистыми.\n"
-        f"Пример: банк 10 G, на верный путь поставили двое (4 G и 2 G) → пул "
+        "на верную сцену пропорционально ставкам — каждый получает чистыми.\n"
+        f"Пример: банк 10 G, на верную сцену поставили двое (4 G и 2 G) → пул "
         f"{pool1:.2f} G делится как {pool1 * 4 / 6:.2f} G и {pool1 * 2 / 6:.2f} G.\n"
         f"Одинокий верный игрок забирает весь пул: банк 5 G при ставке 0.5 G → "
         f"выигрыш {pool2:.2f} G (×{coef2:.1f}).\n"
         f"Доля меньше {settings.min_payout_gram:g} G не станет переводом — она капнет "
-        "в копилку недели. На верный путь не поставил никто — все ставки возвращаются целиком."
+        "в копилку недели. На верную сцену не поставил никто — все ставки возвращаются целиком."
     )
 
 
@@ -188,7 +190,7 @@ async def _wallet_view_text(user) -> str:
                 f"{money_mark(str(user.id))} Привязанный кошелёк:\n<code>{shown}</code>\n"
                 "Переводы считаются твоими, если отправлены именно с этого кошелька.\n"
                 "Чтобы перепривязать: пришли одной строкой <code>/wallet</code> и адрес.\n"
-                "Как поставить на путь: /stake"
+                "Как поставить Gram на свой выбор: /stake"
             )
             if player.wallet_verified:
                 body += "\n\nКошелёк подтверждён. Начисленные призы обрабатываются очередью выплат."
@@ -205,8 +207,8 @@ async def _wallet_view_text(user) -> str:
             body = (
                 f"{money_mark('none')} Кошелёк не привязан.\n"
                 "Напиши /wallet — бот сам попросит адрес следующим сообщением.\n"
-                "Он нужен для ставок на путь и призовых выплат (включая топ недели).\n"
-                "Как поставить на путь: /stake"
+                "Он нужен для ставок на выбор дня и призовых выплат (включая топ недели).\n"
+                "Как поставить Gram на свой выбор: /stake"
             )
         if stake_line:
             body += f"\n\n💸 {stake_line}"
@@ -273,7 +275,7 @@ async def _bind_wallet(message: Message, address: str) -> bool:
             )
             return True
         player.wallet_address = normalize_address(address)
-        player.wallet_linked_at = datetime.now(timezone.utc)
+        player.wallet_linked_at = datetime.now(UTC)
         if settings.ton_enabled:
             # Деньги включены: привязка не доверяется сразу — иначе любой мог бы
             # присвоить публичный адрес чужого кошелька (их видно в постах дня) и
@@ -282,7 +284,7 @@ async def _bind_wallet(message: Message, address: str) -> bool:
             # телеграм-аккаунта, а перевести с адреса может только владелец кошелька.
             player.wallet_verified = False
             player.wallet_verify_code = _wallet_verify_code()
-            player.wallet_verify_created = datetime.now(timezone.utc)
+            player.wallet_verify_created = datetime.now(UTC)
         else:
             # Бесплатная версия без ставок и призов: доказывать нечего.
             player.wallet_verified = True
@@ -328,7 +330,7 @@ async def _wallet_throttled(session, user_id: int) -> bool:
     удаляем и заводим заново, чтобы запись оставалась единственным источником."""
     key = f"wallet_cd:{user_id}"
     row = await session.get(WatcherState, key)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     throttled = False
     if row is not None:
         try:
@@ -337,7 +339,7 @@ async def _wallet_throttled(session, user_id: int) -> bool:
             last = None
         if last is not None:
             if last.tzinfo is None:
-                last = last.replace(tzinfo=timezone.utc)
+                last = last.replace(tzinfo=UTC)
             throttled = (now - last).total_seconds() < _WALLET_COOLDOWN
         await session.delete(row)
     session.add(WatcherState(key=key, value=now.isoformat()))
@@ -375,13 +377,7 @@ async def _cmd_wallet_impl(message: Message) -> None:
             if not player.wallet_address:
                 logger.info("/wallet uid=%s: кошелёк не привязан — открываю диалог привязки", message.from_user.id)
                 await _dialog_start(message.from_user.id)
-                await message.answer(
-                    f"{hint_mark('wallet-dialog')} Пришли следующим сообщением адрес своего Gram-кошелька (бывший TON) — привяжу автоматически.\n"
-                    "Он начинается с UQ или EQ и выглядит примерно так:\n"
-                    "<code>UQD5…длинный набор букв и цифр</code>\n\n"
-                    "Отменить: напиши <b>отмена</b>.",
-                    parse_mode=ParseMode.HTML,
-                )
+                await message.answer(_wallet_bind_prompt(), parse_mode=ParseMode.HTML)
                 return
             logger.info(
                 "/wallet uid=%s: кошелёк привязан (%s…) — показываю вид",
@@ -406,6 +402,17 @@ async def _cmd_wallet_impl(message: Message) -> None:
     )
 
 
+def _wallet_bind_prompt() -> str:
+    """Приглашение к диалогу привязки кошелька (команда и кнопка меню)."""
+    return (
+        f"{hint_mark('wallet-dialog')} Пришли следующим сообщением адрес своего "
+        "Gram-кошелька (бывший TON) — привяжу автоматически.\n"
+        "Он начинается с UQ или EQ и выглядит примерно так:\n"
+        "<code>UQD5…длинный набор букв и цифр</code>\n\n"
+        "Отменить: напиши <b>отмена</b>."
+    )
+
+
 @router.callback_query(F.data == "wallet:view")
 async def on_wallet_view(callback: CallbackQuery) -> None:
     if callback.message is not None and callback.message.chat.type == ChatType.PRIVATE:
@@ -419,40 +426,40 @@ async def on_wallet_view(callback: CallbackQuery) -> None:
 
 
 _STAKE_HOWTO = (
-    "В лабиринте ничего не берётся просто так: жетон, который стая отдаёт за путь, "
-    "лабиринт запоминает как запах того, кто вкладывается в день. Так платят за "
-    "то, во что верят, — мир держит клятву тем усерднее, чем весомее было вложение.\n\n"
-    "{mark} Ставка на путь — три шага:\n"
+    "Плёнка LOST HOWL пишет только то, во что верит стая: грамм, что ты кладёшь "
+    "на свой выбор, ложится на ленту следом того, кто поставил всерьёз. Кассета "
+    "помнит вклад и держит слово тем крепче, чем глубже след.\n\n"
+    "{mark} Ставка на кадр дня — три шага:\n"
     "1. Привяжи кошелёк: /wallet (потом можно перепривязать — старый адрес просто перестанет считаться).\n"
     "2. Переведи от {min:g} Gram (потолка нет) со СВОЕГО привязанного кошелька — "
-    "подойдёт любой TON-кошелёк (Tonkeeper, Tonhub, MyTonWallet…):\n"
+    "подойдёт любой TON-кошелёк (Keeper, Tonhub, MyTonWallet…):\n"
     "<code>{treasury}</code>\n"
     "Кнопки ниже: открыть кошелёк с готовым получателем или скопировать адрес. "
     "Memo не нужен: перевод найдётся по отправителю.\n"
-    "3. Нажми кнопку с картой пути — когда угодно до закрытия голосования.\n\n"
-    "Ставка — голос за исход дня: победителя считают по сумме Gram на тропах "
-    "(закон дня). Если за день не поставлено ни одного Gram — исход решат голоса.\n\n"
+    "3. Нажми кнопку выбранного варианта — когда угодно до закрытия голосования.\n\n"
+    "Ставка — голос за кадр дня: победителя считает счёт Gram на сценах "
+    "(закон дня). Если за день не поставлено ни одного Gram — исход решат голоса стаи.\n\n"
     "Порядок не важен: голос и перевод засчитываются в любой последовательности, "
     "важно успеть до дедлайна «Голосование до». Одна ставка на игрока в день. "
     "Перевод, не ставший ставкой (нет кошелька, ставка уже есть, день закрылся), "
-    "вернётся автоматически. Исключение — зона платы за смену пути "
-    "({revote:g}…{min:g} Gram): если игрок уже выбрал путь сегодня, перевод "
-    "зачтётся как оплата смены и без мемо."
+    "вернётся автоматически. Исключение — зона платы за перемотку кадра "
+    "({revote:g}…{min:g} Gram): если игрок уже выбрал кадр сегодня, перевод "
+    "зачтётся как оплата перемотки и без мемо."
 )
 
 
 async def _stake_view_text(user) -> str:
     if not settings.ton_enabled:
-        return "Приём ставок сейчас выключен. Игра бесплатна: просто выбирай путь кнопкой."
+        return "Приём ставок сейчас выключен. Игра бесплатна: просто выбирай вариант кнопкой."
     # Версия без ставок (день в снимке режима): приём ставок закрыт для игроков.
     if await _active_round_money_mode() is False:
-        return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай путь кнопкой."
+        return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
     if await _active_round_money_mode() is None:
         from app.ops import money_mode_enabled as _pending_mode
 
         async with SessionLocal() as session:
             if not await _pending_mode(session):
-                return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай путь кнопкой."
+                return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
     head = _STAKE_HOWTO.format(
         mark=money_mark(str(user.id)),
         min=settings.stake_min_ton,
@@ -490,8 +497,8 @@ async def _stake_view_text(user) -> str:
 def _stake_pay_keyboard() -> InlineKeyboardMarkup | None:
     """Кнопки оплаты ставки: несколько кошельков + копирование адреса.
 
-    Универсальная ссылка Tonkeeper осталась, но добавлены Tonhub и кнопка
-    «Скопировать адрес» — не у всех Tonkeeper, а адрес нужен любому
+    Универсальная ссылка Keeper осталась, но добавлены Tonhub и кнопка
+    «Скопировать адрес» — не у всех Keeper, а адрес нужен любому
     TON-кошельку. Memo не требуется: watcher ищет перевод по отправителю.
     """
     if not settings.ton_enabled or not settings.active_treasury_address:
@@ -501,7 +508,7 @@ def _stake_pay_keyboard() -> InlineKeyboardMarkup | None:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💸 Tonkeeper", url=f"https://app.tonkeeper.com/transfer/{addr}"
+                    text="💸 Keeper", url=f"https://app.tonkeeper.com/transfer/{addr}"
                 ),
                 InlineKeyboardButton(
                     text="🪙 Tonhub", url=f"https://tonhub.com/transfer/{addr}"
@@ -538,7 +545,7 @@ async def on_stake_copy(callback: CallbackQuery) -> None:
 async def cmd_stake(message: Message) -> None:
     if message.chat.type != ChatType.PRIVATE:
         await message.answer(
-            "Как поставить Gram на путь — нажми кнопку.",
+            "Как поставить Gram на свой выбор — нажми кнопку.",
             reply_markup=_personal_keyboard("stake:view", "Как поставить"),
         )
         return
@@ -561,18 +568,18 @@ async def on_stake_view(callback: CallbackQuery) -> None:
         return
     # Попап кнопки виден только нажавшему — личные цифры можно показывать
     # прямо в группе, как у /score: сумма ставки и её статус.
-    hint = f"Ставка: переведи от {settings.stake_min_ton:g} Gram казначею со своего привязанного кошелька (/wallet), потом жми карту. Подробности: /stake в личке."
+    hint = f"Ставка: переведи от {settings.stake_min_ton:g} Gram казначею со своего привязанного кошелька (/wallet), потом жми свой вариант. Подробности: /stake в личке."
     try:
         async with SessionLocal() as session:
             player = await upsert_player(session, callback.from_user)
             if not settings.ton_enabled:
-                hint = "Приём ставок сейчас выключен. Игра бесплатна: просто выбирай путь кнопкой."
+                hint = "Приём ставок сейчас выключен. Игра бесплатна: просто выбирай вариант кнопкой."
             elif await _active_round_money_mode() is False:
-                hint = "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай путь кнопкой."
+                hint = "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
             elif not player.wallet_address:
                 hint = (
                     f"Кошелёк не привязан: /wallet в личке. Потом переведи от "
-                    f"{settings.stake_min_ton:g} Gram казначею и жми карту пути."
+                    f"{settings.stake_min_ton:g} Gram казначею и жми свой вариант."
                 )
             else:
                 line = await _today_stake_line(session, player.id)
@@ -604,7 +611,7 @@ def _format_top(
     )
     lines = [f"{money_mark('week')} Копилка недели: {week_pot_nanotons:g} Gram · места: {pcts}%"]
     if not week_rows:
-        lines.append("Верных путей на этой неделе ещё нет — всё впереди.")
+        lines.append("Верных сцен на этой неделе ещё нет — всё впереди.")
     else:
         lines.append("Лидеры недели:")
         for place, (name, count, eligible) in enumerate(week_rows, 1):
@@ -620,9 +627,9 @@ def _format_top(
     lines.append("")
     lines.append(f"{money_mark('top')} Копилка месяца: {month_pot_nanotons:g} Gram · места: {m_pcts}%")
     if not month_rows:
-        lines.append("Верных путей в этом месяце ещё нет.")
+        lines.append("Верных сцен в этом месяце ещё нет.")
     else:
-        lines.append("Лидеры месяца по верным путям:")
+        lines.append("Лидеры месяца по верным сценам:")
         for place, (name, count, eligible) in enumerate(month_rows, 1):
             ticket = "🎟" if eligible else "🔒"
             lines.append(f"{place}. {ticket} {name} — {count} верн.")
@@ -634,9 +641,8 @@ def _format_top(
     return "\n".join(lines)
 
 
-@router.message(Command("fund"))
-async def cmd_fund(message: Message) -> None:
-    """Прозрачность Фонда Стаи: баланс и последние движения журнала."""
+async def _fund_text() -> str:
+    """Прозрачность Фонда Стаи: баланс и последние движения журнала (текст)."""
     from app.models import PackFund as _Fund
     from app.models import PackFundLedger as _Ledger
 
@@ -653,8 +659,8 @@ async def cmd_fund(message: Message) -> None:
             .scalars()
             .all()
         )
-    lines = [f"🐾 Фонд Стаи: <b>{fund_nano / 1e9:.2f} Gram</b>", ""]
-    lines.append("Прозрачный журнал (последние движения):")
+    lines = [f"🐾 Фонд Стаи на плёнке: <b>{fund_nano / 1e9:.2f} Gram</b>", ""]
+    lines.append("Журнал фонда, последние записи:")
     if not rows:
         lines.append("  — пока пусто —")
     for row in reversed(rows):
@@ -663,27 +669,34 @@ async def cmd_fund(message: Message) -> None:
         when = (
             row.created_at.strftime("%d.%m")
             if row.created_at.tzinfo
-            else row.created_at.replace(tzinfo=timezone.utc).strftime("%d.%m")
+            else row.created_at.replace(tzinfo=UTC).strftime("%d.%m")
         )
         lines.append(
             f"  {when} {sign}{row.amount_nanotons / 1e9:.4g} Gram · день {day} · {row.note}"
         )
     lines.append("")
     lines.append(
-        f"{_pct_text(settings.pack_fund_pct)}% банка дня копится сюда и не раздаётся сам. "
-        "Хранитель распоряжается вручную — каждая раздача видна в этом журнале."
+        f"{_pct_text(settings.pack_fund_pct)}% банка дня копится на эту плёнку и сам не раздаётся. "
+        "Хранитель распоряжается вручную — каждая выдача видна в журнале."
     )
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    return "\n".join(lines)
 
 
-@router.message(Command("top"))
-async def cmd_top(message: Message) -> None:
+@router.message(Command("fund"))
+async def cmd_fund(message: Message) -> None:
+    """Прозрачность Фонда Стаи: баланс и последние движения журнала."""
+    await message.answer(await _fund_text(), parse_mode=ParseMode.HTML)
+
+
+async def _top_text() -> str:
+    """Копилки недели и месяца с лидерами (текст; публичный, можно в группе)."""
+    from datetime import timedelta
+
     from app.leaderboard import _players_with_stake, _rank_window
     from app.models import WeeklyPot
     from app.weeks import iso_week_key, week_bounds
-    from datetime import timedelta
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     week_start, week_end = week_bounds(iso_week_key(now))
     async with SessionLocal() as session:
@@ -765,4 +778,9 @@ async def cmd_top(message: Message) -> None:
         ).scalar_one_or_none()
     month_pot_ton = from_nano(pot_row.nanotons) if pot_row is not None else 0.0
     week_pot_ton = from_nano(week_pot_row.nanotons) if week_pot_row is not None else 0.0
-    await message.answer(_format_top(week_rows, week_pot_ton, month_rows, month_pot_ton))
+    return _format_top(week_rows, week_pot_ton, month_rows, month_pot_ton)
+
+
+@router.message(Command("top"))
+async def cmd_top(message: Message) -> None:
+    await message.answer(await _top_text())

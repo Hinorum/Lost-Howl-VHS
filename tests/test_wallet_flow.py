@@ -5,7 +5,7 @@
 казначея, шаги и статус ставки; порядок «голос/перевод» не важен.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,9 +20,8 @@ from app.handlers import (
     on_stake_view,
 )
 from app.handlers import wallet as wallet_mod
-from app.ton_utils import normalize_address
 from app.models import Player, Round, RoundStatus, Stake, WalletDialog, WinRule
-
+from app.ton_utils import normalize_address
 
 # Адреса уникальны в рамках прогона: players.wallet_address имеет UNIQUE,
 # а глобальная тестовая БД общая для всех модулей. Все ниже — валидные
@@ -151,7 +150,7 @@ async def test_fallback_ignores_strangers() -> None:
 async def test_rebind_locked_while_stake_in_game(monkeypatch) -> None:
 
     uid = next_uid()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with SessionLocal() as session:
         session.add(Player(id=uid, username="staker", wallet_address=LOCKED_ADDRESS))
         rnd = Round(
@@ -207,7 +206,7 @@ def _pay_keyboard_rows(markup):
 
 
 async def test_pay_keyboard_multiwallet_and_copy(monkeypatch) -> None:
-    """Кнопки: Tonkeeper + Tonhub (ссылки) и «Скопировать адрес» (callback)."""
+    """Кнопки: Keeper + Tonhub (ссылки) и «Скопировать адрес» (callback)."""
     from app.handlers import _stake_pay_keyboard
 
     monkeypatch.setattr(settings, "ton_enabled", True)
@@ -217,7 +216,7 @@ async def test_pay_keyboard_multiwallet_and_copy(monkeypatch) -> None:
     rows = _pay_keyboard_rows(markup)
     assert len(rows) == 2
     texts = [cell[0] for row in rows for cell in row]
-    assert any("Tonkeeper" in t for t in texts)
+    assert any("Keeper" in t for t in texts)
     assert any("Tonhub" in t for t in texts)
     assert any("Скопировать адрес" in t for t in texts)
     urls = [cell[2] for row in rows for cell in row if cell[2]]
@@ -377,7 +376,7 @@ async def test_wallet_view_html_is_telegram_safe(monkeypatch) -> None:
 
 
 async def _seed_open_day_with_stake(uid: int, day_index: int, amount_nanotons: int, address: str) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with SessionLocal() as session:
         session.add(Player(id=uid, username=f"viewer{uid}", wallet_address=address))
         rnd = Round(
@@ -512,7 +511,7 @@ async def test_wallet_throttle_expires_with_time(monkeypatch) -> None:
     async with SessionLocal() as session:
         row = await session.get(WatcherState, cooldown_key)
         assert row is not None
-        row.value = (datetime.now(timezone.utc) - timedelta(seconds=40)).isoformat()
+        row.value = (datetime.now(UTC) - timedelta(seconds=40)).isoformat()
         await session.commit()
 
     third = make_message("private", uid, "/wallet")

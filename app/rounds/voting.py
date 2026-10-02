@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import random
 
-from sqlalchemy import distinct, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Round, Stake, Vote, WinRule
@@ -11,33 +11,23 @@ from app.stakes import current_network
 
 logger = logging.getLogger(__name__)
 
-# Визуальная фактура типов эхов: содержание скрыто, фактура повторяется —
-# внимательный игрок учится узнавать класс следа по кадру дня.
-_ECHO_ART_MOTIFS = {
-    "угроза": "ominous burnt-wire glow in the fog",
-    "память": "a warm amber keepsake bowl catching light",
-    "обман": "a mirage-like silhouette of an unfamiliar dog",
-}
-
 # Театр жребия: реплики к честному броску при ничьей (детерминированы сидом).
 _TIE_THEATER = (
-    "Кость архива стукнула о дно урны: путь {chosen}.",
+    "Котёл булькнул дважды — жребий лёг на {chosen}.",
     "Жребий дня лёг на {paths} — и указал {chosen}.",
-    "Дневник перевернул страницу дважды; выпало {chosen}.",
+    "Часы Вокзала пробили полночь лишний раз: выпало {chosen}.",
 )
 
 
 async def count_votes_for_tally(session: AsyncSession, round_id: int) -> dict[int, int]:
-    """Allowed only from the tally job. One GROUP BY, O(n) scan of the day partition."""
-    result = await session.execute(
-        select(Vote.card_position, func.count())
-        .where(Vote.round_id == round_id)
-        .group_by(Vote.card_position)
-    )
-    counts = {0: 0, 1: 0, 2: 0}
-    for position, total in result.all():
-        counts[int(position)] = int(total)
-    return counts
+    """Счёт голосов для подведения итога дня.
+
+    Совместимая обёртка: единственная реализация GROUP BY по голосам —
+    plain_vote_counts (хранимый счёт и fallback-исход при пустом фонде).
+    Имя сохранено — по нему ходят tally-джоба и тесты
+    (test_winner_by_stakes).
+    """
+    return await plain_vote_counts(session, round_id)
 
 
 async def plain_vote_counts(session: AsyncSession, round_id: int) -> dict[int, int]:
@@ -100,28 +90,63 @@ async def _decisive_counts(
     return vote_counts, False
 
 
-def tied_positions(counts: dict[int, int], rule: WinRule) -> list[int]:
-    """Все пути, претендующие на победу по закону дня (без учёта позиций)."""
+def tied_positions(
+    counts: dict[int, int],
+    rule: WinRule,
+    votes: dict[int, int] | None = None,
+) -> list[int]:
+    """Все пути, претендующие на победу по закону дня (без учёта позиций).
+
+    votes (бесплатные голоса) — только для тай-брейка «ничьей на нуле»
+    Меньшинства: пути с 0 Gram делят минимум, но сцена, где игроки
+    голосовали без ставок, не равна невыбранной вовсе — уцелеет путь с
+    меньшим числом голосов. Не-нулевые и прочие ничьи решаются жребием.
+    """
     items = [(counts.get(i, 0), i) for i in range(3)]
     if rule is WinRule.MAJORITY:
         best = max(item[0] for item in items)
         return sorted(i for total, i in items if total == best)
     if rule is WinRule.MINORITY:
         worst = min(item[0] for item in items)
-        return sorted(i for total, i in items if total == worst)
+        candidates = sorted(i for total, i in items if total == worst)
+        # Ничья на нуле: пустые пути (0 Gram) разделили минимум — решают голоса.
+        if worst == 0 and votes is not None and len(candidates) > 1:
+            fewest = min(votes.get(i, 0) for i in candidates)
+            candidates = sorted(i for i in candidates if votes.get(i, 0) == fewest)
+        return candidates
     ordered = sorted(items, key=lambda item: (item[0], item[1]))
     median = ordered[1][0]
     return sorted(i for total, i in items if total == median)
 
 
-def pick_winner(counts: dict[int, int], rule: WinRule, seed: str | None = None) -> int:
-    """Победитель по закону дня. Без seed — детерминированный fallback
-    (меньший номер пути); с seed — честный жребий по закону дня, чтобы
-    ничья не решалась «номером карты»."""
-    candidates = tied_positions(counts, rule)
-    if len(candidates) > 1 and seed:
-        return random.Random(f"law:{seed}").choice(candidates)
-    return candidates[0]
+def pick_winner(
+    counts: dict[int, int],
+    rule: WinRule,
+    seed: str | None = None,
+    votes: dict[int, int] | None = None,
+) -> int:
+    """Победитель по закону дня.
+
+    С энтропией мастерчейна (seed = «day:law:seqno:root_hash») — по последней
+    цифре root_hash по модулю числа претендентов: любой игрок скопирует хеш
+    блока из эксплорера и пересчитает исход в уме. Без энтропии — прежний
+    детерминированный жребий (сид день+закон), чтобы ничья не «зависала» на
+    недоступной сети. Без seed — fallback «меньший номер пути».
+    """
+    candidates = tied_positions(counts, rule, votes)
+    if len(candidates) < 2:
+        return candidates[0]
+    if not seed:
+        return candidates[0]
+    parts = seed.split(":")
+    if len(parts) == 4:
+        try:
+            return candidates[int(parts[3][-1], 16) % len(candidates)]
+        except (TypeError, ValueError) as exc:
+            # Хвост seed не похож на хеш блока — выбор всё равно детерминирован
+            # по строке ниже, но разбор стоит увидеть.
+            logger.debug("Хвост seed %r не разобран (%s) — выбор по строке", seed, exc)
+    return random.Random(f"law:{seed}").choice(candidates)
 
 
 def tie_seed(round_row: Round) -> str:
@@ -138,31 +163,18 @@ def tie_seed(round_row: Round) -> str:
     return base
 
 
-async def _staked_paths(session: AsyncSession, round_id: int) -> set[int]:
-    """Пути дня, за которые есть хотя бы один подтверждённый ставщик."""
-    rows = await session.execute(
-        select(Vote.card_position, func.count(distinct(Vote.player_id)))
-        .join(
-            Stake,
-            (Stake.round_id == Vote.round_id) & (Stake.player_id == Vote.player_id),
-        )
-        .where(Vote.round_id == round_id, Stake.status == "confirmed")
-        .group_by(Vote.card_position)
-    )
-    return {int(p) for p, holders in rows.all() if holders > 0}
-
-
 async def _winner_and_tied(
     session: AsyncSession,
     round_row: Round,
     counts: dict[int, int],
     seed: str,
+    votes: dict[int, int] | None = None,
 ) -> tuple[int, list[int]]:
     """Выбор победителя по закону дня.
 
     counts уже решающие (суммы ставок или голоса) — закон дня
     применяется к ним напрямую.
     """
-    return pick_winner(counts, round_row.win_rule, seed=seed), tied_positions(
-        counts, round_row.win_rule
+    return pick_winner(counts, round_row.win_rule, seed=seed, votes=votes), tied_positions(
+        counts, round_row.win_rule, votes
     )

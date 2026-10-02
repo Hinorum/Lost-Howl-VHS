@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -48,7 +48,7 @@ async def _payouts_text() -> str:
         )
     lines.append("")
     lines.append(
-        "Спам (пыль с рекламой): /payout <id> spam\n"
+        "Спам (пыль с рекламой, только refund): /payout <id> spam confirm\n"
         "Настоящий долг, отправить снова: /payout <id> retry"
     )
     return "\n".join(lines)
@@ -143,23 +143,44 @@ async def cmd_payouts(message: Message) -> None:
 
 @router.message(Command("payout"))
 async def cmd_payout(message: Message) -> None:
-    """Ручной разбор одной выплаты: /payout <id> spam|retry."""
+    """Ручной разбор одной выплаты: /payout <id> spam confirm|retry.
+
+    «spam» гасит выплату безвозвратно — только refund (входящий перевод с
+    рекламой, возврат которого не нужен), и только с явным словом confirm:
+    случайное/мгновенное списание чужого приза недопустимо.
+    """
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
         await message.answer("Команда только для хранителя игры.")
         return
     parts = (message.text or "").lower().split()
-    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in {"spam", "retry"}:
+    if (
+        len(parts) not in (3, 4)
+        or not parts[1].isdigit()
+        or parts[2] not in {"spam", "retry"}
+    ):
         await message.answer(
-            "Формат: <code>/payout &lt;id&gt; spam</code> — пометить спамом, "
-            "<code>/payout &lt;id&gt; retry</code> — вернуть в очередь.",
+            "Формат: <code>/payout &lt;id&gt; spam confirm</code> — безвозвратно погасить "
+            "пыльный входящий refund,\n"
+            "<code>/payout &lt;id&gt; retry</code> — вернуть выплату в очередь.",
             parse_mode=ParseMode.HTML,
         )
         return
     payout_id, action = int(parts[1]), parts[2]
+    if action == "spam" and parts[3:4] != ["confirm"]:
+        await message.answer(
+            f"{warn_mark('nopay')} Пометка спамом безвозвратна и возврата не создаёт: "
+            "подтверди явно <code>/payout &lt;id&gt; spam confirm</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     from app.ton_pay import resolve_dead_payout
 
     async with SessionLocal() as session:
-        new_status = await resolve_dead_payout(session, payout_id, action)
+        try:
+            new_status = await resolve_dead_payout(session, payout_id, action)
+        except ValueError as exc:
+            await message.answer(f"{warn_mark('nopay')} {exc}")
+            return
     if new_status == "dismissed":
         await message.answer(f"{ok_mark(str(payout_id))} Выплата #{payout_id} помечена как спам: из очереди ушла, сбросу больше не мешает.")
     elif new_status == "pending":
@@ -256,7 +277,7 @@ async def _revenue_text() -> str:
     """
     from app.ops import MANUAL_IN_KIND, MANUAL_OUT_KIND
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     revenue_kinds = Income.kind.notin_([MANUAL_OUT_KIND, MANUAL_IN_KIND])
 
@@ -333,7 +354,7 @@ async def cmd_incoming(message: Message) -> None:
         )
         stamp = income.created_at
         if stamp is not None:
-            stamp = stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+            stamp = stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
             when = f"{stamp:%d.%m %H:%M} UTC"
         else:
             when = "—"
@@ -408,3 +429,30 @@ async def cmd_blockchain(message: Message) -> None:
     except Exception as exc:
         logger.exception("Отчёт /blockchain не собран")
         await message.answer(f"Не собрал отчёт: {exc}")
+
+
+@router.message(Command("mirror"))
+async def cmd_mirror(message: Message) -> None:
+    """Пересборка зеркала казны: /mirror reset confirm.
+
+    Сбрасывает курсоры синка — следующий цикл пересканирует историю кошелька
+    от головы к генезису и перепроверит тождество «Σ = баланс». Лекарство от
+    глубокого рассинхрона (сбои индексаторов, реорги вглубь истории).
+    """
+    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
+        await message.answer("Команда только для хранителя игры.")
+        return
+    if message.text.split()[1:] != ["reset", "confirm"]:
+        await message.answer(
+            "Пересборка зеркала казны: /mirror reset confirm\n"
+            "После сброса зеркало пересканирует историю и сверку запускает "
+            "/treasury (бутстрап занимает несколько циклов синка)."
+        )
+        return
+    from app.treasury_mirror import reset_treasury_mirror
+
+    try:
+        await message.answer(await reset_treasury_mirror())
+    except Exception as exc:
+        logger.exception("Сброс зеркала казны не выполнен")
+        await message.answer(f"Не сбросил зеркало: {exc}")

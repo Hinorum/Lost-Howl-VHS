@@ -13,16 +13,16 @@ Revision ID: c9d0e1f2a3b4
 Revises: a7b8c9d0e1f2
 Create Date: 2026-09-18 13:00:00.000000
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "c9d0e1f2a3b4"
-down_revision: Union[str, Sequence[str], None] = "a7b8c9d0e1f2"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = "a7b8c9d0e1f2"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def _columns(table: str) -> dict[str, dict]:
