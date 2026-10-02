@@ -1445,3 +1445,68 @@ async def test_unprocessed_pending_stakes_alert(monkeypatch: pytest.MonkeyPatch)
             if player is not None:
                 await db.delete(player)
             await db.commit()
+
+
+# ---------- Честность жребия: закон дня без энтропии сети ----------
+
+
+async def test_day_without_entropy_raises_alert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """День, открытый без энтропии мастерчейна, поднимает тревогу.
+
+    Фолбэк на локальный secrets-жребий нужен, чтобы день не завис при молчащем
+    TonAPI, — но он не проверяем игроком по эксплореру. Раньше это уходило
+    в лог и оставалось невидимым: оператор узнавал о непроверяемом исходе
+    только из вопросов игроков в чате.
+    """
+    from app import ops
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    bot = SimpleNamespace(send_message=AsyncMock())
+    day = 706_001
+    async with SessionLocal() as db:
+        db.add(_open_round(day))  # rule_entropy не задан → жребий локальный
+        await db.commit()
+    try:
+        await _fresh_watcher_marks()
+        problems = await ops.check_anomalies(bot=bot)
+        assert any(str(day) in p and "энтропии" in p for p in problems)
+        sent = [c.args[1] if len(c.args) > 1 else "" for c in bot.send_message.await_args_list]
+        assert any("без блока TON" in t for t in sent)
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(Round.__table__.delete().where(Round.day_index == day))
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_([ops.ALERT_ENTROPY_KEY, ops.TICK_KEY])
+                )
+            )
+            await db.commit()
+
+
+async def test_day_with_entropy_stays_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Обратная сторона: день на честном блоке TON тревоги не поднимает."""
+    from app import ops
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    bot = SimpleNamespace(send_message=AsyncMock())
+    day = 706_002
+    async with SessionLocal() as db:
+        rnd = _open_round(day)
+        rnd.rule_entropy = "96545285:" + "a" * 64
+        db.add(rnd)
+        await db.commit()
+    try:
+        await _fresh_watcher_marks()
+        problems = await ops.check_anomalies(bot=bot)
+        assert not any("энтропии" in p for p in problems)
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(Round.__table__.delete().where(Round.day_index == day))
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_([ops.ALERT_ENTROPY_KEY, ops.TICK_KEY])
+                )
+            )
+            await db.commit()

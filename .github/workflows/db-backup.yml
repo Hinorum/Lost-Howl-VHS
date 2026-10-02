@@ -1,5 +1,13 @@
 name: db-backup
 
+# Дамп боевой базы — самый чувствительный артефакт в репозитории: он содержит
+# все ставки, адреса кошельков и memo игроков. Раньше он лежал открытым
+# artifact'ом на 90 суток, а artifact в публичном репозитории скачивает любой,
+# кто залогинен в GitHub, без права на репозиторий и без аудита.
+#
+# Теперь дамп шифруется openssl (AES-256, KDF с итерациями) и падает в контейнер
+# только уже ciphertext'ом. Ключ — в secrets, в репозиторий не попадает.
+
 on:
   schedule:
     - cron: "30 1 * * *"
@@ -9,9 +17,23 @@ jobs:
   dump:
     runs-on: ubuntu-latest
     permissions:
+      # Минимум: workflow только читает код и публикует артефакт.
       contents: read
     steps:
       - uses: actions/checkout@v7
+
+      - name: Check encryption key is configured
+        # Fail loudly, а не «успешно» без ключа: незашифрованный дамп в artifact'е
+        # — ровно та дыра, которую workflow закрывает. Молчаливый пропуск ключа
+        # вернул бы утечку в виде зелёной галочки.
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          if [ -z "${BACKUP_PASSPHRASE}" ]; then
+            echo "::error::secret BACKUP_PASSPHRASE не задан — дамп не будет зашифрован, публикация отменена. Создай его: Settings → Secrets → New repository secret."
+            exit 1
+          fi
+
       - name: Install PostgreSQL client 17
         run: |
           sudo apt-get update
@@ -20,6 +42,7 @@ jobs:
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql-client-17
+
       - name: pg_dump
         env:
           PGURL: ${{ secrets.SUPABASE_URL }}
@@ -32,10 +55,38 @@ jobs:
           esac
           pg_dump17="/usr/lib/postgresql/17/bin/pg_dump"
           "${pg_dump17}" --format=custom --file="backup-${stamp}.dump" "${dsn}"
-          ls -lh backup-*.dump
+          # Дамп НЕ должен пережить шаг шифрования: снимаем его с диска
+          # сразу, иначе он уедет в кэш раннера в открытом виде.
+          rm -f "backup-${stamp}.dump"
+
+      - name: Encrypt
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -eu
+          raw="$(ls -1 backup-*.dump)"
+          # AES-256-CBC + PBKDF2 (200k итераций) + случайная соль: openssl enc
+          # по умолчанию не делает ничего из этого, поэтому всё задаётся явно.
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -in "${raw}" -out "${raw}.enc" \
+            -pass env:BACKUP_PASSPHRASE
+          rm -f "${raw}"
+          # Незашифрованных дампов в каталоге быть не должно — иначе encrypt
+          # молча зашифровал бы не тот файл, а в артефакт уехал бы сырой.
+          if ls -1 backup-*.dump >/dev/null 2>&1; then
+            echo "::error::после шифрования остались незашифрованные дампы"
+            exit 1
+          fi
+          ls -lh backup-*.enc
+
       - uses: actions/upload-artifact@v7
         with:
           name: db-backup
-          path: backup-*.dump
-          retention-days: 90
+          # Только зашифрованное. Расширение .enc — чтобы случайный restore
+          # в прод не начался с расшифровки мусора.
+          path: backup-*.enc
+          # 30 суток вместо 90: шифрованный дамп всё равно нельзя держать
+          # вечно, а срок хранения копии должен быть короче срока её
+          # актуальности. Хранилище — отдельное и внешнее (см. README).
+          retention-days: 30
           if-no-files-found: error

@@ -24,6 +24,7 @@ from app.config import settings
 from app.core.registry import (
     ALERT_BALANCE_KEY,
     ALERT_DEAD_KEY,
+    ALERT_ENTROPY_KEY,
     ALERT_MIRROR_KEY,
     ALERT_QUEUE_KEY,
     ALERT_REFUND_KEY,
@@ -487,6 +488,47 @@ async def _raise(session, bot, alert_key: str, problem: str, notice: str) -> Non
         _problem_entry[record] = {"alert": alert_key}
 
 
+async def _entropy_fallback_days(session, limit: int = 3) -> list[int]:
+    """Номера последних дней, закон которых пришлось выбрать без сети.
+
+    Берём только несколько самых свежих дней: глубокая история не нужна —
+    важно «сейчас и вчера», а не «когда-нибудь упал TonAPI». Иначе тревога
+    жила бы вечно из-за одного старого дня, и её перестали бы читать.
+    """
+    from app.models import Round
+
+    result = await session.execute(
+        select(Round.day_index, Round.rule_entropy)
+        .order_by(Round.day_index.desc())
+        .limit(limit)
+    )
+    return [
+        int(day_index)
+        for day_index, entropy in result.all()
+        if day_index is not None and not entropy
+    ]
+
+
+async def _check_entropy_fallback(session, bot) -> None:
+    """Тревога: последние дни выпали на локальный жребий, а не на блок TON.
+
+    Список проблем и кулдаун ведёт _raise — здесь только решаем, тревожить ли.
+    """
+    days = await _entropy_fallback_days(session)
+    if not days:
+        return
+    listed = ", ".join(str(day) for day in days)
+    await _raise(
+        session,
+        bot,
+        ALERT_ENTROPY_KEY,
+        f"закон дня без энтропии сети (дни {listed})",
+        f"⚠️ Жребий дня без блока TON: дни {listed} выпали на локальный жребий — "
+        "игроки не могут пересчитать исход по эксплореру. Проверь доступ к "
+        "TonAPI/Toncenter и TON_API_KEY/TONCENTER_API_KEY: /ton и логи TON.",
+    )
+
+
 def _detail(entries: list[tuple[str, dict]]) -> list[dict]:
     """Проблемы для /ops и снимка: текст, сколько держится, сколько раз видели."""
     return [
@@ -852,6 +894,14 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
         mirror_note = await _treasury_mirror_anomaly(session)
         if mirror_note is not None:
             await _raise(session, bot, ALERT_MIRROR_KEY, mirror_note, mirror_note + " Разбор: /treasury")
+    # 5. Честность жребия. Закон дня выводится из энтропии мастерчейна TON
+    #    (root_hash % 3), и каждый игрок может пересчитать исход по блоку в
+    #    эксплорере. Когда энтропия недоступна (оба индексатора молчат), день
+    #    уходит на локальный secrets-жребий: он не подделываем и не может быть
+    #    пересчитан игроком. Формально это «фолбэк, чтобы день не завис»,
+    #    фактически — исход перестал быть проверяемым, и в этом надо жить.
+    if settings.ton_enabled:
+        await _check_entropy_fallback(session, bot)
     # Итог прохода: кто из тревог ушёл сам, кто держится дольше часа.
     await _settle_alerts(session, bot, problems)
     # Снимок для /health и /ops. Кэш, а не пересчёт на каждый опрос: одно и то

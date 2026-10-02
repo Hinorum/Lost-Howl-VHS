@@ -39,6 +39,153 @@ async def _seed_payout(attempts: int) -> int:
         return payout.id
 
 
+async def _seed_payouts(count: int) -> list[int]:
+    """Несколько выплат подряд — чтобы проверить поведение ПАЧКИ."""
+    ids: list[int] = []
+    for index in range(count):
+        async with SessionLocal() as session:
+            payout = Payout(
+                round_id=7,
+                player_id=100 + index,
+                kind="prize",
+                amount_nanotons=500_000_000,
+                dest_address="0:" + os.urandom(32).hex(),
+            )
+            session.add(payout)
+            await session.flush()
+            payout.attempts = 0
+            payout.status = "pending"
+            await session.commit()
+            ids.append(payout.id)
+    return ids
+
+
+async def _drop_payouts(ids: list[int]) -> None:
+    async with SessionLocal() as session:
+        for payout_id in ids:
+            row = await session.get(Payout, payout_id)
+            if row is not None:
+                await session.delete(row)
+        await session.commit()
+
+
+# ---------- Окно подтверждения seqno в пачке выплат ----------
+
+
+async def test_batch_waits_for_previous_confirm_on_liteserver_path(monkeypatch) -> None:
+    """Второй перевод пачки ждёт блока по первому и на ЛАЙТСЕРВЕРНОМ пути.
+
+    Окно подтверждения нужно любому каналу: батч-seqno переиспользуется и на
+    лайтсерверах, а узел держит подписанный seqno+1 в мемпуле. Без ожидания
+    второй внешний месседж (seqno+2) сражается с первым за место и молча
+    отбрасывается — потерю ловит только 2-часовая сверка. Раньше ожидание
+    стояло под условием «работает HTTP-канал», то есть на живом лайтсерверном
+    пути пропускалось вовсе.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "payout_batch_confirm_seconds", 5)
+    ids = await _seed_payouts(2)
+    waits: list[tuple] = []
+
+    async def empty_markers() -> set[str]:
+        return set()
+
+    async def fake_wait(memo, seconds):
+        waits.append((set(memo), seconds))
+        return True  # первый перевод подтвердился — ждать дальше нечего
+
+    transfer = AsyncMock(return_value="bcast:1")
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
+    # Именно в dispatch: модуль импортирует символ себе при загрузке, и подмена
+    # одноимённого атрибута в ton_pay его бы не увидела.
+    monkeypatch.setattr("app.ton_pay.dispatch._wait_for_broadcast_memo", fake_wait)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    try:
+        await ton_pay.dispatch_pending_payouts(bot=None)
+        assert transfer.await_count == 2
+        # Ровно одно ожидание — перед вторым переводом, по его предшественнику.
+        assert len(waits) == 1
+        waited_memo, waited_seconds = waits[0]
+        assert waited_seconds == 5
+        assert waited_memo == {_comment(ids[0])}
+    finally:
+        await _drop_payouts(ids)
+
+
+async def test_batch_defers_remaining_payouts_when_prev_unconfirmed(monkeypatch) -> None:
+    """Предыдущий перевод не подтвердился за окно — пачка встаёт на паузу.
+
+    Раньше в этой ветке только сбрасывался счётчик seqno, и следующий перевод
+    шёл с seqno, прочитанным из сети. Но в сети там всё ещё НЕПОДТВЕРЖДЁННЫЙ
+    номер предыдущего перевода: второй подписался бы тем же seqno и молча
+    потерялся бы. Читать живой seqno можно только после блока, поэтому
+    остаток пачки возвращается в очередь, а не вещается вслепую.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "payout_batch_confirm_seconds", 1)
+    ids = await _seed_payouts(3)
+
+    async def empty_markers() -> set[str]:
+        return set()
+
+    async def never_confirmed(memo, seconds):
+        return False  # предыдущий перевод в блок не встал
+
+    transfer = AsyncMock(return_value="bcast:1")
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
+    monkeypatch.setattr("app.ton_pay.dispatch._wait_for_broadcast_memo", never_confirmed)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    try:
+        await ton_pay.dispatch_pending_payouts(bot=None)
+        # Вещан только первый: второй и третий не подписывались вслепую.
+        assert transfer.await_count == 1
+        async with SessionLocal() as session:
+            rows = [await session.get(Payout, payout_id) for payout_id in ids]
+        assert rows[0].status == "sent"
+        assert [row.status for row in rows[1:]] == ["pending", "pending"]
+        # Причина видна оператору — не «списали молча».
+        assert "не подтверждён" in rows[1].last_error
+        assert "не подтверждён" in rows[2].last_error
+    finally:
+        await _drop_payouts(ids)
+
+
+async def test_batch_resumes_normally_after_pause(monkeypatch) -> None:
+    """Пауза не «съедает» очередь: следующий цикл разосылает остаток целиком."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "payout_batch_confirm_seconds", 1)
+    ids = await _seed_payouts(2)
+
+    async def empty_markers() -> set[str]:
+        return set()
+
+    async def never_confirmed(memo, seconds):
+        return False
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
+    monkeypatch.setattr("app.ton_pay.dispatch._wait_for_broadcast_memo", never_confirmed)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", AsyncMock(return_value="bcast:1"))
+    try:
+        await ton_pay.dispatch_pending_payouts(bot=None)
+
+        # Второй цикл: сеть отвечает, подтверждение пришло — пачка идёт дальше.
+        transfer = AsyncMock(return_value="bcast:2")
+        monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+
+        async def confirmed(memo, seconds):
+            return True
+
+        monkeypatch.setattr("app.ton_pay.dispatch._wait_for_broadcast_memo", confirmed)
+        await ton_pay.dispatch_pending_payouts(bot=None)
+
+        async with SessionLocal() as session:
+            rows = [await session.get(Payout, payout_id) for payout_id in ids]
+        assert [row.status for row in rows] == ["sent", "sent"]
+        assert rows[1].tx_hash == "bcast:2"
+    finally:
+        await _drop_payouts(ids)
+
+
 def test_out_comments_extractors_cover_both_providers() -> None:
     tonapi_item = {
         "out_msgs": [

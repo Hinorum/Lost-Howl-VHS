@@ -6,6 +6,7 @@ import random
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Round, Stake, Vote, WinRule
 from app.stakes import current_network
 
@@ -83,7 +84,13 @@ async def _decisive_counts(
 
     Исход определяют суммы подтверждённых ставок; день, где
     нет ни одного грамма, решается бесплатными голосами (fallback).
+
+    При settings.winner_by_stakes=false ставки в исход не входят вовсе:
+    счёт всегда голосовой, и второй элемент пары — False, чтобы тексты
+    дня взяли формулировку про голоса (RULE_PHRASES vs VOTE_RULE_PHRASES).
     """
+    if not settings.winner_by_stakes:
+        return vote_counts, False
     stakes = await count_stakes_for_tally(session, round_row.id)
     if any(value > 0 for value in stakes.values()):
         return stakes, True

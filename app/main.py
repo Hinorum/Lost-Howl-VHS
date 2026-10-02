@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
+import difflib
 import logging
+import os
 import signal
 from pathlib import Path
 
@@ -210,6 +212,45 @@ def validate_config() -> list[str]:
                 "и доли копилки уйдут «сами себе». Укажи отдельный кошелёк владельца."
             )
     return problems
+
+
+def warn_config() -> list[str]:
+    """Неблокирующие замечания к конфигурации (warn, не мешают старту).
+
+    Держится отдельно от validate_config, потому что тот роняет старт, а
+    подозрение на опечатку в имени переменной — не повод не подниматься.
+    """
+    return _unknown_env_keys()
+
+
+def _unknown_env_keys() -> list[str]:
+    """Переменные окружения, похожие на настройки, но не совпадающие с ними.
+
+    Причина проверки: pydantic по умолчанию молча игнорирует лишние
+    переменные окружения. Опечатка в имени денежного рычага (например
+    PAYOUT_FEE_GARM вместо _GRAM) выглядит как «настроил», а работает как
+    «применилось значение по умолчанию» — и прод уезжает с комиссией,
+    которую никто не выбирал.
+
+    Отбираются только БЛИЗКИЕ имена (difflib), а не все лишние переменные:
+    в окружении Render/CI/локальной машины законно лежит сотня чужих
+    переменных (PATH, PROCESSOR_*, CI_*), и общий список на старте только
+    приучил бы читать предупреждение мимо. Близость — признак опечатки.
+    """
+    known = [name.upper() for name in type(settings).model_fields]
+    suspects: list[str] = []
+    for key in os.environ:
+        if not key.isupper() or "_" not in key or key.upper() in known:
+            continue
+        close = difflib.get_close_matches(key.upper(), known, n=1, cutoff=0.9)
+        if close:
+            suspects.append(f"{key} → {close[0]}")
+    if not suspects:
+        return []
+    return [
+        "Похоже на опечатку в имени переменной окружения (будет применено "
+        "значение по умолчанию, а не твоё): " + ", ".join(sorted(suspects))
+    ]
 
 
 # Интервал фоновой попытки перехватить лок планировщика. Согласован с ритмом
@@ -430,6 +471,8 @@ async def main() -> None:
             "Критичные проблемы конфигурации (см. лог выше). "
             "Укажи недостающие переменные в .env и перезапусти."
         )
+    for warning in warn_config():
+        log.warning("CONFIG: %s", warning)
     await init_db()
     bot = await create_bot()
     dispatcher = build_dispatcher()

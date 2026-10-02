@@ -26,6 +26,17 @@ services:
         value: certs/supabase-root.pem
       - key: TIMEZONE
         value: Europe/Moscow
+      # PORT, RENDER_EXTERNAL_URL и RENDER_EXTERNAL_HOSTNAME Render подставляет
+      # сам — их нельзя фиксировать здесь, иначе платформа перестанет их
+      # обновлять и бот начнёт считать неверный внешний адрес.
+      - key: DAY_CLOSE_HOUR_UTC
+        value: "11"
+      # Само-пинг /alive держит free plan Render от засыпания: без него контейнер
+      # засыпает через 15 минут простоя и дни перестают открываться по UTC-сетке.
+      - key: SELF_PING_SECONDS
+        value: "600"
+      - key: PLAYER_DM
+        value: "true"
       - key: LLM_API_KEY
         sync: false
       - key: LLM_BASE_URL
@@ -66,6 +77,25 @@ services:
         sync: false
       - key: TREASURY_WALLET_VERSION
         value: "auto"
+      # Встроенный конфиг лайтсерверов периодически мёртв — выплаты встают с
+      # «have no alive peers». Лечение: официальный конфиг, подтягиваемый при старте.
+      - key: LITESERVER_CONFIG_URL
+        value: https://ton.org/testnet-global.config.json
+      # Цикл наблюдателя входящих (сек) = скорость подтверждения ставок.
+      # 60 — минута; 120/180 — вдвое-втрое дешевле по квоте TonAPI/Toncenter.
+      - key: TON_WATCH_INTERVAL_SECONDS
+        value: "60"
+      # Глубина скана входящих за цикл. Перекрытие курсора обязано переживать
+      # паузу между циклами, иначе хвост теряется и ставка «зависает».
+      - key: WATCH_PAGE_LIMIT
+        value: "100"
+      - key: WATCH_MAX_PAGES
+        value: "50"
+      - key: WATCH_CURSOR_OVERLAP_SECONDS
+        value: "90"
+      # Старше этого перевод-ставка авто-возвратом уже не считается.
+      - key: WATCH_REFUND_MAX_AGE_DAYS
+        value: "14"
       - key: TONCENTER_API_BASE
         value: https://toncenter.com
       - key: TONCENTER_API_BASE_TESTNET
@@ -92,6 +122,84 @@ services:
         value: "40"
       - key: PAYOUT_MAX_ATTEMPTS
         value: "5"
+      # === Денежные пороги выплат ===
+      # Это единственное место, где прод видит эти рычаги: не выставив их в
+      # render.yaml, оператор меняет их в app/config.py и молча получает
+      # другие значения на деплое. Значения — те же, что в app/config.py.
+      # PAYOUT_FEE_GRAM: оценка комиссии за один исходящий перевод; вычитается
+      # из призового пула ЗАРАНЕЕ. Недобор встаёт очередью («казначей подкачан»),
+      # перебор тихо срезает каждого победителя. Перед mainnet — замер на
+      # testnet: 5–10 переводов A→B, среднее × 1.15, округлить вверх.
+      - key: PAYOUT_FEE_GRAM
+        value: "0.002"
+      # Ниже порога перевод не создаётся (газ съел бы большую часть), доля
+      # капает в копилку недели. Ориентир — 10 × PAYOUT_FEE_GRAM.
+      - key: MIN_PAYOUT_GRAM
+        value: "0.02"
+      # Авто-возвраты дешевле порога не создаются — газ дороже самой пыли.
+      - key: REFUND_MIN_GRAM
+        value: "0.05"
+      # 0 = плоский PAYOUT_FEE_GRAM с возврата; >0 — комиссия долей от ставки.
+      - key: REFUND_FEE_RATIO
+        value: "0"
+      # Доля (%) от подтверждённой ставки по реферальной ссылке, которая уходит
+      # пригласившему и НЕ попадает в пул победителей.
+      - key: REFERRAL_PCT
+        value: "1.0"
+      # Порог (Gram), с которого реферальная награда превращается в перевод.
+      - key: REFERRAL_MIN_PAYOUT_GRAM
+        value: "0.5"
+      # Окно, за которое вещание bcast: должно подтвердиться появлением memo
+      # в цепочке. Должно заметно превышать нормальное время блока, иначе
+      # очередь начнёт ретраить переводы, которые уже ушли в блок.
+      - key: PAYOUT_CONFIRM_TIMEOUT_SECONDS
+        value: "1200"
+      - key: PAYOUT_SEND_TIMEOUT_SECONDS
+        value: "90"
+      # Окно подтверждения seqno внутри пачки: без него два внешних сообщения
+      # подписываются соседними номерами, пока первый ещё в мемпуле узла, и
+      # второй теряется молча. Задержка цикла — не более окна.
+      - key: PAYOUT_BATCH_CONFIRM_SECONDS
+        value: "15"
+      # Окно анти-дубля обязано перекрывать PAYOUT_CONFIRM_TIMEOUT_SECONDS с
+      # запасом: иначе memo ушедшего перевода выпадет из сверки и очередь
+      # продублирует платёж.
+      - key: PAYOUT_RECONCILE_HISTORY_SECONDS
+        value: "604800"
+      - key: PAYOUT_RECONCILE_MAX_PAGES
+        value: "12"
+      # Зеркало казны: независимая сверка баланса (БД = Σ цепочки). /treasury.
+      - key: TREASURY_MIRROR_INTERVAL_SECONDS
+        value: "180"
+      - key: TREASURY_MIRROR_MAX_PAGES_PER_SYNC
+        value: "40"
+      - key: STUCK_HEAL_RECHECK_SECONDS
+        value: "600"
+      - key: STUCK_RETENTION_DAYS
+        value: "7"
+      # Исход дня по ставкам. Явно, а не «как в коде»: выключение этого флага
+      # молча меняет механику выплат на проде.
+      - key: WINNER_BY_STAKES
+        value: "true"
+      - key: LEADERBOARD_CLAIM_ENABLED
+        value: "true"
+      - key: CLAIM_WINDOW_HOURS
+        value: "48"
+      - key: MONTHLY_PRIZE_TOP_K
+        value: "3"
+      - key: MONTHLY_PRIZE_WEIGHTS
+        value: "50,30,20"
+      - key: CATCHUP_WINDOW_HOURS
+        value: "72"
+      - key: DISPUTES_ENABLED
+        value: "true"
+      - key: LEADERBOARD_CORRECT_CAP
+        value: "0"
+      # Подпись токена реферальной ссылки (?start=ref_<id>_<токен>).
+      # Пусто — рефералки выключены (REFERRAL_PCT просто не участвует).
+      # Задаётся только в секретах Render, в коде и репозитории не лежит.
+      - key: REFERRAL_SECRET
+        sync: false
       - key: WORLD_NAME
         value: "Эхо Стаи"
       - key: REVOTE_ENABLED

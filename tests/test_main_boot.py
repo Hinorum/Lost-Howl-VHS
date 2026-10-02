@@ -403,6 +403,62 @@ async def test_main_refuses_to_start_on_broken_config(monkeypatch) -> None:
     assert "data" in made
 
 
+async def test_main_warns_but_starts_on_typo_in_env_name(monkeypatch, caplog) -> None:
+    """Опечатка в имени переменной — предупреждение, а не повод не стартовать.
+
+    validate_config роняет бота, и это правильно для пустого токена. Но
+    подозрение на опечатку (PAYOUT_FEE_GARM вместо _GRAM) — не поломка
+    конфигурации: процесс может подняться и работать, просто с дефолтом.
+    Раньше такой случай был не виден вовсе — pydantic молча игнорирует лишние
+    переменные, и прод уезжал с комиссией, которую никто не выбирал.
+    """
+    monkeypatch.setenv("PAYOUT_FEE_GARM", "0.002")
+    monkeypatch.setattr(main_module, "Path", lambda value: SimpleNamespace(mkdir=Mock()))
+    monkeypatch.setattr(main_module, "validate_config", Mock(return_value=[]))
+    monkeypatch.setattr(main_module, "init_db", AsyncMock())
+    bot = SimpleNamespace(delete_webhook=AsyncMock())
+    monkeypatch.setattr(main_module, "create_bot", AsyncMock(return_value=bot))
+    dispatcher = SimpleNamespace(start_polling=AsyncMock())
+    monkeypatch.setattr(main_module, "build_dispatcher", Mock(return_value=dispatcher))
+    monkeypatch.setattr(main_module, "boot_game", AsyncMock())
+    monkeypatch.setattr(settings, "webhook_base_url", "")
+    run_webhook = AsyncMock()
+    monkeypatch.setattr(main_module, "run_webhook", run_webhook)
+
+    with caplog.at_level("WARNING", logger="app.main"):
+        await main_module.main()
+
+    # Старт состоялся — предупреждение не превратилось в отказ.
+    dispatcher.start_polling.assert_awaited_once_with(bot)
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("PAYOUT_FEE_GARM" in message for message in warned)
+
+
+def test_env_typo_detection_ignores_unrelated_variables(monkeypatch) -> None:
+    """Проверка целится в опечатки, а не перечисляет всё лишнее в окружении.
+
+    В окружении Render/CI/локальной машины законно лежит сотня чужих
+    переменных (PATH, PROCESSOR_*, CI_*). Если бы проверка ругалась на них
+    всех, её перестали бы читать — и тогда она перестала бы ловить настоящее.
+    """
+    monkeypatch.delenv("PAYOUT_FEE_GARM", raising=False)
+    monkeypatch.setenv("SOME_COMPLETELY_UNRELATED_VAR", "1")
+    monkeypatch.setenv("PATH_TO_SOMEWHERE", "1")
+    assert main_module.warn_config() == []
+
+    monkeypatch.setenv("PAYOUT_FEE_GARM", "0.002")
+    warnings_seen = main_module.warn_config()
+    assert len(warnings_seen) == 1
+    assert "PAYOUT_FEE_GRAM" in warnings_seen[0]
+
+
+def test_env_typo_detection_is_not_a_startup_problem(monkeypatch) -> None:
+    """Подозрение на опечатку не попадает в validate_config (он блокирует)."""
+    monkeypatch.setenv("PAYOUT_FEE_GARM", "0.002")
+    problems = main_module.validate_config()
+    assert not any("PAYOUT_FEE_GARM" in problem for problem in problems)
+
+
 async def test_main_runs_webhook_mode(monkeypatch) -> None:
     monkeypatch.setattr(main_module, "validate_config", Mock(return_value=[]))
     monkeypatch.setattr(main_module, "Path", lambda value: SimpleNamespace(mkdir=Mock()))

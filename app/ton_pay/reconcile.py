@@ -183,7 +183,14 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
             break
         if len(items) < _state._RECONCILE_PAGE_LIMIT:
             break  # неполная страница = хвост истории, дальше пусто
-        offset += _state._RECONCILE_PAGE_LIMIT - _state._RECONCILE_PAGE_OVERLAP
+        # Шаг — от ФАКТИЧЕСКИ пришедших записей, а не от запрошенного лимита.
+        # Провайдер вправе отдать страницу короче запроса: при жёстком шаге по
+        # константе следующий offset перепрыгнул бы через неперечитанный кусок,
+        # и в карте анти-дубля появилась бы дыра. Реальный Toncenter лимит
+        # отдаёт честно (проверено живыми запросами: limit=256 → 256 записей,
+        # limit=1000 → 1000), но опираться на это в анти-дубле незачем: тот же
+        # инвариант уже держит _advance_cursor в treasury_mirror.
+        offset += max(1, len(items) - _state._RECONCILE_PAGE_OVERLAP)
     return tx_map
 
 

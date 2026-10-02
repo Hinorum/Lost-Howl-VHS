@@ -29,6 +29,19 @@ os.environ.setdefault("TREASURY_MNEMONIC", "")
 # тесты дефолта (test_metrics) строят Settings() из реального окружения.
 os.environ.setdefault("HEALTH_REQUIRE_TOKEN", "true")
 
+import datetime as _dt
+import sqlite3
+
+# Python 3.12 объявил устаревшим встроенный адаптер datetime/date в sqlite3, и
+# pytest.ini гоняет DeprecationWarning как ошибку — любой raw text() с параметром
+# datetime ронял прогон. Рецепт замены из документации sqlite3: адаптер
+# объявляется явно. Формат ровно тот же, что был у встроенного (пробел вместо
+# «T», микросекунды при наличии), поэтому поведение не меняется — исчезает
+# только предупреждение. Глобальная регистрация осознанна: это рецепт из
+# stdlib, иначе каждый новый фикстурный raw-SQLite тест падал бы заново.
+sqlite3.register_adapter(_dt.datetime, lambda v: v.isoformat(" "))
+sqlite3.register_adapter(_dt.date, lambda v: v.isoformat())
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 

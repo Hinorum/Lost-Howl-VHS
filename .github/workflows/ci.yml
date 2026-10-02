@@ -20,6 +20,11 @@ jobs:
           pip install -r requirements-dev.txt
       - name: Lint (runtime errors only)
         run: python -m ruff check .
+      # Тот же скрипт, что вешается локальным pre-commit хуком, только в режиме
+      # --all: локальный хук проверяет staged, и мнемоника, попавшая в
+      # репозиторий мимо него (другая машина, --no-verify), осталась бы незамеченной.
+      - name: Secret scan (whole repo)
+        run: python scripts/hooks/check_secrets.py --all
       - name: Alembic drift check
         env:
           DATABASE_URL: "sqlite+aiosqlite:///./data/ci_drift.db"

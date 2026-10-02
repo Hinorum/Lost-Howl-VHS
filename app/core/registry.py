@@ -34,6 +34,7 @@ ALERT_MIRROR_KEY = "alert_mirror_ts"
 ALERT_REFUND_KEY = "alert_refund_ts"
 ALERT_STAKE_KEY = "alert_stake_ts"
 ALERT_STUCK_KEY = "alert_stuck_ts"
+ALERT_ENTROPY_KEY = "alert_entropy_ts"
 
 # Снимок последнего вердикта check_anomalies: JSON-список строк-проблем и
 # время, когда он снят. Считает джоба ops-sweep раз в 120с; /health и /ops

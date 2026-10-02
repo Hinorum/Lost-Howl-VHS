@@ -190,6 +190,10 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
         # HTTP-канала: вплотную разосланные месседжи со следующими seqno
         # сражаются за место, и второй молча отбрасывается).
         prev_memo: set[str] | None = None
+        # Пачка встала на паузу из-за неподтверждённого предыдущего перевода:
+        # строки, которые остались в 'sending' за нами, НИКОГДА не вещаем в этом
+        # цикле — иначе их seqno пришлось бы угадывать вслепую.
+        deferred = False
         try:
             for payout in payouts:
                 # Свободный комментарий (возвраты при паузе) дополняется
@@ -230,10 +234,18 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     )
                     logger.warning("Выплата %d: повтор отложен — история казначея недоступна", payout.id)
                     continue
-                if prev_memo and _tp._http_channel_engaged_at is not None:
+                if prev_memo:
                     # Гонка двух быстрых переводов: следующий seqno подписываем,
                     # только когда предыдущий перевод этого цикла подтверждён в
-                    # блоке (HTTP-канал; лайтсерверный путь таких окон не знает).
+                    # блоке. Канал тут ни при чём — окно нужно на ЛЮБОМ пути,
+                    # лайтсерверном в том числе: подписанный seqno+1 может ещё
+                    # лежать в мемпуле узла, и следующий внешний месседж с
+                    # seqno+2 сражается с ним за место (второй молча теряется,
+                    # ловим только 2-часовой сверкой). Условие на
+                    # _http_channel_engaged_at было оптимизацией, которая
+                    # осталась после того, как seqno начали переиспользовать и
+                    # на лайтсерверном пути (до этого каждый перевод брал
+                    # свежий get_seqno и ждать было нечего).
                     if await _wait_for_broadcast_memo(
                         prev_memo, settings.payout_batch_confirm_seconds
                     ):
@@ -243,17 +255,26 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                         )
                     else:
                         # За окно подтверждения перевод не пришёл: он в пути или
-                        # потерян. Повторять сейчас НЕЛЬЗЯ (анти-дубль по memo),
-                        # а батч-счётчик уже протух. Сбрасываем: следующая
-                        # отправка заново прочитает живой seqno казначея, а судьбу
-                        # этого перевода дожмёт confirm_broadcast_payouts.
+                        # потерян. Пачку на этом цикле останавливаем, и это не
+                        # перестраховка, а требование корректности: сброс
+                        # _batch_seqno заставил бы следующий перевод взять seqno
+                        # из сети, а там всё ещё старая (предыдущая) величина —
+                        # второй перевод подписался бы тем же номером и молча
+                        # потерялся бы, как уже ушедший. Живой seqno можно
+                        # прочитать только после того, как предыдущий перевод
+                        # встанет в блок; до этого — пауза. Оставшиеся строки
+                        # вернёт _reset_retriable следующим циклом, а судьбу
+                        # неподтверждённого перевода дожмёт confirm_broadcast_payouts.
                         logger.warning(
                             "Выплата %d: предыдущий перевод не подтвердился за %d с — "
-                            "seqno для следующего будет взят из сети заново",
+                            "пачка на этом цикле остановлена, seqno не читаем из сети, "
+                            "пока предыдущий не в блоке",
                             payout.id,
                             settings.payout_batch_confirm_seconds,
                         )
                         _state._batch_seqno = None
+                        deferred = True
+                        break
                 try:
                     # Через app.ton_pay — чтобы monkeypatch.setattr(ton_pay,
                     # "send_ton_transfer", mock) из тестов доходил до вызова.
@@ -301,6 +322,21 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     payout.status = "pending"
         finally:
             _state._batch_seqno = None
+        if deferred:
+            # Причина одна на всю остановленную часть пачки, чтобы в /payouts
+            # было видно, что дело в неподтверждённом предыдущем переводе, а не
+            # в каждой строке отдельно. Строки откатываем сразу: так они не
+            # висят в полусостоянии «взято в работу, но не взято».
+            reason = (
+                f"пачка приостановлена: предыдущий перевод не подтверждён в блоке за "
+                f"{settings.payout_batch_confirm_seconds} с — ждём блок, чтобы не "
+                f"подписать следующий seqno вслепую"
+            )
+            for rest in payouts:
+                if rest.status != "sending":
+                    continue
+                rest.status = "pending"
+                rest.last_error = reason
         await session.commit()
     dead = [p.id for p in payouts if p.status == "failed"]
     if dead:

@@ -146,6 +146,10 @@ class Settings(BaseSettings):
     # они питают только лидерборд (score, correct_picks, стрики, копилки).
     # День, на который не поставлено ни одного грамма, решается голосами
     # (fallback: мир выбрал «сердцем» — иначе победителя не вывести).
+    #
+    # false = исход дня всегда по бесплатным голосам (прежний режим). Рычаг
+    # аварийный: держать его в true — иначе README обещает флаг, которого нет.
+    winner_by_stakes: bool = True
     disputes_enabled: bool = True
     owner_wallet_address: str = ""
     stake_confirm_seconds: int = 40

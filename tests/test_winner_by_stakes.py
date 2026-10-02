@@ -357,6 +357,73 @@ async def test_results_post_stake_decided_text(session: AsyncSession) -> None:
     assert "← 🏆 След" in text
 
 
+# ---------- Флаг winner_by_stakes ----------
+
+
+async def test_winner_by_stakes_off_falls_back_to_votes(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WINNER_BY_STAKES=false: исход дня решают голоса, ставки не входят.
+
+    Флаг документирован в README, но до сих пор не существовал в коде: настройки
+    не было, а исход всегда считался по ставкам. Теперь рычаг настоящий — и
+    выключенный режим честно откатывает именно к прежнему «сердцу» (голосам).
+    """
+    monkeypatch.setattr(settings, "winner_by_stakes", False)
+    # Голоса за путь 0 (1,2,3), Gram за путь 1 — при разных счётах исход разойдётся.
+    round_row = await _seed_day(
+        session,
+        WinRule.MAJORITY,
+        votes={0: [1, 2, 3], 1: [4], 2: []},
+        stakes={1: [(4, 5.0)]},
+    )
+    closed, _ = await finish_tally(session, round_row)
+    assert closed.winner_card == 0, "при флаге off решают голоса, а не Gram"
+
+
+async def test_winner_by_stakes_on_ignores_votes(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Обратная сторона того же рычага: при true голоса на исход не влияют.
+
+    Сцена зеркальна предыдущему тесту — тот же день, но исход уезжает в сторону
+    Gram. Без этой пары тестов «флаг не работает» выглядело бы как «работает».
+    """
+    monkeypatch.setattr(settings, "winner_by_stakes", True)
+    round_row = await _seed_day(
+        session,
+        WinRule.MAJORITY,
+        votes={0: [1, 2, 3], 1: [4], 2: []},
+        stakes={1: [(4, 5.0)]},
+    )
+    closed, _ = await finish_tally(session, round_row)
+    assert closed.winner_card == 1, "при флаге on решают суммы ставок"
+
+
+async def test_winner_by_stakes_off_ignores_stakes_for_text_phrase(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Выключенный флаг берёт и ФОРМУЛИРОВКУ про голоса (VOTE_RULE_PHRASES).
+
+    Формулировка берётся по признаку «счёт пришёл из ставок», который _decisive_counts
+    возвращает вторым элементом пары. Проверяем, что флаг меняет и текст дня:
+    иначе игрокам говорили бы «уцелеет кадр, собравший больше всего Gram», а
+    считали бы по голосам.
+    """
+    from app.models import VOTE_RULE_PHRASES
+
+    monkeypatch.setattr(settings, "winner_by_stakes", False)
+    round_row = await _seed_day(
+        session,
+        WinRule.MAJORITY,
+        votes={0: [1, 2, 3], 1: [4], 2: []},
+        stakes={1: [(4, 5.0)]},
+    )
+    closed, _ = await finish_tally(session, round_row)
+    assert closed.stake_counts_json is None, "ставки не участвовали — счёт не голосовой"
+    assert VOTE_RULE_PHRASES[WinRule.MAJORITY] == "уцелеет кадр, собравший больше всех голосов (день Большинства)"
+
+
 def test_results_post_scene_numbers_without_stakes() -> None:
     # Голосовой день (без ставок): номера сцен всё равно проставлены.
     rnd = Round(

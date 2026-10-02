@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import sqlite3
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from app.config import settings
 
@@ -36,21 +38,57 @@ def sqlite_file_path() -> Path | None:
 
 
 def is_postgres() -> bool:
-    return settings.database_url.startswith(("postgres://", "postgresql://"))
+    """Postgres или нет — по схеме DSN, а не по точному префиксу.
+
+    app.config хранит database_url ровно как задали в окружении, а
+    postgresql+asyncpg:// — законная запись (её нормализует sqlalchemy_url,
+    и db.py с ней работает). Раньше проверка ловила только postgres:// и
+    postgresql://, и при «+asyncpg» бэкап молча выключался: is_postgres()
+    давало False, sqlite_file_path() — тоже None, и backup_now() возвращал
+    None без единой записи в лог. Место, где бэкапов нет, обязано хотя бы
+    говорить об этом вслух.
+    """
+    return settings.database_url.startswith(("postgres://", "postgresql://", "postgresql+"))
+
+
+def _pg_env(url: str) -> tuple[dict[str, str], str]:
+    """(окружение для pg_dump, DSN без пароля).
+
+    Пароль передаётся через PGPASSWORD, а не аргументом командной строки.
+    Причина: argv виден любому процессу системы (`ps aux`, /proc/*/cmdline,
+    сторонние мониторы), и секрет базы попадает в вывод и в логи процессов.
+    libpq штатно читает пароль из PGPASSWORD, поэтому поведение не меняется —
+    меняется только способ доставки. Прокси/цепочка в DSN
+    (postgresql://...?...&options=-c...) сохраняется как есть: libpq сам
+    разберёт параметры из строки подключения.
+    """
+    parsed = urlsplit(url)
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username:
+        netloc = f"{parsed.username}@{netloc}"
+    clean = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
+    env = dict(os.environ)
+    if parsed.password:
+        env["PGPASSWORD"] = unquote(parsed.password)
+    return env, clean
 
 
 def _pg_dump_sync(dest: Path) -> None:
     """pg_dump в custom-формате: сжатый, восстанавливается pg_restore.
 
-    URL отдаётся как есть (libpq понимает postgres:// и параметры провайдеров);
-    sslmode и прочие libpq-параметры вычищать не нужно — они для pg_dump родные.
+    DSN отдаётся как есть, кроме пароля (см. _pg_env): libpq понимает
+    postgres:// и параметры провайдера, sslmode и прочие вычищать не нужно.
     """
+    env, clean_url = _pg_env(settings.database_url)
     result = subprocess.run(
-        ["pg_dump", "--format=custom", f"--file={dest}", settings.database_url],
+        ["pg_dump", "--format=custom", f"--file={dest}", clean_url],
         capture_output=True,
         text=True,
         timeout=600,
         check=True,
+        env=env,
     )
     if result.stderr.strip():
         logger.warning("pg_dump предупреждает: %s", result.stderr.strip()[:500])

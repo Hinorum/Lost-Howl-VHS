@@ -210,7 +210,10 @@ async def test_fetch_page_falls_back_to_toncenter(monkeypatch) -> None:
     toncenter_call = next(c for c in called if "toncenter" in c["url"])
     assert toncenter_call["params"]["account"] == TREASURY
     assert toncenter_call["params"]["sort"] == "desc"
-    assert toncenter_call["params"]["limit"] == 100
+    # Размер страницы берётся из кода, а не вписан числом: прежний тест держал
+    # тут 100, и любое осознанное изменение _MIRROR_PAGE_LIMIT роняло его,
+    # хотя поведение зеркала оставалось правильным.
+    assert toncenter_call["params"]["limit"] == treasury_mirror._MIRROR_PAGE_LIMIT
 
 
 async def test_fetch_page_reports_unavailable_when_both_silent(monkeypatch) -> None:
