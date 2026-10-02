@@ -53,6 +53,14 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                         select(Payout).where(
                             Payout.status == "sent",
                             Payout.network == network,
+                            Payout.confirmed.is_(False),
+                            # Без confirmed=False попадали бы строки, уже
+                            # прошедшие проверку N блоков (на старом
+                            # payout_confirm_blocks=0 confirmed=True сразу
+                            # после первого цикла). Хвост из bcast:/NULL —
+                            # для mainnet это исчерпывается на первом цикле,
+                            # а для обычных sent без подтверждения это и есть
+                            # «нужно поднять до confirmed».
                             or_(
                                 Payout.tx_hash.is_(None),
                                 Payout.tx_hash.like("bcast:%"),
@@ -83,6 +91,12 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
             cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(
                 seconds=settings.payout_confirm_timeout_seconds
             )
+            # Кэш head-блока на весь цикл: все «незрелые» confirmed-выплаты
+            # проверяются против одного masterchain head seqno, иначе каждая
+            # транзакция дёргала бы сеть отдельно и в случайные моменты (что
+            # искажает число подтверждений на стыке вызовов).
+            head_seqno_cache: int | None = None
+            need_confirm_blocks = settings.payout_confirm_blocks > 0
             for payout in rows:
                 real_hash = next(
                     (
@@ -94,7 +108,40 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                 )
                 if real_hash:
                     payout.tx_hash = real_hash
-                    confirmed += 1
+                    if not need_confirm_blocks:
+                        # Старое поведение: реальный хеш из истории = финал.
+                        # Это и есть «confirmed» по смыслу, даже если флаг
+                        # остался False после миграции исторических строк.
+                        payout.confirmed = True
+                        confirmed += 1
+                        continue
+                    if payout.confirmed:
+                        # Уже подтверждено в прошлом цикле — не дёргаем сеть.
+                        confirmed += 1
+                        continue
+                    import app.ton_pay as _tp_confirm
+
+                    if head_seqno_cache is None:
+                        head_seqno_cache = await _tp_confirm.fetch_masterchain_head_seqno()
+                    if head_seqno_cache is None:
+                        # «Не знаю» — НЕ поднимаем confirmed, цикл повторится
+                        # через 120 с. Счётчик confirmed не растёт, но и
+                        # requeued тоже: пустая попытка, без действий.
+                        continue
+                    tx_seqno = await _tp_confirm.fetch_tx_mc_seqno(real_hash)
+                    if tx_seqno is None:
+                        continue
+                    depth = head_seqno_cache - tx_seqno
+                    if depth < 0:
+                        # Теоретически невозможно на mainnet, но защищаемся:
+                        # пропускаем, цикл повторится.
+                        continue
+                    if depth >= settings.payout_confirm_blocks:
+                        payout.confirmed = True
+                        confirmed += 1
+                    # Иначе: строка остаётся confirmed=False, ждём ещё блоков
+                    # до payout_confirm_blocks. Следующий цикл в том же коде
+                    # проверит снова — head_seqno_cache обновится.
                     continue
                 sent_at = payout.sent_at.replace(tzinfo=None) if payout.sent_at is not None else None
                 if sent_at is not None and sent_at > cutoff:

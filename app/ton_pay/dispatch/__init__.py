@@ -201,10 +201,15 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     # Перевод уже ушёл в цепочку раньше, но статус тогда не
                     # сохранился (краш/таймаут после вещания). Повтор задвоил бы
                     # платёж — фиксируем доставку без новой отправки.
+                    # confirmed=False: пусть confirm_broadcast_payouts проставит
+                    # после проверки N подтверждений; в текущем тике мы только
+                    # знаем, что memo в истории есть, но mc_block_seqno ещё не
+                    # запрашивали.
                     payout.tx_hash = None
                     payout.status = "sent"
                     payout.sent_at = datetime.now(UTC)
                     payout.last_error = None
+                    payout.confirmed = (settings.payout_confirm_blocks == 0)
                     sent += 1
                     logger.warning(
                         "Выплата %d уже разослана ранее (memo найдено у казначея) — помечена sent без повтора",
@@ -290,6 +295,11 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     payout.sent_at = datetime.now(UTC)
                     payout.attempts = 0
                     payout.last_error = None
+                    # confirmed=False, если нужны подтверждения блокчейна —
+                    # следующий тик confirm_broadcast_payouts проверит глубину
+                    # и поднимет флаг. Иначе (payout_confirm_blocks=0) считаем
+                    # строку окончательно подтверждённой сразу.
+                    payout.confirmed = (settings.payout_confirm_blocks == 0)
                     sent += 1
                     # Следующий перевод пачки дождётся подтверждения ЭТОГО в блоке.
                     prev_memo = set(candidates)

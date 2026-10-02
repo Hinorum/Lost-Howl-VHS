@@ -159,6 +159,38 @@ async def get_wallet():
             state._wallet = await WalletV4R2.from_private_key(state._provider, private_key, wc=0)
         state._wallet_network = network
         logger.info("Кошелёк казначея готов (%s, контракт %s)", network, version)
+        # Cold-start sanity-check: на mainnet это страховка от ситуации «пока
+        # бот лежал, казначей успел сделать N внешних переводов (через
+        # Tonkeeper / руками), LiteBalancer ещё не видел новый блок, и
+        # `get_seqno()` отдаёт устаревший номер». До первой отправки читаем
+        # тот же seqno через Toncenter v3 runGetMethod (HTTP, всегда свежий)
+        # и сравниваем. Расхождение >1 логируем как WARNING — НЕ блокируем:
+        # реальные причины могут быть легитимными (гонка между фиксацией
+        # блока в LiteBalancer и нашим HTTP-запросом), а расследование через
+        # `/treasury` покажет ровную картину. На testnet skip'аем: расхождение
+        # чаще из-за мёртвых лайтсерверов и только маскирует реальный сигнал.
+        if network == "mainnet" and settings.active_treasury_address:
+            try:
+                from .http_channel import http_get_wallet_seqno
+
+                lite_seqno = await state._wallet.get_seqno()
+                http_seqno = await http_get_wallet_seqno(state._wallet)
+                if abs(lite_seqno - http_seqno) > 1:
+                    logger.warning(
+                        "Cold-start seqno sanity-check: лайтсерверы=%d, toncenter=%d "
+                        "(расхождение %d). Возможно, между остановкой и стартом "
+                        "прошли внешние переводы — стоит свериться с /treasury",
+                        lite_seqno, http_seqno, lite_seqno - http_seqno,
+                    )
+                else:
+                    logger.debug(
+                        "Cold-start seqno: лайт=%d, http=%d — совпадает", lite_seqno, http_seqno
+                    )
+            except Exception:
+                # Sanity-check не должен ломать запуск бота: лайтсерверы могли
+                # умереть уже после start_up, а HTTP-провайдер не ответить.
+                # Следующая настоящая отправка сама увидит реальный seqno.
+                logger.warning("Cold-start seqno sanity-check не удался", exc_info=True)
         return state._wallet
 
 

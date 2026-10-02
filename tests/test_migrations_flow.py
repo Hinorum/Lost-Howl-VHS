@@ -496,21 +496,42 @@ async def test_orm_writes_rounds_without_server_default(db_path: Path):
 def test_single_head_and_reachable_revisions():
     """Один head, один base, все ревизии достижимы по down_revision. Расщепление
     истории означает, что `upgrade head` на разных базах приводит к разной
-    схеме — а это ровно то, чего flow не должен допускать."""
+    схеме — а это ровно то, чего flow не должен допускать.
+
+    Обход down_revision учитывает merge-ревизии: их down_revision — tuple
+    имён, и тогда каждая ветка проходится независимо. Иначе любой merge
+    (типичный для параллельных веток разработки) ронял бы тест на
+    `get_revision(tuple)`. Цикл отслеживается через локальный path —
+    повторное посещение через разные ветки merge-графа (одна и та же
+    ревизия может быть down_revision нескольких merge-узлов) НЕ считается
+    циклом.
+    """
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
     heads = script.get_heads()
     assert len(heads) == 1, f"в истории несколько head'ов: {heads}"
     assert len(script.get_bases()) == 1, f"у истории несколько base'ов: {script.get_bases()}"
 
     revisions = {revision.revision for revision in script.walk_revisions()}
-    chain: set[str] = set()
-    current: str | None = heads[0]
-    while current is not None:
-        assert current not in chain, f"цикл в истории ревизий: {current}"
-        chain.add(current)
-        current = script.get_revision(current).down_revision
+    visited: set[str] = set()
+    # Обход с очередью: один head, но merge-ревизия добавляет в очередь
+    # обе свои ветки через tuple down_revision.
+    queue: list[str] = list(heads)
+    while queue:
+        current = queue.pop()
+        path: list[str] = []
+        while current is not None:
+            assert current not in path, f"цикл в истории ревизий: {current}"
+            path.append(current)
+            visited.add(current)
+            down = script.get_revision(current).down_revision
+            if isinstance(down, (tuple, list)):
+                # Merge-ревизия: добавляем все ветки в очередь как независимые
+                # точки входа, потом обойдём каждую с собственным path.
+                queue.extend(down)
+                break
+            current = down
 
-    unreachable = sorted(revisions - chain)
+    unreachable = sorted(revisions - visited)
     assert unreachable == [], f"ревизии не достижимы от head: {unreachable}"
 
 

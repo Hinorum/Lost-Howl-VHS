@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -357,12 +358,21 @@ class Payout(Base):
     alerted: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Подтверждение блокчейна: «sent» ставится сразу после bcast: (лайтсервер
+    # принял BoC), а «confirmed» — только после N блоков mainchain от mc_seqno
+    # транзакции (см. payout_confirm_blocks). До confirmed=True строка не
+    # считается окончательной для сверки остатков и алертов; pending-цикл не
+    # использует confirmed, анти-дубль по memo работает по-прежнему. False
+    # в DEFAULT: для исторических строк (заполненных до миграции) confirmed
+    # проставит следующий confirm_broadcast_payouts после сверки memo.
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
     __table_args__ = (
         CheckConstraint("amount_nanotons > 0", name="ck_payout_positive_amount"),
         CheckConstraint("status IN ('pending', 'sending', 'sent', 'failed', 'dismissed')", name="ck_payout_valid_status"),
         Index("ix_payout_dispatch", "status", "network", "dest_address"),
         Index("ix_payout_alert", "status", "network", "alerted"),
+        Index("ix_payout_confirm", "status", "network", "confirmed"),
     )
 
 

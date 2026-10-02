@@ -219,6 +219,9 @@ from .reconcile import (  # noqa: F401  # noqa: E402,F401
     fetch_broadcast_markers,
     fetch_broadcast_tx_map,
     fetch_masterchain_entropy,
+    fetch_masterchain_head_seqno,
+    fetch_tx_confirmations,
+    fetch_tx_mc_seqno,
 )
 
 # Диагностика казначея (/treasury, /blockchain): реализация в treasury.py.

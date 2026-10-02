@@ -265,3 +265,107 @@ async def fetch_broadcast_markers() -> set[str]:
     import app.ton_pay as _tp
 
     return set(await _tp.fetch_broadcast_tx_map())
+
+
+async def fetch_masterchain_head_seqno() -> int | None:
+    """Текущий seqno мастерчейна TON: head блокчейна прямо сейчас.
+
+    Используется для подсчёта подтверждений уже ушедших транзакций: confirm =
+    head - tx_seqno. При сбое обоих провайдеров возвращает None — это сигнал
+    «не знаю», и confirm_broadcast_payouts в этом случае не ставит
+    confirmed=True (риск пропустить нефинализированный блок дороже задержки).
+    """
+    import app.ton_pay as _tp
+
+    if not settings.ton_enabled:
+        return None
+    candidates = (
+        (
+            f"{settings.active_ton_api_base.rstrip('/')}/v2/blockchain/masterchain-head",
+            api_headers(settings.ton_api_key),
+            lambda data: data,
+        ),
+        (
+            f"{settings.active_toncenter_api_base.rstrip('/')}/api/v3/masterchainInfo",
+            api_headers(settings.toncenter_api_key),
+            lambda data: data.get("last") or data,
+        ),
+    )
+    for url, headers, pick in candidates:
+        try:
+            client = _tp.get_http_client()
+            response = await _tp.http_get_with_retry(
+                client, url, headers=headers, max_retries=0, timeout=8.0
+            )
+            response.raise_for_status()
+            block = pick(response.json())
+            seqno = block.get("seqno")
+            if seqno is not None:
+                return int(seqno)
+        except Exception as exc:
+            logger.warning("Masterchain head (%s) недоступен: %s", url, exc)
+    return None
+
+
+async def fetch_tx_mc_seqno(tx_hash: str) -> int | None:
+    """masterchain seqno блока, в который попала транзакция tx_hash.
+
+    TonAPI: GET /v2/blockchain/transactions/{hash} → блок-предок в mainchain,
+    поле `mc_block_seqno`. Toncenter v3: GET /api/v3/transactions/{hash} →
+    поле `mc_block_seqno` (та же схема). При сбое обоих — None. Не путать
+    с `block_seqno`: логически транзакция живёт в shard, а финальность
+    считается по мастерчейну, поэтому только mc_block_seqno подходит для
+    оценки reorg-риска.
+    """
+    import app.ton_pay as _tp
+
+    candidates = (
+        (
+            f"{settings.active_ton_api_base.rstrip('/')}/v2/blockchain/transactions/{tx_hash}",
+            api_headers(settings.ton_api_key),
+            lambda data: data.get("mc_block_seqno"),
+        ),
+        (
+            f"{settings.active_toncenter_api_base.rstrip('/')}/api/v3/transactions/{tx_hash}",
+            api_headers(settings.toncenter_api_key),
+            lambda data: data.get("mc_block_seqno"),
+        ),
+    )
+    for url, headers, pick in candidates:
+        try:
+            client = _tp.get_http_client()
+            response = await _tp.http_get_with_retry(
+                client, url, headers=headers, max_retries=0, timeout=8.0
+            )
+            response.raise_for_status()
+            seqno = pick(response.json())
+            if seqno is not None:
+                return int(seqno)
+        except Exception as exc:
+            logger.warning("mc_block_seqno (%s) недоступен: %s", url, exc)
+    return None
+
+
+async def fetch_tx_confirmations(tx_hash: str) -> int | None:
+    """Число подтверждений мастерчейна для транзакции (head_seqno - mc_block_seqno).
+
+    Используется confirm_broadcast_payouts для решения «ставить confirmed=True
+    или ждать» при payout_confirm_blocks > 0. При сбое любого из запросов —
+    None: вызывающий код трактует это как «не знаю» и оставляет строку
+    confirmed=False до следующего цикла (а не ставит confirmed=True наугад).
+    Возврат 0 транзакции в head блоке (теоретически) — корректный ноль, не None.
+    """
+    head_seqno = await fetch_masterchain_head_seqno()
+    tx_seqno = await fetch_tx_mc_seqno(tx_hash)
+    if head_seqno is None or tx_seqno is None:
+        return None
+    if tx_seqno > head_seqno:
+        # Невозможно на mainnet: tx в «будущем» относительно head. Не падаем,
+        # но и подтверждение не считаем — вызывающий код оставит строку
+        # confirmed=False и попробует на следующем цикле.
+        logger.warning(
+            "fetch_tx_confirmations: tx_seqno=%d > head_seqno=%d для %s",
+            tx_seqno, head_seqno, tx_hash[:16],
+        )
+        return None
+    return head_seqno - tx_seqno
