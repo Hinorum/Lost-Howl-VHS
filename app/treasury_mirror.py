@@ -49,7 +49,7 @@ from app.ton_utils import normalize_address
 logger = logging.getLogger(__name__)
 
 # Страница истории (лимит индексатора), совмещена с выбором watcher'а.
-_MIRROR_PAGE_LIMIT = 100
+_MIRROR_PAGE_LIMIT = 200
 
 
 @dataclass(frozen=True)
