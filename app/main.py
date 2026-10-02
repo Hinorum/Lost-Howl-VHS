@@ -26,6 +26,12 @@ def _same_address(left: str, right: str) -> bool:
 
 
 logging.basicConfig(level=logging.INFO)
+# pytoniq именует логгеры по имени класса (client.py: self.__class__.__name__),
+# поэтому лайтсервер пишет в «LiteClient» по строке на каждый shard-блок:
+# getAllShardsInfo/getMasterchainInfo на каждом опросе. На живом прогоне это
+# 49% объёма лога и ~155 МБ в сутки при непрерывной работе. Диагностической
+# ценности в INFO-шуме нет, а WARNING/ERROR остаются видны — глушим только его.
+logging.getLogger("LiteClient").setLevel(logging.WARNING)
 log = logging.getLogger("way")
 
 
