@@ -12,11 +12,20 @@ test_winrule_stake_guard.py.
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Card, Player, Round, RoundStatus, Stake, Vote, WinRule
-from app.rounds import count_stakes_for_tally, count_votes_for_tally, finish_tally
+from app.rounds import (
+    close_voting,
+    count_stakes_for_tally,
+    count_votes_for_tally,
+    finish_tally,
+    pick_winner,
+    tied_positions,
+)
 from app.tally import award_points, format_results
 from app.ton_utils import to_nano
 
@@ -106,6 +115,83 @@ async def test_minority_prefers_least_funded_path(session: AsyncSession) -> None
     )
     closed, _ = await finish_tally(session, round_row)
     assert closed.winner_card == 2
+
+
+def test_minority_zero_tie_broken_by_fewest_votes() -> None:
+    # День 23: деньги (1.00 Gram) на пути 0, пути 1 и 2 делят минимум (0 Gram).
+    # Путь 1 никто не выбрал — уцелеет он, без жребия «по людям».
+    stakes = {0: to_nano(1.0), 1: 0, 2: 0}
+    votes = {0: 2, 1: 0, 2: 2}
+    assert tied_positions(stakes, WinRule.MINORITY, votes) == [1]
+    assert pick_winner(stakes, WinRule.MINORITY, "9:minority:zzz", votes) == 1
+
+
+def test_minority_zero_tie_with_equal_votes_keeps_draw() -> None:
+    # Оба пустых пути без голосов — настоящая ничья, жребий остаётся.
+    stakes = {0: to_nano(1.0), 1: 0, 2: 0}
+    votes = {0: 2, 1: 0, 2: 0}
+    assert tied_positions(stakes, WinRule.MINORITY, votes) == [1, 2]
+
+
+def test_minority_nonzero_tie_unaffected_by_votes() -> None:
+    # Не-нулевая ничья голосами не разрешается — только жребием.
+    stakes = {0: 5, 1: 3, 2: 3}
+    votes = {0: 9, 1: 1, 2: 8}
+    assert tied_positions(stakes, WinRule.MINORITY, votes) == [1, 2]
+
+
+async def test_minority_empty_scene_wins_without_draw(session: AsyncSession) -> None:
+    # Интеграция: путь 1 (0 голосов) уцелел при ничьей на нуле с путём 2
+    # (2 голоса без ставок) — и жребий не кидался.
+    round_row = await _seed_day(
+        session,
+        WinRule.MINORITY,
+        votes={0: [1, 2], 2: [3, 4]},
+        stakes={0: [(1, 1.0)]},
+    )
+    closed, _ = await finish_tally(session, round_row)
+    assert closed.winner_card == 1
+    assert (closed.tie_note or "") == ""
+    assert json.loads(closed.stake_counts_json) == {"0": to_nano(1.0), "1": 0, "2": 0}
+    assert json.loads(closed.vote_counts_json) == {"0": 2, "1": 0, "2": 2}
+
+
+async def test_close_voting_skips_draw_when_votes_resolve_zero_tie(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ничья на нуле, разрешимая голосами, не трогает мастерчейн-энтропию."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    captured: list[str] = []
+
+    async def fake_fetch() -> str:
+        captured.append("fetch")
+        return "93123949:abcdef"
+
+    monkeypatch.setattr("app.ton_pay.fetch_masterchain_entropy", fake_fetch)
+
+    round_row = _round_row(WinRule.MINORITY, 423)
+    round_row.status = RoundStatus.OPEN
+    session.add(round_row)
+    await session.commit()
+    for pid, path in ((1, 0), (2, 0), (3, 2)):
+        session.add(Player(id=pid))
+        session.add(Vote(round_id=round_row.id, player_id=pid, card_position=path))
+    session.add(
+        Stake(
+            round_id=round_row.id,
+            player_id=1,
+            amount_nanotons=to_nano(1.0),
+            tx_hash="tx-day423",
+            status="confirmed",
+        )
+    )
+    await session.commit()
+
+    await close_voting(session, round_row)
+    loaded = await session.get(Round, round_row.id)
+    assert loaded.winner_card == 1
+    assert captured == []  # энтропии не снимали — исхода нет ничьей
+    assert loaded.tie_entropy is None
 
 
 async def test_median_takes_middle_bank(session: AsyncSession) -> None:
@@ -264,3 +350,27 @@ async def test_results_post_stake_decided_text(session: AsyncSession) -> None:
     assert "Тропа B" in text
     assert "Кадр дня уцелел по счёту Gram" in text
     assert "на волоске" not in text
+    # Строки сцен пронумерованы римскими — как кнопки «Сцена I/II/III».
+    assert "I: Тропа A: 5" in text
+    assert "II: Тропа B: 1" in text
+    assert "III: Тропа C: 0" in text
+    assert "← 🏆 След" in text
+
+
+def test_results_post_scene_numbers_without_stakes() -> None:
+    # Голосовой день (без ставок): номера сцен всё равно проставлены.
+    rnd = Round(
+        day_index=6,
+        win_rule=WinRule.MAJORITY,
+        winner_card=1,
+        vote_counts_json='{"0": 1, "1": 4, "2": 2}',
+        stake_counts_json=None,
+    )
+    for pos, title in ((0, "Тропа A"), (1, "Тропа B"), (2, "Тропа C")):
+        rnd.cards.append(
+            Card(position=pos, title=title, description="d", consequence="к", image_path="")
+        )
+    text = format_results(rnd)
+    assert "I: Тропа A: 1" in text
+    assert "II: Тропа B: 4" in text
+    assert "III: Тропа C: 2" in text

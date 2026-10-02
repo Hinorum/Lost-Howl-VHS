@@ -9,14 +9,14 @@ from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Chat, Round, RoundStatus
+from app.models import Chat, Round, RoundStatus, StatusPost
 from app.style import day_mark
 from app.tally import format_results
 
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 POSITIONS = ("I", "II", "III")
 _MAX_TEXT_LEN = 3900
+_TITLE_CLAMP = 80
 _FORGET_MARKS = ("forbidden", "not found", "kicked", "deactivated", "migrated")
 
 
@@ -93,8 +94,9 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
     # Пути голосования читаются словами: заголовок + суть каждого.
     # (Раньше описания жили в подписях трёх фото-карт — генерацию карт
     # убрали, и текст снова стал носителем смысла развилки.)
-    # Компактный профиль: промпт просит карту не длиннее 210 знаков, а показ
-    # здесь даёт задел до 260 — текст развилки не режется многоточием.
+    # Компактный профиль: контракт кассеты просит карту не длиннее 260 знаков
+    # (поле description, схема ≤260), а показ здесь даёт ровно этот задел —
+    # текст развилки не режется многоточием.
     cards = "\n".join(
         f"{POSITIONS[card.position]}. {_clamp(card.title, 80)} — {_clamp(card.description, 260)}"
         for card in sorted(round_row.cards, key=lambda item: item.position)
@@ -120,19 +122,23 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
         deadline = f"🗳 Голосование до {voting_at:%H:%M} UTC — итоги и новый день придут сразу после"
     head = ""
     if show_title:
-        head += f"{day_mark(str(round_row.id))} {round_row.chapter_title}\n\n"
+        head += f"{day_mark(str(round_row.id))} {_clamp(round_row.chapter_title, _TITLE_CLAMP)}\n\n"
     # Глава кассеты живым текстом между заголовком и развилкой: сначала стая
-    # слышит день, потом видит три сцены. Обрезка по словам страхует короткий
-    # лимит (3900) — механика поста не вытеснится прозой.
+    # слышит день, потом видит три сцены. Жёсткий потолок кассеты — 700 знаков
+    # (schema.py), обрезка по словам ниже лишь страхует легаси-раунды без кассеты.
     story = (
         f"{_clamp(round_row.chapter_text, 1500)}\n\n"
         if getattr(round_row, "chapter_text", "")
         else ""
     )
-    text = (
-        f"{head}{story}{cards}\n\n{phase}{bank_line}\n{deadline}"
-    )
-    return text[:_MAX_TEXT_LEN]
+    # Хвост поста (правило дня, банк, дедлайн) неприкосновенен: при упоре в
+    # потолок режется «верх», а не обещание игроку сроков исхода голосования.
+    tail = f"\n\n{phase}{bank_line}\n{deadline}"
+    core = f"{head}{story}{cards}"
+    budget = _MAX_TEXT_LEN - len(tail)
+    if len(core) > budget:
+        core = _clamp(core, budget)
+    return core + tail
 
 
 def build_day_post(round_row: Round) -> list:
@@ -249,6 +255,21 @@ async def results_body(finished: Round, session=None) -> str:
                 text += f"\n\n{economics}"
         except Exception:
             logger.exception("Экономика дня %s не посчитана", getattr(finished, "day_index", "?"))
+    # Запись дневника кассеты (ПОВ-контраст): читается из активной кассеты
+    # месяца по дате и дню закрытого раунда. Нет кассеты / нет поля / сбой —
+    # дневника нет, сухие итоги не зависят от сюжетного слоя (fail-open).
+    try:
+        from app.story import bay as story_bay
+
+        if session is not None:
+            diary = await story_bay.day_diary(session, finished)
+        else:
+            async with SessionLocal() as _diary_db:
+                diary = await story_bay.day_diary(_diary_db, finished)
+        if diary:
+            text += f"\n\n📖 {html.escape(diary)}"
+    except Exception:
+        logger.debug("Дневник дня не добавлен в итоги", exc_info=True)
     # Плагиновые строки итогов (echoes, relations, bestiary и т.д.)
     try:
         plugin_text = await format_plugin_results(finished, session)
@@ -292,6 +313,7 @@ async def _deliver_day(
     finished: Round | None,
     results_text: str | None = None,
     remember: bool = False,
+    is_dm: bool = False,
 ) -> None:
     """Полный пакет дня в один чат. Итоги передаются готовым текстом:
     экономика дня считается один раз на рассылку, а не на каждый чат."""
@@ -311,12 +333,163 @@ async def _deliver_day(
         # вложений. Новый мир даёт один кадр дня — шлём обычным фото, иначе
         # анонс падал ПОСЛЕ обложки и статус с кнопками голосования не уходил.
         await bot.send_photo(chat_id, photo=media[0].media, caption=media[0].caption)
-    await bot.send_message(
+    sent = await bot.send_message(
         chat_id,
         await status_text(round_row, show_title=True),
         parse_mode=ParseMode.HTML,
         reply_markup=cards_keyboard(round_row.id, remember=remember, day_index=round_row.day_index),
     )
+    # Запоминаем, куда ушёл пост-статус дня: когда watcher подтвердит новые
+    # ставки, refresh_day_bank отредактирует этот пост с актуальным банком —
+    # без повторного /today. Точку доставки пишем защищённо: тесты и легаси
+    # вызовы без реального сообщения/раунда не должны ронять рассылку дня.
+    msg_id = getattr(sent, "message_id", 0)
+    if msg_id and isinstance(getattr(round_row, "id", None), int):
+        await remember_day_post(round_row.id, chat_id, msg_id, is_dm=is_dm)
+
+
+async def remember_day_post(round_id: int, chat_id: int, message_id: int, *, is_dm: bool) -> None:
+    """Записать/обновить точку доставки поста-статуса дня (upsert).
+
+    Повторный анонс того же дня (ретрай после флуд-контроля) просто
+    переписывает message_id; обнулённый last_pot_nanotons означает, что свежий
+    пост ещё не сверен с банком и refresh правил его не пропустит.
+    """
+    try:
+        async with SessionLocal() as session:
+            # Посты прошлых дней заморожены (банк не меняется) — точка доставки
+            # нового дня вытесняет устаревшие. От своих однораундовых строк не
+            # избавляемся: их правит refresh по мере роста банка этого дня.
+            from sqlalchemy import delete
+
+            await session.execute(delete(StatusPost).where(StatusPost.round_id != round_id))
+            row = (
+                await session.execute(
+                    select(StatusPost).where(
+                        StatusPost.round_id == round_id,
+                        StatusPost.chat_id == chat_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(
+                    StatusPost(
+                        round_id=round_id,
+                        chat_id=chat_id,
+                        message_id=int(message_id),
+                        is_dm=is_dm,
+                    )
+                )
+            else:
+                row.message_id = int(message_id)
+                row.is_dm = is_dm
+                row.last_pot_nanotons = None
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "Точка доставки поста дня не записана (round=%s chat=%s):",
+            round_id,
+            chat_id,
+            exc_info=True,
+        )
+
+
+async def refresh_day_bank(bot: Bot | None = None) -> None:
+    """Актуализировать банк дня в УЖЕ отправленных постах-статусах.
+
+    Пост дня уходит один раз при анонсе — с суммой подтверждённых ставок на тот
+    момент. Дальше банк живёт своей жизнью (watcher подтверждает новые ставки),
+    а текст поста замирает: игроки видят устаревший счёт, пока не позовут /today.
+    Здесь правим только посты ОТКРЫТОГО раунда и только в тех чатах, где число
+    подтверждённого банка МЕНЯЛОСЬ (last_pot_nanotons) — без правок-простыней
+    на каждый тик. Точки доставки прошлых дней (закрытые/подсчёт) вычищаются:
+    их банк заморожен, редактировать нечего.
+    """
+    if bot is None:
+        return
+    from app.rounds import get_active_round, round_pot
+
+    async with SessionLocal() as session:
+        current = await get_active_round(session)
+        if current is None or current.status != RoundStatus.OPEN:
+            return
+        if not (settings.ton_enabled and getattr(current, "money_mode", True) is not False):
+            return
+        nano, _bets = await round_pot(session, current.id)
+        rows = (
+            (
+                await session.execute(
+                    select(StatusPost).where(
+                        StatusPost.round_id == current.id,
+                        (
+                            (StatusPost.last_pot_nanotons.is_(None))
+                            | (StatusPost.last_pot_nanotons != nano)
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return
+        loaded = (
+            await session.execute(
+                select(Round).where(Round.id == current.id).options(selectinload(Round.cards))
+            )
+        ).scalar_one_or_none()
+        if loaded is None:
+            return
+        text = await status_text(loaded, show_title=True)
+        keyboard = cards_keyboard(loaded.id, remember=False, day_index=loaded.day_index)
+
+        for row in rows:
+            try:
+                await bot.edit_message_text(
+                    text,
+                    chat_id=row.chat_id,
+                    message_id=row.message_id,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+                row.last_pot_nanotons = nano
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 1)
+                try:
+                    await bot.edit_message_text(
+                        text,
+                        chat_id=row.chat_id,
+                        message_id=row.message_id,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                    )
+                    row.last_pot_nanotons = nano
+                except Exception as exc2:
+                    logger.warning(
+                        "Правка банка дня не удалась после ретрая (chat=%s): %s",
+                        row.chat_id,
+                        exc2,
+                    )
+                    await session.delete(row)
+            except TelegramBadRequest as exc:
+                lowered = str(exc).lower()
+                if "not modified" not in lowered:
+                    # Пост/чат исчезли (удалено, бот выгнан) — точка доставки мертва.
+                    await session.delete(row)
+                    continue
+                # Текст совпал (пост уже с этим банком) — фиксируем счёт, правка не нужна.
+                row.last_pot_nanotons = nano
+            except TelegramForbiddenError:
+                # Бот выгнан из чата: точка доставки мертва, дедуп не спасёт.
+                await session.delete(row)
+            except Exception as exc:
+                logger.warning(
+                    "Правка банка дня не удалась (round=%s chat=%s): %s",
+                    current.id,
+                    row.chat_id,
+                    exc,
+                )
+        await session.commit()
 
 
 async def _deliver_chat(
@@ -334,8 +507,15 @@ async def _deliver_chat(
     except TelegramRetryAfter as exc:
         logger.warning("Флуд-контроль в чате %s: пауза %d с", chat_id, exc.retry_after)
         await asyncio.sleep(exc.retry_after + 1)
-        await _deliver_day(bot, chat_id, round_row, finished, results_text, remember=remember)
-        return chat_id
+        # Повтор тоже может не пройти (флуд не прошёл и с паузой). Без try
+        # исключение улетало из worker'а в gather и отменяло рассылку дня
+        # ВООБЩЕ — из-за одного болтливого чата. Ответ симметричен ветке ниже.
+        try:
+            await _deliver_day(bot, chat_id, round_row, finished, results_text, remember=remember)
+            return chat_id
+        except Exception as exc2:
+            logger.warning("Анонс дня в чат %s не доставлен (после ретрая): %s", chat_id, exc2)
+            return None
     except TelegramForbiddenError:
         await deactivate_chat(chat_id)
         return None
@@ -391,7 +571,7 @@ async def announce_new_day(
         delivered_dm = await _dm_send_all(
             bot,
             lambda pid: _deliver_day(
-                bot, pid, round_row, finished, results_text, remember=remember
+                bot, pid, round_row, finished, results_text, remember=remember, is_dm=True
             ),
             f"Личный пакет дня {round_row.day_index}",
         )
@@ -475,6 +655,181 @@ async def announce_results(bot: Bot | None, finished: Round) -> int:
         return 0
     delivered = await _broadcast_text(bot, text, parse_mode=ParseMode.HTML)
     logger.info("Итоги дня %s разосланы: доставлено %d чатов", getattr(finished, "day_index", "?"), delivered)
+    return delivered
+
+
+def scene_label(cards: dict[int, str], position: int) -> str:
+    """Короткая подпись сцены: «I. «Вскрыть крышу»» — и в алерты, и в личные итоги."""
+    title = cards.get(position, "")
+    label = POSITIONS[position] if position < len(POSITIONS) else str(position + 1)
+    if title:
+        return f"{label}. «{html.escape(title)}»"
+    return label
+
+
+def _build_player_result_text(
+    round_row: Round,
+    cards: dict[int, str],
+    position: int,
+    stake=None,
+    payouts: list | None = None,
+) -> str:
+    """Персональный текст «за что голосовал и чем кончилось» для одного игрока.
+
+    Общий пост итогов не отвечает на вопрос «а я за что голосовал и выиграл ли»:
+    нужна строка про КОНКРЕТНЫЙ выбор игрока. Здесь: сцена дня, выбор игрока,
+    исход, судьба ставки (если день денежный).
+    """
+    from app.ton_utils import from_nano
+
+    payouts = payouts or []
+    won = position == round_row.winner_card
+    lines = [
+        f"📼 День {round_row.day_index} — твой итог",
+        "",
+        f"🏆 Сцена дня: {scene_label(cards, round_row.winner_card or 0)}",
+        f"🎯 Ты выбрал: {scene_label(cards, position)}",
+        "",
+    ]
+    if won:
+        lines.append("🎉 Ты угадал сцену дня!")
+    else:
+        lines.append("Твоя сцена не победила — но голос учтён в лидерборде.")
+    money = ""
+    if settings.ton_enabled and getattr(round_row, "money_mode", True) is not False:
+        if stake is not None:
+            stake_g = f"{from_nano(stake.amount_nanotons):g}"
+            prize = sum(p.amount_nanotons for p in payouts if p.kind == "prize")
+            refund = max((p.amount_nanotons for p in payouts if p.kind == "refund"), default=0)
+            if prize > 0:
+                money = f"💰 Ставка {stake_g} Gram в выигрыш: +{from_nano(prize):g} Gram (перевод уже в очереди)."
+            elif refund > 0:
+                money = f"💰 Ставка {stake_g} Gram возвращается: {from_nano(refund):g} Gram (минус газ сети) — перевод в очереди."
+            elif stake.status == "confirmed":
+                money = f"💰 Ставка {stake_g} Gram принята в банк дня."
+        else:
+            money = "💸 Ставки в этот день не было — выбор шёл голосом."
+        if money:
+            lines.extend(["", money])
+    return "\n".join(lines)
+
+
+async def _player_result_texts(finished: Round) -> list[tuple[int, str]]:
+    """Персональные итоги для каждого проголосовавшего подписчика: (player_id, текст).
+
+    Только dm_subscribed: тем, кто выключил личную рассылку, личный итог не
+    лезем. Карты дня перечитываем с selectinload, чтобы названия сцен были.
+    """
+    from app.models import Player, Stake, Vote
+
+    async with SessionLocal() as session:
+        loaded = (
+            await session.execute(
+                select(Round)
+                .where(Round.id == finished.id)
+                .options(selectinload(Round.cards))
+            )
+        ).scalar_one_or_none()
+        if loaded is None:
+            return []
+        cards = {card.position: card.title for card in loaded.cards}
+        votes = (
+            (
+                await session.execute(
+                    select(Vote)
+                    .join(Player, Player.id == Vote.player_id)
+                    .where(
+                        Vote.round_id == finished.id,
+                        Player.dm_subscribed.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        positions = {vote.player_id: vote.card_position for vote in votes}
+        if not positions:
+            return []
+        stakes = {
+            stake.player_id: stake
+            for stake in (
+                await session.execute(select(Stake).where(Stake.round_id == finished.id))
+            )
+            .scalars()
+            .all()
+        }
+        from app.models import Payout
+
+        payouts: dict[int, list] = {}
+        for payout in (
+            await session.execute(select(Payout).where(Payout.round_id == finished.id))
+        ).scalars().all():
+            payouts.setdefault(payout.player_id, []).append(payout)
+        return [
+            (
+                player_id,
+                _build_player_result_text(
+                    loaded,
+                    cards,
+                    positions[player_id],
+                    stakes.get(player_id),
+                    payouts.get(player_id, []),
+                ),
+            )
+            for player_id in sorted(positions)
+        ]
+
+
+async def announce_player_results(bot: Bot | None, finished: Round) -> int:
+    """Личные итоги дня каждому проголосовавшему подписчику (мой выбор → исход).
+
+    Дополняет групповой пост итогов: игрок видит, за какую сцену голосовал и
+    чем она кончилась для его ставки. Своя рассылка с флуд-контролем; провал
+    одному игроку не срывает остальных. Возвращает число доставленных.
+    """
+    if bot is None or not settings.player_dm:
+        return 0
+    try:
+        texts = await _player_result_texts(finished)
+    except Exception:
+        logger.exception(
+            "Персональные итоги дня %s не собраны",
+            getattr(finished, "day_index", "?"),
+        )
+        return 0
+    if not texts:
+        return 0
+    semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
+
+    async def worker(player_id: int, text: str) -> bool:
+        async with semaphore:
+            try:
+                await bot.send_message(player_id, text, parse_mode=ParseMode.HTML)
+                return True
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 1)
+                try:
+                    await bot.send_message(player_id, text, parse_mode=ParseMode.HTML)
+                    return True
+                except Exception as exc2:
+                    logger.warning(
+                        "Личный итог дня не доставлен игроку %s (после ретрая): %s",
+                        player_id,
+                        exc2,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning("Личный итог дня не доставлен игроку %s: %s", player_id, exc)
+                return False
+
+    outcomes = await asyncio.gather(*(worker(pid, text) for pid, text in texts))
+    delivered = sum(1 for ok in outcomes if ok)
+    logger.info(
+        "Личные итоги дня %s: доставлено %d из %d игроков",
+        getattr(finished, "day_index", "?"),
+        delivered,
+        len(texts),
+    )
     return delivered
 
 

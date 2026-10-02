@@ -199,6 +199,24 @@ async def test_status_carries_story_between_title_and_paths(tmp_path) -> None:
     assert title_at < story_at < paths_at
 
 
+async def test_status_keeps_deadline_when_core_overflows(tmp_path, monkeypatch) -> None:
+    """При переполнении поста режется «верх», а дедлайн/правило дня всегда целы."""
+    from app import broadcast
+    from app.broadcast import status_text
+
+    round_row = _round(9303, tmp_path)
+    for card in round_row.cards:
+        card.description = "д" * 60
+    monkeypatch.setattr(broadcast, "_MAX_TEXT_LEN", 300)
+    status = await status_text(round_row)
+    vote = round_row.voting_ends_at.strftime("%H:%M")
+    tally = round_row.tally_ends_at.strftime("%H:%M")
+    assert status.endswith(
+        f"🗳 Голосование до: {vote} UTC · 🏁 Итоги и новый день: {tally} UTC"
+    )
+    assert len(status) <= 300
+
+
 def _finished(day_index: int, media_dir) -> Round:
     finished = _round(day_index, media_dir)
     finished.status = RoundStatus.CLOSED

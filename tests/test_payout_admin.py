@@ -9,7 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Payout
+from app.models import Income, Payout
+from app.stakes import current_network
 from app.ton_pay import pending_payout_count, resolve_dead_payout
 from app.ton_watch import Transfer, _stash_refund
 
@@ -53,6 +54,18 @@ async def test_resolve_dead_payout_actions(session: AsyncSession) -> None:
     assert await resolve_dead_payout(session, 101, "nuke") is None
 
 
+async def test_resolve_dead_payout_spam_guards_non_refund(session: AsyncSession) -> None:
+    """Спамом гасится только refund: деньги игрока (prize/weekly/…) списать нельзя."""
+    session.add(
+        Payout(id=201, kind="prize", amount_nanotons=100, dest_address="0:zz", status="failed", attempts=1)
+    )
+    await session.commit()
+    with pytest.raises(ValueError, match="только refund"):
+        await resolve_dead_payout(session, 201, "spam")
+    row = await session.get(Payout, 201)
+    assert row.status == "failed" and row.amount_nanotons == 100
+
+
 async def test_stash_refund_skips_ancient_transfers(
     session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -85,4 +98,63 @@ async def test_stash_refund_skips_dust_below_threshold(
         comment="", utime=int(now - 60),
     )
     assert await _stash_refund(session, dust, None) == "refund_dust"
+    assert (await session.execute(select(Payout))).scalars().all() == []
+
+
+async def test_stash_refund_skips_transfer_booked_as_stake(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Двойная выплата: транзакция уже учтена ставкой (ушла в банк дня,
+    разыграна победителю/в Фонд) — повторный авто-возврат той же транзакции
+    (ре-скан после сброса курсора / overlap-окно) НЕ создаётся."""
+    from app.models import Stake
+
+    monkeypatch.setattr(settings, "watch_refund_max_age_days", 30)
+    monkeypatch.setattr(settings, "refund_min_gram", 0)
+    session.add(
+        Stake(
+            round_id=1,
+            player_id=7,
+            amount_nanotons=2_080_000_000,
+            tx_hash="booked-stake",
+            network=current_network(),
+            status="confirmed",
+        )
+    )
+    await session.commit()
+    transfer = Transfer(
+        tx_hash="booked-stake",
+        source="0:bb",
+        value_nanotons=2_080_000_000,
+        comment="",
+        utime=int(datetime.now(UTC).timestamp() - 60),
+    )
+    assert await _stash_refund(session, transfer, None) == "already_booked"
+    assert (await session.execute(select(Payout))).scalars().all() == []
+
+
+async def test_stash_refund_skips_transfer_booked_as_income(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Транзакция уже учтена входящим доходом казны (revote-оплата/ставка в
+    журнале) — повторный авто-возврат не создаётся (монета уже в выручке)."""
+    monkeypatch.setattr(settings, "watch_refund_max_age_days", 30)
+    monkeypatch.setattr(settings, "refund_min_gram", 0)
+    session.add(
+        Income(
+            kind="ton",
+            amount_nanotons=3_000_000_000,
+            unit_ref="booked-income",
+            network=current_network(),
+        )
+    )
+    await session.commit()
+    transfer = Transfer(
+        tx_hash="booked-income",
+        source="0:bb",
+        value_nanotons=3_000_000_000,
+        comment="",
+        utime=int(datetime.now(UTC).timestamp() - 60),
+    )
+    assert await _stash_refund(session, transfer, None) == "already_booked"
     assert (await session.execute(select(Payout))).scalars().all() == []

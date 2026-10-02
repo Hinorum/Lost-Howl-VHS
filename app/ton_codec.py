@@ -95,6 +95,8 @@ def norm_tx_hash(raw: str) -> str:
             int(candidate, 16)
             return candidate.lower()
         except ValueError:
+            # Не hex — значит, это base64-вид, пробуем его ниже. Это проверка
+            # формата, а не сбой: исключение здесь часть разбора адреса.
             pass
     if len(candidate) not in (43, 44):
         return candidate.lower()

@@ -13,6 +13,7 @@ from app.handlers import build_dispatcher, create_bot
 from app.http_utils import close_http_client, get_http_client
 from app.profile import apply_profile
 from app.scheduler import set_bot, start_scheduler, tick
+from app.scheduler_lock import acquire_scheduler_lock, release_scheduler_lock
 from app.ton_utils import normalize_address
 
 
@@ -28,28 +29,47 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("way")
 
 
+def _authorized(request: web.Request) -> bool:
+    """Общая проверка доступа к диагностике (/health, /metrics).
+
+    Если задан HEALTH_TOKEN, снимок (очередь выплат, возраст тика, watcher,
+    метрики) доступен только с авторизацией: мониторинг Render/UptimeRobot
+    передаёт токен в заголовке Authorization: Bearer <token> либо в
+    ?token=. Требование токена без самого токена — отказ (fail closed).
+    """
+    if settings.health_require_token and not settings.health_token.strip():
+        return False
+    if not settings.health_token:
+        return True
+    expected = settings.health_token.strip()
+    supplied = (
+        (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+        or request.query.get("token", "").strip()
+    )
+    return bool(expected) and supplied == expected
+
+
+async def alive(request: web.Request) -> web.Response:
+    """Живость процесса — без токена и без снимка, для health check Render.
+
+    Раньше проверка Render ходила на /health?token=<HEALTH_TOKEN>, и токен
+    приходилось держать в render.yaml открытым текстом (репозиторий публичный,
+    значение утекало всем желающим). Здесь нет ни секрета, ни данных: 200
+    значит только «процесс отвечает». Операционный снимок — на /health и
+    /metrics, они остаются под HEALTH_TOKEN.
+    """
+    return web.json_response({"status": "alive"})
+
+
 async def health(request: web.Request) -> web.Response:
     """Живость + операционный снимок: тик, очередь выплат, watcher, день.
-
-    Если задан HEALTH_TOKEN, снимок (очередь выплат, возраст тика, watcher)
-    доступен только с авторизацией: Render/UptimeRobot передают его в
-    заголовке Authorization: Bearer <token> либо в query-параметре ?token=.
-    Без живого токена — 401 и ничего о состоянии процесса.
 
     Сбой снимка (переходное окно миграции, деградация БД) не роняет
     эндпоинт — Render должен видеть процесс живым; но и «ok» без данных мы
     не притворяемся: честный статус degraded.
     """
-    if settings.health_require_token and not settings.health_token.strip():
+    if not _authorized(request):
         return web.Response(status=401, text="unauthorized")
-    if settings.health_token:
-        expected = settings.health_token.strip()
-        supplied = (
-            (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-            or request.query.get("token", "").strip()
-        )
-        if not expected or supplied != expected:
-            return web.Response(status=401, text="unauthorized")
     try:
         from app.ops import snapshot
 
@@ -58,6 +78,31 @@ async def health(request: web.Request) -> web.Response:
         log.warning("snapshot упал — отвечаем degraded: %s", exc)
         payload = {"status": "degraded", "detail": "snapshot unavailable"}
     return web.json_response(payload)
+
+
+async def metrics(request: web.Request) -> web.Response:
+    """Метрики процесса в текстовом формате Prometheus.
+
+    Основа для графиков и алертов: раньше длительность и успешность фоновых
+    задач не измерялись ничем, а при max_instances=1 долгий цикл тихо съедал
+    следующие. Снимок БД не обязателен: при его недоступности отдаём 200 с
+    way_snapshot_up 0 и счётчиками из памяти — частичные данные полезнее 500.
+    """
+    if not _authorized(request):
+        return web.Response(status=401, text="unauthorized")
+    from app.metrics import render
+    from app.ops import snapshot
+
+    try:
+        payload = await snapshot()
+    except Exception as exc:
+        log.warning("снимок для /metrics недоступен: %s", exc)
+        payload = None
+    # Content-Type с version=0.0.4 ставим заголовком: aiohttp не даёт указать
+    # charset в content_type иначе, а именно эта версия формата нужна сборщику.
+    response = web.Response(text=render(payload), content_type="text/plain")
+    response.headers["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8"
+    return response
 
 
 async def _self_ping_loop(stop: asyncio.Event) -> None:
@@ -91,6 +136,8 @@ def _install_stop_handlers(stop: asyncio.Event) -> None:
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
+            # Windows и часть песочниц: обработчик не поддерживается, но
+            # остановку всё равно ловит внешний supervisor. Ожидаемо.
             pass
 
 
@@ -159,11 +206,27 @@ def validate_config() -> list[str]:
     return problems
 
 
-async def boot_game(bot) -> None:
-    """Стартовые шаги. Планировщик запускается ПЕРВЫМ делом: сетевой сбой
-    бэкапа или профиля не смеет оставлять игру без тиков навсегда (раньше
-    исключение до start_scheduler означало молчаливо мёртвое расписание)."""
-    set_bot(bot)
+# Интервал фоновой попытки перехватить лок планировщика. Согласован с ритмом
+# way-tick (15 с): как только старый инстанс отпустит advisory lock, новый
+# подхватит его в течение одного-двух циклов, без ручного рестарта на Render.
+_SCHEDULER_LOCK_RETRY_SECONDS = 15
+
+# Ссылка на фоновую задачу retry-а: нужна, чтобы корректно дождаться/отменить
+# её при shutdown. None до неудачного acquire_scheduler_lock().
+_lock_retry_task: asyncio.Task | None = None
+
+
+async def _boot_after_lock(bot) -> None:
+    """Шаги, которые выполняются только после успешного захвата лока планировщика.
+
+    Вынесено из boot_game(), чтобы и синхронный путь (первый acquire удался),
+    и фоновая retry-попытка (defer после освобождения лока старым инстансом
+    при Render rolling deploy) выполняли одну и ту же последовательность:
+    install_bay → tick → прогрев кэшей → start_scheduler → boot_maintenance →
+    apply_profile. Иначе пришлось бы дублировать шаги и рисковать расхождением
+    (например, один путь забудет вызвать boot_maintenance и пропустит свежий
+    бэкап после рестарта).
+    """
     # Сюжетный слой (необязателен): проигрыватель кассет включает себя, только
     # если есть каталог библиотеки; сбой установки не смеет ронять игру.
     try:
@@ -198,12 +261,93 @@ async def boot_game(bot) -> None:
             log.exception("Шаг старта «%s» не удался — игра продолжается без него", name)
 
 
+async def _retry_scheduler_lock_loop(bot) -> None:
+    """Фоновая попытка перехватить лок планировщика после его отпускания.
+
+    Инцидент: при Render rolling deploy новый инстанс поднимался, пока старый
+    ещё держал Postgres advisory lock. acquire_scheduler_lock() возвращал False,
+    boot_game() уходил в фон (без start_scheduler), и бот стоял без tick'ов
+    до ручного рестарта — дни не закрывались, лидерборд месяца не выплачивался.
+
+    Цикл пробует лок каждые _SCHEDULER_LOCK_RETRY_SECONDS: как только старый
+    инстанс закрыл соединение и pg_advisory_lock освободился, retry захватывает
+    его, прогоняет _boot_after_lock() и завершается. /health и webhook'и всё
+    это время работают — основной процесс не блокируется. Исключение внутри
+    цикла логируется, но не убивает задачу: один сбой БД не должен оставлять
+    бот без игрового движка.
+    """
+    from app.scheduler_lock import scheduler_lock_held
+
+    while True:
+        if scheduler_lock_held():
+            # Лок каким-то образом уже у процесса (гонка с основным boot_game
+            # невозможна: create_task срабатывает только после неудачного acquire,
+            # где _lock_conn остаётся None; защищаемся на всякий случай).
+            log.info("Фоновый retry лока: лок уже у процесса — выходим")
+            return
+        try:
+            if await acquire_scheduler_lock():
+                log.info(
+                    "Лок планировщика перехвачен фоновым retry — продолжаем запуск"
+                )
+                try:
+                    await _boot_after_lock(bot)
+                except Exception:
+                    log.exception(
+                        "Фоновый bootstrap после получения лока упал — игра стоит",
+                        exc_info=True,
+                    )
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Фоновая попытка взять лок планировщика упала")
+        await asyncio.sleep(_SCHEDULER_LOCK_RETRY_SECONDS)
+
+
+async def boot_game(bot) -> None:
+    """Стартовые шаги. Планировщик запускается ПЕРВЫМ делом: сетевой сбой
+    бэкапа или профиля не смеет оставлять игру без тиков навсегда (раньше
+    исключение до start_scheduler означало молчаливо мёртвое расписание).
+
+    Лок берётся синхронно: если БД занята другим процессом (Render rolling
+    deploy оставил старый инстанс, ещё не отдавший advisory lock), возвращаемся
+    немедленно, чтобы /health и webhook'и работали, и параллельно запускаем
+    фоновый retry — как только лок освободится, инициализация продолжится
+    без ручного рестарта. Один процесс — один путь загрузки: либо синхронный
+    (когда лок свободен сразу), либо фоновая retry-попытка (когда занят)."""
+    global _lock_retry_task
+    set_bot(bot)
+    # Лок ПЕРЕД первым тиком, а не перед start_scheduler: стартовый tick тоже
+    # пишет в игру (анонсы, финализация, выплаты), поэтому второй инстанс не
+    # должен отработать даже один раз.
+    if not await acquire_scheduler_lock():
+        log.critical(
+            "База уже занята другим процессом — этот экземпляр уходит в фон: "
+            "/health работает, игру он не трогает. Если так не задумано, на "
+            "Render живут два сервиса с одним DATABASE_URL. "
+            "Фоновый retry через %d с попробует перехватить лок после освобождения.",
+            _SCHEDULER_LOCK_RETRY_SECONDS,
+        )
+        # Один процесс — одна retry-таска: повторный create_task защищён от
+        # двойного фонового bootstrap (двух _boot_after_lock и двух start_scheduler).
+        if _lock_retry_task is None or _lock_retry_task.done():
+            _lock_retry_task = asyncio.create_task(
+                _retry_scheduler_lock_loop(bot),
+                name="scheduler-lock-retry",
+            )
+        return
+    await _boot_after_lock(bot)
+
+
 async def run_webhook(bot, dispatcher) -> None:
     path = "/webhook"
     secret = settings.webhook_secret or None
     app = web.Application()
     app.router.add_get("/", health)
+    app.router.add_get("/alive", alive)
     app.router.add_get("/health", health)
+    app.router.add_get("/metrics", metrics)
     SimpleRequestHandler(dispatcher=dispatcher, bot=bot, secret_token=secret).register(app, path=path)
     setup_application(app, dispatcher, bot=bot)
     runner = web.AppRunner(app)
@@ -227,10 +371,26 @@ async def run_webhook(bot, dispatcher) -> None:
     from app.scheduler import shutdown_scheduler
 
     shutdown_scheduler()
+    # Лок отдаём явно: пока держим соединение, держим и лок, а Render может
+    # переиспользовать контейнер. Само закрытие соединения тоже освободило бы
+    # лок, но на shutdown полагаться на это не стоит.
+    try:
+        await release_scheduler_lock()
+    except Exception:
+        log.warning("Лок планировщика не отдан явно — освободится с соединением", exc_info=True)
     stop.set()  # будим self-ping для корректного завершения
     boot_task.cancel()
     ping_task.cancel()
-    for task in (boot_task, ping_task):
+    # Фоновая retry-захвата лока: если она жива (новый инстанс не успел
+    # перехватить лок до shutdown), отменяем — пусть живёт ровно столько,
+    # сколько живёт процесс. Если уже успела завершиться (захватила лок и
+    # прогнала _boot_after_lock), cancel() будет no-op, а планировщик уже
+    # остановлен через shutdown_scheduler() выше.
+    if _lock_retry_task is not None and not _lock_retry_task.done():
+        _lock_retry_task.cancel()
+    for task in (boot_task, ping_task, _lock_retry_task):
+        if task is None:
+            continue
         with contextlib.suppress(asyncio.CancelledError):
             await task
     await runner.cleanup()
@@ -280,4 +440,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        # Ctrl+C — штатная остановка, а не сбой: тишина здесь уместна.
         pass

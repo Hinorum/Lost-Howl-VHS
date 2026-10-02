@@ -166,12 +166,12 @@ async def test_send_uses_local_seqno_when_batch_active(monkeypatch: pytest.Monke
         return fake
 
     monkeypatch.setattr(ton_pay, "_get_wallet", fake_get)
-    monkeypatch.setattr(ton_pay, "_batch_seqno", 100)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", 100)
     try:
         await ton_pay.send_ton_transfer("0:" + "11" * 32, to_nano(1), comment="a")
         await ton_pay.send_ton_transfer("0:" + "22" * 32, to_nano(2), comment="b")
     finally:
-        monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
     assert fake.seqnos == [100, 101]
     # Батч-путь не ходит в wallet.transfer: каждый перевод — отдельный
     # подписанный external со своим seqno, вещается напрямую.
@@ -196,13 +196,13 @@ async def test_send_batch_aborts_on_failure(monkeypatch: pytest.MonkeyPatch) -> 
         return fake
 
     monkeypatch.setattr(ton_pay, "_get_wallet", fake_get)
-    monkeypatch.setattr(ton_pay, "_batch_seqno", 100)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", 100)
     try:
         with pytest.raises(RuntimeError, match="не приняли"):
             await ton_pay.send_ton_transfer("0:" + "11" * 32, to_nano(1), comment="a")
-        assert ton_pay._batch_seqno is None
+        assert ton_pay.state._batch_seqno is None
     finally:
-        monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
 
 
 async def test_send_batch_aborts_on_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -222,13 +222,13 @@ async def test_send_batch_aborts_on_cancellation(monkeypatch: pytest.MonkeyPatch
         return fake
 
     monkeypatch.setattr(ton_pay, "_get_wallet", fake_get)
-    monkeypatch.setattr(ton_pay, "_batch_seqno", 100)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", 100)
     try:
         with pytest.raises(asyncio.CancelledError):
             await ton_pay.send_ton_transfer("0:" + "11" * 32, to_nano(1), comment="a")
-        assert ton_pay._batch_seqno is None
+        assert ton_pay.state._batch_seqno is None
     finally:
-        monkeypatch.setattr(ton_pay, "_batch_seqno", None)
+        monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
 
 
 # ---------- Регрессия формата внешнего сообщения v5 ----------

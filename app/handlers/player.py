@@ -19,7 +19,7 @@ from aiogram.types import (
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.broadcast import POSITIONS, cards_keyboard, status_text
+from app.broadcast import POSITIONS, cards_keyboard, scene_label, status_text
 from app.config import settings
 from app.db import SessionLocal
 from app.models import LeaderboardClaim, Player, RoundStatus
@@ -341,8 +341,10 @@ async def on_dm_toggle(callback: CallbackQuery) -> None:
     if callback.message is not None:
         try:
             await callback.message.edit_reply_markup(reply_markup=keyboard)
-        except TelegramBadRequest:
-            pass
+        except TelegramBadRequest as exc:
+            # Клавиатуру могло не сменить (тот же набор) или сообщение устарело.
+            # Пользователь уже получил финальный ответ, повторять правку некуда.
+            logger.debug("Клавиатура подписок не обновилась: %s", exc)
     await callback.answer(
         "Итоги и анонсы снова приходят в личку." if subscribed
         else "Личные рассылки отключены — играем только в группе.",
@@ -736,12 +738,18 @@ async def on_vote(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Некорректный выбор.", show_alert=True)
         return
+    label = POSITIONS[position]
     async with SessionLocal() as session:
         player = await upsert_player(session, callback.from_user)
         round_row = await get_active_round(session)
         if round_row is None or round_row.id != round_id:
             await callback.answer("Этот день уже закрыт.", show_alert=True)
             return
+        # Имя сцены выбора — чтобы игрок ВИДЕЛ, за что именно голосует
+        # («Выбор I. «Вскрыть крышу»»), а не абстрактную римскую цифру.
+        label = scene_label(
+            {card.position: card.title for card in round_row.cards}, position
+        )
         result = await cast_vote(session, round_row, player.id, position)
         outcome = ""
         if result == "already":
@@ -755,12 +763,24 @@ async def on_vote(callback: CallbackQuery) -> None:
             ):
                 # Есть оплаченный грант — списываем и меняем путь прямо здесь.
                 outcome = await change_vote(session, round_row, player.id, position)
-        else:
-            current_position = None
+        elif result == "ok":
+            # Подтверждение выбора в личку отдельным сообщением: по кнопке
+            # (в группе или личке) алерт исчезает, а «мой выбор дня» должно
+            # оставаться видимым до конца дня. Молчим, если игрок ещё не
+            # открывал диалог с ботом — алерт был и так показан.
+            if settings.player_dm:
+                try:
+                    await callback.bot.send_message(
+                        callback.from_user.id,
+                        f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as exc:
+                    logger.debug("Личное подтверждение выбора игроку %s не доставлено: %s", callback.from_user.id, exc)
     if result == "already":
         if outcome == "ok":
             await callback.answer(
-                f"Грант списан. Выбор изменён на {POSITIONS[position]}.",
+                f"Грант списан. Выбор изменён на {label}.",
                 show_alert=True,
             )
             return
@@ -773,7 +793,7 @@ async def on_vote(callback: CallbackQuery) -> None:
             await callback.answer(hint[:200], show_alert=True)
             return
     texts = {
-        "ok": f"{ok_mark(str(round_id))} Выбор {POSITIONS[position]} принят. Итоги скрыты до конца дня.",
+        "ok": f"{ok_mark(str(round_id))} Выбор {label} принят. Итоги скрыты до конца дня.",
         "already": f"{hint_mark('already')} Ты уже сделал выбор сегодня.",
         "closed": f"{warn_mark('closed')} День закрыт — кадр фиксируется, итоги скоро.",
         "invalid": f"{warn_mark('invalid')} Такого варианта нет в кадре дня.",

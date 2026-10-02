@@ -13,6 +13,8 @@ import os
 import time
 from unittest.mock import AsyncMock
 
+import pytest
+
 from app import ton_pay
 from app.config import settings
 from app.core.registry import BEAT_KEY, CURSOR_KEY, SOURCE_KEY, STUCK_TX_KEY
@@ -292,6 +294,50 @@ async def test_fetch_broadcast_tx_map_passes_targets_to_fetchers(monkeypatch) ->
     assert seen["api"] == {"way:1:pr#1"}
 
 
+async def test_empty_200_without_transactions_is_unknown(monkeypatch) -> None:
+    """HTTP 200 с телом БЕЗ transactions — аномалия провайдера, а не
+    «история пуста»: сверка остаётся «не знаем», повторы заморожены.
+
+    Именно такой ответ (дроссель/ошибка-обёртка в 200) молча превращался в
+    «memo в цепочке нет», и повтор уезжал на уже ушедший платёж.
+    """
+    from app.ton_pay import state as _st
+
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    empty = AsyncMock()
+    empty.get = AsyncMock(return_value=_FakeResp({}))
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: empty)
+    _st._RECONCILE_HISTORY_OK = True
+    try:
+        tx_map = await ton_pay.fetch_broadcast_tx_map(targets={"way:1:pr#1"})
+        assert tx_map == {}
+        assert _st._RECONCILE_HISTORY_OK is False
+    finally:
+        _st._RECONCILE_HISTORY_OK = True
+
+
+async def test_empty_200_without_transactions_on_tonapi_also_unknown(monkeypatch) -> None:
+    """То же на основном провайдере напрямую: без фолбэка его {}-ответ падает."""
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    empty = AsyncMock()
+    empty.get = AsyncMock(return_value=_FakeResp({}))
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: empty)
+    try:
+        await ton_pay._tx_map_via_tonapi(targets={"way:1:pr#1"})
+        pytest.fail("TonAPI с {} обязан падать, а не молчать")
+    except RuntimeError as exc:
+        assert "transactions" in str(exc)
+    # Валидная пустая история (transactions: []) остаётся честной пустотой.
+    empty.get = AsyncMock(return_value=_FakeResp({"transactions": []}))
+    assert await ton_pay._tx_map_via_tonapi(targets={"way:1:pr#1"}) == {}
+
+
 # ---------- Guard: повтор при недоступной истории ----------
 
 
@@ -330,7 +376,7 @@ async def test_retry_held_when_history_unavailable(monkeypatch) -> None:
     transfer = AsyncMock(return_value="bcast:123")
 
     async def empty_markers() -> set[str]:
-        ton_pay._RECONCILE_HISTORY_OK = False  # оба провайдера реально упали
+        ton_pay.state._RECONCILE_HISTORY_OK = False  # оба провайдера реально упали
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
@@ -359,7 +405,7 @@ async def test_retry_proceeds_when_history_known(monkeypatch) -> None:
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", True)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", True)
 
     try:
         sent = await ton_pay.dispatch_pending_payouts(bot=None)
@@ -384,7 +430,7 @@ async def test_first_attempt_not_blocked_by_unknown_history(monkeypatch) -> None
         return set()
 
     _patch_send_environment(monkeypatch, transfer, empty_markers)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", False)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", False)
 
     try:
         sent = await ton_pay.dispatch_pending_payouts(bot=None)
@@ -539,7 +585,7 @@ async def test_blockchain_diagnostics_reports_pipeline(monkeypatch) -> None:
         return 5_000_000_000, "active", "tonapi"
 
     monkeypatch.setattr(ton_pay, "fetch_account_state", fake_state)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", True)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", True)
 
     async with SessionLocal() as session:
         for key, value in (
@@ -578,7 +624,7 @@ async def test_blockchain_diagnostics_flags_history_down(monkeypatch) -> None:
         return None, None, "none"
 
     monkeypatch.setattr(ton_pay, "fetch_account_state", silent)
-    monkeypatch.setattr(ton_pay, "_RECONCILE_HISTORY_OK", False)
+    monkeypatch.setattr(ton_pay.state, "_RECONCILE_HISTORY_OK", False)
 
     text = await ton_pay.blockchain_diagnostics()
     assert "НЕДОСТУПНА" in text

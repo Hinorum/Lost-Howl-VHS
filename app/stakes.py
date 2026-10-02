@@ -53,7 +53,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -74,6 +74,10 @@ from app.models import (
 from app.ops import claim_once
 from app.ton_utils import from_nano, to_nano
 from app.weeks import iso_week_key
+
+# Модели копилок переэкспортируются сюда: тесты контракта обращаются к ним
+# как stakes_mod.LeaderboardPot / stakes_mod.WeeklyPot.
+__all__ = ["LeaderboardPot", "WeeklyPot"]
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +196,14 @@ async def register_stake(
                     player_id=previous.player_id,
                     kind="refund",
                     amount_nanotons=refund,
-                    dest_address=player.wallet_address or "",
+                    # Только подтверждённый bv: адрес, как в пустом dest приза:
+                    # недоказанный адрес после перепривязки увёл бы возврат в
+                    # bounce, а пустой dest дозаполнит _hydrate_player_dests,
+                    # когда игрок подтвердит кошелёк. Саму ставку это не
+                    # блокирует — сумма не теряется, она ждёт в очереди.
+                    dest_address=(
+                        player.wallet_address if player.wallet_verified else ""
+                    ),
                     network=current_network(),
                 )
             )
@@ -230,24 +241,39 @@ async def confirm_stake(session: AsyncSession, tx_hash: str) -> bool:
     round_row = await session.get(Round, stake.round_id)
     if round_row is None or round_row.status != RoundStatus.OPEN:
         return False
-    stake.status = "confirmed"
-    stake.confirmed_at = datetime.now(UTC)
+    # Условный UPDATE-claim (см. confirm_aged_pending): рубленный возврат может
+    # пройти между SELECT'ом и записью — без WHERE pending он был бы затёрт.
+    claimed = await session.execute(
+        update(Stake)
+        .where(Stake.id == stake.id, Stake.status == "pending")
+        .values(status="confirmed", confirmed_at=datetime.now(UTC))
+    )
+    if claimed.rowcount != 1:
+        return False  # уже не pending (возврат/дубль) — не перезаписываем
     await session.commit()
     return True
 
 
 async def _credit_referral(session: AsyncSession, referrer_id: int, amount: int) -> None:
-    """Каплет долю подтверждённой ставки приведённого игрока в накопитель."""
+    """Каплет долю подтверждённой ставки приведённого игрока в накопитель.
+
+    Атомарный upsert ОДНОЙ строкой: две параллельные финализации дней (тик
+    закрывает N, ton-maintenance закрывает N-1) тем же реферером не теряют
+    сумму и не ловят IntegrityError на уникальном referrer_id — покрыты и
+    INSERT первой строки, и последующие UPDATE.
+    """
     if amount <= 0:
         return
-    row = (
-        await session.execute(select(ReferralPot).where(ReferralPot.referrer_id == referrer_id))
-    ).scalar_one_or_none()
-    if row is None:
-        session.add(ReferralPot(referrer_id=referrer_id, nanotons=amount))
-    else:
-        row.nanotons += amount
-        row.updated_at = datetime.now(UTC)
+    await session.execute(
+        text(
+            "INSERT INTO referral_pots (referrer_id, nanotons) "
+            "VALUES (:referrer, :amount) "
+            "ON CONFLICT (referrer_id) DO UPDATE SET "
+            "nanotons = referral_pots.nanotons + :amount, "
+            "updated_at = CURRENT_TIMESTAMP"
+        ),
+        {"referrer": referrer_id, "amount": amount},
+    )
 
 
 async def _settle_referral_pots(session: AsyncSession) -> int:
@@ -495,23 +521,32 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                 created += add_treasury_payout("rake", house_cut)
             if board_cut > 0:
                 month = round_row.tally_ends_at.strftime("%Y-%m")
-                pot_row = (await session.execute(
-                    select(LeaderboardPot).where(LeaderboardPot.month == month)
-                )).scalar_one_or_none()
-                if pot_row is None:
-                    session.add(LeaderboardPot(month=month, nanotons=board_cut))
-                else:
-                    pot_row.nanotons += board_cut
+                # Атомарный upsert (см. _credit_referral): месяц уникален,
+                # без ON CONFLICT параллельные финализации задвоили бы row
+                # или перетёрли накопление.
+                await session.execute(
+                    text(
+                        "INSERT INTO leaderboard_pots (month, nanotons) "
+                        "VALUES (:m, :amount) "
+                        "ON CONFLICT (month) DO UPDATE SET "
+                        "nanotons = leaderboard_pots.nanotons + :amount, "
+                        "updated_at = CURRENT_TIMESTAMP"
+                    ),
+                    {"m": month, "amount": board_cut},
+                )
             week_total_cut = weekly_cut + dust_to_week
             if week_total_cut > 0:
                 week = iso_week_key(round_row.opens_at)
-                week_row = (await session.execute(
-                    select(WeeklyPot).where(WeeklyPot.week == week)
-                )).scalar_one_or_none()
-                if week_row is None:
-                    session.add(WeeklyPot(week=week, nanotons=week_total_cut))
-                else:
-                    week_row.nanotons += week_total_cut
+                await session.execute(
+                    text(
+                        "INSERT INTO weekly_pots (week, nanotons) "
+                        "VALUES (:w, :amount) "
+                        "ON CONFLICT (week) DO UPDATE SET "
+                        "nanotons = weekly_pots.nanotons + :amount, "
+                        "updated_at = CURRENT_TIMESTAMP"
+                    ),
+                    {"w": week, "amount": week_total_cut},
+                )
                 round_row.weekly_nanotons = week_total_cut
             # Фонд Стаи: неубывающее накопление без периода раздачи. Единственная
             # строка-накопитель; деньги остаются на кошельке казначея и забираются
@@ -519,13 +554,32 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             if fund_cut > 0:
                 from app.handlers.wallet import _pct_text
 
+                # Фонд Стаи — единственная строка-накопитель, уникального ключа
+                # для ON CONFLICT нет, поэтому: ряд-лок (на Postgres реальный,
+                # на SQLite no-op — там один процесс) + условная вставка первой
+                # строки. Итог — атомарное начисление и при параллельных
+                # финализациях разных дней.
                 fund_row = (
                     await session.execute(
-                        select(PackFund).order_by(PackFund.id).limit(1)
+                        select(PackFund)
+                        .order_by(PackFund.id)
+                        .limit(1)
+                        .with_for_update()
                     )
                 ).scalar_one_or_none()
                 if fund_row is None:
-                    session.add(PackFund(nanotons=fund_cut))
+                    await session.execute(
+                        text(
+                            "INSERT INTO pack_fund (nanotons) "
+                            "SELECT :amount WHERE NOT EXISTS (SELECT 1 FROM pack_fund)"
+                        ),
+                        {"amount": fund_cut},
+                    )
+                    fund_row = (
+                        await session.execute(
+                            select(PackFund).order_by(PackFund.id).limit(1)
+                        )
+                    ).scalar_one()
                 else:
                     fund_row.nanotons += fund_cut
                 # Аудит: каждое начисление пишется в прозрачный журнал фонда.
@@ -556,6 +610,54 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
     logger.info("finalize_day_payouts: round %s создано выплат: %d (pot=%d нанотонов)", round_row.id, created, pot)
     await session.commit()
     return created
+
+
+async def finalize_pending_payouts(session: AsyncSession) -> int:
+    """Добирает выплаты дней, закрытых без финализации ставок.
+
+    Краш между коммитом finish_tally (lifecycle) и самокоммитом
+    finalize_day_payouts оставляет день CLOSED с payouts_finalized=false:
+    тик и heal закрывают только OPEN/TALLYING, award_pending_points чинит
+    очки, но не выплаты, а копилки недели/месяца ждут payouts_finalized
+    (leaderboard.ready_marker) — без этого призы зависли бы навсегда.
+    Идемпотентно: claim finalize_day_payouts (payouts_finalized=false)
+    пускает только одного, повторный тик ничего не создаёт.
+
+    Ловим только НЕДАВНИЕ дни (catchup_cutoff): finalize_day_payouts создаёт
+    Payout заново из ставок и НЕ проверяет уже существующие выплаты — всю
+    идемпотентность держит флаг. Колонка payouts_finalized заводилась с
+    server_default=0, так что у исторических закрытых дней маркер false, и
+    без границы первый же тик этой версии пересоздал бы выплаты за всю
+    историю (дубли призов/возвратов). Догон — только для свежих крашей.
+    """
+    from app.rounds.time import catchup_cutoff
+
+    rows = (
+        await session.execute(
+            select(Round.id).where(
+                Round.status == RoundStatus.CLOSED,
+                Round.payouts_finalized.is_(False),
+                Round.voting_ends_at >= catchup_cutoff(),
+            )
+        )
+    ).all()
+    finalized = 0
+    for (round_id,) in rows:
+        round_row = await session.get(Round, round_id)
+        if round_row is None:
+            continue
+        try:
+            finalized += await finalize_day_payouts(session, round_row)
+        except Exception as exc:
+            logger.warning(
+                "Финализация ставок закрытого дня %s упала (повторится): %s",
+                round_id,
+                exc,
+            )
+            # Частичные вставки канувшей транзакции не должны «до-коммититься»
+            # следующим днём — свой хвост откатываем, чужие дни продолжаем.
+            await session.rollback()
+    return finalized
 
 
 async def refundable_stakes(session, limit: int = 25) -> list[tuple[Stake, Player | None, Round | None]]:
@@ -632,6 +734,16 @@ async def create_manual_refund(session, stake_id: int) -> str:
     wallet = player.wallet_address if player is not None else ""
     if not wallet:
         return "у игрока не привязан кошелёк — возврат невозможен"
+    if not player.wallet_verified:
+        # Тот же класс, что у приза (finalize_day_payouts: игроки с
+        # wallet_verified не попадают в очередь выплаты): адрес без
+        # bv:-подтверждения ещё не доказан как свой, возврат ушёл бы в
+        # необработанный bounce.
+        return (
+            "кошелёк игрока не подтверждён (bv:) — возврат невозможен: "
+            "привязанный адрес ещё не доказан микро-переводом. Пусть игрок "
+            "подтвердит кошелёк в /wallet."
+        )
     refund = refund_net_amount(stake.amount_nanotons)
     if refund <= 0:
         return "сумма ставки не покрывает газ сети — возвращать нечего"

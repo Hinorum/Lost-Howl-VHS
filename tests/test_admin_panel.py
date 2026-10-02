@@ -305,3 +305,19 @@ async def test_panel_stakes_button_lists_unprocessed(monkeypatch) -> None:
             await db.execute(_d(Round).where(Round.day_index == 97_601))
             await db.execute(_d(Player).where(Player.id == uid))
             await db.commit()
+
+
+def test_report_text_keeps_verdict_and_tail_when_overlong() -> None:
+    """Обрезка отчёта: вердикт «✅» и финальный статус переживают, режется середина."""
+    lines = [f"Замечание №{i}: " + "x" * 120 for i in range(60)]
+    lines.append("Проверено — файл не изменён.")
+    report = panel_mod._report_text("✅ ", lines)
+    assert len(report) <= 4000
+    assert report.startswith("✅ ")
+    assert report.endswith("Проверено — файл не изменён.")
+    assert "…" in report
+
+
+def test_report_text_short_report_untouched() -> None:
+    lines = ["Сценарий mel.json принят.", "Проверено — файл не изменён."]
+    assert panel_mod._report_text("✅ ", lines) == "✅ " + "\n".join(lines)

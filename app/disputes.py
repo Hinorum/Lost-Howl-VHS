@@ -111,6 +111,15 @@ async def compensate_dispute(
     player = await session.get(Player, d.player_id)
     if player is None or not player.wallet_address:
         return "у игрока не привязан кошелёк — компенсация невозможна"
+    if not player.wallet_verified:
+        # Тот же класс, что у приза (stakes.finalize_day_payouts) и ручного
+        # возврата (stakes.create_manual_refund): адрес без bv:-подтверждения
+        # ещё не доказан как свой, компенсация ушла бы в необработанный bounce.
+        return (
+            "кошелёк игрока не подтверждён (bv:) — компенсация невозможна: "
+            "привязанный адрес ещё не доказан микро-переводом. Пусть игрок "
+            "подтвердит кошелёк в /wallet, спор держим открытым."
+        )
     try:
         amount = to_nano(float(str(amount_gram).replace(",", ".")))
     except (ValueError, TypeError):

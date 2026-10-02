@@ -13,8 +13,11 @@
 Решение принимает не кассета, а ядро — кассета только объявляет условия.
 
 Проверка делится на жёсткую (кассета отвергнута) и мягкую (warning):
-жёстко — структура, длины, позиции карт и стоп-слова; мягко — бюджет
-режиссуры rule_hint (≈ N/3 дней на каждый закон).
+жёстко — структура, длины, позиции карт, уникальность дорог и пар
+(at_day, winner) перемоток, стоп-слова; мягко — бюджет режиссуры rule_hint
+(≈ N/3 дней на каждый закон по главной дороге), мёртвые ключи prev на входе
+дороги перемотки и стилевые замечания (витрина одним экраном, кадр не тянется,
+заголовок карты не повторяет дословно своё описание).
 """
 
 from __future__ import annotations
@@ -29,13 +32,22 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 # Лимиты из движка (см. docs/story_world_manifest.md, раздел «Формат полей»).
+# Схема не выпускает текст, который рендер поста не сможет показать целиком:
+# лимит равен обрезке в app/broadcast.py — глава до 1500 → мы жёстче 700,
+# description 260 == показу 260, заголовки 80 == показу 80 (ничего не режется
+# многоточием); consequence 220 — итог пути звучит коротко, а не пересказом дня.
 FIELD_LIMITS = {
-    "chapter_title": 300,
-    "card_title": 120,
+    "chapter_title": 80,
+    "chapter_text": 700,
+    "card_title": 80,
+    "card_description": 260,
+    "card_consequence": 220,
     "hook_text": 700,
     "tie_note": 200,
     "attribution": 200,
     "track_name": 32,
+    "diary": 200,
+    "prev_value": 160,
 }
 
 # Максимум перемоток (развилок) в одной кассете: ветвление месяца держим
@@ -48,6 +60,29 @@ RULE_HINT_VALUES = ("any", "majority", "minority", "median")
 # трёх законов ожидается ≈ N/3 дней месяца, отклонение в пределах toleration
 # допустимо.
 RULE_HINT_TOLERANCE = 2
+
+# Стилевые пороги (мягкие warning'и, не ошибки). Калибр — текущая библиотека
+# кассет (суммы описаний до ~500, главы до ~550 знаков), поэтому пороги ловят
+# ЗАМЕТНО более тяжёлый текст, а не нюансы «хорошего слога».
+_CARD_DESCRIPTION_BUDGET = 700  # сумма трёх описаний дня: витрина = один экран
+_CHAPTER_TOO_LONG = 600  # выше этого кадр тянется (жёсткий кап — 700 из FIELD_LIMITS)
+_CHAPTER_TOO_SHORT = 140  # короче и в одно предложение — «заголовок», не кадр
+
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?…]+")
+
+
+def _tautology_hit(title: str, description: str) -> str | None:
+    """Заголовок витрины, слово в слово повторённый в СВОЁМ описании карты —
+    буквальное «масло масленое». Повтор корней-предметов («крышу»/«крышей»)
+    умышленно не ловим: путь законно называет предмет сцены, там нужен
+    авторский глаз, а не автомат.
+    """
+    folded = title.casefold().strip()
+    if len(folded) < 8:
+        return None
+    if folded in description.casefold():
+        return title
+    return None
 
 # Стоп-слова: реальные бренды/криптобиржи/обещания дохода. Канон «Lost Dogs:
 # The Way» (Догтаун, имена персонажей) ДОЗВОЛЕН: кассеты — открытый фанфик,
@@ -87,8 +122,8 @@ class CardModel(BaseModel):
 
     position: int
     title: str = Field(min_length=1, max_length=FIELD_LIMITS["card_title"])
-    description: str = Field(min_length=1)
-    consequence: str = Field(min_length=1)
+    description: str = Field(min_length=1, max_length=FIELD_LIMITS["card_description"])
+    consequence: str = Field(min_length=1, max_length=FIELD_LIMITS["card_consequence"])
     tag: str = "care"
     image_path: str = ""
 
@@ -106,17 +141,44 @@ class DayModel(BaseModel):
     day_index: int = Field(ge=1)
     station: str = Field(min_length=1)
     chapter_title: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_title"])
-    chapter_text: str = Field(min_length=1)
+    chapter_text: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_text"])
     hook_text: str | None = Field(default=None, max_length=FIELD_LIMITS["hook_text"])
     rule_hint: str = "any"
     cards: list[CardModel] = Field(min_length=3, max_length=3)
     tie_note: str | None = Field(default=None, max_length=FIELD_LIMITS["tie_note"])
+    prev: dict[int, str] | None = Field(
+        default=None,
+        description="Эхо вчерашнего выбора стаи: {позиция победителя: как стая "
+        "вспомнит его последствие}. Рендерится в начале главы следующего дня.",
+    )
+    diary: str | None = Field(
+        default=None,
+        max_length=FIELD_LIMITS["diary"],
+        description="Запись дневника (ПОВ-контраст к эпической главе): звучит "
+        "в итогах дня после канона.",
+    )
 
     @field_validator("rule_hint")
     @classmethod
     def _rule_hint_known(cls, value: str) -> str:
         if value not in RULE_HINT_VALUES:
             raise ValueError(f"rule_hint должен быть одним из: {', '.join(RULE_HINT_VALUES)}")
+        return value
+
+    @field_validator("prev")
+    @classmethod
+    def _prev_echo_sane(cls, value: dict[int, str] | None) -> dict[int, str] | None:
+        if value is None:
+            return value
+        for position, text in value.items():
+            if position not in (0, 1, 2):
+                raise ValueError("ключи prev — только позиции карт 0, 1 или 2")
+            if not text.strip():
+                raise ValueError("текст эха prev не может быть пустым")
+            if len(text) > FIELD_LIMITS["prev_value"]:
+                raise ValueError(
+                    f"эхо prev не длиннее {FIELD_LIMITS['prev_value']} знаков"
+                )
         return value
 
     @model_validator(mode="after")
@@ -198,6 +260,15 @@ class Cassette(BaseModel):
         roads: set[str] = {fork.to for fork in self.switch}
         if len(roads) != len(self.switch):
             raise ValueError("дороги перемоток не должны дублироваться")
+        windows: set[tuple[int, int]] = set()
+        for fork in self.switch:
+            window = (fork.at_day, fork.winner)
+            if window in windows:
+                raise ValueError(
+                    f"пара (at_day={fork.at_day}, winner={fork.winner}) дублируется: "
+                    "вторая такая дорога в road() молча теряется — её дни не отыграются"
+                )
+            windows.add(window)
         for fork in self.switch:
             if fork.at_day > expected:
                 raise ValueError(
@@ -257,7 +328,7 @@ class Cassette(BaseModel):
         return None
 
     def rule_hint_budget_warnings(self) -> list[str]:
-        """Отклонения бюджета режиссуры: ≈N/3 на каждый закон, ±толеранс."""
+        """Отклонения бюджета режиссуры по ГЛАВНОЙ дороге: ≈N/3 на каждый закон, ±толеранс."""
         counts = {value: 0 for value in RULE_HINT_VALUES}
         for day in self.days:
             counts[day.rule_hint] += 1
@@ -267,8 +338,82 @@ class Cassette(BaseModel):
             if abs(counts[law] - expected) > RULE_HINT_TOLERANCE:
                 warnings.append(
                     f"{law}: {counts[law]} дней вместо ≈{len(self.days) // 3} "
-                    f"(±{RULE_HINT_TOLERANCE})"
+                    f"(±{RULE_HINT_TOLERANCE}) по главной дороге"
                 )
+        return warnings
+
+    def dead_prev_warnings(self) -> list[str]:
+        """Мёртвые ключи эха на входе дороги перемотки (warning).
+
+        Первый день дороги (at_day) помнит победителя дня at_day − 1, а это РОВНО
+        фиксированный winner перемотки — ключи prev, не равные ему, не покажутся
+        никогда: эхо рендерится только под честного победителя, которым может быть
+        только этот winner. Дубликаты (at_day, winner) запрещены жёстко (см.
+        _days_match_month); здесь — предупреждение о мёртвом тексте.
+        """
+        warnings: list[str] = []
+        for fork in self.switch:
+            first_day = fork.days[0] if fork.days else None
+            if first_day is None or not first_day.prev:
+                continue
+            dead = sorted(key for key in first_day.prev if key != fork.winner)
+            if dead:
+                warnings.append(
+                    f"перемотка «{fork.to}» (at_day={fork.at_day}): ключи prev первого "
+                    f"дня {dead} — мёртвые, дорога играет только при winner={fork.winner}"
+                )
+        return warnings
+
+    def style_warnings(self) -> list[str]:
+        """Стилевые замечания (warning, не ошибка): витрина и кадр читаются легко.
+
+        * Бюджет витрины: сумма трёх описаний дня > _CARD_DESCRIPTION_BUDGET —
+          развилка обязана влезать в один экран, а не три абзаца.
+        * Кадр дня: глава не растянута (жёсткий кап — FIELD_LIMITS, тут мягкий
+          порог) и не выглядит заголовком (короче порога одним предложением).
+        * Тавтология витрины: заголовок карты дословно повторён в её же описании —
+          «масло масленое»; заголовок должен звать действие, а не пересказывать сцену.
+        """
+        warnings: list[str] = []
+
+        def _sentence_count(text: str) -> int:
+            parts = [p for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+            return max(1, len(parts))
+
+        def _guard_day(day: DayModel, label: str) -> None:
+            descriptions = sum(len(card.description) for card in day.cards)
+            if descriptions > _CARD_DESCRIPTION_BUDGET:
+                warnings.append(
+                    f"{label}: описания трёх карт = {descriptions} знаков "
+                    f"(> {_CARD_DESCRIPTION_BUDGET}) — витрина дня должна читаться "
+                    "одним экраном, разведи карты по существу развилки"
+                )
+            chapter = len(day.chapter_text)
+            if chapter > _CHAPTER_TOO_LONG:
+                warnings.append(
+                    f"{label}: глава {chapter} знаков (мягкий порог "
+                    f"{_CHAPTER_TOO_LONG}, жёсткий — {FIELD_LIMITS['chapter_text']}) — "
+                    "кадр тянется, игрок читает пост дня целиком"
+                )
+            if chapter < _CHAPTER_TOO_SHORT and _sentence_count(day.chapter_text) == 1:
+                warnings.append(
+                    f"{label}: глава одним предложением — выглядит заголовком, "
+                    "добавь 1–3 предложения обстановки, чтобы кадр заработал"
+                )
+            for card in day.cards:
+                hit = _tautology_hit(card.title, card.description)
+                if hit is not None:
+                    warnings.append(
+                        f"{label}, карта {card.position}: заголовок «{hit}» повторён "
+                        "слово в слово в описании — масло масленое, назови карту как "
+                        "поступок, а не пересказ сцены"
+                    )
+
+        for day in self.days:
+            _guard_day(day, f"день {day.day_index}")
+        for fork in self.switch:
+            for day in fork.days:
+                _guard_day(day, f"перемотка «{fork.to}», день {day.day_index}")
         return warnings
 
 
@@ -327,6 +472,8 @@ def validate_payload(payload: dict) -> ValidationResult:
             errors=[f"стоп-слова: {', '.join(taboo)}"],
         )
     warnings.extend(cassette.rule_hint_budget_warnings())
+    warnings.extend(cassette.dead_prev_warnings())
+    warnings.extend(cassette.style_warnings())
     if not (cassette.attribution or "").strip():
         warnings.append(
             "attribution не указано — клеймо плёнки-фанфика («по мотивам …») желательно"

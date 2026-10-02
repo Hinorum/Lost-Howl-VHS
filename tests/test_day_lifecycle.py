@@ -38,6 +38,7 @@ from app.models import (
 )
 from app.ops import PAUSE_KEY, set_game_paused
 from app.rounds import heal_stale_rounds
+from app.rounds import lifecycle as lifecycle_mod
 
 ADMIN_ID = 4242
 
@@ -131,6 +132,43 @@ async def test_heal_stale_rounds_closes_orphan_and_writes_canon(session) -> None
         await _wipe([700, 701])
 
 
+async def test_heal_stale_rounds_survives_midloop_failure(session, monkeypatch) -> None:
+    """Сбой одного застрявшего дня не убивает лечение следующих.
+
+    Иницидент: session.rollback() в except истёк ВСЕ инстансы, на следующей
+    итерации прямой read round_row.status дал MissingGreenlet (lazy load вне
+    greenlet-контекста) — heal падал целиком, остальные дни висели вечно."""
+    earliest = _round(712, RoundStatus.OPEN, voting_in_minutes=-30)
+    stuck = _round(713, RoundStatus.OPEN, voting_in_minutes=-30)
+    current = _round(714, RoundStatus.OPEN, voting_in_minutes=600)
+    session.add_all([earliest, stuck, current])
+    await session.commit()
+
+    real_finish = lifecycle_mod.finish_tally
+    calls = 0
+
+    async def flaky_finish(sess, round_row):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("симуляция сбоя подсчёта")
+        return await real_finish(sess, round_row)
+
+    monkeypatch.setattr(lifecycle_mod, "finish_tally", flaky_finish)
+    try:
+        healed = await heal_stale_rounds(session)
+        statuses = dict(
+            (await session.execute(select(Round.day_index, Round.status))).all()
+        )
+        # Первый день упал и откатился; ВТОРОЙ вылечен тем же прогоном.
+        assert healed >= 1
+        assert statuses[712] == RoundStatus.TALLYING  # сбой; повторится в тике
+        assert statuses[713] == RoundStatus.CLOSED    # пережил откат предшественника
+        assert statuses[714] == RoundStatus.OPEN      # актуальный не тронут
+    finally:
+        await _wipe([712, 713, 714])
+
+
 async def test_heal_skips_when_nothing_stuck(session) -> None:
     current = _round(710, RoundStatus.OPEN, voting_in_minutes=600)
     session.add(current)
@@ -161,7 +199,6 @@ async def test_advance_auto_resumes_from_pause(offline_all, monkeypatch) -> None
         await cmd_advance(message)
     finally:
         await _wipe([stale_day])
-
     texts = [c.args[0] for c in message.answer.await_args_list if c.args]
     joined = "\n".join(texts)
     assert "Пауза снята автоматически" in joined
@@ -169,6 +206,34 @@ async def test_advance_auto_resumes_from_pause(offline_all, monkeypatch) -> None
     async with SessionLocal() as db:
         row = await db.get(WatcherState, PAUSE_KEY)
         assert bool(row and row.value) is False
+
+
+async def test_advance_refuses_fresh_open_day(offline_all) -> None:
+    """/advance не закрывает свежеоткрытый день.
+
+    Инцидент: тик уже закрыл N и открыл N+1, а /advance брал свежий день как
+    «актуальный» — закрывал его с нулём голосов и жребием, затем плодил N+2
+    (target по latest+1). Свежий день не трогаем: у застрявшего окно
+    голосования уже истекло."""
+    fresh_day = 721
+    round_row = _round(fresh_day, RoundStatus.OPEN, voting_in_minutes=600)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+    try:
+        message = _message("/advance")
+        await cmd_advance(message)
+        replies = [c.args[0] for c in message.answer.await_args_list if c.args]
+        assert any("ещё голосуется" in text for text in replies)
+        async with SessionLocal() as db:
+            status = (
+                await db.execute(
+                    select(Round.status).where(Round.day_index == fresh_day)
+                )
+            ).scalar_one()
+        assert status == RoundStatus.OPEN  # не закрыт, день живёт
+    finally:
+        await _wipe([fresh_day])
 
 
 async def test_resetgame_auto_resumes_from_pause(offline_all) -> None:
@@ -321,6 +386,153 @@ async def test_resetgame_wipes_income_and_memory_links(offline_all) -> None:
     await _wipe([1])
 
 
+async def test_finalize_pending_payouts_recovers_crashed_closed_day(session) -> None:
+    """Краш между коммитом finish_tally и finalize_day_payouts оставляет день
+    CLOSED с payouts_finalized=false: догон создаёт возвраты и ставит маркер,
+    а копилки недели/месяца больше не ждут закрытый день вечно."""
+    from app.stakes import current_network, finalize_pending_payouts
+    from app.ton_utils import to_nano
+
+    player_id = 881_001
+    day = 901
+    round_row = _round(day, RoundStatus.CLOSED, voting_in_minutes=-40)
+    round_row.winner_card = 0
+    round_row.vote_counts_json = "{}"
+    session.add(
+        Player(id=player_id, username="crashed_p", wallet_address="0:" + "00" * 16)
+    )
+    session.add(round_row)
+    await session.flush()
+    session.add(
+        Stake(
+            round_id=round_row.id,
+            player_id=player_id,
+            amount_nanotons=to_nano(0.3),
+            tx_hash="crash-tx",
+            status="confirmed",
+            network=current_network(),
+        )
+    )
+    await session.commit()
+    try:
+        created = await finalize_pending_payouts(session)
+        assert created == 1
+        paid = (
+            await session.execute(select(Payout).where(Payout.round_id == round_row.id))
+        ).scalars().all()
+        assert len(paid) == 1 and paid[0].kind == "refund"
+        claimed = await session.get(Round, round_row.id)
+        assert claimed.payouts_finalized is True
+        # Идемпотентен: повторный тик ничего не создаёт (claim пройден).
+        assert await finalize_pending_payouts(session) == 0
+        assert (
+            len(
+                (
+                    await session.execute(
+                        select(Payout).where(Payout.round_id == round_row.id)
+                    )
+                ).scalars().all()
+            )
+            == 1
+        )
+    finally:
+        await _wipe([day])
+
+
+async def test_finalize_pending_payouts_skips_historical_day(session) -> None:
+    """Регрессия прода: payouts_finalized заводился с server_default=0, поэтому у
+    всей истории закрытых дней маркер false. finalize_day_payouts создаёт Payout
+    заново из ставок и НЕ проверяет уже существующие выплаты — без recency-гарда
+    первый же тик этой версии пересоздал бы выплаты за всю историю (дубли
+    призов/возвратов). Старый день догон не трогает."""
+    from app.stakes import current_network, finalize_pending_payouts
+    from app.ton_utils import to_nano
+
+    day = 904
+    round_row = _round(day, RoundStatus.CLOSED, voting_in_minutes=-40)
+    round_row.winner_card = 0
+    round_row.vote_counts_json = "{}"
+    # Уводим день за окно догона (100 дней назад — фиксировано, не выводится
+    # из настройки, иначе тест масштабировался бы вместе с гардом).
+    stale = datetime.now(UTC) - timedelta(days=100)
+    round_row.opens_at = stale
+    round_row.voting_ends_at = stale
+    round_row.tally_ends_at = stale
+    session.add(Player(id=881_020, username="old_p", wallet_address="0:" + "00" * 16))
+    session.add(round_row)
+    await session.flush()
+    session.add(
+        Stake(
+            round_id=round_row.id,
+            player_id=881_020,
+            amount_nanotons=to_nano(0.3),
+            tx_hash="old-tx",
+            status="confirmed",
+            network=current_network(),
+        )
+    )
+    await session.commit()
+    try:
+        assert await finalize_pending_payouts(session) == 0
+        paid = (
+            await session.execute(select(Payout).where(Payout.round_id == round_row.id))
+        ).scalars().all()
+        assert paid == []
+    finally:
+        await _wipe([day])
+
+
+async def test_finalize_pending_payouts_survives_midloop_crash(session, monkeypatch) -> None:
+    """Упавшая финализация одного дня не обрушивает тик: её хвост откатывается,
+    остальные закрытые дни догоняются, а больной день честно остаётся
+    unfinalized и повторится следующим тиком."""
+    from app.stakes import current_network, finalize_pending_payouts
+    from app.ton_utils import to_nano
+
+    days = [902, 903]
+    for i, day in enumerate(days):
+        round_row = _round(day, RoundStatus.CLOSED, voting_in_minutes=-40)
+        round_row.winner_card = 0
+        round_row.vote_counts_json = "{}"
+        session.add(Player(id=881_010 + i))
+        session.add(round_row)
+        await session.flush()
+        session.add(
+            Stake(
+                round_id=round_row.id,
+                player_id=881_010 + i,
+                amount_nanotons=to_nano(0.2),
+                tx_hash=f"f-tx-{day}",
+                status="confirmed",
+                network=current_network(),
+            )
+        )
+    await session.commit()
+
+    import app.stakes as stakes_mod
+
+    boom_id = (await session.execute(select(Round.id).where(Round.day_index == days[0]))).scalar_one()
+    real = stakes_mod.finalize_day_payouts
+
+    async def flaky(_session, round_row):
+        if round_row.id == boom_id:
+            raise RuntimeError("synthetic crash")
+        return await real(_session, round_row)
+
+    monkeypatch.setattr(stakes_mod, "finalize_day_payouts", flaky)
+    try:
+        created = await finalize_pending_payouts(session)
+        assert created == len(days) - 1
+        rows = (
+            await session.execute(select(Round).where(Round.day_index.in_(days)))
+        ).scalars().all()
+        by_index = {row.day_index: row for row in rows}
+        assert by_index[days[0]].payouts_finalized is False
+        assert by_index[days[1]].payouts_finalized is True
+    finally:
+        await _wipe(days)
+
+
 def test_every_round_foreign_key_table_is_wiped() -> None:
     """Будущее-проф: любая новая таблица с FK на rounds обязана попасть в
     reset_game, иначе сброс снова молча откатится по ForeignKeyViolation."""
@@ -328,7 +540,7 @@ def test_every_round_foreign_key_table_is_wiped() -> None:
 
     from app.models import Base
 
-    wiped = {"payouts", "stakes", "votes", "revote_grants", "cards", "incomes", "prepared_days"}
+    wiped = {"payouts", "stakes", "votes", "revote_grants", "cards", "incomes", "prepared_days", "status_post"}
     referencing: set[str] = set()
     for table in Base.metadata.tables.values():
         for fk in table.foreign_keys:

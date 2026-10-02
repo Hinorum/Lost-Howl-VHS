@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.models import (
     Card,
     Income,
@@ -20,6 +21,7 @@ from app.models import (
     Round,
     RoundStatus,
     Stake,
+    StatusPost,
     StoryBeat,
     Vote,
     WatcherState,
@@ -153,6 +155,7 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
     await session.execute(delete(Payout))
     await session.execute(delete(Stake))
     await session.execute(delete(Vote))
+    await session.execute(delete(StatusPost))
     await session.execute(delete(RevoteGrant))
     await session.execute(delete(Income))
     await session.execute(delete(MemoryHit))
@@ -192,6 +195,23 @@ async def claim_announcement(session: AsyncSession, round_row: Round) -> bool:
     return result.rowcount > 0
 
 
+async def unclaim_announcement(session: AsyncSession, round_id: int) -> None:
+    """Освобождает право анонса неудачливому вещателю.
+
+    claim_announcement коммитит метку ДО реального анонса: сбой сети в
+    середине рассылки оставил бы день «объявленным», а пост так и не ушёл —
+    анонс нового дня потерялся бы навсегда (тик и /advance не повторяют уже
+    помеченное). Снятие метки возвращает право восстановителю
+    (_retry_new_day_job): анонс становится at-least-once вместо дыры.
+    """
+    await session.execute(
+        update(Round)
+        .where(Round.id == round_id, Round.announced_at.is_not(None))
+        .values(announced_at=None)
+    )
+    await session.commit()
+
+
 async def ensure_current_round(session: AsyncSession) -> Round:
     current = await get_active_round(session)
     if current is not None:
@@ -222,9 +242,20 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
     healed = 0
     from app.tally import award_points
 
-    for round_row in stale:
-        day = round_row.day_index
+    # Снимок до цикла: session.rollback() истекает ВСЕ инстансы в сессии, и
+    # read stale_row.status из списка после отката предыдущего дня падает
+    # MissingGreenlet (lazy load вне greenlet-контекста) — тик умирал, остальные
+    # застрявшие дни не лечились. Каждую итерацию берём свежую запись через
+    # await session.get (настоящий IO), а день держим простым int.
+    stale_ids = [(round_row.id, round_row.day_index) for round_row in stale]
+
+    for round_id, day in stale_ids:
         try:
+            round_row = await session.get(
+                Round, round_id, options=[selectinload(Round.cards)]
+            )
+            if round_row is None:
+                continue
             if round_row.status == RoundStatus.OPEN:
                 await close_voting(session, round_row)
             finished, closed_here = await finish_tally(session, round_row)
@@ -238,6 +269,9 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
                         "Финализация ставок вылеченного дня %s упала", day,
                         exc_info=True,
                     )
+                    # Частично вставленные Payout не должны «до-коммититься»
+                    # следующим успешным днём — откатываем их транзакционный хвост.
+                    await session.rollback()
                 try:
                     await write_epilogue(session, finished)
                 except Exception:
@@ -245,13 +279,16 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
                         "Эпилог вылеченного дня %s не удался", day,
                         exc_info=True,
                     )
+                    await session.rollback()
                 healed += 1
                 logger.info(
                     "Вылечен застрявший день %s: подсчёт завершён, "
                     "ставки финализированы", day,
                 )
         except Exception as exc:
-            logger.exception("Лечение застрявшего дня %s не удалось (повторится)", day, exc)
+            logger.exception(
+                "Лечение застрявшего дня %s не удалось (повторится): %s", day, exc
+            )
             await session.rollback()
     return healed
 
@@ -304,15 +341,16 @@ async def close_voting(session: AsyncSession, round_row: Round) -> Round:
     )
     counts = await _tally_counts_for(session, round_row)
     round_row._tally_counts = counts
+    votes = round_row._tally_votes
     # Честная жеребьёвка: при ничьей снимаем энтропию мастерчейна TON и
     # фиксируем в дне ОДИН раз. heal/пересчёт используют ту же сохранённую
     # энтропию, исход не зависит от состояния сети в момент подсчёта.
-    if len(tied_positions(counts, round_row.win_rule)) > 1 and not round_row.tie_entropy:
+    if len(tied_positions(counts, round_row.win_rule, votes)) > 1 and not round_row.tie_entropy:
         from app.ton_pay import fetch_masterchain_entropy
 
         round_row.tie_entropy = await fetch_masterchain_entropy()
     seed = tie_seed(round_row)
-    round_row.winner_card, _ = await _winner_and_tied(session, round_row, counts, seed)
+    round_row.winner_card, _ = await _winner_and_tied(session, round_row, counts, seed, votes)
     await session.commit()
     return round_row
 
@@ -355,30 +393,36 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
         staked_counts = await count_stakes_for_tally(session, round_row.id)
     display_counts = vote_counts
     seed = tie_seed(round_row)
-    winner, tied = await _winner_and_tied(session, round_row, counts, seed)
+    winner, tied = await _winner_and_tied(session, round_row, counts, seed, vote_counts)
     tie_note: str | None = None
     if len(tied) > 1:
-        theater = _TIE_THEATER[
-            sum(ord(c) for c in seed) % len(_TIE_THEATER)
-        ].format(
-            paths=" и ".join(_ROMAN[p] for p in tied),
-            chosen=_ROMAN[winner],
+        path_names = " и ".join(_ROMAN[p] for p in tied)
+        chosen = _ROMAN[winner]
+        theater = _TIE_THEATER[sum(ord(c) for c in seed) % len(_TIE_THEATER)].format(
+            paths=path_names,
+            chosen=chosen,
         )
-        block_ref = ""
+        head = (
+            "Счёт Gram на сценах разделился" if used_stakes else "Голоса разделились"
+        )
         if round_row.tie_entropy:
-            seqno = round_row.tie_entropy.split(":", 1)[0]
-            block_ref = f" Жребий брошен блоком TON №{seqno}."
-        if used_stakes:
-            intro = (
-                f"Счёт Gram на сценах разделился ({' и '.join(_ROMAN[p] for p in tied)}) — "
-                f"жребий закона выбрал сцену {_ROMAN[winner]}."
-            )
-        else:
-            intro = (
-                f"Голоса разделились ({' и '.join(_ROMAN[p] for p in tied)}) — "
-                f"жребий закона выбрал сцену {_ROMAN[winner]}."
-            )
-        tie_note = f"{intro} {theater}{block_ref}"[:200]
+            try:
+                seqno, root_hash = round_row.tie_entropy.split(":", 1)
+                block_url = (
+                    "https://testnet.tonviewer.com" if settings.is_testnet else "https://tonviewer.com"
+                )
+                tie_note = (
+                    f"{head} ({path_names}) — жребий блока TON №{seqno} "
+                    f"(хеш …{root_hash[-4:]}): выпала сцена {chosen}. "
+                    f"Проверка: {block_url}/block/-1:8000000000000000:{seqno}"
+                )
+            except (TypeError, ValueError) as exc:
+                # Жребий по блоку — бонус к проверяемости, а не основа: без него
+                # ниже подставляется честная заметка без ссылки на блок.
+                logger.debug("Жребий блока не собран (%s) — без ссылки на блок", exc)
+        if tie_note is None:
+            tie_note = f"{head} ({path_names}) — {theater}"
+        tie_note = tie_note[:200]
     if not round_row.cards:
         loaded = await get_round(session, round_row.id)
         if loaded is not None:
@@ -402,6 +446,10 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
             vote_counts_json=counts_json,
             stake_counts_json=stake_counts_json,
             tie_note=tie_note,
+            # Канон дня — уцелевший consequence: пост итогов читает epilogue_text
+            # (broadcast.results_body), выставить его надо в момент закрытия, а не
+            # в write_epilogue — тот срабатывает уже после рассылки итогов.
+            epilogue_text=winning_card.consequence[:700],
             status=RoundStatus.CLOSED,
         )
     )
@@ -413,6 +461,7 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
     round_row.vote_counts_json = counts_json
     round_row.stake_counts_json = stake_counts_json
     round_row.tie_note = tie_note
+    round_row.epilogue_text = winning_card.consequence[:700]
     round_row.status = RoundStatus.CLOSED
     # Канон дня — только победивший кадр. Крючка для следующей кассеты больше
     # нет: каждая кассета — самостоятельная история, месяц не обязан ничем.

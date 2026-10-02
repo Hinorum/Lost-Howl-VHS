@@ -23,7 +23,7 @@ def _day(index: int, **overrides) -> dict:
         "day_index": index,
         "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
-        "chapter_text": "Стая собирается у котла и решает, куда идти.",
+        "chapter_text": "Стая собирается у котла. Огонь лижет бак, дождь трогает крыши. Пути ждут до рассвета.",
         "hook_text": None,
         "rule_hint": "any",
         "cards": [
@@ -130,9 +130,23 @@ def test_field_length_limits_rejected() -> None:
     )
     assert not result.ok
 
+    too_long_chapter = "а" * (FIELD_LIMITS["chapter_text"] + 1)
+    result = validate_payload(
+        _payload("2026-04", 30, days=[_day(1, chapter_text=too_long_chapter)])
+    )
+    assert not result.ok
+
     too_long_card = "а" * (FIELD_LIMITS["card_title"] + 1)
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["title"] = too_long_card
+    assert not validate_payload(payload).ok
+
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["cards"][0]["description"] = "д" * (FIELD_LIMITS["card_description"] + 1)
+    assert not validate_payload(payload).ok
+
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["cards"][0]["consequence"] = "с" * (FIELD_LIMITS["card_consequence"] + 1)
     assert not validate_payload(payload).ok
 
     payload = _payload("2026-04", 30)
@@ -172,6 +186,76 @@ def test_missing_attribution_is_soft_warning() -> None:
     assert result.cassette is not None
     assert not (result.cassette.attribution or "").strip()
     assert any("attribution" in warning for warning in result.warnings)
+
+
+def test_field_limits_tighten_to_display() -> None:
+    """Капы схемы = потолкам показа в app/broadcast.py: пост дня не режется «…»."""
+    assert FIELD_LIMITS["chapter_title"] == 80
+    assert FIELD_LIMITS["card_title"] == 80
+    assert FIELD_LIMITS["card_description"] == 260
+    assert FIELD_LIMITS["card_consequence"] == 220
+
+
+def test_style_vitrina_budget_warns() -> None:
+    """Три описания длиннее одного экрана витрины — мягкое замечание."""
+    payload = _payload("2026-04", 30)
+    for card in payload["days"][0]["cards"]:
+        card["description"] = "д" * 240
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("одним экраном" in warning for warning in result.warnings)
+
+
+def test_style_chapter_long_warns() -> None:
+    """Глава заметно выше канона (мягкий порог) — кадр тянется."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["chapter_text"] = "а" * 605
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("мягкий порог" in warning for warning in result.warnings)
+
+
+def test_style_chapter_single_sentence_warns() -> None:
+    """Глава одним предложением выглядит заголовком, а не кадром дня."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["chapter_text"] = "Стая молчит у котла."
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("одним предложением" in warning for warning in result.warnings)
+
+
+def test_style_tautology_warns() -> None:
+    """Заголовок, повторённый слово в слово в описании карты («вскрыть крышу»)."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["cards"][0]["title"] = "Вскрыть крышу"
+    payload["days"][0]["cards"][0]["description"] = "Снять обшивку, вскрыть крышу и подать свет."
+    result = validate_payload(payload)
+    assert result.ok
+    assert any(
+        "«Вскрыть крышу»" in warning and "масло масленое" in warning
+        for warning in result.warnings
+    )
+
+
+def test_style_object_repeat_not_flagged() -> None:
+    """Путь законно называет предмет сцены («Починить антенну»/«антенна») — не тавтология."""
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["cards"][0]["title"] = "Починить антенну"
+    payload["days"][0]["cards"][0]["description"] = "Антенна ловит шум, а не голос."
+    result = validate_payload(payload)
+    assert result.ok
+    assert not any("масло масленое" in warning for warning in result.warnings)
+
+
+def test_style_clean_payload_no_style_warnings() -> None:
+    """Свежий день без перегибов не тянет стилевых замечаний."""
+    result = validate_payload(_payload("2026-04", 30))
+    assert result.ok
+    assert not any(
+        word in warning
+        for word in ("одним экраном", "мягкий порог", "одним предложением", "масло масленое")
+        for warning in result.warnings
+    )
 
 
 def test_active_day_matches_calendar_day() -> None:
@@ -221,3 +305,88 @@ def test_bom_is_tolerated(tmp_path) -> None:
     path = tmp_path / "bom.json"
     path.write_bytes(b"\xef\xbb\xbf" + raw)
     assert validate_file(path).ok
+
+
+def test_prev_echo_and_diary_accepted() -> None:
+    payload = _payload("2026-04", 30)
+    payload["days"][1]["prev"] = {
+        0: "Вчера стая пошла на свет.",
+        2: "Вчера стая ждала утра.",
+    }
+    payload["days"][1]["diary"] = "Щенок записал: мама почти выздоровела."
+    result = validate_payload(payload)
+    assert result.ok, result.errors
+    assert result.cassette is not None
+    assert result.cassette.days[1].diary
+    assert result.cassette.days[1].prev == {0: "Вчера стая пошла на свет.", 2: "Вчера стая ждала утра."}
+
+
+def test_prev_bad_keys_rejected() -> None:
+    payload = _payload("2026-04", 30)
+    payload["days"][1]["prev"] = {0: "текст", 5: "текст"}
+    result = validate_payload(payload)
+    assert not result.ok
+    assert any("ключи prev" in error for error in result.errors)
+
+
+def test_prev_empty_value_rejected() -> None:
+    payload = _payload("2026-04", 30)
+    payload["days"][1]["prev"] = {0: "   "}
+    result = validate_payload(payload)
+    assert not result.ok
+
+
+def test_prev_value_too_long_rejected() -> None:
+    payload = _payload("2026-04", 30)
+    payload["days"][1]["prev"] = {0: "а" * (FIELD_LIMITS["prev_value"] + 1)}
+    result = validate_payload(payload)
+    assert not result.ok
+
+
+def test_diary_too_long_rejected() -> None:
+    payload = _payload("2026-04", 30)
+    payload["days"][0]["diary"] = "д" * (FIELD_LIMITS["diary"] + 1)
+    result = validate_payload(payload)
+    assert not result.ok
+
+
+def _fork_payload() -> dict:
+    payload = _payload("2026-11", 30)
+    branches = []
+    for name, winner in (("b", 1), ("c", 2)):
+        days = [_day(i) for i in range(28, 31)]
+        days[0]["prev"] = {winner: "Вчера стая выбрала свой путь."}
+        branches.append({"to": name, "at_day": 28, "winner": winner, "days": days})
+    payload["switch"] = branches
+    return payload
+
+
+def test_fork_duplicate_at_day_winner_rejected() -> None:
+    """Пара (at_day, winner) должна быть уникальна: вторая дорога в road() теряется."""
+    payload = _fork_payload()
+    payload["switch"].append(
+        {"to": "b2", "at_day": 28, "winner": 1, "days": [_day(i) for i in range(28, 31)]}
+    )
+    result = validate_payload(payload)
+    assert not result.ok
+    assert any("at_day=28" in error and "winner=1" in error for error in result.errors)
+
+
+def test_fork_dead_prev_key_on_entrance_warns() -> None:
+    """Первый день дороги помнит ТОЛЬКО своего победителя: чужие ключи мёртвые."""
+    payload = _fork_payload()
+    payload["switch"][0]["days"][0]["prev"] = {
+        0: "Вчера стая шла на свет.",
+        1: "Вчера стая выбрала свой путь.",
+        2: "Вчера стая ждала утра.",
+    }
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("мёртвые" in warning for warning in result.warnings)
+
+
+def test_fork_only_own_prev_key_on_entrance_is_clean() -> None:
+    payload = _fork_payload()
+    result = validate_payload(payload)
+    assert result.ok
+    assert not any("мёртвые" in warning for warning in result.warnings)

@@ -15,6 +15,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Card, PreparedDay, Round, RoundStatus, WinRule
 from app.scheduler import tick
+from app.stakes import current_network
 
 
 @pytest.fixture(autouse=True)
@@ -357,6 +358,8 @@ async def test_tick_closes_finished_day_and_kicks_background_jobs(monkeypatch) -
         "payout_dispatch",
         "announce_results",
         "finalize_new_day",
+        "retry_results",
+        "retry_new_day",
     ]
 
 
@@ -401,6 +404,92 @@ async def test_announce_results_job_round_missing() -> None:
     await sched._announce_results_job(-1)  # warning, без падения
 
 
+async def test_announce_results_job_marks_marker_after_delivery(monkeypatch) -> None:
+    """Доставил итоги — поставил results_at: восстановитель этот день не тронет."""
+    from app import scheduler as sched
+
+    rid = await _make_round(9721, RoundStatus.CLOSED)
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+
+    async def fake_announce(b, finished):
+        pass
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_announce)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_announce)
+        await sched._announce_results_job(rid)
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is not None
+    finally:
+        await _cleanup(9721)
+
+
+async def test_retry_results_job_redelivers_crashed_day(monkeypatch) -> None:
+    """CLOSED-день без маркера (краш между коммитом и рассылкой) досылается
+    восстановителем ровно один раз — повторный прогон молчит."""
+    from app import scheduler as sched
+
+    rid = await _make_round(9722, RoundStatus.CLOSED)
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    seen = []
+
+    async def fake_announce(b, finished):
+        seen.append(finished.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_announce)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_announce)
+        await sched._retry_results_job()
+        assert seen == [rid, rid]  # общий пост + личные итоги
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is not None
+        seen.clear()
+        await sched._retry_results_job()
+        assert seen == []
+    finally:
+        await _cleanup(9722)
+
+
+async def test_retry_results_rolls_back_marker_on_failure(monkeypatch) -> None:
+    """Крах в середине рассылки снимает маркер откатом — повтор доставляет
+    (at-least-once), а не теряет итоги навсегда."""
+    from app import scheduler as sched
+
+    rid = await _make_round(9723, RoundStatus.CLOSED)
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    tries = {"n": 0}
+
+    async def flaky(b, finished):
+        tries["n"] += 1
+        if tries["n"] == 1:
+            raise RuntimeError("крах посередине рассылки")
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", flaky)
+        monkeypatch.setattr("app.broadcast.announce_player_results", flaky)
+        await sched._retry_results_job()  # падение проглочено
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is None  # маркер снят откатом
+
+        async def ok(b, finished):
+            pass
+
+        monkeypatch.setattr("app.broadcast.announce_results", ok)
+        monkeypatch.setattr("app.broadcast.announce_player_results", ok)
+        await sched._retry_results_job()
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is not None  # повтор доставил
+    finally:
+        await _cleanup(9723)
+
+
 async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> None:
     from app import scheduler as sched
 
@@ -414,16 +503,34 @@ async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> Non
     async def fake_mark(session, finished):
         marks.append(finished.day_index)
     monkeypatch.setattr("app.leaderboard.mark_leaderboards_for_finished", fake_mark)
-    nxt = SimpleNamespace(id=5)
     created = []
+    announced: list[int] = []
+    async def fake_announce(bot, round_row):
+        announced.append(round_row.id)
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+
     async def fake_create(session, *, base_day_index):
         created.append(base_day_index)
+        # Реальный открытый день: джоба анонсит его под claim-меткой (свежая
+        # выборка из своей сессии — SimpleNamespace тут не маячит).
+        nxt = Round(
+            day_index=9713,
+            status=RoundStatus.OPEN,
+            win_rule=WinRule.MAJORITY,
+            chapter_title="День 9713",
+            chapter_text="Текст.",
+            opens_at=datetime.now(UTC) - timedelta(hours=1),
+            voting_ends_at=datetime.now(UTC) + timedelta(hours=9),
+            tally_ends_at=datetime.now(UTC) + timedelta(hours=10),
+            vote_counts_json="{}",
+        )
+        async with SessionLocal() as db:
+            db.add(nxt)
+            await db.commit()
+            await db.refresh(nxt)
         return nxt, True
+
     monkeypatch.setattr("app.rounds.create_next_round_detailed", fake_create)
-    announced = []
-    async def fake_announce(bot, round_row):
-        announced.append(round_row)
-    monkeypatch.setattr("app.broadcast.announce_new_day", fake_announce)
 
     waited: list[bool] = []
     async def wait_results():
@@ -433,7 +540,10 @@ async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> Non
         await sched._finalize_new_day_job(rid, wait_results=wait_results())
         assert epilogues and marks
         assert waited == [True]  # анонс ждёт доставку итогов
-        assert announced == [nxt]
+        assert announced and len(announced) == 1
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.day_index == 9713))).scalar_one()
+            assert row.announced_at is not None  # claim-метка стоит: дубля не будет
     finally:
         await _clear_rounds()
 
@@ -442,6 +552,184 @@ async def test_finalize_new_day_job_round_missing() -> None:
     from app import scheduler as sched
 
     await sched._finalize_new_day_job(-1)  # warning, без падения
+
+
+async def test_announce_round_releases_marker_on_failure(monkeypatch) -> None:
+    """Сбой вещания снимает claim-метку (at-least-once): восстановитель может
+    объявить день снова, а не потерять его пост навсегда."""
+    from app import scheduler as sched
+
+    did = 9724
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    async with SessionLocal() as db:
+        day = Round(
+            day_index=did,
+            status=RoundStatus.OPEN,
+            win_rule=WinRule.MAJORITY,
+            chapter_title=f"День {did}",
+            chapter_text="Текст.",
+            opens_at=datetime.now(UTC) - timedelta(hours=1),
+            voting_ends_at=datetime.now(UTC) + timedelta(hours=9),
+            tally_ends_at=datetime.now(UTC) + timedelta(hours=10),
+            vote_counts_json="{}",
+        )
+        db.add(day)
+        await db.commit()
+        row_id = day.id
+
+    async def boom(bot_, round_row):
+        raise RuntimeError("сеть легла в середине рассылки")
+
+    try:
+        monkeypatch.setattr(sched, "announce_new_day", boom)
+        async with SessionLocal() as db:
+            day = await db.get(Round, row_id)
+            with pytest.raises(RuntimeError):
+                await sched._announce_round(db, day, bot)
+            fresh = await db.get(Round, row_id)
+            assert fresh.announced_at is None  # метка снята — повтор возможен
+
+        # Повторный проход (следующий тик) доставляет и ставит метку.
+        seen = []
+        async def ok(bot_, round_row):
+            seen.append(round_row.id)
+        monkeypatch.setattr(sched, "announce_new_day", ok)
+        async with SessionLocal() as db:
+            day = await db.get(Round, row_id)
+            await sched._announce_round(db, day, bot)
+        assert seen == [row_id]
+        async with SessionLocal() as db:
+            assert (await db.get(Round, row_id)).announced_at is not None
+    finally:
+        await _cleanup(did)
+
+
+async def test_retry_new_day_job_announces_only_open_unannounced(monkeypatch) -> None:
+    """Восстановитель объявляет только OPEN-дни без метки; уже помеченные и
+    подсчитываемые не трогает, повторный прогон молчит."""
+    from app import scheduler as sched
+
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    missing = await _make_round(9725, RoundStatus.OPEN)
+    claimed = await _make_round(9726, RoundStatus.OPEN)
+    tallying = await _make_round(9727, RoundStatus.TALLYING)
+    async with SessionLocal() as db:
+        row = await db.get(Round, claimed)
+        row.announced_at = datetime.now(UTC)
+        await db.commit()
+
+    seen = []
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    try:
+        await sched._retry_new_day_job()
+        assert seen == [missing]  # день без поста объявлен, остальные нет
+        async with SessionLocal() as db:
+            assert (await db.get(Round, missing)).announced_at is not None
+        seen.clear()
+        await sched._retry_new_day_job()
+        assert seen == []  # идемпотентно: метки стоят
+    finally:
+        await _cleanup(missing, claimed, tallying)
+
+
+async def test_retry_new_day_job_respects_pause(monkeypatch) -> None:
+    """Стоп-кран: восстановитель молчит, пока игра на паузе."""
+    from app import scheduler as sched
+
+    missing = await _make_round(9728, RoundStatus.OPEN)
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=True))
+    seen = []
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    try:
+        await sched._retry_new_day_job()
+        assert seen == []
+    finally:
+        await _cleanup(missing)
+
+
+async def test_retry_jobs_skip_history(monkeypatch) -> None:
+    """Регрессия прода: дни за пределами окна догона НЕ переигрываются.
+
+    Маркеры доставки добавлялись миграциями без бэкфилла, поэтому у всей
+    истории маркер NULL. Без recency-гарда первый же тик новой версии считал
+    всю историю недоставленной и заново рассылал закрытые дни и анонсы.
+
+    Данные здесь намеренно «древние» (100 дней) и НЕ выводятся из настройки
+    окна: иначе тест масштабировался бы вместе с гардом и ловил бы ровно
+    то, что нужно — отсутствие фильтра по времени.
+    """
+    from app import scheduler as sched
+
+    ancient = datetime.now(UTC) - timedelta(days=100)
+    stale = await _make_round(9729, RoundStatus.CLOSED, voting_in=timedelta(days=-100))
+    stale_open = await _make_round(9730, RoundStatus.OPEN)
+    async with SessionLocal() as db:
+        row = await db.get(Round, stale_open)
+        row.opens_at = ancient
+        await db.commit()
+
+    monkeypatch.setattr(sched, "_bot", object())
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    results: list[int] = []
+    new_days: list[int] = []
+
+    async def fake_results(b, finished):
+        results.append(finished.id)
+
+    async def fake_announce(bot_, round_row):
+        new_days.append(round_row.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_results)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_results)
+        monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+        await sched._retry_results_job()
+        await sched._retry_new_day_job()
+        # Проверяем именно свои дни: в общей тестовой БД остаются OPEN/CLOSED
+        # строки от других тестов, их догон не входит в предмет проверки.
+        assert stale not in results
+        assert stale_open not in new_days
+        async with SessionLocal() as db:
+            assert (await db.get(Round, stale)).results_at is None
+            assert (await db.get(Round, stale_open)).announced_at is None
+    finally:
+        await _cleanup(9729, 9730)
+
+
+async def test_retry_jobs_window_is_load_bearing(monkeypatch) -> None:
+    """Гард — не декорация: сузив окно, свежий день перестаёт догоняться,
+    а расширив — догоняется. Это доказывает, что фильтр по времени реально
+    решает, а не «случайно проходит» на тестовых данных."""
+    from app import scheduler as sched
+
+    fresh = await _make_round(9731, RoundStatus.CLOSED, voting_in=timedelta(hours=-1))
+    monkeypatch.setattr(sched, "_bot", object())
+    seen: list[int] = []
+
+    async def fake_results(b, finished):
+        seen.append(finished.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_results)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_results)
+        monkeypatch.setattr(settings, "catchup_window_hours", 0)
+        await sched._retry_results_job()
+        assert seen == []  # окно в 0 ч: час назад закрытый день уже «история»
+        monkeypatch.setattr(settings, "catchup_window_hours", 72)
+        await sched._retry_results_job()
+        assert seen == [fresh, fresh]  # окно 72 ч: свежий краш догоняется
+        async with SessionLocal() as db:
+            assert (await db.get(Round, fresh)).results_at is not None
+    finally:
+        await _cleanup(9731)
 
 
 async def test_finalize_new_day_job_swallows_failures(monkeypatch) -> None:
@@ -516,13 +804,34 @@ async def test_ton_maintenance_runs_services_in_order(monkeypatch) -> None:
     monkeypatch.setattr("app.ton_pay.settle_closed_rounds", settle)
     monkeypatch.setattr("app.leaderboard.settle_week_if_due", week)
     monkeypatch.setattr("app.leaderboard.settle_month_if_due", month)
-    monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=[]))
 
     await sched._ton_maintenance()
     assert order == ["confirm", "settle", "week", "month"]
-    # Наличие аномалий — только warning.
+
+
+async def test_ops_sweep_logs_anomalies(monkeypatch) -> None:
+    """Тревоги живут в своей джобе: список проблем — warning, не исключение."""
+    from app import scheduler as sched
+
+    monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=[]))
+    await sched._ops_sweep()
     monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=["фонд разошёлся"]))
-    await sched._ton_maintenance()
+    await sched._ops_sweep()
+
+
+async def test_ops_sweep_registered_without_ton(monkeypatch) -> None:
+    """Тревоги не зависят от TON_ENABLED: иначе при деньгах-выкл их нет вовсе."""
+    from app import scheduler as sched
+
+    registered: list[str] = []
+    monkeypatch.setattr(sched, "_register_job", lambda job_id, *a, **k: registered.append(job_id))
+    monkeypatch.setattr(sched, "scheduler", SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(settings, "ton_enabled", False)
+
+    sched.start_scheduler()
+
+    assert "ops-sweep" in registered
+    assert "ton-watch" not in registered
 
 
 async def test_ton_maintenance_isolates_failures(monkeypatch) -> None:
@@ -543,7 +852,6 @@ async def test_ton_maintenance_isolates_failures(monkeypatch) -> None:
     monkeypatch.setattr("app.ton_pay.settle_closed_rounds", settle)
     monkeypatch.setattr("app.leaderboard.settle_week_if_due", week)
     monkeypatch.setattr("app.leaderboard.settle_month_if_due", month)
-    monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=[]))
 
     await sched._ton_maintenance()
     assert rejected == ["settle", "week", "month"]
@@ -632,12 +940,14 @@ async def test_vote_reminder_sends_dms_once_per_day(monkeypatch) -> None:
 
     try:
         await sched._vote_reminder_job()
-        assert sends.await_count == 2  # 501 и 502 получают напоминание
+        # 501 уже выбрал путь — напоминание ему не уходит; 502 получает.
+        assert sends.await_count == 1
+        assert sends.await_args.args[0] == 502
 
         # Повторный заход в тот же день — маркер job:vote-reminder:<дата>
         # закоммичен и занят, участники не спамятся повторно.
         await sched._vote_reminder_job()
-        assert sends.await_count == 2
+        assert sends.await_count == 1
 
         # Следующий день: маркер свеж, но все проголосовали — рассылка тихо
         # отменяется.
@@ -647,7 +957,92 @@ async def test_vote_reminder_sends_dms_once_per_day(monkeypatch) -> None:
             db.add(Vote(round_id=rid, player_id=502, card_position=1))
             await db.commit()
         await sched._vote_reminder_job()
+        assert sends.await_count == 1
+    finally:
+        await _clear_rounds()
+
+
+async def test_vote_reminder_stake_and_no_stake_lines(monkeypatch) -> None:
+    """Личная строка о ставке: сделана (сумма) / не сделана."""
+    from app import scheduler as sched
+    from app.models import Player, Stake
+
+    await _clear_rounds()
+    rid = await _make_round(9803, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    texts: dict[int, str] = {}
+    sends.side_effect = lambda pid, text: texts.update({pid: text})
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[521, 522]))
+    reminder_now = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
+    monkeypatch.setattr(sched, "_now", lambda: reminder_now)
+
+    async with SessionLocal() as db:
+        db.add(Player(id=521, username="staked", first_name="S", dm_subscribed=True))
+        db.add(Player(id=522, username="plain", first_name="P", dm_subscribed=True))
+        db.add(
+            Stake(
+                round_id=rid,
+                player_id=521,
+                amount_nanotons=500_000_000_000,
+                tx_hash="rm-stake-521",
+                memo="m9803",
+                network=current_network(),
+                status="confirmed",
+            )
+        )
+        await db.commit()
+
+    try:
+        await sched._vote_reminder_job()
         assert sends.await_count == 2
+        assert "500.00 Gram уже принята" in texts[521]
+        assert "путь ещё не выбран" in texts[521]
+        assert "не сделана и путь не выбран" in texts[522]
+    finally:
+        await _clear_rounds()
+
+
+async def test_vote_reminder_pending_stake_line(monkeypatch) -> None:
+    """Ставка ещё парится (pending): напоминание говорит про подтверждение."""
+    from app import scheduler as sched
+    from app.models import Player, Stake
+
+    await _clear_rounds()
+    rid = await _make_round(9804, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    texts: dict[int, str] = {}
+    sends.side_effect = lambda pid, text: texts.update({pid: text})
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[531]))
+    reminder_now = datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+    monkeypatch.setattr(sched, "_now", lambda: reminder_now)
+
+    async with SessionLocal() as db:
+        db.add(Player(id=531, username="pend", first_name="P", dm_subscribed=True))
+        db.add(
+            Stake(
+                round_id=rid,
+                player_id=531,
+                amount_nanotons=700_000_000_000,
+                tx_hash="rm-pend-531",
+                memo="m9804",
+                network=current_network(),
+                status="pending",
+            )
+        )
+        await db.commit()
+
+    try:
+        await sched._vote_reminder_job()
+        assert sends.await_count == 1
+        assert "700.00 Gram подтверждается" in texts[531]
     finally:
         await _clear_rounds()
 

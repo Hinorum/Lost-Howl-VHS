@@ -36,18 +36,28 @@ depends_on: str | Sequence[str] | None = None
 _NAMING_CONVENTION = {"uq": "uq_%(table_name)s_%(column_0_name)s"}
 
 
-def _leftover_single_column_name() -> str | None:
-    """Имя unique-ограничения ровно по tx_hash, либо None (уже снято)."""
+def _leftover_single_column_unique() -> dict | None:
+    """Unique-ограничение ровно по tx_hash (dict рефлексии) либо None.
+
+    Различать надо не по имени, а по наличию: SQLite отдаёт анонимный
+    автоиндекс с name=None — раньше он неотличим был от «снимать нечего»,
+    и ревизия падала ValueError на базах, где дубликата нет вовсе (в том
+    числе на базах, идущих через реконсиляцию легаси).
+    """
     inspector = sa.inspect(op.get_bind())
     for constraint in inspector.get_unique_constraints("stakes"):
         if constraint.get("column_names") == ["tx_hash"]:
-            return constraint.get("name")
+            return constraint
     return None
 
 
 def upgrade() -> None:
     """Upgrade schema."""
-    name = _leftover_single_column_name()
+    constraint = _leftover_single_column_unique()
+    if constraint is None:
+        # Уже снято (или база шла create_all-минуя эту ревизию) — no-op.
+        return
+    name = constraint.get("name")
     if name:
         with op.batch_alter_table("stakes", schema=None) as batch_op:
             batch_op.drop_constraint(name, type_="unique")

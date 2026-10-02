@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import stakes as stakes_mod
@@ -218,6 +218,51 @@ async def test_register_stake_flow(session: AsyncSession, monkeypatch: pytest.Mo
     await session.commit()
     monkeypatch.setattr(settings, "ton_enabled", True)
     assert await stakes_mod.register_stake(session, round_row, fourth, to_nano(1), "tx7") == "closed"
+
+
+async def test_dust_refund_waits_for_unverified_wallet(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Пылевой возврат не уходит на недоказанный bv: адрес.
+
+    Привязка сама по себе не доказывает владение: после перепривязки на чужой
+    адрес пыль ушла бы в bounce. Поэтому dest пустой — сумма не теряется, её
+    подставит _hydrate_player_dests, когда игрок подтвердит кошелёк. Ставку
+    при этом не блокируем: это возврат, а не приём денег.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    now = datetime.now(UTC)
+    round_row = Round(
+        day_index=555,
+        status=RoundStatus.OPEN,
+        win_rule=WinRule.MAJORITY,
+        chapter_title="t",
+        chapter_text="x",
+        opens_at=now - timedelta(hours=1),
+        voting_ends_at=now + timedelta(hours=1),
+        tally_ends_at=now + timedelta(hours=2),
+    )
+    session.add(round_row)
+    player = Player(id=91, username="dust", wallet_address="EQforeign", wallet_verified=False)
+    session.add(player)
+    await session.commit()
+
+    assert await stakes_mod.register_stake(session, round_row, player, to_nano(0.01), "dust-1") == "too_small"
+    assert await stakes_mod.register_stake(session, round_row, player, to_nano(2), "dust-2") == "ok"
+
+    refund = (
+        await session.execute(
+            select(Payout).where(Payout.kind == "refund", Payout.player_id == 91)
+        )
+    ).scalar_one()
+    # Ждёт подтверждения, а не улетает на перепривязанный адрес.
+    assert refund.dest_address == ""
+    assert refund.amount_nanotons == stakes_mod.refund_net_amount(to_nano(0.01))
+    # Валидная ставка на месте — возврат не должен был её сломать.
+    stake_row = (
+        await session.execute(select(Stake).where(Stake.tx_hash == "dust-2"))
+    ).scalar_one()
+    assert stake_row.status == "pending" and stake_row.amount_nanotons == to_nano(2)
 
 
 def test_split_equal_dust_to_smallest_id() -> None:
@@ -546,6 +591,59 @@ async def test_confirm_stake_respects_network(
     assert await stakes_mod.confirm_stake(session, "tx-cross") is True
 
 
+async def test_confirm_stake_race_with_manual_refund_keeps_refunded(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Гонка «ручной возврат VS подтверждение»: возврат ставит refunded в ЯВНОМ
+    UPDATE между выборкой ставки и записью подтверждения. Без WHERE pending в
+    claim свип/конфирмация перезаписали бы refunded на confirmed — ставка
+    засчитана в банк удара И игрок получил возврат (двойной учёт)."""
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    player = Player(id=33, wallet_address="w")
+    session.add(player)
+    round_row = _open_round(33)
+    session.add(round_row)
+    await session.commit()
+    stake_row = Stake(
+        round_id=round_row.id,
+        player_id=player.id,
+        amount_nanotons=to_nano(1),
+        tx_hash="tx-race-refund",
+        memo="m",
+        network="testnet",
+        status="pending",
+    )
+    session.add(stake_row)
+    await session.commit()
+
+    real_execute = session.execute
+    race_done = False
+
+    async def racing_execute(stmt, *args, **kwargs):
+        nonlocal race_done
+        result = await real_execute(stmt, *args, **kwargs)
+        sql = str(stmt)
+        # Возврат прилетает ПОСЛЕ выборки pending-ставки, но ДО claim-апдейта:
+        # именно это окно — гонка, на которую должен реагировать conditional-update.
+        if not race_done and "FROM stakes" in sql.replace("\n", " "):
+            race_done = True
+            await real_execute(
+                update(Stake).where(Stake.id == stake_row.id).values(status="refunded"),
+                *args,
+                **kwargs,
+            )
+        return result
+
+    monkeypatch.setattr(session, "execute", racing_execute)
+
+    assert await stakes_mod.confirm_stake(session, "tx-race-refund") is False
+    stake_id = stake_row.id
+    await session.commit()
+    session.expire_all()
+    stake = (await session.execute(select(Stake).where(Stake.id == stake_id))).scalar_one()
+    assert stake.status == "refunded"
+
+
 def _open_round(day_index: int, status: RoundStatus = RoundStatus.OPEN) -> Round:
     now = datetime.now(UTC)
     return Round(
@@ -646,6 +744,76 @@ async def test_unknown_sender_transfer_is_auto_refunded(monkeypatch: pytest.Monk
                 await db.execute(Payout.__table__.select().where(Payout.tx_hash == tx_hash))
             ).all()
             assert len(rows) == 1
+        finally:
+            await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
+            await db.commit()
+
+
+async def test_owner_bank_credit_is_kept_not_refunded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пополнение казны владельцем (мемо bank: с OWNER_WALLET_ADDRESS) не
+    возвращается и не становится ставкой: пишется строкой входящего дохода."""
+    import os
+
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.models import Income
+    from app.ton_watch import Transfer, process_transfer
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    owner = "0:" + os.urandom(32).hex()
+    monkeypatch.setattr(settings, "owner_wallet_address", owner)
+    tx_hash = "bank-" + os.urandom(8).hex()
+    transfer = Transfer(
+        tx_hash=tx_hash,
+        source=owner,
+        value_nanotons=to_nano(1.0),
+        comment="bank: депозит после тестов",
+        utime=int(datetime.now(UTC).timestamp()),
+    )
+    async with SessionLocal() as db:
+        try:
+            assert await process_transfer(transfer) == "bank_credit"
+            income = (
+                await db.execute(select(Income).where(Income.unit_ref == tx_hash))
+            ).scalar_one_or_none()
+            assert income is not None
+            assert income.player_id is None and income.round_id is None
+            assert "in:bank" in income.note
+            refund = (
+                await db.execute(select(Payout).where(Payout.tx_hash == tx_hash))
+            ).scalar_one_or_none()
+            assert refund is None
+            # Повторная обработка транзакции не плодит вторую строку дохода.
+            assert await process_transfer(transfer) == "bank_credit"
+            rows = (await db.execute(select(Income).where(Income.unit_ref == tx_hash))).scalars().all()
+            assert len(rows) == 1
+        finally:
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
+            await db.commit()
+
+
+async def test_stranger_bank_memo_is_still_refunded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """bank: с чужого кошелька — не привилегия: обычный неизвестный возврат."""
+    import os
+
+    from app.db import SessionLocal
+    from app.ton_watch import Transfer, process_transfer
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "owner_wallet_address", "0:" + os.urandom(32).hex())
+    source = "0:" + os.urandom(32).hex()
+    tx_hash = "bk-" + os.urandom(8).hex()
+    transfer = Transfer(
+        tx_hash=tx_hash,
+        source=source,
+        value_nanotons=to_nano(1.0),
+        comment="bank: капитан",
+        utime=int(datetime.now(UTC).timestamp()),
+    )
+    async with SessionLocal() as db:
+        try:
+            assert await process_transfer(transfer) == "refund_queued"
         finally:
             await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
             await db.commit()

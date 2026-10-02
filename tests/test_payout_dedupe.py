@@ -377,27 +377,67 @@ async def test_payouts_listing_shows_reason(monkeypatch) -> None:
             await session.commit()
 
 
-async def test_peer_failure_hint_points_to_liteserver_config(monkeypatch) -> None:
-    """«have no alive peers» — причина-действие: конфиг лайтсерверов или локальный разгон."""
+async def test_peer_failure_engages_http_channel(monkeypatch) -> None:
+    """«have no alive peers» больше не топит строку: диспетчер уходит в HTTP-канал.
+
+    Раньше мёртвые лайтсерверы означали вердикт «задай LITESERVER_CONFIG_URL»
+    и выплата копила попытки. Теперь сбой лайтсерверного канала вызывает
+    оффлайн-подпись и HTTPS-вещание (_send_ton_transfer_http): если канал жив,
+    строка уходит в sent тем же циклом."""
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "treasury_mnemonic", " ".join(["слово"] * 24))
-    payout_id = await _seed_payout(attempts=settings.payout_max_attempts - 1)
+    payout_id = await _seed_payout(attempts=0)
 
     async def no_peers():
         raise RuntimeError("LiteServerError: have no alive peers")
+
+    async def http_success(dest, amount, comment):
+        return f"bcast:{int(_time_now() + 1)}"
 
     async def empty_markers() -> set[str]:
         return set()
 
     monkeypatch.setattr(ton_pay, "_get_wallet", no_peers)
+    monkeypatch.setattr(ton_pay, "_send_ton_transfer_http", http_success)
     monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
 
     try:
         await ton_pay.dispatch_pending_payouts(bot=None)
         async with SessionLocal() as session:
             row = await session.get(Payout, payout_id)
-        assert row.status == "failed"
-        assert "LITESERVER_CONFIG_URL" in row.last_error
+        assert row.status == "sent"
+        assert row.tx_hash and row.tx_hash.startswith("bcast:")
+    finally:
+        async with SessionLocal() as session:
+            await session.delete(await session.get(Payout, payout_id))
+            await session.commit()
+
+
+async def test_http_channel_failure_records_reason(monkeypatch) -> None:
+    """HTTP-канал тоже может упасть: ошибка провайдера обязана стать last_error."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_mnemonic", " ".join(["слово"] * 24))
+    payout_id = await _seed_payout(attempts=0)
+
+    async def no_peers():
+        raise RuntimeError("LiteServerError: have no alive peers")
+
+    async def http_broken(dest, amount, comment):
+        raise RuntimeError("Toncenter не принял сообщение (500): внутренняя ошибка")
+
+    async def empty_markers() -> set[str]:
+        return set()
+
+    monkeypatch.setattr(ton_pay, "_get_wallet", no_peers)
+    monkeypatch.setattr(ton_pay, "_send_ton_transfer_http", http_broken)
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
+
+    try:
+        await ton_pay.dispatch_pending_payouts(bot=None)
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert row.status == "pending"  # attempts=1 < max → вернётся в очередь
+        assert "Toncenter" in (row.last_error or "")
     finally:
         async with SessionLocal() as session:
             await session.delete(await session.get(Payout, payout_id))
@@ -487,7 +527,7 @@ async def test_wallet_uses_remote_liteserver_config(monkeypatch) -> None:
         fake_from_config.config = config
         raise Boom("доходим до построения провайдера")
 
-    monkeypatch.setattr(ton_pay, "_fetch_remote_json", fake_fetch)
+    monkeypatch.setattr(ton_pay.wallet, "fetch_remote_json", fake_fetch)
     monkeypatch.setattr("pytoniq.LiteBalancer.from_config", staticmethod(fake_from_config))
     monkeypatch.setattr(settings, "liteserver_config_url", "https://example.test/config.json")
 

@@ -68,7 +68,7 @@ def downgrade() -> None:
     sa.Column('earliest_day', sa.INTEGER(), nullable=False),
     sa.Column('status', sa.VARCHAR(length=16), nullable=False),
     sa.Column('surfaced_day', sa.INTEGER(), nullable=True),
-    sa.Column('created_at', sa.DATETIME(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('lore_echoes', schema=None) as batch_op:

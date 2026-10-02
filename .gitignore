@@ -11,6 +11,7 @@ htmlcov/
 .mypy_cache/
 data/
 media/generated/
+app/story/cassettes/*.json.bak
 *.log
 out.txt
 *_out.txt

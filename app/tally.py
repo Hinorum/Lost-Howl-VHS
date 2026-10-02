@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,11 +15,13 @@ from app.models import (
     Payout,
     Player,
     Round,
+    RoundStatus,
     Stake,
     Vote,
     WeeklyPot,
 )
 from app.rounds import pick_winner
+from app.rounds.time import _ROMAN
 from app.stakes import current_network
 from app.ton_utils import from_nano
 from app.weeks import iso_week_key
@@ -42,6 +45,17 @@ def _chunks(ids: list[int], size: int = _CHUNK):
 async def award_points(session: AsyncSession, round_row: Round) -> int:
     if round_row.winner_card is None:
         return 0
+    # Маркер-claim в ОДНОЙ транзакции с начислением: победитель гонки
+    # (scheduler, heal, админский /advance) проставляет awards_at и пишет
+    # очки атомарно. Соперник ждёт на коммите и получает rowcount=0 —
+    # score не удваивается даже при одновременных финализациях.
+    claim = await session.execute(
+        update(Round)
+        .where(Round.id == round_row.id, Round.awards_at.is_(None))
+        .values(awards_at=datetime.now(UTC))
+    )
+    if claim.rowcount == 0:
+        return 0  # уже начислено (повторный тик / админское переигрывание)
     voters = await session.execute(select(Vote.player_id).where(Vote.round_id == round_row.id))
     voter_ids = [row[0] for row in voters.all()]
     for chunk in _chunks(voter_ids):
@@ -61,10 +75,6 @@ async def award_points(session: AsyncSession, round_row: Round) -> int:
             .where(Player.id.in_(chunk))
             .values(score=Player.score + 10, correct_picks=Player.correct_picks + 1)
         )
-    # Жетон «Вдохновение» пока не выдаём: механики личной микросцены ещё нет,
-    # а непотратный ресурс копить нечестно. Поле inspiration в моделях —
-    # задел под неё (как ton_watch и не выдаёт покупку такого жетона).
-
     # Обновление стриков: победители увеличивают, проигравшие сбрасывают
     from app.streaks import update_streak
 
@@ -83,6 +93,37 @@ async def award_points(session: AsyncSession, round_row: Round) -> int:
 
     await session.commit()
     return len(winner_ids)
+
+
+async def award_pending_points(session: AsyncSession) -> int:
+    """Добирает очки дней, закрытых без начисления: краш между коммитом
+    finish_tally и award_points оставляет день CLOSED (heal_stale_rounds
+    лечит только OPEN/TALLYING), и без этого никто очки не вернул бы.
+    Идемпотентно: claim по awards_at IS NULL пускает только одного.
+
+    Ловим только НЕДАВНИЕ дни (catchup_cutoff): колонка awards_at добавлена
+    миграцией без бэкфилла, поэтому у всей истории закрытых дней маркер
+    NULL — без границы первый же тик новой версии начислил бы очки заново
+    за все дни, где они уже были начислены (двойные очки у игроков).
+    """
+    from app.rounds.time import catchup_cutoff
+
+    rows = (
+        await session.execute(
+            select(Round.id).where(
+                Round.status == RoundStatus.CLOSED,
+                Round.winner_card.is_not(None),
+                Round.awards_at.is_(None),
+                Round.voting_ends_at >= catchup_cutoff(),
+            )
+        )
+    ).all()
+    awarded = 0
+    for (round_id,) in rows:
+        round_row = await session.get(Round, round_id)
+        if round_row is not None:
+            awarded += await award_points(session, round_row)
+    return awarded
 
 
 _FLIP_SEARCH_CAP = 15  # отрыв больше этого уже не «на волоске» — строку не пишем
@@ -170,7 +211,9 @@ def format_results(
         stake_nano = stakes.get(position, 0)
         stake_str = f" ({from_nano(stake_nano):.2f} Gram)" if stake_nano > 0 else ""
 
-        lines.append(f"{names[position]}: {counts.get(position, 0)}{stake_str}{mark}")
+        lines.append(
+            f"{_ROMAN[position]}: {names[position]}: {counts.get(position, 0)}{stake_str}{mark}"
+        )
     # Коэффициент: если есть ставки на победивший путь
     if multiplier is not None and multiplier > 0:
         lines.append(f"🎯 Коэффициент: ×{multiplier:.2f}")

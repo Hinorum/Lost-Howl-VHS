@@ -16,6 +16,7 @@ import pytest
 from app.rounds import lifecycle as lifecycle_mod
 from app.rounds import rendering as rendering_mod
 from app.story import bay
+from app.story import editor as ed
 from app.story.bay import (
     active_cassette,
     get_next_cassette,
@@ -203,3 +204,139 @@ def test_list_cassettes_reports_broken_files(tmp_path) -> None:
     assert by_name["ok.json"].errors == []
     assert by_name["bad.json"].cassette is None
     assert by_name["bad.json"].errors
+
+
+async def test_editor_edit_picked_up_on_next_render(
+    session, tmp_path, monkeypatch
+) -> None:
+    """Правка редактором (apply_cassette_file) видна проигрывателю по mtime."""
+    monkeypatch.setattr(bay, "datetime", _FakeDatetime)  # сегодня: 2026-05-11
+    _write_cassette(tmp_path, "may.json", "2026-05", 31, "may-kasseta")
+    await set_next_cassette(session, "may.json")
+    assert install_bay(tmp_path) is True
+    try:
+        before = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        assert before["chapter_title"] == "Глава 11"
+
+        cassette = active_cassette(date(2026, 5, 11), directory=tmp_path)
+        assert cassette is not None
+        edited = ed.scenario_yaml(cassette).replace(
+            "Глава 11", "Глава 11 (правка хранителя)"
+        )
+        ok, lines, _final = ed.apply_cassette_file(
+            edited.encode("utf-8"), "may.json", "month", tmp_path
+        )
+        assert ok, lines
+
+        after = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        assert after["chapter_title"] == "Глава 11 (правка хранителя)"
+    finally:
+        uninstall_bay()
+
+
+async def test_plan_day_prepends_echo_of_yesterday_winner(
+    session, tmp_path, monkeypatch
+) -> None:
+    """Поле `prev`: следующий день «знает» вчерашний выбор по закрытому кадру.
+
+    День 11 (2026-05-11) помнит победителя дня 10: эхо в начале главы, ровно
+    тот вариант, что уцелел по движку. Других победителей нет — эха нет.
+    """
+    monkeypatch.setattr(bay, "datetime", _FakeDatetime)  # сегодня: 2026-05-11
+
+    async def fake_winner(session_arg, decision: date) -> int | None:
+        return 1 if decision.day == 10 else None
+
+    monkeypatch.setattr(bay, "_decision_day_winner", fake_winner)
+
+    payload = {
+        "cassette_id": "echo-kasseta",
+        "month": "2026-05",
+        "title": "Эхо",
+        "days": [
+            {
+                **_day(i),
+                "prev": {
+                    0: "Вчера стая пошла на свет.",
+                    1: "Вчера стая пошла на тень.",
+                    2: "Вчера стая осталась.",
+                },
+            }
+            for i in range(1, 32)
+        ],
+    }
+    (tmp_path / "may-echo.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    await set_next_cassette(session, "may-echo.json")
+    assert install_bay(tmp_path) is True
+    try:
+        rendered = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        assert rendered["day_index"] == 7
+        assert rendered["rule_entropy"] == "100:deadbeef"
+        assert rendered["chapter_text"].startswith("Вчера стая пошла на тень.")
+        assert "Стая собирается у котла" in rendered["chapter_text"]
+    finally:
+        uninstall_bay()
+
+
+async def test_plan_day_echo_absent_without_yesterday_winner(
+    session, tmp_path, monkeypatch
+) -> None:
+    """Нет закрытого кадра за вчера — глава дня идёт без эха (fail-open)."""
+    monkeypatch.setattr(bay, "datetime", _FakeDatetime)
+
+    async def fake_winner(session_arg, decision: date) -> int | None:
+        return None
+
+    monkeypatch.setattr(bay, "_decision_day_winner", fake_winner)
+
+    payload = {
+        "cassette_id": "echo-kasseta",
+        "month": "2026-05",
+        "title": "Эхо",
+        "days": [
+            {**_day(i), "prev": {0: "Вчера стая пошла на свет."}} for i in range(1, 32)
+        ],
+    }
+    (tmp_path / "may-echo.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    await set_next_cassette(session, "may-echo.json")
+    assert install_bay(tmp_path) is True
+    try:
+        rendered = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        assert rendered["chapter_text"].startswith("Стая собирается у котла")
+    finally:
+        uninstall_bay()
+
+
+async def test_day_diary_reads_cassette(session, tmp_path, monkeypatch) -> None:
+    """Запись дневника дня читается из активной кассеты для поста итогов."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(bay, "datetime", _FakeDatetime)  # сегодня: 2026-05-11
+    payload = {
+        "cassette_id": "diary-kasseta",
+        "month": "2026-05",
+        "title": "Дневник",
+        "days": [{**_day(i), "diary": "Щенок записал: мама почти выздоровела."} for i in range(1, 32)],
+    }
+    (tmp_path / "may-diary.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    await set_next_cassette(session, "may-diary.json")
+    assert install_bay(tmp_path) is True
+    try:
+        finished = SimpleNamespace(
+            day_index=11,
+            opens_at=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+        )
+        assert (
+            await bay.day_diary(session, finished)
+            == "Щенок записал: мама почти выздоровела."
+        )
+        # Нет даты открытия — дневника нет (пусто, без ошибок).
+        assert await bay.day_diary(session, SimpleNamespace(day_index=11, opens_at=None)) == ""
+    finally:
+        uninstall_bay()
