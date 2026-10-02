@@ -33,7 +33,7 @@ jobs:
           pg_dump17="/usr/lib/postgresql/17/bin/pg_dump"
           "${pg_dump17}" --format=custom --file="backup-${stamp}.dump" "${dsn}"
           ls -lh backup-*.dump
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: db-backup
           path: backup-*.dump
