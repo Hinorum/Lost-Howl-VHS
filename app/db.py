@@ -167,25 +167,68 @@ async def _stamp_alembic_head(conn) -> None:
     logger.info("alembic_version помечена на head=%s после create_all", head)
 
 
+async def _has_alembic_history() -> bool:
+    """Ведётся ли база alembic'ом (в alembic_version есть хоть одна строка).
+
+    Различает два принципиально разных случая, которые раньше сводились к
+    одному «upgrade не прошёл»:
+
+    * истории нет вовсе (легаси create_all-эпоха) — тогда реконсиляция в
+      таймлайн это ровно то, что нужно;
+    * история есть и база управляется таймлайном — тогда провал upgrade
+      означает сломанную миграцию, а не отсутствие истории, и «лечить» это
+      create_all'ом нельзя.
+    """
+    try:
+        async with engine.connect() as conn:
+            def _probe(sync_conn) -> bool:
+                if not inspect(sync_conn).has_table("alembic_version"):
+                    return False
+                rows = sync_conn.execute(text("SELECT version_num FROM alembic_version")).scalars().first()
+                return rows is not None
+
+            return bool(await conn.run_sync(_probe))
+    except Exception as exc:  # noqa: BLE001 — не смогли понять, значит считаем managed
+        logger.warning("Не удалось прочитать alembic_version: %s", exc)
+        return True
+
+
 async def _migrate() -> None:
     """Привести схему к текущим моделям ИСКЛЮЧИТЕЛЬНО через alembic.
 
-    Обычный путь — `upgrade head` по таймлайну базы. Если он не проходит
-    (легаси-база create_all-эпохи вне таймлайна: история ревизий расходится
-    с фактической схемой), дотягиваем недостающие таблицы по моделям,
-    штампуемся на якорь и сходимся единственной идемпотентной ревизией
-    legacy_convergence — без прогона промежуточной геометрии, которая могла
-    бы упереться в уже существующие колонки.
+    Обычный путь — `upgrade head` по таймлайну базы. Если он не проходит и
+    истории alembic нет вовсе (легаси-база create_all-эпохи вне таймлайна),
+    дотягиваем недостающие таблицы по моделям, штампуемся на якорь и сходимся
+    единственной идемпотентной ревизией legacy_convergence — без прогона
+    промежуточной геометрии, которая могла бы упереться в уже существующие
+    колонки.
+
+    Если же история есть, база управляется таймлайном, и upgrade на ней упал,
+    старт прерывается. Раньше любой сбой миграции приводил к create_all по
+    живой базе и stamp на якорь, то есть объявлял состояние схемы, которого
+    никто не проверял, и на alembic-базе превращал ЛЮБУЮ ошибку миграции в
+    молчаливое расхождение. Единственным признаком был WARNING в логе.
     """
+    managed = await _has_alembic_history()
     result = await asyncio.to_thread(_run_alembic, "upgrade", "head")
     if result.returncode == 0:
         logger.info("Схема приведена к head: alembic upgrade")
         return
 
+    tail = result.stderr.strip()[-800:]
+    if managed:
+        raise RuntimeError(
+            "alembic upgrade head не прошёл на базе, которая ведётся таймлайном. "
+            "Реконсиляция не запускается: она рассчитана на базу без истории "
+            "alembic, а здесь любая ошибка миграции молча превратилась бы в "
+            "расхождение схемы (create_all + stamp на якорь). Разберись с "
+            f"миграцией вручную. Хвост ошибки: {tail}"
+        )
+
     logger.warning(
-        "alembic upgrade head не прошёл на живой базе — реконсиляция легаси. "
-        "Хвост ошибки: %s",
-        result.stderr.strip()[-800:],
+        "alembic upgrade head не прошёл на базе без истории alembic — "
+        "реконсиляция легаси. Хвост ошибки: %s",
+        tail,
     )
 
     async with engine.begin() as conn:

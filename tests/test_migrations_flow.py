@@ -98,6 +98,11 @@ def _version(url: str) -> str | None:
         return conn.execute(text("select version_num from alembic_version")).scalar_one_or_none()
 
 
+def _table_exists(url: str, table: str) -> bool:
+    with create_engine(url).connect() as conn:
+        return inspect(conn).has_table(table)
+
+
 def _shape(url: str) -> dict:
     """Отражённая форма схемы SQLite-базы: таблицы, колонки, типы, nullability, PK,
     уникальные ограничения и индексы. Server defaults сознательно НЕ в
@@ -451,6 +456,85 @@ async def test_db_left_by_failed_reconcile_heals(app_db: Path):
     assert "No new upgrade operations detected" in _alembic_ok(
         _async_url(app_db), "check"
     ), "`alembic check` после долечивания не чист — README обещает обратное"
+
+
+async def test_broken_migration_on_managed_db_stops_boot(app_db: Path, monkeypatch):
+    """Сбой миграции на базе с историей alembic останавливает старт.
+
+    Реконсиляция существует для баз create_all-эпохи, у которых истории нет
+    вовсе. Раньше её триггером был «upgrade не прошёл», а не «истории нет», то
+    есть на базе, управляемой таймлайном, ЛЮБАЯ ошибка миграции приводила к
+    create_all по живой базе и stamp на якорь: версия объявлялась та, которую
+    никто не проверял. На базе с реальными деньгами и выплатами это молчаливое
+    расхождение схемы, единственным следом которого был WARNING в логе.
+
+    Теперь сбой upgrade при непустом alembic_version роняет старт.
+    """
+    import app.db as db_module
+    from app.db import init_db
+
+    _chain_to_head(app_db)
+    assert _version(_sync_url(app_db)) is not None, "фикстура обязана дать базу с историей"
+
+    # _run_alembic зовётся через asyncio.to_thread, то есть синхронно.
+    def failing(*args, **kwargs):
+        return _FakeResult(1, stderr="RuntimeError: сломанная ревизия")
+
+    monkeypatch.setattr(db_module, "_run_alembic", failing)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await init_db()
+
+    assert "таймлайном" in str(excinfo.value)
+    # Версия не переписана: база осталась на том, на чём была.
+    assert _version(_sync_url(app_db)) == _alembic_head()
+
+
+async def test_broken_migration_without_history_still_reconciles(app_db: Path, monkeypatch):
+    """База без истории alembic по-прежнему лечится реконсиляцией.
+
+    Это тот случай, ради которого путь и написан, и он не должен пострадать от
+    ужесточения: create_all-эпоха обязана сойтись в таймлайн сама.
+    """
+    import app.db as db_module
+    from app.db import init_db
+
+    async def _create_all() -> None:
+        engine = create_async_engine(_async_url(app_db))
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await engine.dispose()
+
+    await _create_all()
+    assert not _table_exists(_sync_url(app_db), "alembic_version"), (
+        "фикстура обязана дать базу без истории alembic"
+    )
+
+    calls: list[tuple[str, ...]] = []
+    real_run = db_module._run_alembic
+
+    # Реконсиляция обязана была понадобиться: заставим первый upgrade упасть.
+    def failing(*args, **kwargs):
+        calls.append(args)
+        if args and args[0] == "upgrade" and len(calls) == 1:
+            return _FakeResult(1, stderr="RuntimeError: база вне таймлайна")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(db_module, "_run_alembic", failing)
+
+    await init_db()
+
+    assert _version(_sync_url(app_db)) == _alembic_head()
+    assert any(c and c[0] == "stamp" for c in calls), calls
+
+
+class _FakeResult:
+    """Минимальный CompletedProcess для подменённого _run_alembic."""
+
+    def __init__(self, returncode: int, stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = stderr
 
 
 async def test_orm_writes_rounds_without_server_default(db_path: Path):
