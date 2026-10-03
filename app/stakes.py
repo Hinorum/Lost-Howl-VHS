@@ -447,6 +447,15 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                 refund = refund_net_amount(stake.amount_nanotons)
                 if refund > 0:
                     created += add_payout(stake, "refund", refund)
+                    # Ставка разобрана — обязана сменить статус. Иначе игрок
+                    # получает 100% ставки назад И остаётся «поставившим»:
+                    # лидерборд отбирает по Stake.status == confirmed
+                    # (leaderboard._players_with_stake и _gram_contributions),
+                    # то есть в дне без победителя, где у всех нулевая
+                    # экспозиция, копилки — наполненные чужими потерями —
+                    # всё равно уходили бы к тем, кто поставил и получил
+                    # ставку обратно.
+                    stake.status = "refunded"
             round_row.pot_nanotons = pot
             round_row.rake_nanotons = 0
         else:

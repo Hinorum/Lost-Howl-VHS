@@ -458,6 +458,15 @@ async def test_finalize_refunds_when_no_winning_stakes(
     assert all(row["kind"] == "refund" for row in payouts)
     assert all(row["amount_nanotons"] > 0 for row in payouts)
     assert round_row.rake_nanotons == 0
+    # Ставка обязана сменить статус: вернули 100% — значит поставившим её
+    # больше не считаем. Иначе в дне без победителя, где у всех нулевая
+    # экспозиция, копилки недели и месяца (наполненные потерями других дней)
+    # всё равно доставались бы тем, кто поставил и получил ставку обратно.
+    statuses = {
+        int(pid): status
+        for pid, status in (await session.execute(select(Stake.player_id, Stake.status))).all()
+    }
+    assert statuses == {1: "refunded", 2: "refunded"}
 
 
 async def test_finalize_skips_unconfirmed(session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
