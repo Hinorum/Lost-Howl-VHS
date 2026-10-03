@@ -29,6 +29,7 @@ os.environ.setdefault("TREASURY_MNEMONIC", "")
 # тесты дефолта (test_metrics) строят Settings() из реального окружения.
 os.environ.setdefault("HEALTH_REQUIRE_TOKEN", "true")
 
+import asyncio
 import datetime as _dt
 import sqlite3
 from datetime import UTC, datetime
@@ -97,6 +98,36 @@ async def truncate_all(db) -> None:
         return
     for table in reversed(tables):
         await db.execute(delete(table))
+
+
+@pytest.fixture(autouse=True)
+async def _quiesce_background_tasks():
+    """Дождаться фоновых задач, переживших свой тест, и отменить висящие.
+
+    spawn() создаёт настоящие asyncio-задачи (app/async_utils.py). Тест, дёрнувший
+    tick(), может запустить финализацию дня с фоновыми джобами — и они продолжают
+    писать в ОБЩУЮ БД, когда тест уже завершился и следующий уже начался.
+
+    Именно это делало прогон нестабильным: падали по очереди
+    test_tick_heartbeat::test_snapshot_reports_counter,
+    test_failed_tick_leaves_heartbeat_stale и
+    test_ton::test_repeat_stake_and_closed_day_transfers_are_refunded — по
+    разным причинам, но все три читали глобальные ключи и счётчики, которые
+    досасыпала чужая задача (TICK_FAIL_KEY, TICK_KEY, открытый раунд).
+
+    Тесты ничего не теряют: задачи, которые тест хочет дождаться, он ждёт сам.
+    Здесь гасим только то, что осталось висеть, и делаем это ДО очистки БД
+    следующего теста.
+    """
+    from app.async_utils import _TASKS
+
+    yield
+    pending = [task for task in list(_TASKS) if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    _TASKS.clear()
 
 
 @pytest.fixture(autouse=True)
