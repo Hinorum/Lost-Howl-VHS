@@ -213,6 +213,12 @@ async def test_metrics_endpoint_survives_snapshot_failure(monkeypatch) -> None:
 
 
 async def test_metrics_endpoint_requires_token(monkeypatch) -> None:
+    """Токен принимается только заголовком; query-форма больше не авторизует.
+
+    Query-форма клала секрет в access-логи прокси, историю браузера и Referer.
+    Легитимного потребителя у неё нет: self-ping ходит с заголовком, проба
+    живости Render идёт на /alive.
+    """
     monkeypatch.setattr("app.config.settings.health_token", "s3cret")
 
     async def good_snapshot():
@@ -223,7 +229,7 @@ async def test_metrics_endpoint_requires_token(monkeypatch) -> None:
     assert (
         await main_module.metrics(_request(headers={"Authorization": "Bearer s3cret"}))
     ).status == 200
-    assert (await main_module.metrics(_request(query={"token": "s3cret"}))).status == 200
+    assert (await main_module.metrics(_request(query={"token": "s3cret"}))).status == 401
 
 
 async def test_metrics_endpoint_locked_when_require_token_without_secret(monkeypatch) -> None:

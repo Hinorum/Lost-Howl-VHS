@@ -65,13 +65,34 @@ async def test_health_rejects_wrong_token(monkeypatch) -> None:
     assert response.status == 401
 
 
-async def test_health_accepts_query_token(monkeypatch) -> None:
+async def test_health_rejects_query_token(monkeypatch) -> None:
+    """Токен в строке запроса больше не авторизует снимок.
+
+    Query-форма кладёт секрет в access-логи прокси и CDN, в историю браузера и
+    в заголовок Referer при переходе со страницы, открытой в браузере. Кто
+    читает логи — читает и токен. Легитимного потребителя у этой формы нет:
+    self-ping ходит с заголовком, проба живости Render идёт на /alive.
+    """
     monkeypatch.setattr("app.config.settings.health_token", "s3cret")
     async def good_snapshot():
         return {"status": "ok"}
 
     monkeypatch.setattr("app.ops.snapshot", good_snapshot)
     response = await main_module.health(_request(query={"token": "s3cret"}))
+    assert response.status == 401
+    assert response.body == b"unauthorized"
+
+
+async def test_query_token_ignored_even_when_header_present(monkeypatch) -> None:
+    """Правильный заголовок работает, даже когда в query лежит мусорный токен."""
+    monkeypatch.setattr("app.config.settings.health_token", "s3cret")
+    async def good_snapshot():
+        return {"status": "ok"}
+
+    monkeypatch.setattr("app.ops.snapshot", good_snapshot)
+    response = await main_module.health(
+        _request(headers={"Authorization": "Bearer s3cret"}, query={"token": "wrong"})
+    )
     assert response.status == 200
     assert b'"ok"' in response.body
 

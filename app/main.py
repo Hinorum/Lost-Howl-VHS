@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import difflib
+import hmac
 import logging
 import os
 import signal
@@ -42,19 +43,25 @@ def _authorized(request: web.Request) -> bool:
 
     Если задан HEALTH_TOKEN, снимок (очередь выплат, возраст тика, watcher,
     метрики) доступен только с авторизацией: мониторинг Render/UptimeRobot
-    передаёт токен в заголовке Authorization: Bearer <token> либо в
-    ?token=. Требование токена без самого токена — отказ (fail closed).
+    передаёт токен в заголовке Authorization: Bearer <token>. Требование токена
+    без самого токена — отказ (fail closed).
+
+    Query-формы (?token=) здесь нет намеренно. Токен в строке запроса попадает
+    в access-логи прокси и CDN, в историю браузера и в заголовок Referer при
+    любом переходе со страницы, открытой в браузере. Легитимного потребителя у
+    query-формы тоже нет: self-ping ходит с заголовком, а проба живости Render
+    идёт на /alive, где токен не нужен вовсе.
     """
     if settings.health_require_token and not settings.health_token.strip():
         return False
     if not settings.health_token:
         return True
     expected = settings.health_token.strip()
-    supplied = (
-        (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-        or request.query.get("token", "").strip()
-    )
-    return bool(expected) and supplied == expected
+    supplied = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    # Сравнение за постоянное время: секрет длинный, но заголовок приходит из
+    # сети, а не из локального кода — утечка по времени сравнения формально
+    # возможна. В проекте hmac.compare_digest уже используется (referrals.py).
+    return bool(expected) and hmac.compare_digest(supplied, expected)
 
 
 async def alive(request: web.Request) -> web.Response:

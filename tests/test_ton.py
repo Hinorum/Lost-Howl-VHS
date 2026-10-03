@@ -908,13 +908,29 @@ async def test_self_transfer_does_not_refund_itself(monkeypatch: pytest.MonkeyPa
 async def test_repeat_stake_and_closed_day_transfers_are_refunded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Деньги, не ставшие ставкой (повтор за поставившего, закрытый день), возвращаются."""
+    """Деньги, не ставшие ставкой (повтор за поставившего, закрытый день), возвращаются.
+
+    Тест работает с глобальной БД, а `_maybe_auto_grant` ищет открытый день
+    одним запросом по ВСЕМ раундам (status=OPEN, order by day_index desc). Чужой
+    открытый раунд, оставшийся от другого теста, становится «днём игрока»: у
+    этого игрока нет голоса в нём, поэтому перевод из вилки
+    [revote_ton, stake_min_ton) уходил в revote_auto_no_vote вместо refund.
+    Закрываем чужие открытые дни перед сидом, чтобы проверка зависела от своей
+    логики, а не от порядка прогона.
+    """
     import os
 
     from app.db import SessionLocal
     from app.ton_watch import Transfer, process_transfer
 
     monkeypatch.setattr(settings, "ton_enabled", True)
+    async with SessionLocal() as db:
+        await db.execute(
+            Round.__table__.update()
+            .where(Round.status == RoundStatus.OPEN)
+            .values(status=RoundStatus.CLOSED)
+        )
+        await db.commit()
     pid = 800_000 + int.from_bytes(os.urandom(2), "big")
     wallet = "0:" + os.urandom(32).hex()
     hash_dup = "dup-" + os.urandom(8).hex()

@@ -713,17 +713,23 @@ async def cmd_refinalize(message: Message) -> None:
             # создаст её ПОВТОРНО (новый payout.id, анти-дубль по memo слеп).
             # Отказ внятным сообщением: пусть хранитель сам разберётся с уже
             # ушедшим (сверка /treasury, /adjust), а не плодит вторую выплату.
+            #
+            # failed тоже в списке, и это не перестраховка. Перевод, ушедший с
+            # неподтверждённым memo, умирает как failed после исчерпания
+            # попыток: с точки зрения БД он «никуда не ушёл», по факту монеты
+            # могли уйти. Новый payout.id даёт новый memo, поэтому
+            # анти-дубль по memo такую строку структурно не видит.
             moved_q = await session.execute(
                 select(func.count()).select_from(Payout).where(
                     Payout.round_id == row.id,
-                    Payout.status.in_(["sent", "sending"]),
+                    Payout.status.in_(["sent", "sending", "failed"]),
                 )
             )
             moved_count = int(moved_q.scalar_one())
             if moved_count:
                 await message.answer(
                     f"Round#{row.id} (день {target_day}): перефинализация отменена — "
-                    f"уже двинуто денег: {moved_count} строк (sent/sending). "
+                    f"уже двинуто денег: {moved_count} строк (sent/sending/failed). "
                     "Повторное создание задвоило бы реальные переводы в блокчейне. "
                     "Разберись с ушедшим через /treasury или /adjust."
                 )

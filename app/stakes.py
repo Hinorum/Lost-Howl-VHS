@@ -254,15 +254,49 @@ async def confirm_stake(session: AsyncSession, tx_hash: str) -> bool:
     return True
 
 
-async def _credit_referral(session: AsyncSession, referrer_id: int, amount: int) -> None:
+async def _claim_pot(session: AsyncSession, round_id: int, pot_kind: str) -> bool:
+    """Однократное начисление в копилку за конкретный день. True — начисляем.
+
+    Начисления в копилки аддитивны (`nanotons = nanotons + :amount`) и
+    идемпотентного ключа не имели: у месячной копилки уникален месяц, у Фонда
+    Стаи вообще одна строка-накопитель. При этом повторный прогон
+    finalize_day_payouts по одному и тому же дню штатно возможен (/refinalize,
+    долечивание после сбоя миграции, ручной пересчёт) — и каждая такая копия
+    раздувала обязательства на целый день, которых в казне нет.
+
+    Платы выплат от повторной финализации защищает флаг payouts_finalized;
+    начисления в копилки он не покрывает, потому что они идут мимо Payout.
+    Поэтому у каждого начисления своя метка «уже зачтено за этот день».
+
+    Сеть входит в ключ по той же причине, что и в Stake/Payout/Income: один и
+    тот же Round может быть дофинализирован на testnet и на mainnet, и обе
+    финализации обязаны зачесть свою долю. Метка живёт в watcher_state тем же
+    механизмом, что и refund:/ledger: — атомарный
+    INSERT ... ON CONFLICT DO NOTHING в той же транзакции, так что две
+    параллельные финализации зачислят один раз. Ключ намеренно не чистится
+    еженедельной уборкой watcher_state (см. _cleanup_watcher_state_job).
+    """
+    return await claim_once(session, f"pot:{current_network()}:{pot_kind}:{round_id}")
+
+
+async def _credit_referral(
+    session: AsyncSession, round_id: int, referrer_id: int, amount: int
+) -> None:
     """Каплет долю подтверждённой ставки приведённого игрока в накопитель.
 
     Атомарный upsert ОДНОЙ строкой: две параллельные финализации дней (тик
     закрывает N, ton-maintenance закрывает N-1) тем же реферером не теряют
     сумму и не ловят IntegrityError на уникальном referrer_id — покрыты и
     INSERT первой строки, и последующие UPDATE.
+
+    Повторная финализация того же дня не должна начислять рефереру второй раз:
+    метка зачисления — своя на каждый (день, реферер), потому что в один день
+    один реферер может получить доли от нескольких приведённых игроков и всё
+    равно должен получить их ровно один раз.
     """
     if amount <= 0:
+        return
+    if not await _claim_pot(session, round_id, f"ref:{referrer_id}"):
         return
     await session.execute(
         text(
@@ -525,10 +559,10 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                     created += add_payout(stake, "prize", share)
             if referral_cut > 0:
                 for referrer_id, share in split_pot(referral_cut, referred_entries):
-                    await _credit_referral(session, referrer_id, share)
+                    await _credit_referral(session, round_row.id, referrer_id, share)
             if house_cut > 0:
                 created += add_treasury_payout("rake", house_cut)
-            if board_cut > 0:
+            if board_cut > 0 and await _claim_pot(session, round_row.id, "month"):
                 month = round_row.tally_ends_at.strftime("%Y-%m")
                 # Атомарный upsert (см. _credit_referral): месяц уникален,
                 # без ON CONFLICT параллельные финализации задвоили бы row
@@ -544,7 +578,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                     {"m": month, "amount": board_cut},
                 )
             week_total_cut = weekly_cut + dust_to_week
-            if week_total_cut > 0:
+            if week_total_cut > 0 and await _claim_pot(session, round_row.id, "week"):
                 week = iso_week_key(round_row.opens_at)
                 await session.execute(
                     text(
@@ -560,7 +594,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             # Фонд Стаи: неубывающее накопление без периода раздачи. Единственная
             # строка-накопитель; деньги остаются на кошельке казначея и забираются
             # хранителем вручную (см. /panel, ручной вывод).
-            if fund_cut > 0:
+            if fund_cut > 0 and await _claim_pot(session, round_row.id, "fund"):
                 from app.handlers.wallet import _pct_text
 
                 # Фонд Стаи — единственная строка-накопитель, уникального ключа

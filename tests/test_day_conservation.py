@@ -88,6 +88,64 @@ async def _assert_day_balances(
     )
 
 
+async def test_refinalizing_day_does_not_inflate_pots(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Повторная финализация дня не должна раздувать копилки.
+
+    Повторный прогон finalize_day_payouts по одному дню штатно возможен:
+    /refinalize, долечивание после сбоя миграции, ручной пересчёт хранителя.
+    Выплаты от этого защищает флаг payouts_finalized — но он ловит только
+    создание строк Payout. Начисления в копилки идут мимо Payout, а записи
+    аддитивны (`nanotons = nanotons + :amount`), поэтому каждая копия
+    раздувала обязательства на целый день, которых в казне нет.
+
+    Последствие было не косметическим: сверка казны с БД начинала читать
+    «ожидаемое» больше фактического, и баланс-guard диспетчера выплат
+    отказывался отправлять вообще ничего — очередь вставала целиком.
+    """
+    for pid in (1, 2):
+        session.add(Player(id=pid, wallet_address=f"wallet-{pid}", wallet_verified=True))
+    round_row = await make_closed_round(session, winner_card=0)
+    session.add_all(
+        [
+            Vote(round_id=round_row.id, player_id=1, card_position=0),
+            Vote(round_id=round_row.id, player_id=2, card_position=0),
+            Stake(round_id=round_row.id, player_id=1, amount_nanotons=to_nano(6), tx_hash="a", status="confirmed"),
+            Stake(round_id=round_row.id, player_id=2, amount_nanotons=to_nano(4), tx_hash="b", status="confirmed"),
+        ]
+    )
+    await session.commit()
+
+    async def pots() -> dict:
+        return {
+            "week": sum(
+                r.nanotons
+                for r in (await session.execute(select(stakes_mod.WeeklyPot))).scalars().all()
+            ),
+            "month": sum(
+                r.nanotons
+                for r in (await session.execute(select(stakes_mod.LeaderboardPot))).scalars().all()
+            ),
+            "fund": sum(
+                r.nanotons
+                for r in (await session.execute(select(stakes_mod.PackFund))).scalars().all()
+            ),
+        }
+
+    await stakes_mod.finalize_day_payouts(session, round_row)
+    first = await pots()
+
+    # Именно то, что делает /refinalize: сброс флага и повторный прогон.
+    round_row.payouts_finalized = False
+    await session.commit()
+    await stakes_mod.finalize_day_payouts(session, round_row)
+    second = await pots()
+
+    assert first["week"] > 0 and first["month"] > 0 and first["fund"] > 0
+    assert second == first, f"повторная финализация раздула копилки: {first} -> {second}"
+
+
 async def test_conservation_single_winner_with_losers_and_stuck(session: AsyncSession) -> None:
     """Победный день: выигравший получает приз минус газ, проигравший без
     возврата (деньги в пуле), застрявшая ставка возвращается с газом."""
