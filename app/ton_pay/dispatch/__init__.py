@@ -137,6 +137,12 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
         # sending → pending на следующем цикле, а memo-антидубль (attempts>1)
         # уберёт повтор уже ушедшего перевода.
         claimed_ids: set[int] = set()
+        # Попытки ДО клейма: клейм тратит попытку на весь батч разом, а откат
+        # ниже (пачка встала на неподтверждённом переводе, либо история казначея
+        # недоступна) может вернуть в очередь строки, которые НИКОГДА не
+        # отправлялись. Без возврата счётчика они копят потраченные попытки на
+        # чужих сбоях и уходят в dead-letter, не будучи отправлены ни разу.
+        prior_attempts: dict[int, int] = {}
         for payout in payouts:
             if not payout.dest_address:
                 continue
@@ -148,6 +154,7 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
             if gate.rowcount != 1:
                 # Строку уже забрала другая копия — не трогаем и не вещаем.
                 continue
+            prior_attempts[payout.id] = int(payout.attempts or 0)
             payout.attempts += 1
             payout.status = "sending"
             payout.claimed_at = datetime.now(UTC)
@@ -228,6 +235,10 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     # Замораживаем строку с видимой причиной: история вернётся —
                     # сверка повторится сама, без ручного retry.
                     payout.status = "pending"
+                    # Отправки не было — попытку клейма возвращаем: иначе
+                    # недоступная история казначея съедала бы по попытке за
+                    # цикл у каждой повторной выплаты.
+                    payout.attempts = prior_attempts.get(payout.id, int(payout.attempts or 0))
                     payout.last_error = (
                         "история казначея недоступна — повтор отложен (анти-дубль), "
                         "сверка с memo невозможна"
@@ -336,6 +347,13 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                 if rest.status != "sending":
                     continue
                 rest.status = "pending"
+                # Попытку возвращаем: эти строки клейм заняли вместе с батчем,
+                # но до отправки дело не дошло — они стоят правее остановившейся
+                # строки. Иначе после нескольких таких циклов (окно
+                # подтверждения 15с на живом API — обычное дело) строка
+                # исчерпает payout_max_attempts и уйдёт в dead-letter, не будучи
+                # отправлена ни разу.
+                rest.attempts = prior_attempts.get(rest.id, int(rest.attempts or 0))
                 rest.last_error = reason
         await session.commit()
     dead = [p.id for p in payouts if p.status == "failed"]

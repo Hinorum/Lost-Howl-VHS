@@ -39,7 +39,7 @@ async def _seed_payout(attempts: int) -> int:
         return payout.id
 
 
-async def _seed_payouts(count: int) -> list[int]:
+async def _seed_payouts(count: int, attempts: int = 0) -> list[int]:
     """Несколько выплат подряд — чтобы проверить поведение ПАЧКИ."""
     ids: list[int] = []
     for index in range(count):
@@ -53,7 +53,7 @@ async def _seed_payouts(count: int) -> list[int]:
             )
             session.add(payout)
             await session.flush()
-            payout.attempts = 0
+            payout.attempts = attempts
             payout.status = "pending"
             await session.commit()
             ids.append(payout.id)
@@ -146,6 +146,65 @@ async def test_batch_defers_remaining_payouts_when_prev_unconfirmed(monkeypatch)
         # Причина видна оператору — не «списали молча».
         assert "не подтверждён" in rows[1].last_error
         assert "не подтверждён" in rows[2].last_error
+        # Попытка клейма возвращена: эти строки до отправки не дошли, и их
+        # attempts не должны расти на чужих сбоях. Иначе после
+        # payout_max_attempts таких пауз строка уйдёт в dead-letter, не будучи
+        # отправлена ни разу, и игрок просто не получит приз.
+        assert [row.attempts for row in rows[1:]] == [0, 0], (
+            "отложенные строки не должны терять попытки клейма"
+        )
+    finally:
+        await _drop_payouts(ids)
+
+
+async def test_frozen_repeat_does_not_burn_attempts(monkeypatch) -> None:
+    """Заморозка повтора при недоступной истории не тратит попытку.
+
+    Когда оба провайдера истории молчат, повтор (attempts > 1) нельзя
+    переотправлять: не известно, ушёл ли такой-то перевод уже. Строка
+    возвращается в очередь с видимой причиной и ждёт восстановления истории.
+
+    Отправки при этом не было ни разу, поэтому попытка клейма обязана
+    возвращаться. Иначе недоступность истории — внешнее и временное обстоятельство —
+    расходовала бы retries игрока: через payout_max_attempts циклов выплата
+    умерла бы как failed, не будучи отправленной ни разу.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "payout_max_attempts", 5)
+    ids = await _seed_payouts(1, attempts=1)
+
+    async def markers_history_down() -> set[str]:
+        # Так ведёт себя настоящий fetch_broadcast_markers, когда оба
+        # провайдера не ответили: пусто + флаг истории недоступны.
+        ton_pay.state._RECONCILE_HISTORY_OK = False
+        return set()
+
+    transfer = AsyncMock(return_value="bcast:1")
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", markers_history_down)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    try:
+        for _ in range(settings.payout_max_attempts + 2):
+            await ton_pay.dispatch_pending_payouts(bot=None)
+
+        assert transfer.await_count == 0, "замороженный повтор не должен вещаться"
+        async with SessionLocal() as session:
+            row = await session.get(Payout, ids[0])
+        assert row.status == "pending", (
+            f"выплата умерла как {row.status} за {settings.payout_max_attempts + 2} "
+            "циклов, не будучи отправленной ни разу"
+        )
+        assert row.attempts == 1, "попытка клейма не возвращена при заморозке"
+
+        # История ожила — повтор уходит сам, без ручного retry.
+        async def markers_ok() -> set[str]:
+            return set()
+
+        monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", markers_ok)
+        await ton_pay.dispatch_pending_payouts(bot=None)
+        assert transfer.await_count == 1
+        async with SessionLocal() as session:
+            row = await session.get(Payout, ids[0])
+        assert row.status == "sent"
     finally:
         await _drop_payouts(ids)
 
