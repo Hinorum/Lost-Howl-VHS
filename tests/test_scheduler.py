@@ -911,6 +911,7 @@ async def test_boot_maintenance_runs_backup(monkeypatch) -> None:
 
 async def test_cleanup_watcher_state_removes_stale_keeps_live() -> None:
     from app import scheduler as sched
+    from app.core.registry import BACKUP_LAST_OK_KEY
     from app.models import WatcherState
 
     async with SessionLocal() as db:
@@ -923,7 +924,10 @@ async def test_cleanup_watcher_state_removes_stale_keeps_live() -> None:
 
     async with SessionLocal() as db:
         keys = {row.key for row in (await db.execute(select(WatcherState))).scalars()}
-    assert keys == {"run:anchor"}
+    # Живыми остаются потоковые якоря и отметка последнего бэкапа: снести её
+    # недельной чисткой означало бы поднять тревогу «бэкапов нет» на ровном
+    # месте каждую неделю.
+    assert keys == {"run:anchor", BACKUP_LAST_OK_KEY}
 
 
 async def test_cleanup_watcher_state_empty_db_noop() -> None:

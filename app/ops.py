@@ -22,6 +22,7 @@ from sqlalchemy import func, select, text
 
 from app.config import settings
 from app.core.registry import (
+    ALERT_BACKUP_KEY,
     ALERT_BALANCE_KEY,
     ALERT_DEAD_KEY,
     ALERT_ENTROPY_KEY,
@@ -34,6 +35,7 @@ from app.core.registry import (
     ALERT_TICK_FAIL_KEY,
     ALERT_TICK_KEY,
     ALERT_WATCHER_KEY,
+    BACKUP_LAST_OK_KEY,
     BEAT_KEY,
     MONEY_MODE_KEY,
     OPS_ALERT_DIGEST_KEY,
@@ -67,6 +69,10 @@ _QUEUE_OLD_AFTER = timedelta(minutes=30)
 # Возврат ставки (refund) считается «застрявшим», когда ждёт отправки дольше
 # этого окна: игрок остаётся с зависшими деньгами, хранителю нужно узнать.
 _REFUND_OLD_AFTER = timedelta(minutes=30)
+# Успешного бэкапа не было дольше суток — тревога. Дневной цикл с запасом:
+# опоздание на несколько часов (простой процесса, неудачный деплой) должно
+# успокоиться само, а молчащая неделя — нет.
+_BACKUP_STALE_AFTER_HOURS = 26
 # Перевод, который так и не подтвердился в срок — необработанная ставка.
 # Порог — двойное окно подтверждения ставки из настроек.
 _STAKE_CONFIRM_STALE_MULT = 2
@@ -529,6 +535,60 @@ async def _check_entropy_fallback(session, bot) -> None:
     )
 
 
+async def _check_backup_freshness(session, bot) -> None:
+    """Тревога: успешного бэкапа не было слишком долго.
+
+    Про бэкапы не знала ни одна проверка: если pg_dump ломался, крон промахивался
+    (дефолт misfire_grace_time в секунду), контейнер пересоздался не вовремя или
+    workflow на стороне CI отключился, узнать об этом было нельзя. Бэкап, о
+    котором никто не знает, что он сломан, — это отсутствие бэкапа.
+
+    Отметку ставит только успешный backup_now, и только после проверки файла.
+    Неизвестно (отметки нет вовсе) считаем проблемой: свежий процесс без
+    отметки — это как раз случай «бэкап ни разу не удался».
+    """
+    row = (
+        await session.execute(
+            select(WatcherState.value).where(WatcherState.key == BACKUP_LAST_OK_KEY)
+        )
+    ).scalar_one_or_none()
+    if row:
+        try:
+            last_ok = datetime.fromisoformat(row)
+        except ValueError:
+            last_ok = None
+        if last_ok is not None:
+            if last_ok.tzinfo is None:
+                last_ok = last_ok.replace(tzinfo=UTC)
+            age_h = (_now() - last_ok).total_seconds() / 3600
+            if age_h < _BACKUP_STALE_AFTER_HOURS:
+                return
+            await _raise(
+                session,
+                bot,
+                ALERT_BACKUP_KEY,
+                f"нет успешного бэкапа {age_h:.0f} ч",
+                f"⚠️ Последний успешный бэкап БД был {_human_ts(last_ok)}, "
+                f"это {age_h:.0f} ч назад (порог {_BACKUP_STALE_AFTER_HOURS} ч). "
+                "Восстанавливать будет нечего. Проверь, что джоба db-backup "
+                "жива (в /ops — возраст задач), а pg_dump установлен в "
+                "окружении, и что копии реально уходят с эфемерного диска "
+                "контейнера.",
+            )
+            return
+    await _raise(
+        session,
+        bot,
+        ALERT_BACKUP_KEY,
+        "бэкап не подтверждён ни разу",
+        "⚠️ Успешного бэкапа БД не зафиксировано ни разу с момента, как это "
+        "стало проверяться. Либо джоба db-backup не отрабатывает, либо каждый "
+        "запуск падает. Без бэкапа восстановление после любой потери базы "
+        "невозможно. Разбор: /ops (возраст задач), логи планировщика, наличие "
+        "pg_dump в окружении.",
+    )
+
+
 def _detail(entries: list[tuple[str, dict]]) -> list[dict]:
     """Проблемы для /ops и снимка: текст, сколько держится, сколько раз видели."""
     return [
@@ -902,6 +962,11 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
     #    фактически — исход перестал быть проверяемым, и в этом надо жить.
     if settings.ton_enabled:
         await _check_entropy_fallback(session, bot)
+    # 6. Свежесть бэкапа. Проверка вне условия ton_enabled: потеря базы означает
+    #    потерю истории выплат и зеркала казны независимо от того, включены ли
+    #    деньги сейчас, а сломанный pg_dump — это в первую очередь вопрос
+    #    бота, а не игроков.
+    await _check_backup_freshness(session, bot)
     # Итог прохода: кто из тревог ушёл сам, кто держится дольше часа.
     await _settle_alerts(session, bot, problems)
     # Снимок для /health и /ops. Кэш, а не пересчёт на каждый опрос: одно и то

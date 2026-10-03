@@ -31,6 +31,7 @@ os.environ.setdefault("HEALTH_REQUIRE_TOKEN", "true")
 
 import datetime as _dt
 import sqlite3
+from datetime import UTC, datetime
 
 # Python 3.12 объявил устаревшим встроенный адаптер datetime/date в sqlite3, и
 # pytest.ini гоняет DeprecationWarning как ошибку — любой raw text() с параметром
@@ -107,14 +108,26 @@ async def _clean_watcher_state_between_tests():
     один тест успевает освободить свой ключ только в finally, другой
     в том же модуле налетает на IntegrityError. Чистим таблицу в начале
     каждого теста (дёшево: таблица мелкая).
+
+    Заодно ставим свежую отметку последнего бэкапа: проверка свежести
+    бэкапа входит в check_anomalies, поэтому «проблем нет» требует, чтобы
+    бэкап был. Тесты, которые проверяют саму эту тревогу, отметку убирают
+    явно (test_backups.py).
     """
     from sqlalchemy import delete
 
+    from app.core.registry import BACKUP_LAST_OK_KEY
     from app.db import SessionLocal
     from app.models import WatcherState
 
     async with SessionLocal() as db:
         await db.execute(delete(WatcherState))
+        db.add(
+            WatcherState(
+                key=BACKUP_LAST_OK_KEY,
+                value=datetime.now(UTC).isoformat(),
+            )
+        )
         await db.commit()
     yield
 

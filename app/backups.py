@@ -139,13 +139,78 @@ async def backup_now(keep: int = KEEP) -> Path | None:
 
         await asyncio.to_thread(_sqlite_copy)
     pruned = await asyncio.to_thread(_prune, directory, keep)
+    size_kb = dest.stat().st_size / 1024
     logger.info(
         "Бэкап БД готов: %s (%.1f КБ)%s",
         dest.name,
-        dest.stat().st_size / 1024,
+        size_kb,
         f", удалено старых: {pruned}" if pruned else "",
     )
+    await _verify_backup(dest)
+    await _mark_backup_ok()
     return dest
+
+
+async def _verify_backup(dest: Path) -> None:
+    """Файл бэкапа должен существовать и быть непустым.
+
+    Для SQLite проверка настоящая: открываем копию и читаем с неё схему. Дамп
+    без данных (упавший процесс, нехватка места) останется валидным файлом, и
+    тревога «бэкапов давно нет» молчала бы, хотя восстанавливать нечего.
+    """
+    if not dest.exists():
+        raise RuntimeError(f"бэкап не создан: {dest}")
+    size = dest.stat().st_size
+    if size == 0:
+        raise RuntimeError(f"бэкап пустой: {dest}")
+    if dest.suffix == ".db":
+        def _probe() -> int:
+            conn = sqlite3.connect(str(dest))
+            try:
+                row = conn.execute(
+                    "select count(*) from sqlite_master where type='table'"
+                ).fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+
+        try:
+            tables = await asyncio.to_thread(_probe)
+        except sqlite3.DatabaseError as exc:
+            # Битый или недописанный файл: это провал бэкапа, а не сбой проверки.
+            # Без перехвата сырое исключение уехало бы из задачи планировщика
+            # мимо алерта, и хранитель увидел бы только «бэкап БД не удался»
+            # без указания, что копия есть и она мусор.
+            raise RuntimeError(f"копия SQLite не читается ({exc}): {dest}") from exc
+        if tables == 0:
+            raise RuntimeError(f"бэкап без таблиц: {dest}")
+        logger.info("Бэкап проверен: %d таблиц в копии", tables)
+    else:
+        # pg_dump в custom-формате начинается магическим заголовком PGDMP;
+        # без него файл не восстановится.
+        with dest.open("rb") as handle:
+            magic = handle.read(5)
+        if magic != b"PGDMP":
+            raise RuntimeError(f"дамп без заголовка PGDMP: {dest}")
+
+
+async def _mark_backup_ok() -> None:
+    """Отметить время последнего успешного бэкапа для тревоги в ops.
+
+    Отметка ставится только после успешной записи файла и его чтения обратно.
+    Нулевой или урезанный дамп — это не бэкап, и считать его успешным нельзя:
+    иначе тревога «бэкапов нет давно» молчала бы, пока бэкапы перестали бы
+    восстанавливаться в принципе.
+    """
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    async with SessionLocal() as session:
+        session.add(
+            WatcherState(key=BACKUP_LAST_OK_KEY, value=datetime.now(UTC).isoformat())
+        )
+        await session.commit()
 
 
 async def backup_job() -> None:

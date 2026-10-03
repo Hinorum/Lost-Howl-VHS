@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from app import backups
 from app.config import settings
@@ -113,6 +115,229 @@ def test_pg_env_preserves_ambient_environment() -> None:
 
 
 # ---------- Ротация ----------
+
+
+# ---------- Целостность копии и отметка успеха ----------
+
+
+async def test_verify_rejects_empty_file(tmp_path: Path) -> None:
+    """Пустой файл — не бэкап, даже если pg_dump не упал с ненулевым кодом."""
+    empty = tmp_path / "backup-20240101-0400.db"
+    empty.touch()
+    with pytest.raises(RuntimeError, match="пустой"):
+        await backups._verify_backup(empty)
+
+
+async def test_verify_rejects_unreadable_sqlite_copy(tmp_path: Path) -> None:
+    """Недописанный файл не читается как база — это провал с внятной причиной.
+
+    Без перехвата sqlite3.DatabaseError уехал бы из задачи планировщика мимо
+    алерта: хранитель увидел бы «бэкап не удался», не зная, что копия есть и
+    она мусор.
+    """
+    broken = tmp_path / "backup-20240101-0400.db"
+    broken.write_bytes(b"\x00" * 4096)
+
+    with pytest.raises(RuntimeError, match="не читается"):
+        await backups._verify_backup(broken)
+
+
+async def test_verify_rejects_sqlite_copy_without_tables(tmp_path: Path) -> None:
+    """Валидная база без единой таблицы — не бэкап."""
+    import sqlite3
+
+    broken = tmp_path / "backup-20240101-0400.db"
+    with sqlite3.connect(str(broken)) as conn:
+        conn.execute("create table t(x)")
+        conn.execute("drop table t")
+
+    with pytest.raises(RuntimeError, match="без таблиц"):
+        await backups._verify_backup(broken)
+
+
+async def test_verify_rejects_dump_without_pgdmp_magic(tmp_path: Path) -> None:
+    """Дамп без заголовка PGDMP pg_restore не примет — считаем это провалом."""
+    broken = tmp_path / "backup-20240101-0400.dump"
+    broken.write_bytes(b"not a pg dump at all")
+    with pytest.raises(RuntimeError, match="PGDMP"):
+        await backups._verify_backup(broken)
+
+
+async def test_verify_accepts_real_sqlite_copy(tmp_path: Path) -> None:
+    """Настоящая копия проходит проверку."""
+    import sqlite3
+
+    good = tmp_path / "backup-20240101-0400.db"
+    with sqlite3.connect(str(good)) as conn:
+        conn.execute("create table t(x)")
+        conn.execute("insert into t values (1)")
+    await backups._verify_backup(good)
+
+
+async def test_successful_backup_marks_last_ok(monkeypatch, tmp_path: Path) -> None:
+    """Успешный бэкап оставляет отметку — тревога свежести будет чем питаться."""
+    import sqlite3
+
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    source = tmp_path / "live.db"
+    with sqlite3.connect(str(source)) as conn:
+        conn.execute("create table t(x)")
+        conn.execute("insert into t values (1)")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'x.db').as_posix()}")
+    monkeypatch.setattr(backups, "sqlite_file_path", lambda: source)
+
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+        )
+        await session.commit()
+
+    try:
+        await backups.backup_now()
+
+        async with SessionLocal() as session:
+            value = (
+                await session.execute(
+                    select(WatcherState.value).where(WatcherState.key == BACKUP_LAST_OK_KEY)
+                )
+            ).scalar_one_or_none()
+        assert value is not None, "успешный бэкап обязан оставить отметку для тревоги"
+        assert backups.sqlite_file_path() is not None
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+            )
+            await session.commit()
+
+
+async def test_failed_backup_leaves_no_success_mark(monkeypatch, tmp_path: Path) -> None:
+    """Провал бэкапа не должен выглядеть как успешный."""
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    source = tmp_path / "live.db"
+    source.write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "database_url", "postgresql://u:p@db:5432/postgres")
+    monkeypatch.setattr(backups.shutil, "which", lambda _name: "/usr/bin/pg_dump")
+
+    def _fake_dump(dest: Path) -> None:
+        # pg_dump «успешно» создал файл — но мусорный.
+        dest.write_bytes(b"garbage")
+
+    monkeypatch.setattr(backups, "_pg_dump_sync", _fake_dump)
+
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+        )
+        await session.commit()
+
+    try:
+        with pytest.raises(RuntimeError, match="PGDMP"):
+            await backups.backup_now()
+
+        async with SessionLocal() as session:
+            value = (
+                await session.execute(
+                    select(WatcherState.value).where(WatcherState.key == BACKUP_LAST_OK_KEY)
+                )
+            ).scalar_one_or_none()
+        assert value is None, "провалившийся бэкап не должен оставлять отметку успеха"
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+            )
+            await session.commit()
+
+
+# ---------- Тревога свежести ----------
+
+
+async def test_stale_backup_mark_raises_problem() -> None:
+    """Нет успешного бэкапа дольше порога — проблема видна в /health и /ops."""
+    from app import ops
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    stale = (datetime.now(UTC) - timedelta(hours=40)).isoformat()
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+        )
+        session.add(WatcherState(key=BACKUP_LAST_OK_KEY, value=stale))
+        await session.commit()
+    try:
+        problems = await ops.check_anomalies(bot=None)
+        assert any("бэкап" in problem for problem in problems), problems
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+            )
+            await session.commit()
+
+
+async def test_fresh_backup_mark_is_quiet() -> None:
+    """Свежий бэкап тревоги не вызывает: успешный бэкап раз в сутки — норма."""
+    from app import ops
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    fresh = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+        )
+        session.add(WatcherState(key=BACKUP_LAST_OK_KEY, value=fresh))
+        await session.commit()
+    try:
+        async with SessionLocal() as session:
+            await ops._check_backup_freshness(session, None)
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+            )
+            await session.commit()
+
+
+async def test_never_backed_up_is_reported() -> None:
+    """Отметки нет вовсе — тоже проблема: бэкап ни разу не удался.
+
+    Свежий процесс без единой отметки — это и есть случай «бэкап не работает»,
+    и он не должен выглядеть как «просто ещё не было времени». Иначе первый же
+    сломанный pg_dump на боевой базе был бы незаметен ровно до того дня, когда
+    базу придётся восстанавливать.
+    """
+    from app import ops
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+        )
+        await session.commit()
+
+    ops._problems_in_flight.clear()
+    async with SessionLocal() as session:
+        await ops._check_backup_freshness(session, None)
+
+    assert any("бэкап" in problem for problem in ops._problems_in_flight), (
+        "отсутствие отметки бэкапа обязано попасть в список проблем"
+    )
 
 
 def test_prune_keeps_exactly_keep_newest(tmp_path: Path) -> None:

@@ -35,6 +35,12 @@ ALERT_REFUND_KEY = "alert_refund_ts"
 ALERT_STAKE_KEY = "alert_stake_ts"
 ALERT_STUCK_KEY = "alert_stuck_ts"
 ALERT_ENTROPY_KEY = "alert_entropy_ts"
+ALERT_BACKUP_KEY = "alert_backup_ts"
+# Метка времени последнего УСПЕШНОГО бэкапа. Без неё в тревогах не было
+# ни одной строки про бэкапы: если pg_dump ломается, крон промахивается или
+# контейнер пересоздаётся не вовремя, узнать об этом нельзя было ниоткуда —
+# ни одна проверка check_anomalies про бэкапы не знала.
+BACKUP_LAST_OK_KEY = "backup_last_ok_iso"
 
 # Снимок последнего вердикта check_anomalies: JSON-список строк-проблем и
 # время, когда он снят. Считает джоба ops-sweep раз в 120с; /health и /ops
