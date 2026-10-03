@@ -79,8 +79,13 @@ services:
         value: "auto"
       # Встроенный конфиг лайтсерверов периодически мёртв — выплаты встают с
       # «have no alive peers». Лечение: официальный конфиг, подтягиваемый при старте.
+      # ВНИМАНИЕ: URL подставляется с приоритетом над TON_NETWORK. Пока здесь стоял
+      # testnet-global.config.json при TON_NETWORK=mainnet, seqno казначея читался
+      # на testnet-нодах, выплаты подписывались неверным seqno и уходили в dead-letter,
+      # а /health оставался зелёным. validate_config теперь останавливает старт при
+      # таком пересечении; для testnet ставь testnet-global.config.json.
       - key: LITESERVER_CONFIG_URL
-        value: https://ton.org/testnet-global.config.json
+        value: https://ton.org/global.config.json
       # Цикл наблюдателя входящих (сек) = скорость подтверждения ставок.
       # 60 — минута; 120/180 — вдвое-втрое дешевле по квоте TonAPI/Toncenter.
       - key: TON_WATCH_INTERVAL_SECONDS

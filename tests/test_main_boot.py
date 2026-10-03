@@ -459,6 +459,50 @@ def test_env_typo_detection_is_not_a_startup_problem(monkeypatch) -> None:
     assert not any("PAYOUT_FEE_GARM" in problem for problem in problems)
 
 
+@pytest.mark.parametrize(
+    ("network", "url"),
+    [
+        ("mainnet", "https://ton.org/testnet-global.config.json"),
+        ("testnet", "https://ton.org/global.config.json"),
+    ],
+)
+def test_liteserver_config_of_the_wrong_network_blocks_boot(
+    monkeypatch, network: str, url: str
+) -> None:
+    """Лайтсерверы чужой сети останавливают старт, а не ломают выплаты молча.
+
+    LITESERVER_CONFIG_URL подставляется в pytoniq с приоритетом над TON_NETWORK.
+    mainnet с тестнетовым конфигом читает seqno казначея на testnet-нодах:
+    выплата подписывается неверным seqno, возвращает result == 1, помечается
+    sent, пять раз ретраится и уходит в dead-letter. Игрокам не платят вообще,
+    а /health зелёный — кроме невыплаченных денег ошибка нигде не видна.
+    """
+    monkeypatch.setattr(main_module.settings, "bot_token", "t")
+    monkeypatch.setattr(main_module.settings, "admin_ids", "42")
+    monkeypatch.setattr(main_module.settings, "ton_network", network)
+    monkeypatch.setattr(main_module.settings, "liteserver_config_url", url)
+
+    problems = main_module.validate_config()
+
+    assert any("LITESERVER_CONFIG_URL" in problem for problem in problems), problems
+
+
+def test_liteserver_config_of_own_network_is_accepted(monkeypatch) -> None:
+    """Совпадение сети и конфига лайтсерверов — не проблема."""
+    monkeypatch.setattr(main_module.settings, "bot_token", "t")
+    monkeypatch.setattr(main_module.settings, "admin_ids", "42")
+    monkeypatch.setattr(main_module.settings, "health_require_token", False)
+    monkeypatch.setattr(main_module.settings, "ton_enabled", False)
+    monkeypatch.setattr(main_module.settings, "ton_network", "mainnet")
+    monkeypatch.setattr(
+        main_module.settings, "liteserver_config_url", "https://ton.org/global.config.json"
+    )
+
+    problems = main_module.validate_config()
+
+    assert not any("LITESERVER_CONFIG_URL" in problem for problem in problems), problems
+
+
 async def test_main_runs_webhook_mode(monkeypatch) -> None:
     monkeypatch.setattr(main_module, "validate_config", Mock(return_value=[]))
     monkeypatch.setattr(main_module, "Path", lambda value: SimpleNamespace(mkdir=Mock()))

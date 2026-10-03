@@ -189,6 +189,15 @@ def validate_config() -> list[str]:
             "/health закрыт для всех (включая self-ping и чек живости Render). "
             "Задай HEALTH_TOKEN либо выключи HEALTH_REQUIRE_TOKEN."
         )
+    liteserver_mismatch = settings.liteserver_network_mismatch()
+    if liteserver_mismatch:
+        problems.append(
+            f"{liteserver_mismatch}. URL лайтсерверов подставляется с приоритетом над "
+            f"TON_NETWORK: seqno казначея будет читаться на нодах чужой сети, выплаты "
+            "подпишутся неверным seqno и уйдут в dead-letter. Для mainnet нужен "
+            "https://ton.org/global.config.json, для testnet — "
+            "https://ton.org/testnet-global.config.json."
+        )
     if getattr(settings, "ton_enabled", False):
         if not settings.active_treasury_address:
             problems.append(

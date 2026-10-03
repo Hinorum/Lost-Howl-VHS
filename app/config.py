@@ -159,7 +159,13 @@ class Settings(BaseSettings):
     # призового пула ЗАРАНЕЕ и пропорционально доле каждого победителя:
     # приз приходит «чистыми», казначей не финансирует газ из своего остатка,
     # и очередь выплат не встаёт на середине дня с «недостаточно средств».
-    payout_fee_gram: float = 0.005
+    #
+    # Значение обязано совпадать с PAYOUT_FEE_GRAM в render.yaml: прод видит
+    # рычаг только оттуда, а расхождение означало бы, что один и тот же газ
+    # считается в коде и на деплое по-разному. Равенство проверяет
+    # tests/test_money_config_parity.py. Само число берётся замером на testnet
+    # (5–10 переводов A→B, среднее × 1.15, вверх) — см. MAINNET_READINESS.md.
+    payout_fee_gram: float = 0.002
     # Перевод меньше этой суммы (Gram) не создаётся вовсе: комиссия съела бы
     # большую его часть. Пыльные доли капают в копилку недели — видно в итогах.
     min_payout_gram: float = 0.02
@@ -336,6 +342,32 @@ class Settings(BaseSettings):
     @property
     def is_testnet(self) -> bool:
         return self.ton_network.strip().lower() == "testnet"
+
+    def liteserver_network_mismatch(self) -> str | None:
+        """Конфиг лайтсерверов не про ту сеть, что выбрана — вернуть причину.
+
+        LITESERVER_CONFIG_URL подставляется в pytoniq с приоритетом над выбором
+        сети, поэтому конфиг testnet при TON_NETWORK=mainnet означает, что
+        get_seqno() читает seqno mainnet-адреса на testnet-нодах. Выплата
+        подписывается неверным seqno, result == 1, строка помечается sent,
+        пять раз ретраится и уходит в dead-letter: игрокам не платят вообще,
+        а /health зелёный. Пересечение сети с сетью ловим на старте.
+        """
+        url = (self.liteserver_config_url or "").strip().lower()
+        if not url:
+            return None
+        url_looks_testnet = "testnet" in url or "sandbox" in url
+        if self.is_testnet and not url_looks_testnet:
+            return (
+                "TON_NETWORK=testnet, а LITESERVER_CONFIG_URL не похож на тестнетовый "
+                f"({self.liteserver_config_url})"
+            )
+        if not self.is_testnet and url_looks_testnet:
+            return (
+                "TON_NETWORK=mainnet, а LITESERVER_CONFIG_URL указывает на тестнет "
+                f"({self.liteserver_config_url})"
+            )
+        return None
 
     @property
     def active_treasury_address(self) -> str:
