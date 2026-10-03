@@ -189,6 +189,16 @@ def validate_config() -> list[str]:
             "/health закрыт для всех (включая self-ping и чек живости Render). "
             "Задай HEALTH_TOKEN либо выключи HEALTH_REQUIRE_TOKEN."
         )
+    if settings.admin_ids.strip() and settings.database_url.startswith("sqlite") and not settings.allow_sqlite:
+        problems.append(
+            "DATABASE_URL указывает на SQLite, а ADMIN_IDS заданы — это продакшен-режим, "
+            "и он ломает две вещи сразу. advisory-лок (scheduler_lock) на SQLite "
+            "не работает, то есть ничто не мешает подняться второму инстансу: два "
+            "процесса делят очередь выплат и могут разослать историю дважды. И база "
+            "лежит на эфемерном диске контейнера, то есть пропадает при каждом "
+            "деплое вместе с журналом выплат. Укажи PostgreSQL в DATABASE_URL; если "
+            "SQLite нужен намеренно (локально, в тестах) — поставь ALLOW_SQLITE=true."
+        )
     liteserver_mismatch = settings.liteserver_network_mismatch()
     if liteserver_mismatch:
         problems.append(

@@ -108,10 +108,14 @@ async def test_reset_refuses_while_payouts_pending(
 
 
 def test_validate_config_ok_when_minimal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Тесты ходят по SQLite законно, поэтому явное разрешение обязано быть:
+    # при ADMIN_IDS без PostgreSQL старт запрещён (advisory-лок на SQLite
+    # не работает). Проверяется это отдельно в test_main_boot.py.
     monkeypatch.setattr(settings, "bot_token", "123:token")
     monkeypatch.setattr(settings, "admin_ids", "42")
     monkeypatch.setattr(settings, "ton_enabled", False)
     monkeypatch.setattr(settings, "health_token", "s3cret")
+    monkeypatch.setattr(settings, "allow_sqlite", True)
     assert main_module.validate_config() == []
 
 

@@ -18,9 +18,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from pydantic import ValidationError
 
 from app import main as main_module
-from app.config import settings
+from app.config import Settings, settings
 
 RAW = "0:" + "ab" * 32
 
@@ -501,6 +502,61 @@ def test_liteserver_config_of_own_network_is_accepted(monkeypatch) -> None:
     problems = main_module.validate_config()
 
     assert not any("LITESERVER_CONFIG_URL" in problem for problem in problems), problems
+
+
+def test_sqlite_with_admins_blocks_boot(monkeypatch) -> None:
+    """SQLite при непустых ADMIN_IDS ломает advisory-лок — старт запрещён.
+
+    scheduler_lock на не-Postgres отдаёт True без блокировки («а как же один
+    процесс?»), поэтому второй инстанс поднимается свободно: два процесса
+    делят очередь выплат и могут разослать историю дважды. Это не гипотеза:
+    Render однажды поднял старый билд, спавший от лимита аккаунта. Плюс база
+    на эфемерном диске пропадает вместе с контейнером.
+    """
+    monkeypatch.setattr(main_module.settings, "bot_token", "t")
+    monkeypatch.setattr(main_module.settings, "admin_ids", "42")
+    monkeypatch.setattr(main_module.settings, "health_require_token", False)
+    monkeypatch.setattr(main_module.settings, "ton_enabled", False)
+    monkeypatch.setattr(main_module.settings, "database_url", "sqlite+aiosqlite:///./data/x.db")
+    monkeypatch.setattr(main_module.settings, "allow_sqlite", False)
+
+    problems = main_module.validate_config()
+
+    assert any("SQLite" in problem for problem in problems), problems
+
+
+def test_sqlite_allowed_explicitly(monkeypatch) -> None:
+    """Локальная разработка и тесты живут на SQLite законно."""
+    monkeypatch.setattr(main_module.settings, "bot_token", "t")
+    monkeypatch.setattr(main_module.settings, "admin_ids", "42")
+    monkeypatch.setattr(main_module.settings, "health_require_token", False)
+    monkeypatch.setattr(main_module.settings, "ton_enabled", False)
+    monkeypatch.setattr(main_module.settings, "database_url", "sqlite+aiosqlite:///./data/x.db")
+    monkeypatch.setattr(main_module.settings, "allow_sqlite", True)
+
+    problems = main_module.validate_config()
+
+    assert not any("SQLite" in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize("typo", ["testnt", "mainnet-test", "dev", "MAINET", ""])
+def test_ton_network_typo_cannot_boot_as_mainnet(typo: str) -> None:
+    """Опечатка в TON_NETWORK обязана валить конфиг, а не включать mainnet.
+
+    Со строкой вместо перечисления is_testnet это `== "testnet"`, то есть
+    любое другое значение — mainnet: с настоящей 24-словной мнемоникой,
+    адресом казначея mainnet и выплатами реальными деньгами. Проверка при
+    старте сеть не ловила вовсе.
+    """
+    if typo == "":
+        # Пустое значение — тоже не сеть: pydantic отвергает, а не угадывает.
+        with pytest.raises(ValidationError):
+            Settings(ton_network=typo)
+        return
+    with pytest.raises(ValidationError):
+        Settings(ton_network=typo)
+    assert Settings(ton_network="mainnet").is_testnet is False
+    assert Settings(ton_network="testnet").is_testnet is True
 
 
 async def test_main_runs_webhook_mode(monkeypatch) -> None:

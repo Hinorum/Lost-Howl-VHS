@@ -1,8 +1,16 @@
 import ssl
 from pathlib import Path
+from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Сеть строго перечислением, а не строкой. Со строкой любая опечатка
+# (testnt, mainnet-test, dev) молча разрешалась как mainnet — с настоящей
+# 24-словной мнемоникой, real-адресом казначея и выплатами игрокам. Проверки
+# при старте сеть не ловили: is_testnet это `== "testnet"`, то есть всё
+# остальное — mainnet. С Literal опечатка валит импорт конфига сразу.
+TonNetwork = Literal["mainnet", "testnet"]
 
 LIBPQ_QUERY_KEYS = {
     "sslmode",
@@ -65,13 +73,20 @@ class Settings(BaseSettings):
     # инлайн-генерация нового дня и пост).
     day_close_hour_utc: int = 11
     database_url: str = "sqlite+aiosqlite:///./data/the_way.db"
+    # Явное разрешение жить на SQLite при непустых ADMIN_IDS. Нужно локально и в
+    # тестах. На деплое с настоящими админами SQLite означает, что
+    # pg_try_advisory_lock не работает (scheduler_lock.py отдаёт True «а как же
+    # один процесс?»), то есть гарантия единственного инстанта исчезает ровно
+    # тогда, когда нужна: два инстанса делят кассу и рассылают историю дважды.
+    # Плюс база лежит на эфемерном диске и пропадает вместе с контейнером.
+    allow_sqlite: bool = False
     # Путь к PEM-файлу корневого CA для Postgres (Supabase пулер). Пусто — стандартные CA.
     database_ca: str = ""
     timezone: str = "Europe/Moscow"
     media_dir: str = "./media/generated"
 
     ton_enabled: bool = False
-    ton_network: str = "mainnet"
+    ton_network: TonNetwork = "mainnet"
     treasury_address: str = ""
     treasury_mnemonic: str = ""
     treasury_testnet_address: str = ""
