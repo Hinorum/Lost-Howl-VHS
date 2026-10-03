@@ -60,12 +60,16 @@ class Page:
     (см. _deep_collect).
     requested — сколько строк просили; у провайдеров разный потолок, поэтому
     сравнивать надо с тем, что именно запрашивалось.
+    next_cursor — курсор следующей страницы САМОГО провайдера: у TonAPI это lt
+    самой старой строки, у Toncenter v3 — смещение offset. Провайдеры
+    пагинируют по-разному, поэтому курсор вычисляет источник, а не общий цикл.
     """
 
     transfers: list[Transfer]
     state: str
     raw_count: int = 0
     requested: int = 0
+    next_cursor: str | None = None
 
 
 class PassResult(NamedTuple):
@@ -136,7 +140,10 @@ async def fetch_recent_transfers_page(
         transfer = _parse_tx_item(item, since_utime)
         if transfer is not None:
             transfers.append(transfer)
-    return Page(transfers, _PAGE_OK, len(items), _PAGE_LIMIT)
+    # Курсор следующей страницы — lt самой старой строки: /v2/blockchain/...
+    # offset не понимает и режет выборку только before_lt.
+    next_cursor = str(items[-1].get("lt") or "") if items else None
+    return Page(transfers, _PAGE_OK, len(items), _PAGE_LIMIT, next_cursor or None)
 
 
 async def _resolve_tonapi_empty_history(since_utime: int) -> tuple[list[Transfer], bool]:
@@ -281,12 +288,20 @@ def _parse_toncenter_item(item: dict, since_utime: int) -> Transfer | None:
 
 _TONCENTER_MAX_LIMIT = 256
 
-async def _toncenter_page(since_utime: int, before_lt: str | None = None) -> Page:
+async def _toncenter_page(since_utime: int, offset: str | None = None) -> Page:
     """Страница переводов казначея через Toncenter API v3 (фолбэк TonAPI).
 
     Контракт как у fetch_recent_transfers_page, но с состоянием страницы
     (_PAGE_OK/_PAGE_DEGRADED): фолбэк вызывается, только когда основной
-    источник деградировал. Пагинация вглубь по before_lt.
+    источник деградировал.
+
+    Пагинация вглубь идёт СМЕЩЕНИЕМ offset, а не before_lt: Toncenter v3
+    параметр before_lt молча игнорирует (проверено на testnet — ни before_lt,
+    ни after_lt, ни before не меняют страницу; приходит одна и та же свежая
+    страница). Старый код слал before_lt и сюда, поэтому при упавшем TonAPI
+    фолбэк перезапрашивал одну и ту же страницу, а цикл считал проход полным
+    после первой: окно входящих молча усекалось до 100 транзакций ровно
+    тогда, когда фолбэк был нужен. offset по сортировке desc v3 режет честно.
     """
     if not settings.ton_enabled or not settings.active_treasury_address:
         return Page([], _PAGE_OK, 0, 0)
@@ -297,8 +312,12 @@ async def _toncenter_page(since_utime: int, before_lt: str | None = None) -> Pag
         "limit": requested,
         "sort": "desc",
     }
-    if before_lt:
-        params["before_lt"] = before_lt
+    try:
+        shift = max(0, int(offset)) if offset else 0
+    except (TypeError, ValueError):
+        shift = 0
+    if shift:
+        params["offset"] = shift
     try:
         client = _pkg.get_http_client()
         hdr = _pkg._api_headers(settings.toncenter_api_key)
@@ -313,7 +332,13 @@ async def _toncenter_page(since_utime: int, before_lt: str | None = None) -> Pag
         transfer = _parse_toncenter_item(item, since_utime)
         if transfer is not None:
             transfers.append(transfer)
-    return Page(transfers, _PAGE_OK, len(items), requested)
+    return Page(
+        transfers,
+        _PAGE_OK,
+        len(items),
+        requested,
+        next_cursor=str(shift + len(items)),
+    )
 
 _PAGE_OK = "ok"
 
@@ -340,7 +365,6 @@ async def _tonapi_page(since_utime: int, before_lt: str | None) -> Page:
 
 async def _deep_collect(
     fetch_page,
-    cursor_of,
     since: int,
     max_pages: int | None = None,
 ) -> PassResult:
@@ -367,6 +391,7 @@ async def _deep_collect(
     before: str | None = None
     empty_pages = 0
     floor_utime: int | None = None
+    prev_window: tuple[str, str] | None = None
     for _page in range(max_pages or _MAX_PAGES):
         page = await fetch_page(since, before)
         if page.state != _PAGE_OK:
@@ -400,6 +425,22 @@ async def _deep_collect(
             if floor_utime is not None:
                 return PassResult(transfers, True, False, floor_utime)
             return PassResult(transfers, False, False, None)
+        # Провайдер, который не двигает курсор (параметр пагинации молча
+        # игнорируется), приносит ту же самую страницу снова и снова. Раньше
+        # это выглядело как «две страницы подряд без новых переводов» —
+        # то есть как успех, и курсор уезжал в голову, обрезая окно. Такое
+        # состояние — не конец истории, а деградация: помечаем проход
+        # ненадёжным, чтобы цикл не сдвинул курсор и поднял тревогу.
+        window = (transfers_page[0].tx_hash, transfers_page[-1].tx_hash)
+        if window == prev_window:
+            logger.warning(
+                "Провайдер вернул ту же страницу [%s..%s] — курсор пагинации не "
+                "двигается, проход прерван",
+                window[0][:12],
+                window[1][:12],
+            )
+            return PassResult(transfers, False, False, floor_utime)
+        prev_window = window
         oldest = transfers_page[-1]
         if oldest.utime <= since:
             return PassResult(transfers, True, True, floor_utime)  # страница дотянулась до курсора
@@ -409,7 +450,10 @@ async def _deep_collect(
                 return PassResult(transfers, True, True, floor_utime)  # подряд страницы без новых переводов
         else:
             empty_pages = 0
-        before = cursor_of(transfers_page)
+        if page.next_cursor is None:
+            # Источник не умеет вести нас вглубь — продолжать бессмысленно.
+            return PassResult(transfers, True, False, floor_utime)
+        before = page.next_cursor
         await asyncio.sleep(0.12)  # бережём лимиты API на глубоком проходе
     # Бюджет страниц исчерпан, курсор не достигнут: окно ниже floor_utime не
     # прочитано. Это дыра, а не полный проход — вызывающий обязан её учесть.
@@ -448,16 +492,12 @@ async def _collect_transfers(
     # «оба индексатора лежат»), и подмена обязана дойти до этого цикла.
     from app.ton_watch import _tonapi_page, _toncenter_page
 
-    primary = await _deep_collect(
-        _tonapi_page, lambda page: page[-1].provider_ref or page[-1].tx_hash, since, max_pages
-    )
+    primary = await _deep_collect(_tonapi_page, since, max_pages)
     if primary.complete:
         return primary.transfers, True, "tonapi", None
     if not primary.reliable:
         _warn_degraded_primary()
-    fallback = await _deep_collect(
-        _toncenter_page, lambda page: page[-1].provider_ref or page[-1].tx_hash, since, max_pages
-    )
+    fallback = await _deep_collect(_toncenter_page, since, max_pages)
     merged = _merge_unique([primary.transfers, fallback.transfers])
     if fallback.complete:
         return merged, True, "toncenter", None

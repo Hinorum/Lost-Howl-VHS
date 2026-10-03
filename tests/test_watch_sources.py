@@ -151,7 +151,6 @@ async def test_tonapi_pagination_walks_by_lt(monkeypatch: pytest.MonkeyPatch) ->
 
     result = await ton_watch._deep_collect(
         ton_watch._tonapi_page,
-        lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
@@ -406,7 +405,6 @@ async def test_jetton_in_full_page_does_not_end_history(monkeypatch: pytest.Monk
 
     result = await ton_watch._deep_collect(
         ton_watch._tonapi_page,
-        lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
@@ -426,7 +424,6 @@ async def test_short_raw_page_ends_history(monkeypatch: pytest.MonkeyPatch) -> N
 
     result = await ton_watch._deep_collect(
         ton_watch._tonapi_page,
-        lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
@@ -450,7 +447,6 @@ async def test_page_eaten_by_filters_is_not_a_complete_pass(monkeypatch: pytest.
 
     result = await ton_watch._deep_collect(
         ton_watch._tonapi_page,
-        lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
@@ -471,7 +467,6 @@ async def test_page_eaten_by_filters_without_floor_is_unreliable(
 
     result = await ton_watch._deep_collect(
         ton_watch._tonapi_page,
-        lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
@@ -511,8 +506,16 @@ def test_tx_hash_normalized_across_providers() -> None:
 # ---------- Пагинация фолбэка ----------
 
 
-async def test_toncenter_pagination_walks_by_lt(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Полная страница уводит проход вглубь с курсором before_lt."""
+async def test_toncenter_pagination_walks_by_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Полная страница уводит фолбэк вглубь СМЕЩЕНИЕМ, а не before_lt.
+
+    Toncenter v3 параметр before_lt молча игнорирует — по нему приходит одна
+    и та же свежая страница. Старый код слал before_lt и сюда, поэтому при
+    упавшем TonAPI фолбэк перезапрашивал одну страницу и объявлял проход
+    полным: окно входящих молча усекалось ровно тогда, когда фолбэк был
+    нужен. Курсор фолбэка — offset по сортировке desc, который v3 режет честно
+    (проверено на testnet, см. treasury_mirror._fetch_page).
+    """
     limit = ton_watch._PAGE_LIMIT
     page_one = [_v3_tx(2000 - index, to_nano(0.01)) for index in range(limit)]
     page_two = [_v3_tx(1500, to_nano(0.02)), _v3_tx(1400, to_nano(0.03))]
@@ -523,7 +526,6 @@ async def test_toncenter_pagination_walks_by_lt(monkeypatch: pytest.MonkeyPatch)
 
     result = await ton_watch._deep_collect(
         ton_watch._toncenter_page,
-        lambda page: page[-1].provider_ref or page[-1].tx_hash,
         1000,
     )
 
@@ -532,6 +534,56 @@ async def test_toncenter_pagination_walks_by_lt(monkeypatch: pytest.MonkeyPatch)
     v3_calls = [params for url, params in calls if _V3 in url]
     assert len(v3_calls) == 2
     assert v3_calls[0]["account"] == TREASURY
+    # before_lt фолбэку не шлём вовсе — он его игнорирует.
     assert "before_lt" not in v3_calls[0]
-    # Курсор второй страницы — младший lt первой (страница отсортирована desc).
-    assert v3_calls[1]["before_lt"] == page_one[-1]["lt"]
+    assert "offset" not in v3_calls[0]
+    assert v3_calls[1]["offset"] == limit
+
+
+async def test_toncenter_fallback_reads_deep_before_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Фолбэк обходит несколько страниц вглубь, а не читает одну и хватит.
+
+    Сценарий деградации TonAPI: фолбэк обязан дойти до курсора, иначе
+    незакрытые старые дни не будут прочитаны.
+    """
+    _fast_pace(monkeypatch)
+    limit = ton_watch._PAGE_LIMIT
+    pages = [
+        _Response(
+            200,
+            {"transactions": [_v3_tx(5000 - page * limit - index, to_nano(0.01)) for index in range(limit)]},
+        )
+        for page in range(3)
+    ]
+    pages.append(_Response(200, {"transactions": [_v3_tx(1500, to_nano(0.02))]}))
+    install_http(monkeypatch, {_V3: pages})
+
+    result = await ton_watch._deep_collect(ton_watch._toncenter_page, 1000)
+
+    assert result.complete is True
+    assert len(result.transfers) == 3 * limit + 1
+
+
+async def test_provider_ignoring_cursor_is_unreliable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Провайдер, отдающий одну и ту же страницу, проходом полным не считается.
+
+    Отличить «конец истории» от «параметр пагинации игнорируется» по коду
+    нельзя: обе картины дают страницы без новых переводов. Разница в том, что
+    при залипании двигаться дальше бессмысленно, а объявлять проход полным —
+    значит увести курсор в голову и обрезать окно. Поэтому проход
+    ненадёжен: цикл не сдвинет курсор и поднимет тревогу.
+    """
+    limit = ton_watch._PAGE_LIMIT
+    _fast_pace(monkeypatch)
+    same = [_v3_tx(2000 - index, to_nano(0.01)) for index in range(limit)]
+    install_http(
+        monkeypatch,
+        {_V3: [_Response(200, {"transactions": same}) for _ in range(4)]},
+    )
+
+    result = await ton_watch._deep_collect(ton_watch._toncenter_page, 1000)
+
+    assert result.reliable is False
+    assert result.complete is False
