@@ -19,7 +19,7 @@ import logging
 import time
 
 from app.config import settings
-from app.ton_codec import api_headers, extract_comment
+from app.ton_codec import extract_comment, tonapi_headers
 
 from . import state as _state
 
@@ -70,7 +70,14 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
         f"{settings.active_ton_api_base}/v2/blockchain/accounts/"
         f"{settings.active_treasury_address}/transactions"
     )
-    headers = api_headers(settings.ton_api_key)
+    # TonAPI ждёт Authorization: Bearer; X-API-Key он не считает вовсе и тихо
+    # переводит запрос в анонимный режим, где /v2/blockchain режет страницу до
+    # 100 записей при запрошенных 256. Тогда цикл ниже видит короткую страницу и
+    # выходит после первой, а окно сверки схлопывается с 3072 переводов до 100:
+    # выплата, чей memo вытеснили из окна, объявляется неушедшей и уходит
+    # повторно — уже с новым seqno. Ключ обязан доезжать.
+    headers = tonapi_headers(settings.ton_api_key)
+
     tx_map: dict[str, str] = {}
     cutoff = time.time() - settings.payout_reconcile_history_seconds
     max_pages = max(1, settings.payout_reconcile_max_pages)
@@ -234,7 +241,7 @@ async def fetch_masterchain_entropy() -> str | None:
     candidates = (
         (
             f"{settings.active_ton_api_base}/v2/blockchain/masterchain-head",
-            {"X-API-Key": settings.ton_api_key} if settings.ton_api_key else {},
+            tonapi_headers(settings.ton_api_key),
             lambda data: data,
         ),
         (

@@ -15,7 +15,7 @@ from sqlalchemy import func, or_, select
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Income, Payout, Player, WatcherState
-from app.ton_codec import api_headers
+from app.ton_codec import api_headers, tonapi_headers
 from app.ton_utils import friendly_address, from_nano, normalize_address
 
 from . import state as _state
@@ -31,7 +31,7 @@ async def _tonapi_account_raw(address: str) -> dict:
     import app.ton_pay as _tp
 
     url = f"{settings.active_ton_api_base}/v2/accounts/{address}"
-    headers = api_headers(settings.ton_api_key)
+    headers = tonapi_headers(settings.ton_api_key)
     client = _tp.get_http_client()
     response = await _tp.http_get_with_retry(client, url, headers=headers)
     response.raise_for_status()

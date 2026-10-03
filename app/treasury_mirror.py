@@ -43,7 +43,7 @@ from app.db import SessionLocal
 from app.http_utils import get_http_client, http_get_with_retry
 from app.models import Income, Payout, Stake, TreasuryMove, WatcherState
 from app.payments import parse_bank_memo, parse_revote_memo, parse_verify_memo
-from app.ton_codec import api_headers, extract_comment, norm_tx_hash
+from app.ton_codec import api_headers, extract_comment, norm_tx_hash, tonapi_headers
 from app.ton_utils import normalize_address
 
 logger = logging.getLogger(__name__)
@@ -459,9 +459,13 @@ async def _fetch_page(
                 # стратегия «спускаться к генезису» на нём не работает вовсе.
             elif before_lt is not None:
                 params["before_lt"] = str(before_lt)
-            response = await http_get_with_retry(
-                client, url, params=params, headers=api_headers(api_key)
-            )
+            # Заголовок — по провайдеру: TonAPI ждёт Bearer, Toncenter X-API-Key.
+            # Общий api_headers() слал обоим X-API-Key, и TonAPI тихо уходил в
+            # анонимный режим, где /v2/blockchain режет страницу до 100 записей:
+            # бутстрап зеркала, спускающийся от головы к генезису, обрывался на
+            # глубине 100 переводов и тишина выглядела как «истории больше нет».
+            headers = tonapi_headers(api_key) if kind == "tonapi" else api_headers(api_key)
+            response = await http_get_with_retry(client, url, params=params, headers=headers)
             response.raise_for_status()
             payload = response.json()
             items = payload.get("transactions") if isinstance(payload, dict) else None
