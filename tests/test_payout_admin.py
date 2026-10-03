@@ -86,6 +86,104 @@ async def test_stash_refund_skips_ancient_transfers(
     assert len(rows) == 1 and rows[0].tx_hash == "fresh"
 
 
+async def test_refund_cap_stops_sender_gas_burn(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Потолок авто-возвратов ограничивает сжигание газа казны.
+
+    Каждый авто-возврат — это исходящая транзакция за счёт казны. Адрес
+    публичен, стоимость атаки определяется только суммой присланного, поэтому
+    спам переводов чуть выше refund_min_gram заставлял казну платить газ за
+    каждый: 10 000 переводов по 0.06 Gram — это 10 000 исходящих tx, то есть
+    расход в десятки раз больше присланного.
+
+    Перешагнувший потолок НЕ пропадает: он уходит в ledger и ждёт ручного
+    возврата, а сверка казны с БД продолжает сходиться.
+    """
+    monkeypatch.setattr(settings, "refund_min_gram", 0.05)
+    monkeypatch.setattr(settings, "refund_max_per_sender_day", 3)
+    monkeypatch.setattr(settings, "refund_max_total_day", 100)
+    now = int(datetime.now(UTC).timestamp()) - 60
+    source = "0:" + "ee" * 32
+
+    statuses = []
+    for index in range(6):
+        transfer = Transfer(
+            tx_hash=f"spam-{index}",
+            source=source,
+            value_nanotons=60_000_000,  # 0.06 Gram — выше порога пыли
+            comment="",
+            utime=now + index,
+        )
+        statuses.append(await _stash_refund(session, transfer, None))
+
+    assert statuses[:3] == ["refund_queued"] * 3
+    assert statuses[3:] == ["refund_capped"] * 3, statuses
+    rows = (await session.execute(select(Payout))).scalars().all()
+    assert len(rows) == 3, "после потолка возвраты создаваться не должны"
+    # Деньги не пропали: каждый перешагнувший перевод учтён в ledger.
+    ledgered = (
+        await session.execute(select(Income).where(Income.note.like("in:refund_cap%")))
+    ).scalars().all()
+    assert len(ledgered) == 3
+
+
+async def test_refund_cap_global_limit(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Общий потолок срабатывает и для разных отправителей.
+
+    Лимит на отправителя обходится пачкой кошельков, поэтому нужен и общий
+    потолок на сутки: иначе атака распределяется по тысяче адресов.
+    """
+    monkeypatch.setattr(settings, "refund_min_gram", 0.05)
+    monkeypatch.setattr(settings, "refund_max_per_sender_day", 0)
+    monkeypatch.setattr(settings, "refund_max_total_day", 4)
+    now = int(datetime.now(UTC).timestamp()) - 60
+
+    statuses = []
+    for index in range(7):
+        transfer = Transfer(
+            tx_hash=f"spread-{index}",
+            source="0:" + f"{index:02x}" * 32,
+            value_nanotons=60_000_000,
+            comment="",
+            utime=now + index,
+        )
+        statuses.append(await _stash_refund(session, transfer, None))
+
+    assert statuses[:4] == ["refund_queued"] * 4
+    assert statuses[4:] == ["refund_capped"] * 3, statuses
+
+
+async def test_refund_cap_zero_disables_protection(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0 = лимита нет: осознанный отказ, а не «забыли посчитать»."""
+    monkeypatch.setattr(settings, "refund_min_gram", 0.05)
+    monkeypatch.setattr(settings, "refund_max_per_sender_day", 0)
+    monkeypatch.setattr(settings, "refund_max_total_day", 0)
+    now = int(datetime.now(UTC).timestamp()) - 60
+    source = "0:" + "ab" * 32
+
+    statuses = [
+        await _stash_refund(
+            session,
+            Transfer(
+                tx_hash=f"free-{index}",
+                source=source,
+                value_nanotons=60_000_000,
+                comment="",
+                utime=now + index,
+            ),
+            None,
+        )
+        for index in range(8)
+    ]
+
+    assert statuses == ["refund_queued"] * 8
+
+
 async def test_stash_refund_skips_dust_below_threshold(
     session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

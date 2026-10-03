@@ -132,6 +132,21 @@ async def _clean_watcher_state_between_tests():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _refund_caps_off(monkeypatch):
+    """Потолки авто-возвратов выключены по умолчанию.
+
+    Лимиты считаются по реальным строкам выплат за сутки, а тесты живут в общей
+    БД: модуль, насыпавший возвратов, исчерпал бы потолок для всех остальных, и
+    тест падал бы не из-за своей логики, а из-за порядка прогона. Тесты самих
+    потолков включают их явно (test_payout_admin.py).
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "refund_max_per_sender_day", 0)
+    monkeypatch.setattr(settings, "refund_max_total_day", 0)
+
+
 @pytest.fixture
 async def session(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")

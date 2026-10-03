@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import settings
 from app.models import Income, Payout, Stake
@@ -17,6 +17,47 @@ from app.ton_watch.ledger import _ledger_stuck_incoming
 from app.ton_watch.sources import Transfer
 
 logger = logging.getLogger(__name__)
+
+
+async def _refund_cap_reason(session, source: str) -> str | None:
+    """Почему авто-возврат не создаётся из-за потолка, иначе None.
+
+    Считаем уже созданные сегодня возвраты по таблице выплат, а не по
+    счётчику в watcher_state: источник истины один, он переживает уборку
+    watcher_state и отражает ровно то, ради чего потолок и нужен — сколько
+    исходящих транзакций казна уже обещала отдать.
+    """
+    sender_limit = max(0, settings.refund_max_per_sender_day)
+    total_limit = max(0, settings.refund_max_total_day)
+    if sender_limit == 0 and total_limit == 0:
+        return None
+    since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    network = current_network()
+    day_start = {
+        Payout.kind == "refund",
+        Payout.network == network,
+        Payout.created_at >= since,
+    }
+    if total_limit:
+        total_today = (
+            await session.execute(
+                select(func.count()).select_from(Payout).where(*day_start)
+            )
+        ).scalar_one()
+        if int(total_today or 0) >= total_limit:
+            return f"refund_cap_total:{total_today}"
+    if sender_limit and source:
+        sender_today = (
+            await session.execute(
+                select(func.count())
+                .select_from(Payout)
+                .where(*day_start, Payout.dest_address == source)
+            )
+        ).scalar_one()
+        if int(sender_today or 0) >= sender_limit:
+            return f"refund_cap_sender:{sender_today}"
+    return None
+
 
 async def _stash_refund(
     session,
@@ -43,6 +84,10 @@ async def _stash_refund(
     пыль не возвращается (газ дороже), НО это верно для анонимного спама;
     известный отправитель (привязанный игрок, неудачная верификация кошелька)
     должен получить свои копейки назад — иначе деньги пропадают молча.
+
+    Потолок авто-возвратов (refund_max_per_sender_day / refund_max_total_day)
+    применяется и к force-пути: сжигание газа казны ограничивает не тип
+    перевода, а количество исходящих транзакций.
     """
     age_days = (datetime.now(UTC).timestamp() - transfer.utime) / 86_400
     if age_days > max(0, settings.watch_refund_max_age_days):
@@ -103,6 +148,22 @@ async def _stash_refund(
     # (payouts.tx_hash не уникален), проигравший уйдёт без изменения данных.
     if not await claim_once(session, f"refund:{transfer.tx_hash}"):
         return "refund_duplicated"
+    # Потолок авто-возвратов. Проверка после claim_once, чтобы два инстанса не
+    # создавали по одному возврату на перевод, но до создания выплаты: перешагнувший
+    # потолок перевод уходит в ledger и ждёт ручного возврата, а не исчезает.
+    capped = await _refund_cap_reason(session, transfer.source or "")
+    if capped is not None:
+        logger.warning(
+            "Перевод %s на %s Gram не возвращён автоматически: %s. Деньги в казне, "
+            "верни вручную (/incoming, /adjust).",
+            transfer.tx_hash[:16],
+            f"{from_nano(transfer.value_nanotons):g}",
+            capped,
+        )
+        await _ledger_stuck_incoming(
+            session, transfer, ledger_player_id, capped.split(":")[0]
+        )
+        return "refund_capped"
     session.add(
         Payout(
             round_id=round_id,
