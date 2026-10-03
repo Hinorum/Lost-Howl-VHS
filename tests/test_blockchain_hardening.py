@@ -31,6 +31,16 @@ from app.models import Payout, Player, Round, RoundStatus, Stake, Vote, WatcherS
 from app.ton_utils import to_nano
 
 
+def _source_page(transfers):
+    """Страница источника в текущем контракте: сырой размер = числу строк."""
+    return ton_watch.Page(
+        list(transfers),
+        ton_watch._PAGE_OK,
+        len(transfers),
+        ton_watch._PAGE_LIMIT,
+    )
+
+
 async def _closed_round(session: AsyncSession, winner_card: int = 0, day_index: int = 1) -> Round:
     now = datetime.now(UTC)
     round_row = Round(
@@ -187,7 +197,7 @@ async def test_watch_stores_stuck_and_keeps_cursor(monkeypatch: pytest.MonkeyPat
     bad = ton_watch.Transfer("badx-1", "0:" + "aa" * 32, to_nano(0.2), "", base)
     good = ton_watch.Transfer("goodx-1", "0:" + "bb" * 32, to_nano(0.2), "", base + 1)
     monkeypatch.setattr(
-        ton_watch, "fetch_recent_transfers", AsyncMock(return_value=([good, bad], True))
+        ton_watch, "fetch_recent_transfers_page", AsyncMock(return_value=_source_page([good, bad]))
     )
 
     async def exploding(transfer, bot=None):
@@ -223,10 +233,10 @@ async def test_stuck_clears_after_success(monkeypatch: pytest.MonkeyPatch) -> No
     tx = ton_watch.Transfer("retry-1", "0:" + "cc" * 32, to_nano(0.2), "", base + 2)
 
     async def fetch(_since, before_lt=None):
-        return ([tx], True)
+        return _source_page([tx])
 
     calls = {"fail": True}
-    monkeypatch.setattr(ton_watch, "fetch_recent_transfers", fetch)
+    monkeypatch.setattr(ton_watch, "fetch_recent_transfers_page", fetch)
 
     async def flaky(transfer, bot=None):
         if calls["fail"]:

@@ -101,6 +101,7 @@ from app.ton_watch.sources import (  # noqa: F401
     _PAGE_LIMIT,
     _PAGE_OK,
     _TONCENTER_MAX_LIMIT,
+    Page,
     PassResult,
     Transfer,
     _collect_transfers,
@@ -114,7 +115,7 @@ from app.ton_watch.sources import (  # noqa: F401
     _tonapi_page,
     _toncenter_page,
     _warn_degraded_primary,
-    fetch_recent_transfers,
+    fetch_recent_transfers_page,
 )
 from app.ton_watch.state import (  # noqa: F401
     _CURSOR_FALLBACK_HOURS,

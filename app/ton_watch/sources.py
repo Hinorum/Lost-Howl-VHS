@@ -50,6 +50,24 @@ class Transfer:
     provider_ref: str = ""
 
 
+@dataclass
+class Page:
+    """Страница переводов от провайдера вместе с её СЫРЫМ размером.
+
+    raw_count — сколько строк провайдер отдал на самом деле, ДО фильтров
+    парсера (jetton, value<=0, старые по utime). Именно по нему решается,
+    что история кончилась: длина отфильтрованного списка для этого не годится
+    (см. _deep_collect).
+    requested — сколько строк просили; у провайдеров разный потолок, поэтому
+    сравнивать надо с тем, что именно запрашивалось.
+    """
+
+    transfers: list[Transfer]
+    state: str
+    raw_count: int = 0
+    requested: int = 0
+
+
 class PassResult(NamedTuple):
     """Итог одного прохода по страницам одного провайдера.
 
@@ -67,23 +85,25 @@ class PassResult(NamedTuple):
     complete: bool
     floor_utime: int | None
 
-async def fetch_recent_transfers(since_utime: int, before_lt: str | None = None) -> tuple[list[Transfer], bool]:
-    """Страница входящих переводов казначея активной сети (новые сверху).
+async def fetch_recent_transfers_page(
+    since_utime: int, before_lt: str | None = None
+) -> Page:
+    """Страница истории казначея от TonAPI вместе с её сырым размером.
 
-    Ошибки сети не поднимают исключение: возвращается (пусто, False), чтобы
-    цикл знал, что проверка не состоялась, и не ставил сердцебиение.
-    before_lt — пагинация вглубь по логическому времени (lt): каждая следующая
-    страница строго старше последнего lt предыдущей.
+    Ошибки сети не поднимают исключение: возвращается страница в состоянии
+    degraded, чтобы цикл знал, что проверка не состоялась, и не ставил
+    сердцебиение. before_lt — пагинация вглубь по логическому времени (lt):
+    каждая следующая страница строго старше последнего lt предыдущей.
 
     Честная работа с 404: раньше «нет истории» считалось здоровьем, и падение
     индексатора TonAPI маскировалось под тихую цепочку (реальный инцидент:
     ставки не находятся, а /health зелёный). Теперь 404 перепроверяется по
     /v2/accounts/{адрес}: если аккаунт активен и у него есть активность после
-    курсора — история TonAPI врёт, цикл считается несостоявшимся (False),
+    курсора — история TonAPI врёт, цикл считается несостоявшимся,
     и _collect_transfers переключается на фолбэк Toncenter v3.
     """
     if not settings.ton_enabled or not settings.active_treasury_address:
-        return [], True
+        return Page([], _PAGE_OK, 0, 0)
     url = (
         f"{settings.active_ton_api_base}/v2/blockchain/accounts/"
         f"{settings.active_treasury_address}/transactions"
@@ -104,18 +124,20 @@ async def fetch_recent_transfers(since_utime: int, before_lt: str | None = None)
         if response.status_code == 404:
             # Пустая история бывает у двух причин: кошелёк правда молчал
             # или индексатор потерял историю. Различаем честно.
-            return await _resolve_tonapi_empty_history(since_utime)
+            transfers, ok = await _resolve_tonapi_empty_history(since_utime)
+            return Page(transfers, _PAGE_OK if ok else _PAGE_DEGRADED, 0, 0)
         response.raise_for_status()
         items = response.json().get("transactions", [])
     except Exception as exc:
         logger.warning("TonAPI недоступен: %s", exc)
-        return [], False
+        return Page([], _PAGE_DEGRADED, 0, 0)
     transfers: list[Transfer] = []
     for item in items:
         transfer = _parse_tx_item(item, since_utime)
         if transfer is not None:
             transfers.append(transfer)
-    return transfers, True
+    return Page(transfers, _PAGE_OK, len(items), _PAGE_LIMIT)
+
 
 async def _resolve_tonapi_empty_history(since_utime: int) -> tuple[list[Transfer], bool]:
     """404 истории транзакций: «правда пусто» или «индекс сломан»?
@@ -259,19 +281,20 @@ def _parse_toncenter_item(item: dict, since_utime: int) -> Transfer | None:
 
 _TONCENTER_MAX_LIMIT = 256
 
-async def _toncenter_page(since_utime: int, before_lt: str | None = None) -> tuple[list[Transfer], str]:
+async def _toncenter_page(since_utime: int, before_lt: str | None = None) -> Page:
     """Страница переводов казначея через Toncenter API v3 (фолбэк TonAPI).
 
-    Контракт как у fetch_recent_transfers, но вместо булева — состояние
-    страницы (_PAGE_OK/_PAGE_DEGRADED): фолбэк вызывается, только когда
-    основной источник деградировал. Пагинация вглубь по before_lt.
+    Контракт как у fetch_recent_transfers_page, но с состоянием страницы
+    (_PAGE_OK/_PAGE_DEGRADED): фолбэк вызывается, только когда основной
+    источник деградировал. Пагинация вглубь по before_lt.
     """
     if not settings.ton_enabled or not settings.active_treasury_address:
-        return [], _PAGE_OK
+        return Page([], _PAGE_OK, 0, 0)
     url = f"{settings.active_toncenter_api_base.rstrip('/')}/api/v3/transactions"
+    requested = min(_PAGE_LIMIT, _TONCENTER_MAX_LIMIT)
     params: dict = {
         "account": settings.active_treasury_address,
-        "limit": min(_PAGE_LIMIT, _TONCENTER_MAX_LIMIT),
+        "limit": requested,
         "sort": "desc",
     }
     if before_lt:
@@ -284,13 +307,13 @@ async def _toncenter_page(since_utime: int, before_lt: str | None = None) -> tup
         items = response.json().get("transactions") or []
     except Exception as exc:
         logger.warning("Toncenter v3 недоступен: %s", exc)
-        return [], _PAGE_DEGRADED
+        return Page([], _PAGE_DEGRADED, 0, 0)
     transfers: list[Transfer] = []
     for item in items:
         transfer = _parse_toncenter_item(item, since_utime)
         if transfer is not None:
             transfers.append(transfer)
-    return transfers, _PAGE_OK
+    return Page(transfers, _PAGE_OK, len(items), requested)
 
 _PAGE_OK = "ok"
 
@@ -309,12 +332,11 @@ def _warn_degraded_primary() -> None:
         "переводы читаются через фолбэк Toncenter v3"
     )
 
-async def _tonapi_page(since_utime: int, before_lt: str | None) -> tuple[list[Transfer], str]:
-    """Адаптер основного источника под единый контракт (список, состояние)."""
-    # fetch_recent_transfers -- через корень пакета: тесты подменяют его
+async def _tonapi_page(since_utime: int, before_lt: str | None) -> Page:
+    """Адаптер основного источника под единый контракт (страница)."""
+    # fetch_recent_transfers_page -- через корень пакета: тесты подменяют его
     # скриптованным источником, и подмена обязана дойти до этого адаптера.
-    transfers, ok = await _pkg.fetch_recent_transfers(since_utime, before_lt=before_lt)
-    return transfers, (_PAGE_OK if ok else _PAGE_DEGRADED)
+    return await _pkg.fetch_recent_transfers_page(since_utime, before_lt=before_lt)
 
 async def _deep_collect(
     fetch_page,
@@ -346,19 +368,39 @@ async def _deep_collect(
     empty_pages = 0
     floor_utime: int | None = None
     for _page in range(max_pages or _MAX_PAGES):
-        page, state = await fetch_page(since, before)
-        if state != _PAGE_OK:
-            return PassResult(transfers, False, False, floor_utime)
-        fresh = [t for t in page if t.tx_hash and t.tx_hash not in seen]
+        page = await fetch_page(since, before)
+        if page.state != _PAGE_OK:
+            return PassResult(page.transfers, False, False, floor_utime)
+        transfers_page = page.transfers
+        fresh = [t for t in transfers_page if t.tx_hash and t.tx_hash not in seen]
         for item in fresh:
             seen.add(item.tx_hash)
         transfers.extend(fresh)
         if fresh:
             page_floor = min(item.utime for item in fresh)
             floor_utime = page_floor if floor_utime is None else min(floor_utime, page_floor)
-        if not page or len(page) < _PAGE_LIMIT:
+        # «История кончилась» решается по СЫРОМУ числу строк от провайдера.
+        # Длина отфильтрованного списка для этого не годится: одна отброшенная
+        # парсером строка (jetton, value<=0, старая по utime) в полной странице
+        # давала complete=True после первой страницы, и цикл коммитил курсор в
+        # голову цепочки — непрочитанный хвост исчезал навсегда, тихо и без
+        # тревоги. Просили у провайдера page.requested, отдал он page.raw_count.
+        if page.raw_count == 0 or page.raw_count < page.requested:
             return PassResult(transfers, True, True, floor_utime)  # история кончилась — глубже пусто
-        oldest = page[-1]
+        if not transfers_page:
+            # Провайдер отдал полную страницу, но фильтры съели её целиком.
+            # Курсор вглубь вывести не из чего, а объявлять проход полным
+            # нельзя тем более. Держим дыру: курсор встанет на floor_utime.
+            # Если дна нет и подать нечего — проход ненадёжен, цикл не встанет.
+            logger.warning(
+                "Страница от провайдера полная (%d строк), но фильтры оставили пусто — "
+                "курсор вглубь вывести не из чего, проход прерван",
+                page.raw_count,
+            )
+            if floor_utime is not None:
+                return PassResult(transfers, True, False, floor_utime)
+            return PassResult(transfers, False, False, None)
+        oldest = transfers_page[-1]
         if oldest.utime <= since:
             return PassResult(transfers, True, True, floor_utime)  # страница дотянулась до курсора
         if not fresh:
@@ -367,7 +409,7 @@ async def _deep_collect(
                 return PassResult(transfers, True, True, floor_utime)  # подряд страницы без новых переводов
         else:
             empty_pages = 0
-        before = cursor_of(page)
+        before = cursor_of(transfers_page)
         await asyncio.sleep(0.12)  # бережём лимиты API на глубоком проходе
     # Бюджет страниц исчерпан, курсор не достигнут: окно ниже floor_utime не
     # прочитано. Это дыра, а не полный проход — вызывающий обязан её учесть.

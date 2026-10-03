@@ -92,6 +92,13 @@ def _api_tx(utime: int, value_nano: int) -> dict:
     }
 
 
+def _api_jetton_tx(utime: int) -> dict:
+    """Транзакция с jetton-уведомлением: парсер обязан её отбросить."""
+    item = _api_tx(utime, to_nano(0.01))
+    item["in_msg"]["opcode"] = "0x7362d09c"
+    return item
+
+
 def _v3_tx(utime: int, value_nano: int, comment: str | None = None) -> dict:
     """Транзакция в формате Toncenter v3."""
     raw = os.urandom(32)
@@ -120,10 +127,11 @@ async def test_tonapi_success_reads_verify_comment(monkeypatch) -> None:
         decoded_body={"text": "bv:ABC123"},
     )
     install_http(monkeypatch, {_HISTORY: [_Response(200, {"transactions": [item]})]})
-    transfers, ok = await ton_watch.fetch_recent_transfers(1000)
-    assert ok is True
-    assert len(transfers) == 1
-    assert transfers[0].comment == "bv:ABC123"
+    page = await ton_watch.fetch_recent_transfers_page(1000)
+    assert page.state == ton_watch._PAGE_OK
+    assert page.raw_count == 1  # провайдер отдал одну строку
+    assert len(page.transfers) == 1
+    assert page.transfers[0].comment == "bv:ABC123"
 
 
 async def test_tonapi_pagination_walks_by_lt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,8 +200,8 @@ async def test_uninitialized_treasury_404_is_healthy(monkeypatch: pytest.MonkeyP
             _V3: [AssertionError("фолбэк не должен вызываться")],
         },
     )
-    transfers, ok = await ton_watch.fetch_recent_transfers(1000)
-    assert ok is True and transfers == []
+    page = await ton_watch.fetch_recent_transfers_page(1000)
+    assert page.state == ton_watch._PAGE_OK and page.transfers == []
     assert any("/api/v3/" not in url for url, _params in calls)
 
 
@@ -208,8 +216,8 @@ async def test_active_account_without_recent_activity_404_is_healthy(
             _ACCOUNT: [_Response(200, {"status": "active", "last_activity": 900})],
         },
     )
-    transfers, ok = await ton_watch.fetch_recent_transfers(1000)
-    assert ok is True and transfers == []
+    page = await ton_watch.fetch_recent_transfers_page(1000)
+    assert page.state == ton_watch._PAGE_OK and page.transfers == []
 
 
 async def test_stale_index_404_is_degraded_and_toncenter_serves(
@@ -272,15 +280,24 @@ async def test_both_sources_down_means_failed_cycle(monkeypatch: pytest.MonkeyPa
 # ---------- Бюджет страниц кончился раньше курсора ----------
 
 
-def _deep_pages(make_tx, top: int, count: int) -> tuple[list, int]:
+def _deep_pages(make_tx, since: int, count: int, floor: int | None = None) -> tuple[list, int]:
     """count страниц строго новее курсора: проход упрётся в бюджет страниц.
 
     Страницы непустые и не повторяются (хеши случайные), каждая глубже
     предыдущей, но ни одна не достигает курсора — то есть проход физически
     не может завершиться, кроме как исчерпанием бюджета. Возвращает
     (ответы, ожидаемое дно дыры).
+
+    floor — utime самой нижней строки последней страницы, по умолчанию курсор
+    плюс два. Задаётся явно, а не «от вершины вниз», потому что вершина
+    зависит от _PAGE_LIMIT: при limit=200 бюджет в 50 страниц уводил
+    генератор ниже курсора, страницы начинали фильтроваться, и проверка
+    бюджета превращалась в проверку другой ветки. Теперь премис теста —
+    «ни одна страница не достаёт до курсора» — держится при любом limit.
     """
     limit = ton_watch._PAGE_LIMIT
+    lowest = since + 2 if floor is None else floor
+    top = lowest + (count - 1) * limit + (limit - 1)
     pages = [
         _Response(
             200,
@@ -292,7 +309,7 @@ def _deep_pages(make_tx, top: int, count: int) -> tuple[list, int]:
         )
         for page in range(count)
     ]
-    return pages, top - (count - 1) * limit - (limit - 1)
+    return pages, lowest
 
 
 def _fast_pace(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -317,8 +334,8 @@ async def test_page_budget_exhausted_is_not_a_complete_pass(
     limit = ton_watch._PAGE_LIMIT
     budget = ton_watch._MAX_PAGES
     _fast_pace(monkeypatch)
-    history, history_floor = _deep_pages(_api_tx, 7000, budget)
-    fallback, _ = _deep_pages(_v3_tx, 7000, budget)
+    history, history_floor = _deep_pages(_api_tx, 1000, budget)
+    fallback, _ = _deep_pages(_v3_tx, 1000, budget)
     calls = install_http(monkeypatch, {_HISTORY: history, _V3: fallback})
 
     transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
@@ -337,8 +354,8 @@ async def test_page_budget_truncation_keeps_deepest_floor(
     """Оба прохода усечены — дыра называется по самой глубокой достигнутой границе."""
     budget = ton_watch._MAX_PAGES
     _fast_pace(monkeypatch)
-    history, _ = _deep_pages(_api_tx, 7000, budget)
-    fallback, fallback_floor = _deep_pages(_v3_tx, 6500, budget)
+    history, _ = _deep_pages(_api_tx, 1000, budget, floor=1500)
+    fallback, fallback_floor = _deep_pages(_v3_tx, 1000, budget)
     install_http(monkeypatch, {_HISTORY: history, _V3: fallback})
 
     transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
@@ -363,6 +380,104 @@ async def test_full_pass_reports_no_gap(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert (ok, source, gap) == (True, "tonapi", None)
     assert len(transfers) == 1
+
+
+# ---------- «Конец истории» решается по сырому размеру страницы ----------
+#
+# Длина ОТФИЛЬТРОВАННОГО списка для этого не годится: джеттон-уведомления,
+# нулевые переводы и старые по utime выбрасываются парсером, и одна такая
+# строка в полной странице объявляла историю кончившейся. Цикл коммитил курсор
+# в голову цепочки, и всё, что ниже окна, исчезало навсегда — тихо, без записи
+# и без тревоги, при зелёном /health. Достаточно одного перевода USDt, чтобы
+# страница «схлопнулась».
+
+
+async def test_jetton_in_full_page_does_not_end_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Полная страница с одним jetton внутри — проход идёт дальше, а не обрывается."""
+    limit = ton_watch._PAGE_LIMIT
+    _fast_pace(monkeypatch)
+    page_one = [_api_tx(3000 - index, to_nano(0.01)) for index in range(limit)]
+    page_one[-1] = _api_jetton_tx(3000 - limit)  # отброшенная строка в полной странице
+    page_two = [_api_tx(1500, to_nano(0.02))]  # страница доходит до курсора
+    calls = install_http(
+        monkeypatch,
+        {_HISTORY: [_Response(200, {"transactions": page_one}), _Response(200, {"transactions": page_two})]},
+    )
+
+    result = await ton_watch._deep_collect(
+        ton_watch._tonapi_page,
+        lambda page: page[-1].provider_ref or page[-1].tx_hash,
+        1000,
+    )
+
+    assert result.complete is True
+    assert result.reliable is True
+    # limit-1 из первой страницы (jetton выброшен) + 1 из второй
+    assert len(result.transfers) == limit
+    v2_calls = [params for url, params in calls if "/v2/blockchain/" in url]
+    assert len(v2_calls) == 2, "проход обязан был уйти на вторую страницу"
+
+
+async def test_short_raw_page_ends_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Страница короче запрошенной — история правда кончилась, проход полный."""
+    _fast_pace(monkeypatch)
+    page = [_api_tx(3000 - index, to_nano(0.01)) for index in range(ton_watch._PAGE_LIMIT - 1)]
+    calls = install_http(monkeypatch, {_HISTORY: [_Response(200, {"transactions": page})]})
+
+    result = await ton_watch._deep_collect(
+        ton_watch._tonapi_page,
+        lambda page: page[-1].provider_ref or page[-1].tx_hash,
+        1000,
+    )
+
+    assert result.complete is True
+    assert result.reliable is True
+    assert len(result.transfers) == len(page)
+    assert len([p for url, p in calls if "/v2/blockchain/" in url]) == 1
+
+
+async def test_page_eaten_by_filters_is_not_a_complete_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Полная страница, съеденная фильтрами целиком, проходом полным не считается.
+
+    Курсор вглубь вывести не из чего: продолжать нельзя, а объявлять проход
+    полным нельзя тем более. Держим дыру — курсор встанет на её дно, и
+    бэклог догонится следующим циклом.
+    """
+    limit = ton_watch._PAGE_LIMIT
+    _fast_pace(monkeypatch)
+    eaten = [_api_jetton_tx(3000 - index) for index in range(limit)]
+    calls = install_http(monkeypatch, {_HISTORY: [_Response(200, {"transactions": eaten})]})
+
+    result = await ton_watch._deep_collect(
+        ton_watch._tonapi_page,
+        lambda page: page[-1].provider_ref or page[-1].tx_hash,
+        1000,
+    )
+
+    assert result.complete is False
+    assert result.transfers == []
+    # Одна страница прочитана и сразу отброшена — курсор не уводим вглубь
+    assert len([p for url, p in calls if "/v2/blockchain/" in url]) == 1
+
+
+async def test_page_eaten_by_filters_without_floor_is_unreliable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Съеденная страница безо всякого дна — проход ненадёжен, цикл не встанет."""
+    limit = ton_watch._PAGE_LIMIT
+    _fast_pace(monkeypatch)
+    eaten = [_api_jetton_tx(3000 - index) for index in range(limit)]
+    install_http(monkeypatch, {_HISTORY: [_Response(200, {"transactions": eaten})]})
+
+    result = await ton_watch._deep_collect(
+        ton_watch._tonapi_page,
+        lambda page: page[-1].provider_ref or page[-1].tx_hash,
+        1000,
+    )
+
+    assert result.reliable is False
+    assert result.complete is False
+    assert result.floor_utime is None
 
 
 # ---------- Парсер Toncenter v3 ----------

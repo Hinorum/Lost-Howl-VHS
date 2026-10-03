@@ -33,6 +33,23 @@ from app.payments import parse_revote_memo
 from app.ton_utils import to_nano
 
 
+def _source_page(transfers, ok: bool = True):
+    """Страница источника в текущем контракте (сырой размер, а не фильтрованный).
+
+    Подменяемый источник отдаёт ровно столько строк, сколько и просил, поэтому
+    raw_count == len(transfers) и страница честно считается короткой — проход
+    на этом заканчивается, как и заканчивался раньше.
+    """
+    from app import ton_watch
+
+    return ton_watch.Page(
+        list(transfers),
+        ton_watch._PAGE_OK if ok else ton_watch._PAGE_DEGRADED,
+        len(transfers),
+        ton_watch._PAGE_LIMIT,
+    )
+
+
 def _closed_round(day_index: int, tally_at: datetime) -> Round:
     return Round(
         day_index=day_index,
@@ -174,7 +191,7 @@ async def test_watch_once_advances_cursor_and_dedupes(monkeypatch: pytest.Monkey
         for i in range(3)
     ]
     monkeypatch.setattr(
-        ton_watch, "fetch_recent_transfers", AsyncMock(return_value=(transfers, True))
+        ton_watch, "fetch_recent_transfers_page", AsyncMock(return_value=_source_page(transfers))
     )
 
     # Стартовый курсор раньше всех транзакций (фолбэк «now−12ч» их новее).
@@ -218,8 +235,8 @@ async def test_watch_cursor_stops_on_failure(monkeypatch: pytest.MonkeyPatch) ->
     good = ton_watch.Transfer("good-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 1)
     monkeypatch.setattr(
         ton_watch,
-        "fetch_recent_transfers",
-        AsyncMock(return_value=([good, bad], True)),
+        "fetch_recent_transfers_page",
+        AsyncMock(return_value=_source_page([good, bad])),
     )  # API отдаёт новые сверху; watch обрабатывает по возрастанию
 
     async def exploding(transfer):
@@ -248,8 +265,8 @@ async def test_overlap_window_recovers_same_second_transfer(monkeypatch: pytest.
     base = int(datetime.now(UTC).timestamp()) - 3_600
     tx_same = ton_watch.Transfer("same-1", "0:" + os.urandom(32).hex(), to_nano(0.3), "", base + 5)
     tx_later = ton_watch.Transfer("later-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 6)
-    fetch = AsyncMock(return_value=([tx_same, tx_later], True))
-    monkeypatch.setattr(ton_watch, "fetch_recent_transfers", fetch)
+    fetch = AsyncMock(return_value=_source_page([tx_same, tx_later]))
+    monkeypatch.setattr(ton_watch, "fetch_recent_transfers_page", fetch)
     try:
         # Курсор установлен на tx_same.utime: без перекрытия транзакция была бы пропущена.
         async with SessionLocal() as db:
@@ -494,7 +511,7 @@ async def test_watch_beats_on_quiet_chain(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(
-        ton_watch, "fetch_recent_transfers", AsyncMock(return_value=([], True))
+        ton_watch, "fetch_recent_transfers_page", AsyncMock(return_value=_source_page([]))
     )
     try:
         await ton_watch.watch_once()
@@ -527,13 +544,13 @@ async def test_api_outage_does_not_beat_and_alerts(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(settings, "admin_ids", "42")
     bot = SimpleNamespace(send_message=AsyncMock())
     monkeypatch.setattr(
-        ton_watch, "fetch_recent_transfers", AsyncMock(return_value=([], False))
+        ton_watch, "fetch_recent_transfers_page", AsyncMock(return_value=_source_page([], ok=False))
     )
     # Фолбэк-источник тоже недоступен: успешного цикла нет ни у одного провайдера.
     monkeypatch.setattr(
         ton_watch,
         "_toncenter_page",
-        AsyncMock(return_value=([], ton_watch._PAGE_DEGRADED)),
+        AsyncMock(return_value=_source_page([], ok=False)),
     )
     try:
         await ton_watch.watch_once()
