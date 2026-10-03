@@ -834,6 +834,46 @@ async def test_ops_sweep_registered_without_ton(monkeypatch) -> None:
     assert "ton-watch" not in registered
 
 
+async def test_no_job_is_misfire_below_one_second(monkeypatch) -> None:
+    """Ни одна джоба не отбрасывается из-за опоздания.
+
+    Дефолт APScheduler — `misfire_grace_time=1`: любой запуск с задержкой
+    больше секунды не происходит, сопровождаясь одним WARNING в логе
+    планировщика. Для этого расписания цена такого пропуска несимметрична:
+
+    * `db-backup` (cron, раз в сутки) молча терял бы ежедневный бэкап, если
+      цикл был занят в 04:17;
+    * `vote-reminder` (cron, 10:00 UTC) попадает ровно на границу
+      15-секундной сетки `way-tick` и конкурирует с ним каждый день;
+    * постоянного jobstore нет, состояние в RAM, догоняющего запуска нет —
+      пропущенный cron не повторится уже никогда.
+
+    Все джобы здесь либо самовосстанавливающиеся (tick закрывает догоняющие
+    дни, watcher догоняет хвост по курсору), либо обслуживающие, где пропуск
+    молчалив. `coalesce=True` не даёт копиться очереди догоняющих запусков.
+    """
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from app import scheduler as sched
+
+    probe = AsyncIOScheduler(timezone="UTC")
+    monkeypatch.setattr(sched, "scheduler", probe)
+    monkeypatch.setattr(settings, "ton_enabled", True)
+
+    sched.start_scheduler()
+
+    jobs = probe.get_jobs()
+    assert jobs, "ни одна джоба не зарегистрирована — тест ничего не проверил"
+    for job in jobs:
+        assert job.misfire_grace_time is None, (
+            f"{job.id}: misfire_grace_time={job.misfire_grace_time} — запуск "
+            "опоздает больше чем на секунду и будет отброшен молча"
+        )
+    # Смысл проверки выше — про каждый id; убеждаемся, что охватили всё нужное.
+    covered = {job.id for job in jobs}
+    assert {"way-tick", "ops-sweep", "db-backup", "ton-watch", "ton-settle"} <= covered
+
+
 async def test_ton_maintenance_isolates_failures(monkeypatch) -> None:
     """Падение одного сервиса не останавливает остальные (каждый в своём try)."""
     from app import scheduler as sched
