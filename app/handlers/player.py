@@ -740,6 +740,39 @@ async def on_vote(callback: CallbackQuery) -> None:
         return
     label = POSITIONS[position]
     async with SessionLocal() as session:
+        # Кулдаун на нажатие. Голосование — основное действие игры, поэтому окно
+        # короткое (3 с): передумать и вернуться игрок должен успеть, а поток
+        # нажатий от скрипт-клиента (у него нет лимита на тапы, в отличие от
+        # обычного клиента) — нет. Повтор по тому же пути и так безопасен:
+        # cast_vote возвращает already, и второй голос не создаётся.
+        if callback.from_user.id not in settings.admin_id_set:
+            from app.handlers.wallet import _wallet_throttled
+
+            if await _wallet_throttled(session, callback.from_user.id, "vote_cd"):
+                player = await upsert_player(session, callback.from_user)
+                round_row = await get_active_round(session)
+                if round_row is None or round_row.id != round_id:
+                    await callback.answer("Этот день уже закрыт.", show_alert=True)
+                    return
+                current = await get_vote(session, round_row.id, player.id)
+                if current is None:
+                    await callback.answer(
+                        f"{hint_mark('wallet-throttle')} Голос ещё не принят — подожди немного.",
+                        show_alert=True,
+                    )
+                    return
+                # Отвечаем тем, что игрок уже выбрал: троттлинг не должен
+                # выглядеть как «выбор потерялся».
+                held = scene_label(
+                    {card.position: card.title for card in round_row.cards},
+                    current.card_position,
+                )
+                await callback.answer(
+                    f"{hint_mark('wallet-throttle')} Твой выбор: {held}. "
+                    "Подожди немного, чтобы сменить.",
+                    show_alert=True,
+                )
+                return
         player = await upsert_player(session, callback.from_user)
         round_row = await get_active_round(session)
         if round_row is None or round_row.id != round_id:

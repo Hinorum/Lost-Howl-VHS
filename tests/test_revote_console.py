@@ -51,10 +51,14 @@ def _user(uid: int) -> SimpleNamespace:
     return SimpleNamespace(id=uid, username=None, first_name="Тестовый")
 
 
-def _message(text: str = "/change", chat_type: str = "private") -> SimpleNamespace:
+def _message(
+    text: str = "/change",
+    chat_type: str = "private",
+    uid: int | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         chat=SimpleNamespace(type=chat_type, id=555),
-        from_user=_user(_uid()),
+        from_user=_user(uid if uid is not None else _uid()),
         text=text,
         answer=AsyncMock(),
         bot=SimpleNamespace(),
@@ -291,6 +295,52 @@ async def test_paystars_issues_invoice(stage, monkeypatch) -> None:
     assert kwargs["prices"][0].amount == 21
     assert kwargs["chat_id"] == 555
     callback.answer.assert_awaited_with()
+
+
+async def test_paystars_is_rate_limited(stage, monkeypatch) -> None:
+    """Повторное нажатие «Оплатить» не выставляет второй счёт.
+
+    send_invoice — это вызов Bot API, то есть расход квоты бота и риск поймать
+    flood-ожидание от нажатий одного игрока (у скрипт-клиента, в отличие от
+    обычного, лимита на тапы нет). Через полминуты проходит.
+    """
+    from app.handlers import wallet as wallet_mod
+
+    monkeypatch.setattr(topup_mod, "_active_round_money_mode", AsyncMock(return_value=True))
+    first = _callback(f"paystars:{stage.round_id}", stage.uid)
+    await on_paystars(first)
+    assert first.bot.send_invoice.await_count == 1
+
+    second = _callback(f"paystars:{stage.round_id}", stage.uid)
+    await on_paystars(second)
+    assert second.bot.send_invoice.await_count == 0, "второй счёт выставлен без паузы"
+    assert "полминуты" in second.answer.await_args.args[0]
+
+    monkeypatch.setitem(wallet_mod._ACTION_COOLDOWNS, "paystars_cd", 0.0)
+    third = _callback(f"paystars:{stage.round_id}", stage.uid)
+    await on_paystars(third)
+    assert third.bot.send_invoice.await_count == 1, "после остывания счёт должен пройти"
+
+
+async def test_change_is_rate_limited(stage, monkeypatch) -> None:
+    """/change подряд не перебирает игрока и раунд впустую."""
+    from app.handlers import wallet as wallet_mod
+
+    monkeypatch.setattr(settings, "revote_enabled", True)
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(topup_mod, "_active_round_money_mode", AsyncMock(return_value=True))
+
+    first = _message("/change", "private", stage.uid)
+    await cmd_change(first)
+
+    second = _message("/change", "private", stage.uid)
+    await cmd_change(second)
+    assert "Не так часто" in second.answer.call_args.args[0]
+
+    monkeypatch.setitem(wallet_mod._ACTION_COOLDOWNS, "change_cd", 0.0)
+    third = _message("/change", "private", stage.uid)
+    await cmd_change(third)
+    assert "Не так часто" not in third.answer.call_args.args[0]
 
 
 async def test_pre_checkout_rejects_stale_invoice(monkeypatch) -> None:

@@ -61,6 +61,9 @@ async def _seed_round(day_index: int) -> tuple[int, int]:
 
 async def test_group_vote_echoes_dm(monkeypatch) -> None:
     """Нажатие «Сцена…» на групповом посте приносит сообщение в личку."""
+    from app.handlers import wallet as wallet_mod
+
+    monkeypatch.setitem(wallet_mod._ACTION_COOLDOWNS, "vote_cd", 0.0)
     rid, pid = await _seed_round(8101)
     send_dm = AsyncMock()
     callback = _callback(pid=pid, chat_type="supergroup", bot=Mock(send_message=send_dm))
@@ -74,6 +77,54 @@ async def test_group_vote_echoes_dm(monkeypatch) -> None:
         assert "II" in args[1]
         alert = callback.answer.await_args
         assert alert is not None and alert.args[0]
+    finally:
+        await _wipe(rid, pid)
+
+
+async def test_vote_spam_is_rate_limited(monkeypatch) -> None:
+    """Поток нажатий не превращается в поток записи в БД.
+
+    Голосование — основное действие игры, поэтому окно короткое (3 с):
+    передумать и вернуться игрок успевает. Цель ограничения — скрипт-клиент,
+    у которого нет лимита на тапы. Голос при этом не теряется: троттлинг
+    отвечает игроку его текущим выбором, а не «ничего не понятно».
+    """
+    from app.handlers import wallet as wallet_mod
+
+    rid, pid = await _seed_round(8105)
+    first = _callback(pid=pid, chat_type="private", bot=Mock(send_message=AsyncMock()))
+    first.data = f"vote:{rid}:0"
+    second = _callback(pid=pid, chat_type="private", bot=Mock(send_message=AsyncMock()))
+    second.data = f"vote:{rid}:2"
+    try:
+        await on_vote(first)
+        await on_vote(second)
+        # Ответ троттлинга показывает принятый голос, а не «ничего не понятно».
+        assert "Твой выбор" in second.answer.await_args.args[0]
+
+        # Голос, принятый до троттлинга, на месте и виден игроку.
+        async with SessionLocal() as db:
+            vote = (
+                await db.execute(
+                    select(Vote).where(Vote.round_id == rid, Vote.player_id == pid)
+                )
+            ).scalar_one()
+        assert vote.card_position == 0
+
+        # На спаме второе нажатие по другому пути НЕ переписывает голос: это
+        # платное действие (грант), и молчаливая подмена выглядела бы как
+        # «смена прошла», хотя списания не было.
+        monkeypatch.setitem(wallet_mod._ACTION_COOLDOWNS, "vote_cd", 0.0)
+        third = _callback(pid=pid, chat_type="private", bot=Mock(send_message=AsyncMock()))
+        third.data = f"vote:{rid}:2"
+        await on_vote(third)
+        async with SessionLocal() as db:
+            vote = (
+                await db.execute(
+                    select(Vote).where(Vote.round_id == rid, Vote.player_id == pid)
+                )
+            ).scalar_one()
+        assert vote.card_position == 0, "голос сменился без оплаченного гранта"
     finally:
         await _wipe(rid, pid)
 

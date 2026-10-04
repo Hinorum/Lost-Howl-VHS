@@ -481,8 +481,10 @@ async def test_wallet_rate_limited_on_spam(monkeypatch) -> None:
     assert "Не так часто" in second.answer.call_args.args[0]
     assert await _dialog_active(uid)  # старый диалог не тронут
 
-    # Остывание: обнуляем окно — снова пускает.
-    monkeypatch.setattr(wallet_mod, "_WALLET_COOLDOWN", 0.0)
+    # Остывание: обнуляем окно — снова пускает. Окно берётся из таблицы по
+    # действию (сразу после появления кулдаунов у разных команд), поэтому
+    # правится запись, а не одна константа.
+    monkeypatch.setitem(wallet_mod._ACTION_COOLDOWNS, "wallet_cd", 0.0)
     third = make_message("private", uid, "/wallet")
     await cmd_wallet(third)
     assert "Не так часто" not in third.answer.call_args.args[0]

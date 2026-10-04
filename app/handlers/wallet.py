@@ -322,13 +322,34 @@ async def _bind_wallet(message: Message, address: str) -> bool:
 
 
 _WALLET_COOLDOWN = 30.0
+# Голосование — основное действие игры, и здесь окно должно быть коротким:
+# за полминуты игрок успевает передумать и вернуться, плюс это всё равно
+# ловит скрипт-клиент, который шлёт сотни нажатий в секунду.
+_VOTE_COOLDOWN = 3.0
+
+# Кулдауны по действиям. Общий счётчик на пользователя не годится: он либо
+# допускает спам в одно действие, либо блокирует другое тому, кто пользуется
+# обоими.
+_ACTION_COOLDOWNS = {
+    "wallet_cd": _WALLET_COOLDOWN,
+    "change_cd": _WALLET_COOLDOWN,
+    "paystars_cd": _WALLET_COOLDOWN,
+    "payton_cd": _WALLET_COOLDOWN,
+    "vote_cd": _VOTE_COOLDOWN,
+}
 
 
-async def _wallet_throttled(session, user_id: int) -> bool:
-    """Кулдаун /wallet в watcher_state: одна запись на игрока, видная обоим
-    процессам. True — вызов ещё в окне _WALLET_COOLDOWN; протухший ключ
-    удаляем и заводим заново, чтобы запись оставалась единственным источником."""
-    key = f"wallet_cd:{user_id}"
+async def _wallet_throttled(session, user_id: int, action: str = "wallet_cd") -> bool:
+    """Кулдаун команды в watcher_state: одна запись на игрока и действие, видимая
+    обоим процессам. True — вызов ещё в окне своего действия; протухший ключ
+    удаляем и заводим заново, чтобы запись оставалась единственным источником.
+
+    Ключ `action` разделяет кулдауны: у /wallet своя частота, у /change своя.
+    Метрики нет — это анти-спам, а не игровая механика, и лишний счётчик в
+    watcher_state только раздувал бы таблицу.
+    """
+    window = _ACTION_COOLDOWNS.get(action, _WALLET_COOLDOWN)
+    key = f"{action}:{user_id}"
     row = await session.get(WatcherState, key)
     now = datetime.now(UTC)
     throttled = False
@@ -340,7 +361,7 @@ async def _wallet_throttled(session, user_id: int) -> bool:
         if last is not None:
             if last.tzinfo is None:
                 last = last.replace(tzinfo=UTC)
-            throttled = (now - last).total_seconds() < _WALLET_COOLDOWN
+            throttled = (now - last).total_seconds() < window
         await session.delete(row)
     session.add(WatcherState(key=key, value=now.isoformat()))
     await session.commit()

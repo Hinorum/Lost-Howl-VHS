@@ -80,6 +80,19 @@ async def cmd_change(message: Message) -> None:
     if not settings.revote_enabled:
         await message.answer(f"{warn_mark('revote-off')} Перемотка кадра сейчас недоступна.")
         return
+    # Кулдаун ДО любой работы: команда читает игрока, активный раунд и строит
+    # клавиатуру, а вызывается на каждый вызов. Без ограничения скрипт-клиент
+    # (MTProto, а не обычный клиент — у того нет лимита на нажатия) устраивает
+    # постоянный поток запросов в БД и в Telegram.
+    if message.from_user is not None and message.from_user.id not in settings.admin_id_set:
+        from app.handlers.wallet import _wallet_throttled
+
+        async with SessionLocal() as session:
+            if await _wallet_throttled(session, message.from_user.id, "change_cd"):
+                await message.answer(
+                    f"{hint_mark('wallet-throttle')} Не так часто — попробуй ещё раз через полминуты."
+                )
+                return
     # Бесплатная версия (TON выключен): перемотки нет — платить нечем и незачем.
     if not settings.ton_enabled:
         await message.answer(
@@ -149,6 +162,19 @@ async def on_paystars(callback: CallbackQuery) -> None:
     if active_id != round_id:
         await callback.answer(status[:200], show_alert=True)
         return
+    # Кулдаун на выставление счёта. send_invoice — это вызов Bot API: без
+    # ограничения кнопка «Оплатить» превращается в способ жечь квоту бота и
+    # ловить flood-ожидание, и токен бота страдает от чужих нажатий.
+    if callback.from_user.id not in settings.admin_id_set:
+        from app.handlers.wallet import _wallet_throttled
+
+        async with SessionLocal() as session:
+            if await _wallet_throttled(session, callback.from_user.id, "paystars_cd"):
+                await callback.answer(
+                    f"{hint_mark('wallet-throttle')} Счёт только что выставлен — подожди полминуты.",
+                    show_alert=True,
+                )
+                return
     await callback.bot.send_invoice(
         chat_id=callback.message.chat.id,
         title="Перемотка кадра",
@@ -295,6 +321,17 @@ async def on_payton(callback: CallbackQuery) -> None:
     if not raw.isdigit():
         await callback.answer("Некорректный счёт.", show_alert=True)
         return
+    if callback.from_user.id not in settings.admin_id_set:
+        from app.handlers.wallet import _wallet_throttled
+
+        async with SessionLocal() as session:
+            if await _wallet_throttled(session, callback.from_user.id, "payton_cd"):
+                await callback.answer(
+                    f"{hint_mark('wallet-throttle')} Инструкция только что отправлена — "
+                    "подожди полминуты.",
+                    show_alert=True,
+                )
+                return
     address = settings.active_treasury_address
     await callback.message.answer(
         f"{money_mark(raw)} Переведи от {settings.revote_ton:g} до {_revote_gram_ceiling():g} Gram "
