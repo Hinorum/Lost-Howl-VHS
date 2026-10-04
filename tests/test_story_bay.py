@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 
+from app.db import SessionLocal
 from app.rounds import lifecycle as lifecycle_mod
 from app.rounds import rendering as rendering_mod
 from app.story import bay
@@ -334,3 +336,37 @@ async def test_day_diary_reads_cassette(session, tmp_path, monkeypatch) -> None:
         assert await bay.day_diary(session, SimpleNamespace(day_index=11, opens_at=None)) == ""
     finally:
         uninstall_bay()
+
+
+async def test_shipped_cassettes_diary_reaches_results(session) -> None:
+    """Запись дневника из ПОСТАВЛЕННОЙ кассеты доходит до поста итогов.
+
+    Синтетическая кассета выше проверяет механику, но не проверяет главное:
+    что реальные файлы библиотеки вообще содержат дневники и что они находятся
+    по месяцу и дню. Ошибка тут выглядит безобидно — JSON валиден, линтер молчит,
+    а игрок просто не видит 📖 в итогах.
+    """
+    from types import SimpleNamespace
+
+    library = Path(__file__).resolve().parents[1] / "app" / "story" / "cassettes"
+    assert install_bay(library) is True
+    try:
+        # Октябрь 2026 — месяц, который играется прямо сейчас.
+        found: dict[int, str] = {}
+        for day_no in range(1, 32):
+            finished = SimpleNamespace(
+                day_index=day_no,
+                opens_at=datetime(2026, 10, day_no, 12, 0, tzinfo=UTC),
+            )
+            async with SessionLocal() as db:
+                found[day_no] = await bay.day_diary(db, finished)
+    finally:
+        uninstall_bay()
+
+    assert found[4], "в октябрьской кассете нет дневника дня 4"
+    assert "перекрёстке" in found[4]
+    # Дней без записи быть должно — иначе это не дневник, а второй текст дня.
+    empty = [day_no for day_no, text in found.items() if not text]
+    assert len(empty) > 20, f"дневник стоит почти в каждом дне: пусто только {len(empty)}"
+    # Частоты как у флагманской кассеты: единицы, а не каждый день.
+    assert 4 <= len(found) - len(empty) <= 8
