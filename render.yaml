@@ -4,7 +4,12 @@ services:
     runtime: python
     plan: free
     region: frankfurt
-    buildCommand: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg && echo "deb http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg && apt-get update && apt-get install -y --no-install-recommends postgresql-client-17 && pip install -r requirements.txt
+    # В конце сборки — сверка артефактов pytoniq/pytoniq-core с PyPI (шаг
+    # fail-closed). Пин версии не защищает от перезалива артефакта под уже
+    # занятой версией, а эти два пакета держат приватный ключ казначея.
+    # Подробности и порядок ручного обновления — scripts/dependency_hashes.py
+    # и requirements-critical-hashes.txt.
+    buildCommand: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg && echo "deb http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg && apt-get update && apt-get install -y --no-install-recommends postgresql-client-17 && pip install -r requirements.txt && python -m scripts.dependency_hashes
     startCommand: python -m app.main
     # Проба Render — GET без заголовков, поэтому она ходит на /alive: там нет
     # ни снимка, ни секрета, и HEALTH_TOKEN не приходится держать в репозитории.

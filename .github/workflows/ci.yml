@@ -18,6 +18,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
+      # Сверка артефактов критичных зависимостей с тем, что PyPI отдаёт СЕЙЧАС.
+      # Пин версии `pkg==1.2.3` не защищает от перезалива: PyPI разрешает
+      # выложить другое содержимое под занятой версией, и pip примет молча. Для
+      # pytoniq/pytoniq-core это прямой путь к кошельку казначея, поэтому шаг
+      # fail-closed и стоит ДО линта и тестов.
+      #
+      # Проверяется и хеш, и само множество артефактов: добавленный под ту же
+      # версию platform-specific wheel тоже является атакой.
+      #
+      # Почему не --require-hashes: он требует хешей на всю транзитивную
+      # closure и на каждом бампе требует ручной перегенерации lock-файла, то
+      # есть ломает еженедельную автоматику Dependabot. Приоритет — автоматика
+      # работает, защита точечная.
+      - name: Critical dependency artifacts match PyPI
+        run: python -m scripts.dependency_hashes
       - name: Lint (runtime errors only)
         run: python -m ruff check .
       # Тот же скрипт, что вешается локальным pre-commit хуком, только в режиме
