@@ -867,11 +867,28 @@ async def whisper_to_chats(bot: Bot | None, text: str) -> int:
                 lowered = str(exc).lower()
                 if any(mark in lowered for mark in _FORGET_MARKS):
                     await deactivate_chat(chat_id)
+                else:
+                    # Раньше здесь был просто return False — единственный
+                    # except в проекте вообще без лога. Потеря паузы, разворота
+                    # или церемонии не была видна нигде: ни в логах, ни в
+                    # тревогах, ни в счётчике доставки.
+                    logger.warning(
+                        "Шёпот дня не доставлен в чат %s: %s: %s",
+                        chat_id,
+                        type(exc).__name__,
+                        exc,
+                    )
                 return False
 
     outcomes = await asyncio.gather(*(worker(c) for c in chat_ids))
     delivered = sum(1 for ok in outcomes if ok)
-    logger.info("Шёпот дня разослан в %d из %d чатов", delivered, len(chat_ids))
+    failed = len(chat_ids) - delivered
+    logger.info(
+        "Шёпот дня разослан в %d из %d чатов%s",
+        delivered,
+        len(chat_ids),
+        f" (не доставлено: {failed})" if failed else "",
+    )
     # Вечерний привал — и в личку подписчикам (личный дубликат вечернего поста).
     delivered_dm = await _dm_send_all(
         bot, lambda pid: bot.send_message(pid, text), "Личный шёпот (текст)"

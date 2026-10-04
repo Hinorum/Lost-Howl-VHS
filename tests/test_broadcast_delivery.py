@@ -498,6 +498,38 @@ async def test_whisper_handles_every_failure_mode(monkeypatch) -> None:
         await _wipe(Chat)
 
 
+async def test_whisper_logs_unexpected_failure(monkeypatch, caplog) -> None:
+    """Неожиданный сбой отправки виден в логе — не теряется молча.
+
+    Здесь был единственный except в проекте без единого лога: любой сбой
+    кроме «бота заблокировали» возвращал False и исчезал. Пауза, разворот или
+    церемония могли не дойти до всех чатов, и по логам это было не видно —
+    только число доставки, из которого непонятно, потеряно что-то или нет.
+    """
+    import logging
+
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(settings, "player_dm", False)
+    await _wipe(Chat)
+    chat = 777_611
+    async with SessionLocal() as db:
+        db.add(Chat(id=chat, type="group", active=True))
+        await db.commit()
+    try:
+        bot = _flaky_bot({chat: [TimeoutError("сеть легла")]})
+        with caplog.at_level(logging.INFO):
+            assert await bc.whisper_to_chats(bot, "полуденный шёпот") == 0
+        assert "Шёпот дня не доставлен" in caplog.text, caplog.text
+        assert "TimeoutError" in caplog.text, caplog.text
+        # Итоговая строка обязана называть число недоставленных.
+        assert "не доставлено: 1" in caplog.text, caplog.text
+        # Чата никто не отключил: сбой не значит «бот изгнан».
+        async with SessionLocal() as db:
+            assert (await db.get(Chat, chat)).active is True
+    finally:
+        await _wipe(Chat)
+
+
 @pytest.mark.parametrize("retry_after", [1, 5])
 async def test_retry_pause_is_honoured(monkeypatch, retry_after: int) -> None:
     """Пауза берётся из ответа Telegram, а не выдумывается: иначе повтор
