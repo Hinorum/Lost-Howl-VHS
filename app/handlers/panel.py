@@ -333,7 +333,7 @@ async def _panel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-@router.message(Command("panel"))
+@router.message(Command("panel"), F.chat.type == ChatType.PRIVATE)
 async def cmd_panel(message: Message) -> None:
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
         await message.answer("Пульт только для хранителя игры.")
@@ -829,7 +829,7 @@ def _chunk_message(text: str) -> list[str]:
     return chunks
 
 
-@router.message(Command("cassette"))
+@router.message(Command("cassette"), F.chat.type == ChatType.PRIVATE)
 async def cmd_cassette(message: Message) -> None:
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
         await message.answer("Пульт только для хранителя игры.")

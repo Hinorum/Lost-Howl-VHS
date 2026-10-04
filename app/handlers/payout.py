@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from aiogram.enums import ParseMode
+from aiogram import F
+from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
 from sqlalchemy import func, select
@@ -132,7 +133,7 @@ async def _refunds_panel_text() -> str:
     return "\n".join(lines)
 
 
-@router.message(Command("payouts"))
+@router.message(Command("payouts"), F.chat.type == ChatType.PRIVATE)
 async def cmd_payouts(message: Message) -> None:
     """Очередь выплат для хранителя: что не ушло и почему."""
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
@@ -141,7 +142,7 @@ async def cmd_payouts(message: Message) -> None:
     await message.answer(await _payouts_text())
 
 
-@router.message(Command("payout"))
+@router.message(Command("payout"), F.chat.type == ChatType.PRIVATE)
 async def cmd_payout(message: Message) -> None:
     """Ручной разбор одной выплаты: /payout <id> spam confirm|retry.
 
@@ -189,7 +190,7 @@ async def cmd_payout(message: Message) -> None:
         await message.answer(f"{warn_mark('nopay')} Выплата #{payout_id} не найдена или уже отправлена.")
 
 
-@router.message(Command("return"))
+@router.message(Command("return"), F.chat.type == ChatType.PRIVATE)
 async def cmd_return(message: Message) -> None:
     """Ручной возврат «не засчитанной» ставки хранителем: /return <id>."""
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
@@ -217,7 +218,7 @@ async def cmd_return(message: Message) -> None:
         await message.answer(f"{warn_mark('return')} {result}")
 
 
-@router.message(Command("treasury"))
+@router.message(Command("treasury"), F.chat.type == ChatType.PRIVATE)
 async def cmd_treasury(message: Message) -> None:
     """Здоровье казначея одним сообщением: адрес, мнемоника, баланс,
     сверка пары мнемоника/адрес, очередь выплат. Только для хранителя."""
@@ -233,7 +234,7 @@ async def cmd_treasury(message: Message) -> None:
         await message.answer(f"Отчёт не собрался: {exc}")
 
 
-@router.message(Command("fundout"))
+@router.message(Command("fundout"), F.chat.type == ChatType.PRIVATE)
 async def cmd_fundout(message: Message) -> None:
     """Записать ручную раздачу Фонда Стаи в журнал (аудит, не двигает деньги).
 
@@ -321,7 +322,7 @@ async def _revenue_text() -> str:
     )
 
 
-@router.message(Command("incoming"))
+@router.message(Command("incoming"), F.chat.type == ChatType.PRIVATE)
 async def cmd_incoming(message: Message) -> None:
     """Журнал входящих переводов казначея: откуда, сколько, чем стало.
 
@@ -365,7 +366,7 @@ async def cmd_incoming(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
-@router.message(Command("stakes"))
+@router.message(Command("stakes"), F.chat.type == ChatType.PRIVATE)
 async def cmd_stakes(message: Message) -> None:
     """Все ставки текущего и вчерашнего дня: статус каждой."""
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
@@ -404,7 +405,7 @@ async def cmd_stakes(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
-@router.message(Command("revenue"))
+@router.message(Command("revenue"), F.chat.type == ChatType.PRIVATE)
 async def cmd_revenue(message: Message) -> None:
     """Касса игры для хранителя: ledger доходов из Income.
 
@@ -416,7 +417,7 @@ async def cmd_revenue(message: Message) -> None:
     await message.answer(await _revenue_text())
 
 
-@router.message(Command("blockchain"))
+@router.message(Command("blockchain"), F.chat.type == ChatType.PRIVATE)
 async def cmd_blockchain(message: Message) -> None:
     """Аудит блокчейн-контура: watcher, очередь выплат, казна, сверка истории."""
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
@@ -431,7 +432,7 @@ async def cmd_blockchain(message: Message) -> None:
         await message.answer(f"Не собрал отчёт: {exc}")
 
 
-@router.message(Command("mirror"))
+@router.message(Command("mirror"), F.chat.type == ChatType.PRIVATE)
 async def cmd_mirror(message: Message) -> None:
     """Пересборка зеркала казны: /mirror reset confirm.
 
