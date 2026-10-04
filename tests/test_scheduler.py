@@ -426,6 +426,49 @@ async def test_announce_results_job_marks_marker_after_delivery(monkeypatch) -> 
         await _cleanup(9721)
 
 
+async def test_broken_results_body_leaves_day_retryable(monkeypatch) -> None:
+    """Сборка итогов упала — день обязан остаться без маркера.
+
+    Итоги дня — единственное сообщение, за которым игрок узнаёт, кто победил и
+    чем кончилась его ставка. Раньше announce_results глотал исключение сборки,
+    возвращал 0 и не отдавал наружу: откат в _announce_results_job не срабатывал,
+    коммит фиксировал results_at, и восстановитель (CLOSED && results_at IS NULL)
+    этот день больше никогда не видел. День оставался навсегда без итогов при
+    зелёном логе «разосланы».
+    """
+    from app import scheduler as sched
+
+    rid = await _make_round(9723, RoundStatus.CLOSED)
+    monkeypatch.setattr(sched, "_bot", object())
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("БД недоступна")
+
+    try:
+        monkeypatch.setattr("app.broadcast.results_body", broken)
+
+        async def never_called(*_args, **_kwargs):
+            return 0
+
+        monkeypatch.setattr("app.broadcast.announce_player_results", never_called)
+        await sched._announce_results_job(rid)
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            assert row.results_at is None, "маркер зафиксирован при упавшей сборке итогов"
+        # Восстановитель обязан подхватить такой день.
+        sent: list[int] = []
+
+        async def fake_announce(b, finished):
+            sent.append(finished.id)
+
+        monkeypatch.setattr("app.broadcast.announce_results", fake_announce)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_announce)
+        await sched._retry_results_job()
+        assert rid in sent, "восстановитель не подхватил день без маркера"
+    finally:
+        await _cleanup(9723)
+
+
 async def test_retry_results_job_redelivers_crashed_day(monkeypatch) -> None:
     """CLOSED-день без маркера (краш между коммитом и рассылкой) досылается
     восстановителем ровно один раз — повторный прогон молчит."""

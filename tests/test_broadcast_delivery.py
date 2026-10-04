@@ -391,13 +391,29 @@ async def test_broadcast_text_retry_and_failures(monkeypatch) -> None:
         await _wipe(Chat)
 
 
-async def test_announce_results_falls_back_to_dry_template(monkeypatch) -> None:
-    """Если сбор итогов упал — игроки всё равно должны получить хоть что-то."""
+async def test_announce_results_propagates_build_failure(monkeypatch) -> None:
+    """Сборка итогов упала — исключение обязано дойти до вызывающего.
+
+    Тест раньше назывался «falls_back_to_dry_template» и обещал в докстринге,
+    что игроки «всё равно получат хоть что-то», но утверждал ровно обратное:
+    announce_results возвращала 0 и send_message не вызывался. Никакого
+    фолбэка не было — был тихий возврат нуля, из-за которого маркер results_at
+    фиксировался, и день оставался без итогов навсегда.
+
+    Теперь контракт другой и честный: сбой уходит наверх, вызывающий откатывает
+    транзакцию, день остаётся без маркера, и восстановитель дошлёт его позже.
+    Пустой текст без исключения — это другое (нечего слать) и остаётся нулём.
+    """
     monkeypatch.setattr(bc, "results_body", AsyncMock(side_effect=RuntimeError("БД лежит")))
     bot = SimpleNamespace(send_message=AsyncMock())
-    assert await bc.announce_results(bot, _round(9404)) == 0
+    with pytest.raises(RuntimeError):
+        await bc.announce_results(bot, _round(9404))
     bot.send_message.assert_not_awaited()
+    # Без бота — тихий ноль, исключение тут не при чём.
     assert await bc.announce_results(None, _round(9404)) == 0
+    # Собрался пустой пост — тоже ноль, но без исключения.
+    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value=""))
+    assert await bc.announce_results(SimpleNamespace(), _round(9404)) == 0
 
 
 async def test_announce_results_broadcasts_body(monkeypatch) -> None:

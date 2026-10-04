@@ -637,11 +637,14 @@ async def announce_results(bot: Bot | None, finished: Round) -> int:
     """
     if bot is None:
         return 0
-    try:
-        text = await results_body(finished)
-    except Exception:
-        logger.exception("Итоги дня %s не собраны — отдаём сухой шаблон", getattr(finished, "day_index", "?"))
-        text = ""
+    # СБОРКА ИТОГОВ НЕ ГЛОТАЕТСЯ. Раньше здесь был except -> text = "" ->
+    # return 0: исключение наружу не уходило, поэтому откат в джобе не
+    # срабатывал, коммит фиксировал results_at — и восстановитель (CLOSED &&
+    # results_at IS NULL) этот день больше никогда не видел. Итоги — то, по чему
+    # игрок узнаёт победителя и судьбу своей ставки; потерять их молча нельзя.
+    # Оба вызывающих (_announce_results_job и _retry_results_job) уже откатывают
+    # транзакцию и оставляют день без маркера, так что он уйдёт следующим тиком.
+    text = await results_body(finished)
     if not text:
         return 0
     delivered = await _broadcast_text(bot, text, parse_mode=ParseMode.HTML)
