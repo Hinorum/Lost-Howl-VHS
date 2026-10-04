@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from pathlib import Path
 
 from app.story.schema import (
     FIELD_LIMITS,
@@ -390,3 +391,151 @@ def test_fork_only_own_prev_key_on_entrance_is_clean() -> None:
     result = validate_payload(payload)
     assert result.ok
     assert not any("мёртвые" in warning for warning in result.warnings)
+
+
+# --- Линтер привязки эха prev к своему дню ---------------------------------
+#
+# prev дня N — это «как стая вспомнит победителя дня N−1», и рендерится оно в
+# начале дня N. Самая частая ошибка при наборе кассеты на месяц — написать в
+# prev дня N пересказ последствий карт САМОГО дня N. Игрок тогда читает в
+# начале дня последствия выбора, которого ещё не сделал. Линтер ловит это
+# сравнением текста эха с последствиями своего и предыдущего дня.
+
+_ЭХО_ДНЯ1 = "Котельная полыхала всю ночь, и к утру от запаса осталось два рассказа."
+_ЭХО_ДНЯ2 = "Шиповник вымостил тропу сухими ветками, и дорога домой стала ровной."
+
+
+def _payload_with_echoes() -> dict:
+    """Кассета, где у дней 1 и 2 РАЗНЫЕ последствия (иначе сравнение бессмысленно).
+
+    День 1 — котельная/лампа/огонь, день 2 — шиповник/овраг/лёд, дальше фоновое
+    _day(). Поэтому «эхо про котельную» и «эхо про шиповник» различимы.
+    """
+    payload = _payload("2026-01", 31)
+    by_day = {
+        1: [
+            "Котельная полыхала всю ночь, и к утру от запаса осталось два рассказа.",
+            "Лампа вспыхнула на два часа и погасла, будто её обманули.",
+            "Стая легла спать у настоящего огня, а Карандаш считал голоса вслух.",
+        ],
+        2: [
+            "Шиповник вымостил тропу сухими ветками, и дорога домой стала ровной.",
+            "Обогнули овраг по верху, и голос остался подо льдом.",
+            "Сошли по льду, и ночью из трещины пила вся стая.",
+        ],
+    }
+    for day_index, texts in by_day.items():
+        cards = payload["days"][day_index - 1]["cards"]
+        for card, text in zip(cards, texts, strict=True):
+            card["consequence"] = text
+    return payload
+
+
+def test_prev_echo_of_yesterday_is_clean() -> None:
+    """Эхо дня N про день N−1 — норма: никакого предупреждения."""
+    payload = _payload_with_echoes()
+    payload["days"][1]["prev"] = {0: _ЭХО_ДНЯ1}  # день 2 помнит котельную (день 1)
+    result = validate_payload(payload)
+    assert result.ok
+    assert not any("СВОЕГО" in warning and "день 2" in warning for warning in result.warnings)
+
+
+def test_prev_echo_of_own_day_is_flagged() -> None:
+    """Эхо дня N про день N — сдвиг на +1: это и есть баг кассеты."""
+    payload = _payload_with_echoes()
+    payload["days"][1]["prev"] = {0: _ЭХО_ДНЯ2}  # день 2 «помнит» шиповник (свой день)
+    result = validate_payload(payload)
+    assert result.ok, result.errors  # мягкое замечание, не отказ
+    hits = [w for w in result.warnings if "СВОЕГО" in w and "день 2" in w]
+    assert hits, result.warnings
+    assert "ждёт дня на +1" in hits[0]
+
+
+def test_own_day_echo_is_found_in_a_long_cassette() -> None:
+    """Сдвиг ловится и в полной кассете: сравнение только с соседним днём."""
+    payload = _payload_with_echoes()
+    payload["days"][1]["prev"] = {0: _ЭХО_ДНЯ2}
+    result = validate_payload(payload)
+    assert result.ok
+    flagged = [w for w in result.warnings if "СВОЕГО" in w and "день 2" in w]
+    assert flagged, result.warnings
+    # и остальной месяц линтер не сочтит сдвигом
+    assert len(flagged) == 1, flagged
+
+
+def test_repeated_prev_block_is_flagged() -> None:
+    """Дословно повторённый блок prev — забытое эхо другого дня."""
+    payload = _payload_with_echoes()
+    block = {0: _ЭХО_ДНЯ1, 1: "Лампа погасла, и стая осталась совсем без огня."}
+    payload["days"][2]["prev"] = dict(block)
+    payload["days"][8]["prev"] = dict(block)
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("блок prev дословно повторяет день 3" in w for w in result.warnings), (
+        result.warnings
+    )
+
+
+def test_repeated_single_prev_key_is_flagged() -> None:
+    """Повтор одного ключа при других новых — тоже забытое эхо (так был день 19)."""
+    payload = _payload_with_echoes()
+    payload["days"][2]["prev"] = {0: _ЭХО_ДНЯ1}
+    payload["days"][8]["prev"] = {0: _ЭХО_ДНЯ1, 1: "Совсем другой текст для ключа один."}
+    result = validate_payload(payload)
+    assert result.ok
+    assert any("prev[0] дословно повторяет день 3" in w for w in result.warnings), (
+        result.warnings
+    )
+
+
+def test_prev_of_first_day_is_not_judged() -> None:
+    """У первого дня нет вчерашнего: эхо не судим (иначе вечное ложное срабатывание)."""
+    payload = _payload_with_echoes()
+    payload["days"][0]["prev"] = {0: _ЭХО_ДНЯ2}
+    result = validate_payload(payload)
+    assert result.ok
+    assert not any("СВОЕГО" in w and "день 1" in w for w in result.warnings), result.warnings
+
+
+def test_fork_first_day_echo_compared_against_main_road() -> None:
+    """Первый день ветки помнит день at_day−1 ГЛАВНОЙ дороги, а не свой."""
+    payload = _payload("2026-01", 31)
+    main_text = "Главная дорога ушла в тупик, и стая вернулась с подарком."
+    for card in payload["days"][26]["cards"]:  # день 27 — накануне развилки
+        card["consequence"] = main_text
+    fork_text = "Ветка ушла в тупик, и стая засветила фонарь на всех."
+    payload["switch"] = [
+        {"to": "b", "at_day": 28, "winner": 1, "days": [_day(i) for i in range(28, 32)]}
+    ]
+    for card in payload["switch"][0]["days"][0]["cards"]:
+        card["consequence"] = fork_text
+    payload["switch"][0]["days"][0]["prev"] = {1: "Главная дорога ушла в тупик."}
+    result = validate_payload(payload)
+    assert result.ok
+    assert not any("СВОЕГО" in w and "день 28" in w for w in result.warnings), result.warnings
+
+
+def test_fork_day_echoing_its_own_day_is_flagged() -> None:
+    """Сдвиг ловится и внутри ветки — там дней меньше, но игрок видит то же эхо."""
+    payload = _payload("2026-01", 31)
+    payload["switch"] = [
+        {"to": "b", "at_day": 28, "winner": 1, "days": [_day(i) for i in range(28, 32)]}
+    ]
+    fork_days = payload["switch"][0]["days"]
+    own_text = "Ветка обогнула овраг по верху, и голос остался подо льдом."
+    for card in fork_days[1]["cards"]:  # день 29
+        card["consequence"] = own_text
+    fork_days[1]["prev"] = {0: "Ветка обогнула овраг по верху, и голос остался подо льдом."}
+    result = validate_payload(payload)
+    assert result.ok, result.errors
+    assert any("СВОЕГО" in w and "день 29" in w for w in result.warnings), result.warnings
+
+
+def test_real_cassettes_have_no_hard_errors() -> None:
+    """Вся библиотека проходит жёсткий контракт (мягкие замечания — не ошибки)."""
+    library = Path(__file__).resolve().parents[1] / "app" / "story" / "cassettes"
+    files = sorted(library.glob("*.json"))
+    assert files, "библиотека кассет пуста"
+    for path in files:
+        result = validate_file(path)
+        assert result.ok, f"{path.name}: {result.errors}"
