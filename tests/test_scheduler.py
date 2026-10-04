@@ -1174,3 +1174,81 @@ async def test_vote_reminder_vote_only_mode_phrase(monkeypatch) -> None:
     finally:
         await _clear_rounds()
 
+
+async def test_vote_reminder_count_is_truthful(monkeypatch, caplog) -> None:
+    """Счётчик «доставлено» не завышается: промах — это промах.
+
+    Раньше _deliver глотал сбой отправки в logger.debug, а _dm_send_all считает
+    успехом любой вызов без исключения — в лог уходило «отправлено N сообщений»
+    с N больше реального. Плюс аудиторией были ВСЕ подписчики, включая уже
+    проголосовавших, которых фильтр отбрасывал молча: они тоже попадали в счёт.
+
+    Здесь один игрок проголосовал (ему напоминание не нужно), второму отправка
+    падает. Честный результат — ноль из одного.
+    """
+    import logging
+
+    from app import scheduler as sched
+    from app.models import Player, Vote
+
+    await _clear_rounds()
+    round_id = await _make_round(9803, RoundStatus.OPEN)
+
+    async def failing(_pid, _text):
+        raise RuntimeError("telegram timeout")
+
+    monkeypatch.setattr(
+        sched, "_bot", Mock(send_message=AsyncMock(side_effect=failing))
+    )
+    monkeypatch.setattr(settings, "ton_enabled", False)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr(
+        "app.broadcast.active_player_ids", AsyncMock(return_value=[521, 522])
+    )
+
+    # Общая тестовая БД: подчищаем за собой до старта — и игроков, и маркер
+    # рассылки за сегодня. Маркер «одна рассылка на дату» забирает ПЕРВЫЙ
+    # прогон в файле, поэтому без снятия наш тест молчал бы, ничего не отправив.
+    from app.models import WatcherState
+
+    today = sched._now().strftime("%Y-%m-%d")
+    async with SessionLocal() as db:
+        await db.execute(
+            delete(WatcherState).where(WatcherState.key == f"job:vote-reminder:{today}")
+        )
+        await db.execute(delete(Vote).where(Vote.player_id.in_([521, 522])))
+        await db.execute(delete(Player).where(Player.id.in_([521, 522])))
+        await db.commit()
+        db.add_all(
+            [
+                Player(id=521, username="voted", first_name="V", dm_subscribed=True),
+                Player(id=522, username="silent", first_name="S", dm_subscribed=True),
+            ]
+        )
+        await db.commit()
+    async with SessionLocal() as db:
+        db.add(Vote(player_id=521, round_id=round_id, card_position=0))
+        await db.commit()
+
+    try:
+        with caplog.at_level(logging.INFO, logger="app.scheduler"):
+            await sched._vote_reminder_job()
+                # Числитель обязан быть нулём: заглушка роняет КАЖДУЮ отправку, значит
+        # доставлено ноль чего бы то ни было. Знаменатель не проверяем — джоба
+        # читает реальную таблицу Player общей тестовой БД, и число не
+        # проголосовавших зависит от порядка тестов. Сужение аудитории
+        # (only=) проверено отдельно на _dm_send_all с заглушкой.
+        assert "доставлено 0 из" in caplog.text, caplog.text
+        assert "не проголосовавших" in caplog.text, caplog.text
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key == f"job:vote-reminder:{today}"
+                )
+            )
+            await db.execute(delete(Vote).where(Vote.player_id.in_([521, 522])))
+            await db.execute(delete(Player).where(Player.id.in_([521, 522])))
+            await db.commit()
+        await _clear_rounds()
+

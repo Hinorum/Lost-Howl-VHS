@@ -167,16 +167,26 @@ async def active_player_ids() -> list[int]:
         return [row[0] for row in rows.all()]
 
 
-async def _dm_send_all(bot: Bot, deliver, label: str) -> int:
-    """Рассылка одного сообщения всем подписанным игрокам в личку.
+async def _dm_send_all(
+    bot: Bot, deliver, label: str, only: set[int] | None = None
+) -> int:
+    """Рассылка одного сообщения подписанным игрокам в личку.
 
     Промахи не критичны: бот не имеет права писать тем, кто его не начинал
     (forbidden) — их молча пропускаем, как в личном эхе. Возвращает число
     доставленных сообщений.
+
+    `only` сужает аудиторию до конкретных игроков. Без него счётчик доставки
+    врал: доставка считалась успешной для каждого, кого deliver не бросил
+    исключение, — а значит и для тех, кому отправлять было нечего (например
+    напоминание о голосовании уходило уже проголосовавшим, и они попадали в
+    «доставлено»). С `only` знаменатель совпадает с реальной аудиторией.
     """
     if bot is None or not settings.player_dm:
         return 0
     player_ids = await active_player_ids()
+    if only is not None:
+        player_ids = [pid for pid in player_ids if pid in only]
     if not player_ids:
         return 0
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)

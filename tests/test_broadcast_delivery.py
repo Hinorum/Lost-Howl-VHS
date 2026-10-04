@@ -251,6 +251,37 @@ async def test_dm_send_all_survives_plain_error(monkeypatch) -> None:
         await _wipe(Player)
 
 
+async def test_dm_send_all_only_narrows_audience_and_count(monkeypatch) -> None:
+    """`only` сужает аудиторию: и вызовы, и знаменатель счётчика.
+
+    Без него «доставлено» включало тех, кому отправлять было нечего. На
+    напоминании о голосовании это значило, что уже проголосовавшие попадали в
+    «отправлено N сообщений» — и число в логе было больше реального.
+    """
+    monkeypatch.setattr(settings, "player_dm", True)
+    await _wipe(Player)
+    ids = [777_401, 777_402, 777_403]
+    async with SessionLocal() as db:
+        db.add_all([Player(id=pid, dm_subscribed=True) for pid in ids])
+        await db.commit()
+    try:
+        called: list[int] = []
+
+        async def deliver(pid: int) -> None:
+            called.append(pid)
+
+        assert await bc._dm_send_all(
+            SimpleNamespace(), deliver, "напоминание", only={ids[0], ids[2]}
+        ) == 2
+        assert sorted(called) == [ids[0], ids[2]]
+        # Пустое пересечение — ни отправки, ни счёта.
+        assert await bc._dm_send_all(
+            SimpleNamespace(), deliver, "напоминание", only=set()
+        ) == 0
+    finally:
+        await _wipe(Player)
+
+
 # ── мягкие отказы в тексте итогов ───────────────────────────────────────────
 
 

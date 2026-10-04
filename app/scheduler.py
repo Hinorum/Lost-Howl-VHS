@@ -746,23 +746,32 @@ async def _vote_reminder_job() -> None:
             from app.broadcast import _dm_send_all
 
             async def _deliver(pid: int) -> None:
-                # Рассылка идёт по всем подписанным (параллельный пул), но текст
-                # адресован только не выбравшим путь: для них и существуем.
-                if pid not in unbotted_ids:
-                    return
-                try:
-                    await bot.send_message(
-                        pid,
-                        _reminder_text(
-                            stake_mode,
-                            rule_phrase,
-                            stake_totals.get(pid, (0, 0)),
-                        ),
-                    )
-                except Exception as exc:
-                    logger.debug("Напоминание о голосовании игроку %s не доставлено: %s", pid, exc)
+                # Аудитория сужена до не проголосовавших (only=), поэтому и
+                # фильтровать внутри не нужно.
+                #
+                # СБОЙ ОТПРАВКИ НЕ ГЛОТАЕТСЯ. Раньше здесь стоял
+                # except Exception -> logger.debug, из-за чего _dm_send_all
+                # (он считает успехом любой вызов без исключения) записывал
+                # неп��ставленное сообщение как доставленное, и в лог уходило
+                # «Напоминание о голосовании отправлено: N сообщений» с
+                # завышенным N. Теперь промах считается промахом, ретрай
+                # Telegram отрабатывает, а причина видна на уровне warning.
+                await bot.send_message(
+                    pid,
+                    _reminder_text(
+                        stake_mode,
+                        rule_phrase,
+                        stake_totals.get(pid, (0, 0)),
+                    ),
+                )
 
-            sent = await _dm_send_all(bot, _deliver, "vote-reminder")
-            logger.info("Напоминание о голосовании отправлено: %d сообщений", sent)
+            sent = await _dm_send_all(
+                bot, _deliver, "vote-reminder", only=unbotted_ids
+            )
+            logger.info(
+                "Напоминание о голосовании: доставлено %d из %d не проголосовавших",
+                sent,
+                len(unbotted_ids),
+            )
     except Exception as exc:
         logger.warning("Ошибка напоминания о голосовании: %s", exc)
