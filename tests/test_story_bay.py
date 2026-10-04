@@ -58,7 +58,6 @@ def _day(index: int) -> dict:
                 "image_path": "",
             },
         ],
-        "tie_note": None,
     }
 
 

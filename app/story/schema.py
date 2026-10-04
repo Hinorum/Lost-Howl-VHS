@@ -42,7 +42,6 @@ FIELD_LIMITS = {
     "card_title": 80,
     "card_description": 260,
     "card_consequence": 220,
-    "tie_note": 200,
     "attribution": 200,
     "track_name": 32,
     "diary": 200,
@@ -170,7 +169,6 @@ class DayModel(BaseModel):
     chapter_title: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_title"])
     chapter_text: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_text"])
     cards: list[CardModel] = Field(min_length=3, max_length=3)
-    tie_note: str | None = Field(default=None, max_length=FIELD_LIMITS["tie_note"])
     prev: dict[int, str] | None = Field(
         default=None,
         description="Эхо вчерашнего выбора стаи: {позиция победителя: как стая "
@@ -532,8 +530,6 @@ def _taboo_hits(cassette: Cassette) -> list[str]:
         all_days.extend(fork.days)
     for day in all_days:
         parts = [day.chapter_title, day.chapter_text, day.station]
-        if day.tie_note:
-            parts.append(day.tie_note)
         for card in day.cards:
             parts.extend((card.title, card.description, card.consequence))
         haystack = " ".join(parts).lower()

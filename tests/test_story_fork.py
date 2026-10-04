@@ -51,7 +51,6 @@ def _day(index: int, chapter: str | None = None) -> dict:
                 "image_path": "",
             },
         ],
-        "tie_note": None,
     }
 
 

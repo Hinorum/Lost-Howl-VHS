@@ -51,7 +51,6 @@ def _day(index: int, **overrides) -> dict:
                 "image_path": "",
             },
         ],
-        "tie_note": None,
     }
     data.update(overrides)
     return data
@@ -139,10 +138,6 @@ def test_field_length_limits_rejected() -> None:
 
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["consequence"] = "с" * (FIELD_LIMITS["card_consequence"] + 1)
-    assert not validate_payload(payload).ok
-
-    payload = _payload("2026-04", 30)
-    payload["days"][0]["tie_note"] = "т" * (FIELD_LIMITS["tie_note"] + 1)
     assert not validate_payload(payload).ok
 
 
