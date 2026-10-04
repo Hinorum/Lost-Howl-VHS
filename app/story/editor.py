@@ -203,6 +203,26 @@ def _derive_name(cassette: Cassette) -> str:
     return f"{slug}-{cassette.month}.json"
 
 
+def is_safe_cassette_name(file_name: str) -> bool:
+    r"""Имя файла кассеты не выходит за пределы каталога библиотеки.
+
+    Имена приходят из callback_data (то есть от клиента) и склеиваются с
+    каталогом дальше через `directory / name`. Без этой проверки
+    `../../../../etc/passwd` читал бы любой файл контейнера, а `restore` с тем
+    же именем — писал бы в любой путь, где нашлось одноимённое `.bak`.
+
+    Требование строгое: только базовое имя, только «.json», без «..». В
+    библиотеке лежат файлы вида `cassette-YYYY-MM.json`, поэтому проверка
+    ничего не теряет. Символ «\» проверяем отдельно: на Windows он тоже
+    разделитель, а Path.name его не считает.
+    """
+    if not file_name or file_name != Path(file_name).name:
+        return False
+    if "/" in file_name or "\\" in file_name or ".." in file_name:
+        return False
+    return file_name.endswith(".json")
+
+
 def validate_edit(
     data: bytes,
     file_name: str,
@@ -216,6 +236,10 @@ def validate_edit(
     кассета (имя выводится из cassette_id+месяца, существующие не трогаются).
     Возвращает (ok, строки отчёта, конечное имя файла, кассета результата).
     """
+    # Имя кассеты приходит извне, поэтому проверяется здесь, а не в
+    # вызывающем коде: этот модуль используется и из CLI-инструмента.
+    if file_name != "<new>" and not is_safe_cassette_name(file_name):
+        return False, [f"Недопустимое имя файла: {file_name}"], None, None
     text = data.decode("utf-8-sig")
 
     if mode == "new":
@@ -225,6 +249,15 @@ def validate_edit(
             return False, lines, None, None
         cassette = result.cassette
         final_name = _derive_name(cassette)
+        # Имя выводится из сценария, то есть из загруженного документа, и
+        # потому требует той же гарантии, что и имя из callback_data.
+        if not is_safe_cassette_name(final_name or ""):
+            return (
+                False,
+                [f"Недопустимое имя файла по сценарию: {final_name}"],
+                None,
+                None,
+            )
         if (directory / final_name).is_file():
             return (
                 False,
@@ -307,6 +340,11 @@ def apply_cassette_file(
         return False, lines, final_name
     if dry_run:
         return True, [*lines, "Проверено — файл не изменён."], final_name
+    # Конечное имя тоже проверяем: для mode=new оно выводится из сценария
+    # (_derive_name), то есть приходит из загруженного документа, и потому
+    # требует той же гарантии, что и имя из callback_data.
+    if not is_safe_cassette_name(final_name or ""):
+        return False, ["Недопустимое имя файла по сценарию — запись отменена."], None
     path = directory / final_name
     if mode != "new":
         _backup(path)
@@ -319,6 +357,10 @@ def restore_backup(file_name: str, directory: Path) -> tuple[bool, list[str]]:
 
     Бэкап сперва валидируется: битый бэкап не трогает рабочую кассету.
     """
+    # Отказ до любой работы с путями: функция пишет (shutil.copy2), поэтому
+    # имя извне обязано быть проверено здесь.
+    if not is_safe_cassette_name(file_name):
+        return False, ["Недопустимое имя файла."]
     path = directory / file_name
     bak = directory / (file_name + ".bak")
     if not bak.is_file():

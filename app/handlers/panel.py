@@ -737,8 +737,28 @@ def _report_text(head: str, lines: list[str]) -> str:
     return prefix + "\n" + status
 
 
+def _safe_cassette_name(file_name: str) -> str | None:
+    """Имя файла кассеты без выхода за пределы библиотеки, иначе None.
+
+    file_name приходит из callback_data, то есть от клиента. Раньше он
+    подставлялся в путь как есть: `cassette:scene:../../../../etc/passwd` даёт
+    чтение любого файла контейнера, а `cassette:restore:<путь>` — запись в
+    любой путь, где нашлось одноимённое `.bak`. Telegram ограничивает
+    callback_data 64 байтами, то есть такой путь в него помещается.
+
+    Сама проверка живёт в story.editor: там же строятся пути при записи, и
+    дубль правил в двух модулях разошёлся бы при первом же изменении.
+    """
+    from app.story.editor import is_safe_cassette_name
+
+    return file_name if is_safe_cassette_name(file_name) else None
+
+
 def _has_backup(file_name: str) -> bool:
-    return (default_cassettes_dir() / (file_name + ".bak")).is_file()
+    safe = _safe_cassette_name(file_name)
+    if safe is None:
+        return False
+    return (default_cassettes_dir() / (safe + ".bak")).is_file()
 
 
 def _scene_badge(awaiting: bool, hint: str = "") -> str:
@@ -750,12 +770,15 @@ def _scene_badge(awaiting: bool, hint: str = "") -> str:
 
 def _library_entry(file_name: str) -> LibraryEntry | None:
     """Живая запись библиотеки по имени файла (из списка /cassette)."""
-    path = default_cassettes_dir() / file_name
+    safe = _safe_cassette_name(file_name)
+    if safe is None:
+        return None
+    path = default_cassettes_dir() / safe
     if not path.is_file():
         return None
     result = validate_file(path)
     return LibraryEntry(
-        file_name=file_name,
+        file_name=safe,
         cassette=result.cassette,
         errors=result.errors,
         warnings=result.warnings,
@@ -848,6 +871,13 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     op = parts[1] if len(parts) > 1 else ""
     file_name = parts[2] if len(parts) > 2 else ""
+    # Всё, что дальше, работает с именем файла как с путём. Отсекаем выход за
+    # пределы библиотеки ДО ветвления: иначе «неизвестное действие» и
+    # «кассеты нет» выглядели бы одинаково, а проверка по op сползала бы на
+    # действия, где имя не нужно (clear/stop/back), а имя всё равно в данных.
+    if file_name and _safe_cassette_name(file_name) is None:
+        await callback.answer("Некорректное имя кассеты.", show_alert=True)
+        return
     try:
         if op == "set":
             entry = _library_entry(file_name)
@@ -979,11 +1009,12 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 reply_markup=_new_keyboard(),
             )
         elif op == "restore":
-            path = default_cassettes_dir() / file_name
-            if not path.is_file():
+            safe = _safe_cassette_name(file_name)
+            path = default_cassettes_dir() / safe if safe else None
+            if path is None or not path.is_file():
                 await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
                 return
-            ok, lines = restore_backup(file_name, default_cassettes_dir())
+            ok, lines = restore_backup(safe, default_cassettes_dir())
             if not ok:
                 await callback.answer("\n".join(lines)[:200], show_alert=True)
                 return
@@ -1024,9 +1055,27 @@ async def on_cassette_document(message: Message) -> None:
         return
     if message.document is None:
         return
+    # Потолок размера: Telegram и так ограничивает документ 20 МБ, но файл
+    # целиком тянется в память и распаковывается. Кассета — текст в JSON на
+    # единицы килобайт; мегабайтный «документ» может быть только ошибкой или
+    # попыткой положить память контейнера под нож.
+    max_bytes = 2 * 1024 * 1024
+    if (getattr(message.document, "file_size", None) or 0) > max_bytes:
+        await message.reply(
+            f"❌ Документ больше {max_bytes // (1024 * 1024)} МБ — кассета столько "
+            "не весит. Пришли файл поменьше или разбей его.",
+        )
+        return
     async with SessionLocal() as session:
         edit_file, edit_mode = await get_edit_intent(session)
     if edit_file is None:
+        return
+    # Правка всегда идёт по уже известному файлу из библиотеки, но проверяем
+    # имя ещё раз: edit_file лежит в БД, а значит в принципе мог прийти из
+    # callback_data в прежней версии кода. Ссылка на <new> — это создание
+    # новой кассеты, там имя задаёт сам файл.
+    if edit_file != "<new>" and _safe_cassette_name(edit_file) is None:
+        await message.reply("❌ Имя кассеты некорректно — правка отклонена.")
         return
     mode = edit_mode.split("-", 1)[0]
     dry_run = edit_mode.endswith("-check")
