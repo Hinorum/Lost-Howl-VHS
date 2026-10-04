@@ -14,8 +14,7 @@
 
 Проверка делится на жёсткую (кассета отвергнута) и мягкую (warning):
 жёстко — структура, длины, позиции карт, уникальность дорог и пар
-(at_day, winner) перемоток, стоп-слова; мягко — бюджет режиссуры rule_hint
-(≈ N/3 дней на каждый закон по главной дороге), мёртвые ключи prev на входе
+(at_day, winner) перемоток, стоп-слова; мягко — мёртвые ключи prev на входе
 дороги перемотки, привязка эха prev к тому дню, которому оно принадлежит
 (сдвиг на день и копипаст блока), стилевые замечания (витрина одним экраном,
 кадр не тянется, заголовок карты не повторяет дословно своё описание).
@@ -53,13 +52,6 @@ FIELD_LIMITS = {
 # Максимум перемоток (развилок) в одной кассете: ветвление месяца держим
 # строго «домашним» — 2–4 вилки на месяц, чтобы сюжет оставался обозримым.
 MAX_FORKS = 4
-
-RULE_HINT_VALUES = ("any", "majority", "minority", "median")
-
-# Толеранс бюджета режиссуры rule_hint (warning, не ошибка): для каждого из
-# трёх законов ожидается ≈ N/3 дней месяца, отклонение в пределах toleration
-# допустимо.
-RULE_HINT_TOLERANCE = 2
 
 # Стилевые пороги (мягкие warning'и, не ошибки). Калибр — текущая библиотека
 # кассет (суммы описаний до ~500, главы до ~550 знаков), поэтому пороги ловят
@@ -177,7 +169,6 @@ class DayModel(BaseModel):
     station: str = Field(min_length=1)
     chapter_title: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_title"])
     chapter_text: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_text"])
-    rule_hint: str = "any"
     cards: list[CardModel] = Field(min_length=3, max_length=3)
     tie_note: str | None = Field(default=None, max_length=FIELD_LIMITS["tie_note"])
     prev: dict[int, str] | None = Field(
@@ -191,13 +182,6 @@ class DayModel(BaseModel):
         description="Запись дневника (ПОВ-контраст к эпической главе): звучит "
         "в итогах дня после канона.",
     )
-
-    @field_validator("rule_hint")
-    @classmethod
-    def _rule_hint_known(cls, value: str) -> str:
-        if value not in RULE_HINT_VALUES:
-            raise ValueError(f"rule_hint должен быть одним из: {', '.join(RULE_HINT_VALUES)}")
-        return value
 
     @field_validator("prev")
     @classmethod
@@ -360,21 +344,6 @@ class Cassette(BaseModel):
                 return fork.days[offset]
             return None
         return None
-
-    def rule_hint_budget_warnings(self) -> list[str]:
-        """Отклонения бюджета режиссуры по ГЛАВНОЙ дороге: ≈N/3 на каждый закон, ±толеранс."""
-        counts = {value: 0 for value in RULE_HINT_VALUES}
-        for day in self.days:
-            counts[day.rule_hint] += 1
-        expected = len(self.days) / 3
-        warnings: list[str] = []
-        for law in ("majority", "minority", "median"):
-            if abs(counts[law] - expected) > RULE_HINT_TOLERANCE:
-                warnings.append(
-                    f"{law}: {counts[law]} дней вместо ≈{len(self.days) // 3} "
-                    f"(±{RULE_HINT_TOLERANCE}) по главной дороге"
-                )
-        return warnings
 
     def dead_prev_warnings(self) -> list[str]:
         """Мёртвые ключи эха на входе дороги перемотки (warning).
@@ -578,7 +547,7 @@ def validate_payload(payload: dict) -> ValidationResult:
     """Проверяет словарь кассеты (из JSON) против контракта.
 
     Успех → cassette заполнен; иначе ошибки в errors. Мягкие замечания
-    (бюджет rule_hint) всегда в warnings.
+    (привязка эха, стиль) всегда в warnings.
     """
     warnings: list[str] = []
     try:
@@ -595,7 +564,6 @@ def validate_payload(payload: dict) -> ValidationResult:
             cassette=None,
             errors=[f"стоп-слова: {', '.join(taboo)}"],
         )
-    warnings.extend(cassette.rule_hint_budget_warnings())
     warnings.extend(cassette.dead_prev_warnings())
     warnings.extend(cassette.prev_alignment_warnings())
     warnings.extend(cassette.style_warnings())

@@ -69,7 +69,7 @@ def day_view_text(cassette: Cassette, day: int, road: str = "main") -> str:
     header = f"=== {cassette.month} · День {item.day_index}"
     if road != "main":
         header += f" · дорога {road}"
-    header += f" · закон-метка {item.rule_hint} · {item.station} ==="
+    header += f" · {item.station} ==="
     lines = [header, item.chapter_title, "", item.chapter_text, ""]
     for position in (0, 1, 2):
         echo = (item.prev or {}).get(position)

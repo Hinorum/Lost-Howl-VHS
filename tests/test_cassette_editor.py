@@ -51,7 +51,6 @@ def _mk_cassette(
             "station": f"станция {i}",
             "chapter_title": f"глава {i}",
             "chapter_text": f"текст {i}",
-            "rule_hint": "any",
             "cards": [
                 {"position": 0, "title": f"ход {i}a", "description": "описание", "consequence": "канон"},
                 {"position": 1, "title": f"ход {i}b", "description": "описание", "consequence": "канон"},
@@ -214,14 +213,14 @@ def test_apply_broken_day_keeps_file(tmp_path) -> None:
     source = _write_cassette(tmp_path)
     before = source.read_bytes()
     ok, lines, _final = ed.apply_cassette_file(
-        yaml.safe_dump({"day_index": 3, "rule_hint": "not-a-rule"}).encode("utf-8"),
+        yaml.safe_dump({"day_index": 3, "chapter_text": "обрывок без карт"}).encode("utf-8"),
         "mel.json",
         "day",
         tmp_path,
     )
     assert not ok
     assert source.read_bytes() == before
-    assert any("rule_hint" in line for line in lines)
+    assert any("cards" in line for line in lines), lines
 
 
 def test_apply_unknown_file_and_mode(tmp_path) -> None:

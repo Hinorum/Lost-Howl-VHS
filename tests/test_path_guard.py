@@ -168,7 +168,6 @@ def _valid_cassette_text() -> bytes:
             "station": f"станция {index}",
             "chapter_title": f"глава {index}",
             "chapter_text": f"текст {index}",
-            "rule_hint": "any",
             "cards": [
                 {
                     "position": position,

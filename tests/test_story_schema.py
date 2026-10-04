@@ -2,7 +2,7 @@
 
 Кассета обязана описывать ровно один календарный месяц («YYYY-MM») и содержать
 ровно столько дней, сколько в этом месяце по календарю. Жёсткие ошибки
-отвергают кассету; бюджет режиссуры (rule_hint) — мягкие замечания.
+отвергают кассету; привязка эха prev и стиль — мягкие замечания.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ def _day(index: int, **overrides) -> dict:
         "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
         "chapter_text": "Стая собирается у котла. Огонь лижет бак, дождь трогает крыши. Пути ждут до рассвета.",
-        "rule_hint": "any",
         "cards": [
             {
                 "position": 0,
@@ -110,13 +109,6 @@ def test_bad_cards_positions_rejected() -> None:
     assert any("позиции 0, 1, 2" in error for error in result.errors)
 
 
-def test_bad_rule_hint_rejected() -> None:
-    payload = _payload("2026-04", 30)
-    payload["days"][0]["rule_hint"] = "majorit"
-    result = validate_payload(payload)
-    assert not result.ok
-
-
 def test_bad_month_format_rejected() -> None:
     assert not validate_payload(_payload("2026-13", 30)).ok
     assert not validate_payload(_payload("okt-2026", 30)).ok
@@ -166,13 +158,6 @@ def test_taboo_word_rejected() -> None:
     result = validate_payload(payload)
     assert not result.ok
     assert any("стоп-слова" in error for error in result.errors)
-
-
-def test_rule_hint_budget_is_soft_warning() -> None:
-    payload = _payload("2026-04", 30, days=[_day(i, rule_hint="majority") for i in range(1, 31)])
-    result = validate_payload(payload)
-    assert result.ok
-    assert any("majority" in warning for warning in result.warnings)
 
 
 def test_missing_attribution_is_soft_warning() -> None:

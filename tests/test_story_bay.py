@@ -32,7 +32,6 @@ def _day(index: int) -> dict:
         "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
         "chapter_text": "Стая собирается у котла и смотрит на рельсы.",
-        "rule_hint": "any",
         "cards": [
             {
                 "position": 0,
