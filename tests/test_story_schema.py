@@ -25,7 +25,6 @@ def _day(index: int, **overrides) -> dict:
         "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
         "chapter_text": "Стая собирается у котла. Огонь лижет бак, дождь трогает крыши. Пути ждут до рассвета.",
-        "hook_text": None,
         "rule_hint": "any",
         "cards": [
             {
@@ -148,10 +147,6 @@ def test_field_length_limits_rejected() -> None:
 
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["consequence"] = "с" * (FIELD_LIMITS["card_consequence"] + 1)
-    assert not validate_payload(payload).ok
-
-    payload = _payload("2026-04", 30)
-    payload["days"][0]["hook_text"] = "к" * (FIELD_LIMITS["hook_text"] + 1)
     assert not validate_payload(payload).ok
 
     payload = _payload("2026-04", 30)

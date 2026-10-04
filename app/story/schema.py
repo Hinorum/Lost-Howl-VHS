@@ -43,7 +43,6 @@ FIELD_LIMITS = {
     "card_title": 80,
     "card_description": 260,
     "card_consequence": 220,
-    "hook_text": 700,
     "tie_note": 200,
     "attribution": 200,
     "track_name": 32,
@@ -178,7 +177,6 @@ class DayModel(BaseModel):
     station: str = Field(min_length=1)
     chapter_title: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_title"])
     chapter_text: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_text"])
-    hook_text: str | None = Field(default=None, max_length=FIELD_LIMITS["hook_text"])
     rule_hint: str = "any"
     cards: list[CardModel] = Field(min_length=3, max_length=3)
     tie_note: str | None = Field(default=None, max_length=FIELD_LIMITS["tie_note"])
@@ -565,8 +563,6 @@ def _taboo_hits(cassette: Cassette) -> list[str]:
         all_days.extend(fork.days)
     for day in all_days:
         parts = [day.chapter_title, day.chapter_text, day.station]
-        if day.hook_text:
-            parts.append(day.hook_text)
         if day.tie_note:
             parts.append(day.tie_note)
         for card in day.cards:

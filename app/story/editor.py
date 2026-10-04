@@ -84,8 +84,6 @@ def day_view_text(cassette: Cassette, day: int, road: str = "main") -> str:
         lines.append("")
     if item.diary:
         lines.append(f"(дневник стаи) {item.diary}")
-    if item.hook_text:
-        lines.append(f"(пометка автора) {item.hook_text}")
     if item.tie_note:
         lines.append(f"(оговорка ничьей) {item.tie_note}")
     return "\n".join(lines).rstrip()
