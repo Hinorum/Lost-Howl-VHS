@@ -133,42 +133,10 @@ async def test_status_text_for_closed_and_tallying_phases() -> None:
 
 
 # ── доставка пакета дня ─────────────────────────────────────────────────────
-
-
-async def test_single_media_sends_photo_not_group(monkeypatch) -> None:
-    """Telegram принимает mediaGroup только от двух вложений: один кадр дня
-    уходит обычным фото, иначе анонс падал ПОСЛЕ обложки."""
-    monkeypatch.setattr(bc, "build_day_post", Mock(return_value=[SimpleNamespace(media="day.jpg", caption="обложка")]))
-    bot = SimpleNamespace(
-        send_message=AsyncMock(),
-        send_photo=AsyncMock(),
-        send_media_group=AsyncMock(),
-    )
-    round_row = _round()
-    await bc._deliver_day(bot, 1, round_row, finished=None)
-    bot.send_photo.assert_awaited_once()
-    assert bot.send_photo.await_args.kwargs["caption"] == "обложка"
-    bot.send_media_group.assert_not_awaited()
-
-
-async def test_media_group_sent_when_two_attachments(monkeypatch) -> None:
-    media = [SimpleNamespace(media="a.jpg", caption="a"), SimpleNamespace(media="b.jpg", caption="b")]
-    monkeypatch.setattr(bc, "build_day_post", Mock(return_value=media))
-    bot = SimpleNamespace(
-        send_message=AsyncMock(),
-        send_photo=AsyncMock(),
-        send_media_group=AsyncMock(),
-    )
-    await bc._deliver_day(bot, 1, _round(), finished=None)
-    bot.send_media_group.assert_awaited_once()
-    bot.send_photo.assert_not_awaited()
-
-
 async def test_finished_results_text_computed_once_per_chat(monkeypatch) -> None:
     """Экономика дня считается один раз на рассылку, а не на каждый чат."""
     results = AsyncMock(return_value="ИТОГИ")
     monkeypatch.setattr(bc, "results_message", results)
-    monkeypatch.setattr(bc, "build_day_post", Mock(return_value=[]))
     finished = _round(9299)
     finished.status = RoundStatus.CLOSED
     bot = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock(), send_media_group=AsyncMock())
@@ -183,7 +151,6 @@ async def test_retry_after_failure_does_not_abort_day(monkeypatch) -> None:
     отменить рассылку остальным: раньше исключение улетало из worker'а в
     gather и анонс дня не уходил НИКУДА."""
     _no_sleep(monkeypatch)
-    monkeypatch.setattr(bc, "build_day_post", Mock(return_value=[]))
     await _wipe(Chat)
     loud, healthy = 777_101, 777_102
     async with SessionLocal() as db:
@@ -208,7 +175,6 @@ async def test_retry_after_failure_does_not_abort_day(monkeypatch) -> None:
 
 async def test_retry_after_then_success_keeps_chat(monkeypatch) -> None:
     _no_sleep(monkeypatch)
-    monkeypatch.setattr(bc, "build_day_post", Mock(return_value=[]))
     await _wipe(Chat)
     chat = 777_103
     async with SessionLocal() as db:

@@ -562,12 +562,16 @@ def shutdown_scheduler() -> None:
 async def _cleanup_watcher_state_job() -> None:
     """Вычищает одноразовые/устаревшие ключи watcher_state.
 
-    Ключи вида micro_event:*, teaser:*, pecho:*, sniff:*, memquiz:* живут по
-    одному на раунд и никогда не чистятся сами (append-only), как и устаревшие
-    img_stubs:* / day_projection:* / art_bible:* за прошлые дни, и одноразовые
-    маркеры дедупа refund:* / ledger:* (после того как возврат/доход уже создан,
-    метка — мёртвый груз). На больших сезонах таблица растёт бесконечно — раз в
-    неделю держим её в узде, оставляя только живые настройки и потоковые якоря.
+    В списке только то, что действительно пишется. Одноразовые маркеры дедупа
+    refund:* (app/ton_watch/refunds.py) и ledger:* (app/ton_watch/ledger.py):
+    после того как возврат или доход уже созданы, метка — мёртвый груз, а
+    таблица на больших сезонах растёт бесконечно. Раз в неделю держим её в узде,
+    оставляя живые настройки и потоковые якоря.
+
+    Отсюда убраны micro_event:*, teaser:*, pecho:*, sniff:*, memquiz:*,
+    img_stubs:*, day_projection:*, art_bible:* — писателей у них нет ни одного,
+    уборка чистила пустоту. Это наследие снятого слоя (соцмеханика, арт,
+    проекции дня); возвращать префиксы стоит вместе с тем, что их пишет.
 
     ВНИМАНИЕ: pot:* в список НЕ входит и не должен. Это метки «копилка за этот
     день уже зачислена», и снос метки означал бы, что следующая финализация
@@ -578,15 +582,7 @@ async def _cleanup_watcher_state_job() -> None:
     try:
         async with SessionLocal() as session:
             stmt = select(WatcherState).where(
-                (WatcherState.key.like("micro_event:%"))
-                | (WatcherState.key.like("teaser:%"))
-                | (WatcherState.key.like("pecho:%"))
-                | (WatcherState.key.like("sniff:%"))
-                | (WatcherState.key.like("memquiz:%"))
-                | (WatcherState.key.like("img_stubs:%"))
-                | (WatcherState.key.like("day_projection:%"))
-                | (WatcherState.key.like("art_bible:%"))
-                | (WatcherState.key.like("refund:%"))
+                (WatcherState.key.like("refund:%"))
                 | (WatcherState.key.like("ledger:%"))
             )
             rows = (await session.execute(stmt)).scalars().all()

@@ -915,7 +915,7 @@ async def test_cleanup_watcher_state_removes_stale_keeps_live() -> None:
     from app.models import WatcherState
 
     async with SessionLocal() as db:
-        for key in ("teaser:5", "img_stubs:3", "refund:abc", "micro_event:9", "ledger:42"):
+        for key in ("refund:abc", "ledger:42", "pot:1", "teaser:5", "img_stubs:3"):
             db.add(WatcherState(key=key, value="x"))
         db.add(WatcherState(key="run:anchor", value="y"))
         await db.commit()
@@ -924,10 +924,22 @@ async def test_cleanup_watcher_state_removes_stale_keeps_live() -> None:
 
     async with SessionLocal() as db:
         keys = {row.key for row in (await db.execute(select(WatcherState))).scalars()}
-    # Живыми остаются потоковые якоря и отметка последнего бэкапа: снести её
-    # недельной чисткой означало бы поднять тревогу «бэкапов нет» на ровном
-    # месте каждую неделю.
-    assert keys == {"run:anchor", BACKUP_LAST_OK_KEY}
+    # Убираются только маркеры дедупа, которые действительно пишутся
+    # (ton_watch/refunds.py и ton_watch/ledger.py).
+    #
+    # Остальное остаётся: потоковые якоря и отметка последнего бэкапа — снести её
+    # значило бы поднять тревогу «бэкапов нет» на ровном месте каждую неделю;
+    # pot:* — метка «копилка за этот день уже зачислена», её снос начислил бы
+    # копилку второй раз; teaser:* / img_stubs:* — бывшие префиксы снятого слоя,
+    # писателей у них нет, и чистить их нечего (в уборку их вернули бы вместе с
+    # тем, что их пишет).
+    assert keys == {
+        "run:anchor",
+        BACKUP_LAST_OK_KEY,
+        "pot:1",
+        "teaser:5",
+        "img_stubs:3",
+    }
 
 
 async def test_cleanup_watcher_state_empty_db_noop() -> None:

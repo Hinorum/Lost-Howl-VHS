@@ -161,9 +161,6 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
     await session.execute(delete(MemoryHit))
     await session.execute(delete(Card))
     await session.execute(delete(PreparedDay))
-    await session.execute(
-        delete(WatcherState).where(WatcherState.key.like("art_bible:%"))
-    )
     if not keep_story:
         await session.execute(delete(StoryBeat))
     await session.execute(delete(Round))

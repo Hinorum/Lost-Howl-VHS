@@ -141,11 +141,6 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
     return core + tail
 
 
-def build_day_post(round_row: Round) -> list:
-    """Медиа дня отключено (слой сюжета снят): пост дня — чистый текст."""
-    return []
-
-
 async def active_chat_ids() -> list[int]:
     async with SessionLocal() as session:
         rows = await session.execute(select(Chat.id).where(Chat.active.is_(True)))
@@ -325,14 +320,10 @@ async def _deliver_day(
         # HTML: строка правила дня несёт жирные блоки.
         if results_text:
             await bot.send_message(chat_id, results_text, parse_mode=ParseMode.HTML)
-    media = build_day_post(round_row)
-    if len(media) >= 2:
-        await bot.send_media_group(chat_id, media=media)
-    elif media:
-        # Инцидент-регрессия: Telegram принимает mediaGroup только от двух
-        # вложений. Новый мир даёт один кадр дня — шлём обычным фото, иначе
-        # анонс падал ПОСЛЕ обложки и статус с кнопками голосования не уходил.
-        await bot.send_photo(chat_id, photo=media[0].media, caption=media[0].caption)
+    # Медиа дня нет: build_day_post() всегда возвращал пустой список, поэтому
+    # ветки send_photo/send_media_group были недостижимы. Картинки вернутся
+    # вместе с реальной генерацией — тогда понадобится и send_media_group
+    # (Telegram принимает его только от двух вложений, см. историю 2dfc1a).
     sent = await bot.send_message(
         chat_id,
         await status_text(round_row, show_title=True),
