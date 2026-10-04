@@ -25,7 +25,6 @@ _TEMPLATE_CARDS: list[dict] = [
         "description": "Первая сцена для голоса стаи.",
         "consequence": "Стая выбрала первую сцену.",
         "tag": "care",
-        "image_path": "",
     },
     {
         "position": 1,
@@ -33,7 +32,6 @@ _TEMPLATE_CARDS: list[dict] = [
         "description": "Вторая сцена для голоса стаи.",
         "consequence": "Стая выбрала вторую сцену.",
         "tag": "care",
-        "image_path": "",
     },
     {
         "position": 2,
@@ -41,7 +39,6 @@ _TEMPLATE_CARDS: list[dict] = [
         "description": "Третья сцена для голоса стаи.",
         "consequence": "Стая выбрала третью сцену.",
         "tag": "care",
-        "image_path": "",
     },
 ]
 

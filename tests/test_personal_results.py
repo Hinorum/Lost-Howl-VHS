@@ -112,7 +112,6 @@ async def _seed_round(
                     description="описание",
                     consequence="канон",
                     tag="care",
-                    image_path="",
                 )
             )
         for pid, _pos in votes:

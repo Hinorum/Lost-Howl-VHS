@@ -237,7 +237,6 @@ def _transient_round(tmp_path) -> Round:
                 description="описание",
                 consequence="канон",
                 tag="care",
-                image_path=str(image),
             )
         )
     return round_row

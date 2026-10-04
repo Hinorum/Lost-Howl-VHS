@@ -53,7 +53,6 @@ def _round(*, rule_entropy: str | None = None) -> Round:
                 title=f"Тропа {position}",
                 description="д",
                 consequence="Канон дня.",
-                image_path="",
             )
         )
     return round_row

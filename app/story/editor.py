@@ -79,8 +79,6 @@ def day_view_text(cassette: Cassette, day: int, road: str = "main") -> str:
         lines.append(f"[{card.position}] {card.title}")
         lines.append(f"    Суть: {card.description}")
         lines.append(f"    Канон, если уцелеет: {card.consequence}")
-        if card.image_path:
-            lines.append(f"    image_path: {card.image_path}")
         lines.append("")
     if item.diary:
         lines.append(f"(дневник стаи) {item.diary}")

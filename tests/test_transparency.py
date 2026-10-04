@@ -32,7 +32,7 @@ async def test_start_explains_schedule_and_disclaimer(monkeypatch, tmp_path) -> 
         image.write_bytes(b"jpeg")
         fake_round.cards.append(
             Card(position=i, title=f"T{i}", description="d", consequence="c",
-                 tag="care", image_path=str(image))
+                 tag="care")
         )
     monkeypatch.setattr(h, "_ensure_round", AM(return_value=fake_round))
     monkeypatch.setattr(settings, "ton_enabled", True)

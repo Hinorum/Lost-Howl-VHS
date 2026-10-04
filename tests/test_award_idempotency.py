@@ -31,7 +31,7 @@ def _tallying_day(day_index: int) -> Round:
     )
     for pos in (0, 1, 2):
         round_row.cards.append(
-            Card(position=pos, title=f"t{pos}", description="d", consequence="к", image_path="")
+            Card(position=pos, title=f"t{pos}", description="d", consequence="к")
         )
     return round_row
 

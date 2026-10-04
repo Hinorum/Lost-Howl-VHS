@@ -45,7 +45,6 @@ def _round(day_index: int, media_dir) -> Round:
                 description="описание",
                 consequence="канон",
                 tag="care",
-                image_path=str(media_dir / name),
             )
         )
     return round_row

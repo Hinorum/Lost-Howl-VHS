@@ -151,7 +151,6 @@ class CardModel(BaseModel):
     description: str = Field(min_length=1, max_length=FIELD_LIMITS["card_description"])
     consequence: str = Field(min_length=1, max_length=FIELD_LIMITS["card_consequence"])
     tag: str = "care"
-    image_path: str = ""
 
     @field_validator("position")
     @classmethod

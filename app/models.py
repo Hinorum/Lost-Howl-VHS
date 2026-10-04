@@ -254,7 +254,8 @@ class Card(Base):
     position: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(Text)
-    image_path: Mapped[str] = mapped_column(String(400))
+    # image_path удалён миграцией d5f8a1c39b02: арт не делается (build_day_post
+    # пуст), поле было NOT NULL без дефолта и роняло INSERT карточек.
     consequence: Mapped[str] = mapped_column(Text)
     tag: Mapped[str] = mapped_column(String(16), default="care")
 

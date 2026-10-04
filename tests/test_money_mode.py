@@ -47,7 +47,6 @@ def _round_row(money_mode: bool, day_index: int, _id: int, with_cards: bool = Fa
                     description="описание",
                     consequence="канон",
                     tag="care",
-                    image_path="",
                 )
             )
     return round_row

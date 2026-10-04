@@ -32,7 +32,6 @@ def _day(index: int, chapter: str | None = None) -> dict:
                 "description": "Тёплый след.",
                 "consequence": "Стая пошла на юг.",
                 "tag": "care",
-                "image_path": "",
             },
             {
                 "position": 1,
@@ -40,7 +39,6 @@ def _day(index: int, chapter: str | None = None) -> dict:
                 "description": "Ветер с полей.",
                 "consequence": "Стая пошла на запад.",
                 "tag": "care",
-                "image_path": "",
             },
             {
                 "position": 2,
@@ -48,7 +46,6 @@ def _day(index: int, chapter: str | None = None) -> dict:
                 "description": "Близко и высоко.",
                 "consequence": "Стая осталась на крыше.",
                 "tag": "care",
-                "image_path": "",
             },
         ],
     }

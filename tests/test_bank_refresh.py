@@ -46,7 +46,6 @@ async def _persist_round(day_index: int, *, status: RoundStatus = RoundStatus.OP
                     title=f"Путь {position}",
                     description="описание",
                     consequence="канон",
-                    image_path="day.jpg",
                     tag="care",
                 )
             )

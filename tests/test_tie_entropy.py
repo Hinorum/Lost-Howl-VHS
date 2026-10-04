@@ -35,7 +35,6 @@ def _round(day_index: int) -> Round:
                 title=f"Тропа {position}",
                 description="д",
                 consequence="Канон дня.",
-                image_path="",
             )
         )
     return round_row

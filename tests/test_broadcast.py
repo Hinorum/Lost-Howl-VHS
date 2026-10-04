@@ -40,7 +40,6 @@ def _round(day_index: int, media_dir) -> Round:
                 description="описание",
                 consequence="канон",
                 tag="care",
-                image_path=str(media_dir / name),
             )
         )
     return round_row
@@ -175,8 +174,6 @@ async def test_status_carries_paths_and_media_is_empty(tmp_path) -> None:
     from app.broadcast import status_text
 
     round_row = _round(9300, tmp_path)
-    for card in round_row.cards:
-        card.image_path = ""
     status = await status_text(round_row)
     for position in range(3):
         assert f"{['I', 'II', 'III'][position]}. Путь {position} — описание" in status
@@ -188,8 +185,6 @@ async def test_status_carries_story_between_title_and_paths(tmp_path) -> None:
     from app.broadcast import status_text
 
     round_row = _round(9302, tmp_path)
-    for card in round_row.cards:
-        card.image_path = ""
     status = await status_text(round_row)
     assert "День проверки рассылки" in status
     assert "Текст." in status

@@ -45,7 +45,7 @@ def _round_row(rule: WinRule, day_index: int) -> Round:
     )
     for pos in (0, 1, 2):
         round_row.cards.append(
-            Card(position=pos, title=f"t{pos}", description="d", consequence="к", image_path="")
+            Card(position=pos, title=f"t{pos}", description="d", consequence="к")
         )
     return round_row
 
@@ -340,7 +340,7 @@ async def test_results_post_stake_decided_text(session: AsyncSession) -> None:
     )
     for pos, title in ((0, "Тропа A"), (1, "Тропа B"), (2, "Тропа C")):
         rnd.cards.append(
-            Card(position=pos, title=title, description="d", consequence="к", image_path="")
+            Card(position=pos, title=title, description="d", consequence="к")
         )
     text = format_results(
         rnd,
@@ -435,7 +435,7 @@ def test_results_post_scene_numbers_without_stakes() -> None:
     )
     for pos, title in ((0, "Тропа A"), (1, "Тропа B"), (2, "Тропа C")):
         rnd.cards.append(
-            Card(position=pos, title=title, description="d", consequence="к", image_path="")
+            Card(position=pos, title=title, description="d", consequence="к")
         )
     text = format_results(rnd)
     assert "I: Тропа A: 1" in text

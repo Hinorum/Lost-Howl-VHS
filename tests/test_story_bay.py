@@ -39,7 +39,6 @@ def _day(index: int) -> dict:
                 "description": "Громкий путь.",
                 "consequence": "Стая пошла путём А.",
                 "tag": "care",
-                "image_path": "",
             },
             {
                 "position": 1,
@@ -47,7 +46,6 @@ def _day(index: int) -> dict:
                 "description": "Тихий путь.",
                 "consequence": "Стая ушла путём Б.",
                 "tag": "care",
-                "image_path": "",
             },
             {
                 "position": 2,
@@ -55,7 +53,6 @@ def _day(index: int) -> dict:
                 "description": "Середина.",
                 "consequence": "Стая осталась.",
                 "tag": "care",
-                "image_path": "",
             },
         ],
     }

@@ -32,7 +32,6 @@ def _day(index: int, **overrides) -> dict:
                 "description": "Громкий, очевидный путь.",
                 "consequence": "Стая пошла путём А и нашла свет.",
                 "tag": "care",
-                "image_path": "",
             },
             {
                 "position": 1,
@@ -40,7 +39,6 @@ def _day(index: int, **overrides) -> dict:
                 "description": "Тихий, рискованный путь.",
                 "consequence": "Стая ушла путём Б и нашла тень.",
                 "tag": "care",
-                "image_path": "",
             },
             {
                 "position": 2,
@@ -48,7 +46,6 @@ def _day(index: int, **overrides) -> dict:
                 "description": "Середина, компромисс.",
                 "consequence": "Стая осталась и дождалась утра.",
                 "tag": "care",
-                "image_path": "",
             },
         ],
     }
