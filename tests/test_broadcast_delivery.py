@@ -85,6 +85,47 @@ def _no_sleep(monkeypatch) -> None:
     monkeypatch.setattr(bc.asyncio, "sleep", AsyncMock())
 
 
+async def test_deliver_day_does_not_repeat_results_on_status_flood(monkeypatch) -> None:
+    """Флуд на статусе не должен отправлять итоги дня второй раз.
+
+    Пакет дня — это ДВА сообщения: итоги прошлого дня и пост нового с кнопками.
+    Ретрай раньше стоял над всем пакетом, поэтому флуд-контроль на втором
+    сообщении заставлял отправить первое заново: игрок видел итоги дважды —
+    счёт, победивший путь и судьбу своей ставки два раза подряд.
+
+    Ретрай должен быть на уровне сообщения, а не пакета.
+    """
+    _no_sleep(monkeypatch)
+    await _wipe(Chat)
+    chat = 777_621
+    async with SessionLocal() as db:
+        db.add(Chat(id=chat, type="group", active=True))
+        await db.commit()
+    try:
+        round_row = _round(9406)
+        finished = _round(9407)
+        finished.status = RoundStatus.CLOSED
+        sent_texts: list[str] = []
+
+        async def sender(_chat_id, text=None, **_kwargs):
+            sent_texts.append(text)
+            # Флуд ровно на втором сообщении пакета — на посте дня.
+            if len(sent_texts) == 2:
+                raise TelegramRetryAfter(None, "flood", retry_after=1)
+            return SimpleNamespace(message_id=42)
+
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=sender))
+        results = "ИТОГИ ДНЯ"
+        assert await bc._deliver_day(bot, chat, round_row, finished, results_text=results)
+        # Итоги ушли ровно один раз; пост дня отбит флудом и отправлен повторно.
+        assert sent_texts.count(results) == 1, sent_texts
+        assert len(sent_texts) == 3, sent_texts
+        assert sent_texts[0] == results, sent_texts
+        assert sent_texts[1] == sent_texts[2], "повтор поста дня должен быть тем же текстом"
+    finally:
+        await _wipe(Chat)
+
+
 # ── обрезка текстов и клавиатура ────────────────────────────────────────────
 
 

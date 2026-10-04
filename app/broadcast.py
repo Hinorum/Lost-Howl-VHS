@@ -311,6 +311,65 @@ async def _economics_own_session(row: Round) -> dict:
 _BROADCAST_PARALLELISM = 8
 
 
+async def _forget_if_gone(chat_id: int, exc: Exception) -> bool:
+    """Чат выбыл из Telegram — помечаем неактивным. True — чат отключён.
+
+    Признаки берутся из текста ошибки (_FORGET_MARKS): «kicked», «chat not
+    found» и подобное. Вынесено отдельно, потому что проверка нужна в двух
+    местах — в ретрае пакета и в отправке одного сообщения.
+    """
+    lowered = str(exc).lower()
+    if not any(mark in lowered for mark in _FORGET_MARKS):
+        return False
+    await deactivate_chat(chat_id)
+    return True
+
+
+async def _send_once(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    label: str,
+    markup=None,
+) -> object | None:
+    """Одна отправка с одним ретраем по флуд-контролю. None — не доставлено.
+
+    Ретрай живёт здесь, на уровне СООБЩЕНИЯ, а не пакета. Раньше единственный
+    ретрай стоял выше и повторял _deliver_day целиком: итоги уходили первыми,
+    статус вторым — и флуд-контроль на статусе заставлял повторить весь пакет,
+    из-за чего игрок видел итоги дня дважды (и/или два поста с кнопками).
+    """
+    for attempt in (1, 2):
+        try:
+            return await bot.send_message(
+                chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup
+            )
+        except TelegramRetryAfter as exc:
+            if attempt == 2:
+                logger.warning(
+                    "Флуд-контроль в чате %s не прошёл даже с паузой, %s не доставлено: %s",
+                    chat_id,
+                    label,
+                    exc,
+                )
+                return None
+            logger.warning(
+                "Флуд-контроль в чате %s: пауза %d с перед %s", chat_id, exc.retry_after, label
+            )
+            await asyncio.sleep(exc.retry_after + 1)
+        except TelegramForbiddenError:
+            # НЕ глотаем: у вызывающего есть уборка заблокированного чата
+            # (deactivate_chat). Сглатывание здесь делало её недостижимой, и
+            # чат, заблокировавший бота, оставался в аудитории навсегда —
+            # день за днём в него стучались и молча получали отказ.
+            raise
+        except Exception as exc:
+            if not await _forget_if_gone(chat_id, exc):
+                logger.warning("%s в чат %s не доставлено: %s", label, chat_id, exc)
+            return None
+    return None
+
+
 async def _deliver_day(
     bot: Bot,
     chat_id: int,
@@ -319,27 +378,40 @@ async def _deliver_day(
     results_text: str | None = None,
     remember: bool = False,
     is_dm: bool = False,
-) -> None:
+) -> bool:
     """Полный пакет дня в один чат. Итоги передаются готовым текстом:
-    экономика дня считается один раз на рассылку, а не на каждый чат."""
+    экономика дня считается один раз на рассылку, а не на каждый чат.
+
+    Оба текста собираются ДО первой отправки. Иначе падение при вычислении
+    статуса (БД, ленивая загрузка) случалось уже после ушедших итогов, а
+    ретрай пакета их повторял.
+
+    False — пакет доставлен не полностью; вызывающий обязан считать это промахом.
+    """
+    outgoing_results: str | None = None
     if finished is not None:
         if results_text is None:
             results_text = await results_message(finished)
-        # Итоги дня — только текстом. Фото победившей ветки не постим: это был
-        # дубль обложки нового дня, а вечерний костёр уже дал отдельный кадр.
-        # HTML: строка правила дня несёт жирные блоки.
-        if results_text:
-            await bot.send_message(chat_id, results_text, parse_mode=ParseMode.HTML)
+        outgoing_results = results_text or None
+
     # Медиа дня нет: build_day_post() всегда возвращал пустой список, поэтому
     # ветки send_photo/send_media_group были недостижимы. Картинки вернутся
     # вместе с реальной генерацией — тогда понадобится и send_media_group
     # (Telegram принимает его только от двух вложений, см. историю 2dfc1a).
-    sent = await bot.send_message(
-        chat_id,
-        await status_text(round_row, show_title=True),
-        parse_mode=ParseMode.HTML,
-        reply_markup=cards_keyboard(round_row.id, remember=remember, day_index=round_row.day_index),
+    status_body = await status_text(round_row, show_title=True)
+    markup = cards_keyboard(
+        round_row.id, remember=remember, day_index=round_row.day_index
     )
+
+    if outgoing_results:
+        # Итоги дня — только текстом. Фото победившей ветки не постим: это был
+        # дубль обложки нового дня, а вечерний костёр уже дал отдельный кадр.
+        if await _send_once(bot, chat_id, outgoing_results, "Итоги дня") is None:
+            return False
+
+    sent = await _send_once(bot, chat_id, status_body, "Пост дня", markup=markup)
+    if sent is None:
+        return False
     # Запоминаем, куда ушёл пост-статус дня: когда watcher подтвердит новые
     # ставки, refresh_day_bank отредактирует этот пост с актуальным банком —
     # без повторного /today. Точку доставки пишем защищённо: тесты и легаси
@@ -347,6 +419,7 @@ async def _deliver_day(
     msg_id = getattr(sent, "message_id", 0)
     if msg_id and isinstance(getattr(round_row, "id", None), int):
         await remember_day_post(round_row.id, chat_id, msg_id, is_dm=is_dm)
+    return True
 
 
 async def remember_day_post(round_id: int, chat_id: int, message_id: int, *, is_dm: bool) -> None:
@@ -501,22 +574,18 @@ async def _deliver_chat(
     results_text: str | None,
     remember: bool = False,
 ) -> int | None:
-    """Доставка в чат с одним ретраем после флуд-контроля. None — неудача."""
+    """Доставка в чат. None — неудача.
+
+    Пакета целиком НЕ повторяем: ретрай по флуд-контролю живёт в _send_once,
+    на уровне отдельного сообщения. Повтор пакета отправлял итоги дня дважды —
+    игрок видел один и тот же результат два раза подряд.
+    """
     try:
-        await _deliver_day(bot, chat_id, round_row, finished, results_text, remember=remember)
-        return chat_id
-    except TelegramRetryAfter as exc:
-        logger.warning("Флуд-контроль в чате %s: пауза %d с", chat_id, exc.retry_after)
-        await asyncio.sleep(exc.retry_after + 1)
-        # Повтор тоже может не пройти (флуд не прошёл и с паузой). Без try
-        # исключение улетало из worker'а в gather и отменяло рассылку дня
-        # ВООБЩЕ — из-за одного болтливого чата. Ответ симметричен ветке ниже.
-        try:
-            await _deliver_day(bot, chat_id, round_row, finished, results_text, remember=remember)
+        if await _deliver_day(
+            bot, chat_id, round_row, finished, results_text, remember=remember
+        ):
             return chat_id
-        except Exception as exc2:
-            logger.warning("Анонс дня в чат %s не доставлен (после ретрая): %s", chat_id, exc2)
-            return None
+        return None
     except TelegramForbiddenError:
         await deactivate_chat(chat_id)
         return None
@@ -524,9 +593,7 @@ async def _deliver_chat(
         logger.warning(
             "Анонс дня %s не доставлен в чат %s: %s", round_row.day_index, chat_id, exc
         )
-        lowered = str(exc).lower()
-        if any(mark in lowered for mark in _FORGET_MARKS):
-            await deactivate_chat(chat_id)
+        await _forget_if_gone(chat_id, exc)
         return None
 
 
