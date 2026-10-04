@@ -14,9 +14,9 @@ from sqlalchemy import delete, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Income, Player, Round, RoundStatus, WinRule
+from app.models import Income, Payout, Player, Round, RoundStatus, WatcherState, WinRule
 from app.ton_utils import normalize_address
-from app.ton_watch import Transfer, process_transfer
+from app.ton_watch import Transfer, _stash_refund, process_transfer
 
 RAW = normalize_address("UQpfcexKrlNjGFPF44W9am1o75Z6fs_QBdwVNzuhHVX2L4oo")
 STRANGER = "0:" + "9" * 62
@@ -119,3 +119,117 @@ async def test_ledger_is_idempotent_by_tx_hash(ton_on) -> None:
         assert len(rows) == 1
     finally:
         await _wipe([tx], [943])
+
+
+async def test_dedupe_markers_are_redundant_after_their_row_exists(ton_on) -> None:
+    """Метки `ledger:*`/`refund:*` избыточны, как только есть строка.
+
+    Еженедельная уборка `ws-cleanup` сносит эти метки (и правильно делает: рост
+    watcher_state иначе бесконечен). Это допустимо только потому, что метка —
+    средство разрешения гонки на момент обработки, а настоящий дедуп живёт в
+    строках Income/Payout. Если бы метка была единственной защитой, её снос тихо
+    открыл бы двойной учёт, и заметить это можно было бы только по сходимости
+    казны с БД.
+
+    Проверяем ровно это: метку сносят, историю читают заново (как после сброса
+    курсора) — и ни строки Income, ни выплаты не задваиваются.
+    """
+    tx = "marker-gone-1"
+    await _open_round(944)
+    try:
+        transfer = Transfer(
+            tx_hash=tx,
+            source=STRANGER,
+            value_nanotons=100_000_000,  # выше refund_min_gram -> пойдёт возврат
+            comment="",
+            utime=int(datetime.now(UTC).timestamp()),
+        )
+        first = await process_transfer(transfer)
+        assert first in ("refund_queued", "ledgered")
+
+        # Метки действительно созданы обработкой — иначе тест проверял бы пустоту.
+        async with SessionLocal() as session:
+            marks = (
+                await session.execute(
+                    select(WatcherState.key).where(
+                        WatcherState.key.in_([f"ledger:{tx}", f"refund:{tx}"])
+                    )
+                )
+            ).scalars().all()
+        assert set(marks), "обработка не оставила меток — тест бессмысленен"
+
+        # Снос меток — ровно то, что делает еженедельная уборка ws-cleanup.
+        async with SessionLocal() as session:
+            await session.execute(
+                delete(WatcherState).where(WatcherState.key.in_([f"ledger:{tx}", f"refund:{tx}"]))
+            )
+            await session.commit()
+
+        second = await process_transfer(transfer)
+
+        assert second in ("duplicate_tx", "already_booked", "refund_duplicated"), (
+            f"повтор после сноса метки дал {second!r} — идемпотентность держится на метке, "
+            "а не на строке, и уборка открыла бы двойной учёт"
+        )
+
+        async with SessionLocal() as session:
+            incomes = (
+                await session.execute(select(Income).where(Income.unit_ref == tx))
+            ).scalars().all()
+            refunds = (
+                await session.execute(select(Payout).where(Payout.tx_hash == tx))
+            ).scalars().all()
+        assert len(incomes) <= 1, "строка дохода задвоилась"
+        assert len(refunds) <= 1, "возврат задвоился"
+    finally:
+        await _wipe([tx], [944])
+
+
+async def test_refund_without_income_row_dedupes_on_payout(ton_on) -> None:
+    """Возврат без строки Income держится на проверке Payout по tx_hash.
+
+    Вторая половина инварианта. Пути `process_transfer` всегда заводят строку
+    дохода, и там повтор ловится ею. Но ручной возврат (`_stash_refund` без
+    ledger_result, в т.ч. разбор инцидента хранителем) строки Income не создаёт —
+    там единственная защита от задвоения это поиск существующего `Payout` с тем же
+    tx_hash.
+
+    Если снести и её, то после уборки метки повторный проход создал бы вторую
+    выплату, то есть вернул бы отправителю вдвое. Проверяем именно эту
+    зависимость, а не «вообще идемпотентно».
+    """
+    tx = "refund-no-income-1"
+    transfer = Transfer(
+        tx_hash=tx,
+        source=STRANGER,
+        value_nanotons=100_000_000,
+        comment="",
+        utime=int(datetime.now(UTC).timestamp()),
+    )
+    try:
+        async with SessionLocal() as session:
+            first = await _stash_refund(session, transfer, None)
+        assert first == "refund_queued"
+
+        async with SessionLocal() as session:
+            await session.execute(
+                delete(WatcherState).where(WatcherState.key == f"refund:{tx}")
+            )
+            await session.commit()
+
+        async with SessionLocal() as session:
+            second = await _stash_refund(session, transfer, None)
+        assert second == "refund_duplicated", (
+            f"после сноса метки повтор дал {second!r}: без строки Income единственная "
+            "защита от двойного возврата — поиск Payout по tx_hash"
+        )
+
+        async with SessionLocal() as session:
+            refunds = (
+                await session.execute(select(Payout).where(Payout.tx_hash == tx))
+            ).scalars().all()
+        assert len(refunds) == 1, "возврат задвоился после сноса метки"
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(delete(Payout).where(Payout.tx_hash == tx))
+            await session.commit()
