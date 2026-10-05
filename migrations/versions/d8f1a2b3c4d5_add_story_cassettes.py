@@ -6,7 +6,7 @@
 Undo), а каталог на диске остаётся кэшем-зеркалом для синхронного движка.
 
 Revision ID: d8f1a2b3c4d5
-Revises: c4a9e2b7d158
+Revises: d5f8a1c39b02
 Create Date: 2026-10-02 11:10:00.000000
 
 """
@@ -17,7 +17,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = 'd8f1a2b3c4d5'
-down_revision: str | Sequence[str] | None = 'c4a9e2b7d158'
+down_revision: str | Sequence[str] | None = 'd5f8a1c39b02'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
