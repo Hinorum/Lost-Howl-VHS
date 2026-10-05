@@ -533,6 +533,45 @@ async def test_retry_results_rolls_back_marker_on_failure(monkeypatch) -> None:
         await _cleanup(9723)
 
 
+async def test_retry_results_keeps_batch_alive_after_crash(monkeypatch) -> None:
+    """Крах одного дня не рушит обработку остальных дней того же тика.
+
+    Регрессия: except-блок восстановителя читал атрибуты finished ПОСЛЕ
+    session.rollback(). Откат истекает все инстансы сессии, и чтение с такого
+    объекта — это lazy load вне greenlet (MissingGreenlet). Второй exception
+    вылетал прямо из except, continue не выполнялся, и до следующего по
+    порядку дня восстановитель в этом тике не доходил — день оставался без
+    итогов до следующего тика.
+    """
+    from app import scheduler as sched
+
+    first = await _make_round(9732, RoundStatus.CLOSED)
+    second = await _make_round(9733, RoundStatus.CLOSED)
+    monkeypatch.setattr(sched, "_bot", object())
+
+    async def only_first_fails(bot_, finished):
+        if finished.id == first:
+            raise RuntimeError("крах первого дня")
+
+    async def ok(bot_, finished):
+        pass
+
+    async def results_at(round_id: int):
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == round_id))).scalar_one()
+            return row.results_at
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", only_first_fails)
+        monkeypatch.setattr("app.broadcast.announce_player_results", ok)
+        await sched._retry_results_job()
+
+        assert await results_at(first) is None  # откат снял маркер — повтор разрешён
+        assert await results_at(second) is not None  # пачка не оборвана крахом
+    finally:
+        await _cleanup(9732, 9733)
+
+
 async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> None:
     from app import scheduler as sched
 

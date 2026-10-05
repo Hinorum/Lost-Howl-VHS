@@ -291,23 +291,36 @@ async def _retry_results_job() -> None:
                     .options(selectinload(Round.cards))
                 )
             ).scalars().all()
-            for finished in missing:
-                if not await _claim_results(session, finished.id):
+            # Снимок до цикла: session.rollback() в except-блоке истекает ВСЕ
+            # инстансы сессии, и чтение атрибутов после отката предыдущего дня —
+            # это lazy load вне greenlet (MissingGreenlet). Второй exception
+            # тогда вылетал прямо из except, continue не выполнялся и до
+            # остальных дней тика восстановитель не доходил. Id и день держим
+            # простыми int, инстанс достаём заново через session.get — как в
+            # rounds/lifecycle.py.
+            batch = [(finished.id, finished.day_index) for finished in missing]
+            for finished_id, day_index in batch:
+                if not await _claim_results(session, finished_id):
+                    continue
+                finished = await session.get(
+                    Round, finished_id, options=[selectinload(Round.cards)]
+                )
+                if finished is None:
                     continue
                 try:
                     await announce_results(_bot, finished)
                     await announce_player_results(_bot, finished)
                 except Exception:
-                    await session.rollback()
+                    await session.rollback()  # маркер снят — повтор разрешён
                     logger.exception(
                         "Восстановитель итогов дня %s упал — повторит в следующем тике",
-                        finished.day_index,
+                        day_index,
                     )
                     continue
                 await session.commit()
                 logger.info(
                     "Итоги дня %s досланы восстановителем после краха",
-                    finished.day_index,
+                    day_index,
                 )
     except Exception:
         logger.exception("Восстановитель итогов упал целиком")
