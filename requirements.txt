@@ -7,7 +7,7 @@ pydantic-settings==2.10.1
 APScheduler==3.11.3
 httpx==0.28.1
 PyYAML==6.0.3
-python-dotenv==1.2.3
+python-dotenv==1.2.4
 greenlet==3.5.6
 pytoniq==0.1.43
 pytoniq-core==0.1.46
