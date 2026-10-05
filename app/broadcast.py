@@ -681,13 +681,18 @@ async def announce_new_day(
 
 
 async def _broadcast_text(
-    bot: Bot, text: str, parse_mode: ParseMode | None = None
+    bot: Bot, text: str, parse_mode: ParseMode | None = None, kind: str = "text"
 ) -> int:
     """Одно текстовое сообщение во все живые чаты с одним ретраем и флуд-контролем.
 
     Плюс — личные дубликаты подписчикам (итоги, эпилог, анонсы пауз/церемоний).
     parse_mode — формат разметки: итоги дня несут HTML-ссылку на блок закона.
-    Возвращает число доставленных чатов; провалы не критичны.
+
+    kind — вид рассылки для метки доставки, целиком ключом: «results:31»,
+    «epilogue», «pause». Именно вид, а не обрезок текста: ключ из первых
+    символов не привязан к дню, по нему нельзя ни найти «к какому дню относится
+    эта потеря», ни отличить один день от другого.
+    Возвращает число доставленных получателей (чаты и личка вместе).
     """
     if not text.strip():
         return 0
@@ -722,7 +727,7 @@ async def _broadcast_text(
 
         outcomes = await asyncio.gather(*(worker(chat_id) for chat_id in chat_ids))
         delivered = len([c for c in outcomes if c is not None])
-        await record_delivery(f"text:{text[:16]}", delivered, len(chat_ids))
+        await record_delivery(kind, delivered, len(chat_ids))
     else:
         delivered = 0
     # Личные дубликаты подписчикам — даже если живых чатов нет.
@@ -753,7 +758,12 @@ async def announce_results(bot: Bot | None, finished: Round) -> int:
     text = await results_body(finished)
     if not text:
         return 0
-    delivered = await _broadcast_text(bot, text, parse_mode=ParseMode.HTML)
+    delivered = await _broadcast_text(
+        bot,
+        text,
+        parse_mode=ParseMode.HTML,
+        kind=f"results:{getattr(finished, 'day_index', '?')}",
+    )
     logger.info(
         "Итоги дня %s разосланы: доставлено %d получателей (чаты и личка вместе)",
         getattr(finished, "day_index", "?"),

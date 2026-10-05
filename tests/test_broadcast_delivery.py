@@ -22,7 +22,7 @@ from sqlalchemy import delete, select
 from app import broadcast as bc
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Card, Chat, Player, Round, RoundStatus, WinRule
+from app.models import Card, Chat, Player, Round, RoundStatus, WatcherState, WinRule
 
 
 def _round(day_index: int = 9300) -> Round:
@@ -495,6 +495,41 @@ async def test_announce_results_broadcasts_body(monkeypatch) -> None:
     finished = _round(9405)
     assert await bc.announce_results(SimpleNamespace(), finished) == 7
     assert sent.await_args.args[1] == "ИТОГИ"
+
+
+async def test_announce_results_marks_delivery_by_day(monkeypatch) -> None:
+    """Метка доставки итогов обязана называть день.
+
+    Раньше вид рассылки брался из первых 16 символов текста («Итоги дня 9405»),
+    и метка была «text:Итоги дня 9405» — но не потому, что день решает что-то,
+    а потому что совпало с текстом. Смена текста, обрезка, другой язык — и
+    привязка к дню рассыпается, а с ней и тревога «у дня N нет отметки».
+    """
+    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="ИТОГИ"))
+    bot = SimpleNamespace(send_message=AsyncMock(return_value=1))
+    async with SessionLocal() as db:
+        db.add(Chat(id=-9406, type="group", active=True))
+        await db.commit()
+    try:
+        await bc.announce_results(bot, _round(9406))
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(
+                    select(WatcherState).where(
+                        WatcherState.key == "delivery:results:9406"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert row is not None and row.value.endswith("/1"), row
+    finally:
+        await _wipe(Chat)
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key == "delivery:results:9406"
+                )
+            )
+            await db.commit()
 
 
 async def test_whisper_requires_bot_and_text(monkeypatch) -> None:

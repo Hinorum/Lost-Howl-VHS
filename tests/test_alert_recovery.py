@@ -27,11 +27,38 @@ from app.core.registry import (
     OPS_PROBLEMS_KEY,
 )
 from app.db import SessionLocal
-from app.models import WatcherState
+from app.models import Round, RoundStatus, WatcherState, WinRule
+
+
+async def _closed_round(day_index: int) -> None:
+    """Закрытый день, чьи итоги уже помечены отправленными (results_at)."""
+    now = datetime.now(UTC)
+    async with SessionLocal() as db:
+        await db.execute(delete(Round).where(Round.day_index == day_index))
+        await db.commit()
+        db.add(
+            Round(
+                day_index=day_index,
+                status=RoundStatus.CLOSED,
+                win_rule=WinRule.MAJORITY,
+                chapter_title=f"День {day_index}",
+                chapter_text="Сцена.",
+                opens_at=now - timedelta(hours=30),
+                voting_ends_at=now - timedelta(hours=20),
+                tally_ends_at=now - timedelta(hours=19),
+                results_at=now - timedelta(hours=19),
+            )
+        )
+        await db.commit()
+
+
+async def _drop_round(day_index: int) -> None:
+    async with SessionLocal() as db:
+        await db.execute(delete(Round).where(Round.day_index == day_index))
+        await db.commit()
 
 
 class _Bot:
-    """Хранитель, который запоминает всё, что ему прислали."""
 
     def __init__(self) -> None:
         self.sent: list[str] = []
@@ -315,3 +342,75 @@ async def test_unparsable_delivery_marker_is_ignored(_clean) -> None:
                 delete(WatcherState).where(WatcherState.key == "delivery:day:12")
             )
             await db.commit()
+
+
+async def test_missing_delivery_marker_raises_alarm(_clean) -> None:
+    """День отмечен рассылкой, а метки доставки нет — тревога.
+
+    Ноль означает «дошло немного», отсутствие метки — «не знаем». Тишина опаснее:
+    проход мог умереть до записи метки, и это выглядело как успех.
+    """
+    await _closed_round(21)
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert any("нет отметки о доставке" in p and "21" in p for p in problems), problems
+    finally:
+        await _drop_round(21)
+
+
+async def test_existing_day_marker_silences_missing_alarm(_clean) -> None:
+    """Метка за этот день есть — тревоги нет (иначе она кричала бы каждый цикл)."""
+    await _closed_round(22)
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:results:22", value="4/4"))
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert not any("нет отметки о доставке" in p for p in problems), problems
+    finally:
+        await _drop_round(22)
+
+
+async def test_no_closed_round_means_no_missing_alarm(_clean) -> None:
+    """Свежая база без закрытых дней тревоги не поднимает: нечего проверять.
+
+    Закрытые дни заводят и другие тесты (тестовая БД общая), поэтому убираем их
+    явно: иначе тест держался бы на том, что этот файл идёт первым по алфавиту.
+    """
+    async with SessionLocal() as db:
+        await db.execute(delete(Round).where(Round.results_at.is_not(None)))
+        await db.commit()
+    problems = await ops.check_anomalies(_clean)
+    assert not any("нет отметки о доставке" in p for p in problems), problems
+
+
+async def test_closed_round_without_results_is_not_alarmed(_clean) -> None:
+    """День закрыт, но итоги ещё не отправлялись — метки нет законно.
+
+    Это и есть настоящий риск ложной тревоги: ручной переход закрывает день
+    раньше, чем что-то уходит игрокам. Тревога на «нет метки» без оглядки на
+    results_at кричала бы на каждом таком дне.
+    """
+    now = datetime.now(UTC)
+    async with SessionLocal() as db:
+        await db.execute(delete(Round).where(Round.day_index == 23))
+        await db.commit()
+        db.add(
+            Round(
+                day_index=23,
+                status=RoundStatus.CLOSED,
+                win_rule=WinRule.MAJORITY,
+                chapter_title="День 23",
+                chapter_text="Сцена.",
+                opens_at=now - timedelta(hours=30),
+                voting_ends_at=now - timedelta(hours=20),
+                tally_ends_at=now - timedelta(hours=19),
+                results_at=None,
+            )
+        )
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert not any("нет отметки о доставке" in p for p in problems), problems
+    finally:
+        await _drop_round(23)

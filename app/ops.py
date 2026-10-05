@@ -26,6 +26,7 @@ from app.core.registry import (
     ALERT_BALANCE_KEY,
     ALERT_DEAD_KEY,
     ALERT_DELIVERY_KEY,
+    ALERT_DELIVERY_MISSING_KEY,
     ALERT_ENTROPY_KEY,
     ALERT_MIRROR_KEY,
     ALERT_QUEUE_KEY,
@@ -965,6 +966,42 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                 note,
                 f"⚠️ Рассылка не дошла: {note}. Проверьте права бота в чатах и /health.",
             )
+
+    # 3.10. День закрыт и итоги помечены отправленными, а метки доставки нет.
+    #       Значит проход рассылки умер ДО записи метки — или запись не удалась.
+    #       Раньше это была тишина: «разосланы» в логе и results_at в БД, а
+    #       что сообщение дошло — неизвестно. Молчание тут хуже нуля: ноль хотя
+    #       бы означает «дошло немного», а отсутствие метки означает «не знаем».
+    #       Проверяем последний закрытый день, у которого рассылка уже была
+    #       обязана состояться; свежая база без меток тревогу не поднимает.
+    if bot is not None:
+        last_closed = (
+            await session.execute(
+                select(Round)
+                .where(Round.status == RoundStatus.CLOSED, Round.results_at.is_not(None))
+                .order_by(Round.day_index.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if last_closed is not None:
+            seen = (
+                await session.execute(
+                    select(WatcherState).where(
+                        WatcherState.key.like("delivery:%"),
+                        WatcherState.key.like(f"%:{last_closed.day_index}"),
+                    )
+                )
+            ).scalars().all()
+            if not seen:
+                note = f"у дня {last_closed.day_index} нет отметки о доставке"
+                await _raise(
+                    session,
+                    bot,
+                    ALERT_DELIVERY_MISSING_KEY,
+                    note,
+                    f"⚠️ {note.capitalize()}. Рассылка могла не дойти ни разу — "
+                    "смотрите логи и права бота в чатах.",
+                )
 
     if settings.ton_enabled and settings.active_treasury_address:
         balance_note = await _treasury_balance_anomaly(session)
