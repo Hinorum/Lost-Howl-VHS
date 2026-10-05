@@ -287,6 +287,65 @@ async def test_stale_backup_mark_raises_problem() -> None:
             await session.commit()
 
 
+async def test_backup_alarm_names_the_offsite_chain(monkeypatch) -> None:
+    """Тревога о бэкапах различает локальный pg_dump и GitHub-воркфлоу.
+
+    Оба называются db-backup, и текст тревоги вёл только в /ops — то есть к
+    локальному крону Render. Между тем локальные копии лежат на эфемерном
+    диске, а переживает деплой только цепочка GitHub Actions, которую бот не
+    видит вообще. Разбор, начатый по старому тексту, молча упирался в не ту
+    сторону: локальный бэкап был исправен, а офсайтовых копий не было двое
+    суток.
+    """
+    from app import ops
+    from app.core.registry import ALERT_BACKUP_KEY, BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    # Админ нужен, иначе notify_admins выйдет на «админов нет» и тревога некуда
+    # слать; метка троттлинга — иначе предыдущий тест этого же файла поставил
+    # её минуту назад и повторная отправка была бы подавлена как «уже сказали».
+    monkeypatch.setattr(ops.settings, "admin_ids", "42")
+    stale = (datetime.now(UTC) - timedelta(hours=40)).isoformat()
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(
+                WatcherState.key.in_([BACKUP_LAST_OK_KEY, ALERT_BACKUP_KEY])
+            )
+        )
+        session.add(WatcherState(key=BACKUP_LAST_OK_KEY, value=stale))
+        await session.commit()
+    try:
+        sent: list[str] = []
+
+        class _Bot:
+            async def send_message(self, chat_id: int, text: str) -> None:
+                sent.append(text)
+
+        ops._problems_in_flight.clear()
+        ops._problem_entry.clear()
+        await ops.check_anomalies(_Bot())
+        joined = "\n".join(sent)
+        # Оба контура названы поимённо. Проверка на «есть слово GitHub» держалась
+        # бы на одной фразе и пропускала главное: что локальная джоба и офсайтовая
+        # разведены. Именно их разведение и было нужно — иначе «проверь джобу
+        # db-backup» отправляло в Render, где всё исправно.
+        assert "Render" in joined, joined
+        assert "GitHub Actions" in joined, joined
+        assert "db-backup" in joined, joined
+        assert "BACKUP_PASSPHRASE" in joined, joined
+    finally:
+        ops._problems_in_flight.clear()
+        ops._problem_entry.clear()
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_([BACKUP_LAST_OK_KEY, ALERT_BACKUP_KEY])
+                )
+            )
+            await session.commit()
+
+
 async def test_fresh_backup_mark_is_quiet() -> None:
     """Свежий бэкап тревоги не вызывает: успешный бэкап раз в сутки — норма."""
     from app import ops
