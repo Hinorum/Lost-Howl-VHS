@@ -61,6 +61,44 @@ jobs:
         # docs/architecture.md.
         run: python -m pytest -q --cov=app --cov-report=term-missing --cov-fail-under=85
 
+  # Уязвимость в прод-зависимости не виден НИ ОДНИМ другим шагом: пин
+  # `pkg==1.2.3` защищает от перезалива артефактов, но не от Advisory,
+  # выпущенного уже после того, как версия была запинена. Здесь — единственный
+  # джоб, который смотрит на то, что мы реально ставим на прод.
+  #
+  # Отдельным джобом, а не шагом в test, и НЕ в зависимостях test/postgres:
+  # падение аудита должно читаться как «безопасность», а не смешиваться с
+  # падением тестов, и наоборот — при красном аудите тесты обязаны остаться
+  # запускаемыми, иначе причину их падения не найти вообще.
+  #
+  # Ставим requirements-dev.txt, а не `pip install pip-audit==x` строкой в
+  # этом файле: пин в requirements-dev.txt подхватывает Dependabot, пин в
+  # workflow — нет, и аудитор молча стареет. Это тот же приём, что уже
+  # применён к ruff (см. комментарий в requirements-dev.txt).
+  #
+  # Аудируются только прод-зависимости: dev-окружение (pytest, ruff,
+  # pip-audit) на прод не попадает, а его Advisory не про деньги казначея.
+  #
+  # --strict: без него недоступность OSV — это exit 0 и «всё чисто», то есть
+  # сбой проверки маскируется под её успех. Проект в подобных местах
+  # сознательно fail-closed (см. комментарий к шагу Critical dependency
+  # artifacts match PyPI) — здесь та же логика: лучше красный шаг с явной
+  # причиной, чем молчаливое «укрылось».
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Dependency audit (known vulnerabilities)
+        run: python -m pip_audit -r requirements.txt --strict
+
   # Продакшен живет на Supabase Postgres, а основная джоба тестирует только
   # SQLite: прод-инциденты от дрейфа диалектов уже были (VARCHAR-длины
   # вм. truncation, жизненный цикл соединений пулера). Здесь — то, ради чего
