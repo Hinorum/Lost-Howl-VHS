@@ -132,6 +132,90 @@ async def test_dispatch_broadcasts_when_balance_is_enough(monkeypatch) -> None:
             await db.commit()
 
 
+async def test_dispatch_defers_when_balance_is_unknown(monkeypatch) -> None:
+    """Баланс неизвестен ни у кого — не шлём, а откладываем с видимой причиной.
+
+    Раньше «не знаю» ОБХОДИЛО предохранитель («пусть liteserver отвергнет
+    сам»): попытки копились на отправке, которой не было, а по пограничному
+    балансу сжигался газ на отвергнутые внешние сообщения — и строка
+    уезжала в dead-letter с причиной о нехватке средств, хотя проверить
+    это было нечем.
+    """
+    async def silent():
+        return None, None, "none"
+
+    async def dead_wallet():
+        raise RuntimeError("лайтсерверы недоступны")
+
+    monkeypatch.setattr(ton_pay, "fetch_account_state", silent)
+    monkeypatch.setattr(ton_pay, "_get_wallet", dead_wallet)
+
+    broadcasted = False
+
+    async def must_not_broadcast(*args, **kwargs):
+        nonlocal broadcasted
+        broadcasted = True
+        return "tx"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", must_not_broadcast)
+
+    async with SessionLocal() as db:
+        payout = await _mk_payout(db, status="pending")
+        try:
+            assert await ton_pay.dispatch_pending_payouts(bot=None) == 0
+            assert broadcasted is False, "при неизвестном балансе отправлять нельзя"
+            await db.refresh(payout)
+            assert payout.status == "pending"
+            assert payout.attempts == 0, "ретрай-бюджет не сожжён на откладывании"
+            assert "неизвестен" in (payout.last_error or "")
+        finally:
+            await db.delete(payout)
+            await db.commit()
+
+
+async def test_dispatch_reads_balance_from_liteserver_when_indexers_silent(
+    monkeypatch,
+) -> None:
+    """Индексаторы молчат, liteserver жив — читаем баланс с него и шлём.
+
+    Это и есть смысл третьего источника: без него «неизвестный баланс»
+    означал бы остановку очереди ровно тогда, когда отправка через
+    liteserver всё ещё возможна.
+    """
+    async def silent():
+        return None, None, "none"
+
+    probed = False
+
+    class Wallet:
+        async def get_balance(self):
+            nonlocal probed
+            probed = True
+            return to_nano(5)
+
+    async def wallet():
+        return Wallet()
+
+    monkeypatch.setattr(ton_pay, "fetch_account_state", silent)
+    monkeypatch.setattr(ton_pay, "_get_wallet", wallet)
+
+    async def fake_send(dest, amount, comment):
+        return "bcast-marker"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", fake_send)
+
+    async with SessionLocal() as db:
+        payout = await _mk_payout(db, status="pending")
+        try:
+            assert await ton_pay.dispatch_pending_payouts(bot=None) == 1
+            assert probed, "баланс должен быть прочитан напрямую с liteserver"
+            await db.refresh(payout)
+            assert payout.status == "sent" and payout.tx_hash == "bcast-marker"
+        finally:
+            await db.delete(payout)
+            await db.commit()
+
+
 async def test_anomaly_flags_deficit_and_drift_and_stays_quiet_when_funded(
     monkeypatch,
 ) -> None:

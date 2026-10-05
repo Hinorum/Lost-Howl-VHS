@@ -54,6 +54,42 @@ from .queue import (
 from .send import _send_raw_with_seqno, send_ton_transfer  # noqa: F401
 
 
+async def _balance_via_liteserver() -> int | None:
+    """Баланс казначея напрямую с liteserver — третий источник.
+
+    TonAPI и Toncenter — HTTP-индексаторы: у них своя квота, свой аптайм, свой
+    прокси; читают они аккаунт, а не ту транзакцию, которую мы собираемся
+    слать. Liteserver — тот же канал, которым уходит сама отправка, поэтому
+    для решения «хватит ли средств» его ответ авторитетнее. И важнее другое:
+    при живой сети он ровно тогда, когда отправка вообще возможна — так
+    «не знаю» перестаёт означать «слать вслепую».
+
+    Читаем ТОЛЬКО когда оба индексатора молчат, под коротким таймаутом: это
+    проба перед решением, а не отправка.
+    """
+    if not settings.active_treasury_mnemonic or not settings.active_treasury_address:
+        return None
+
+    async def probe() -> int:
+        # Через app.ton_pay — тем же способом, как в цикле ищутся
+        # fetch_account_state/send_ton_transfer, чтобы тесты патчили один объект.
+        import app.ton_pay as _tp
+
+        wallet = await _tp._get_wallet()
+        return int(await wallet.get_balance())
+
+    try:
+        return await asyncio.wait_for(
+            probe(), timeout=settings.payout_balance_probe_timeout_seconds
+        )
+    except Exception as exc:
+        logger.warning(
+            "Баланс казначея через liteserver не прочитан: %s",
+            str(exc) or type(exc).__name__,
+        )
+        return None
+
+
 async def dispatch_pending_payouts(limit: int = 50, bot: Bot | None = None) -> int:
     """Разгребает очередь выплат. Весь цикл под _DISPATCH_LOCK: только один
     диспетчер в эвентлупе вещает, _reset_retriable не восстанавливает строки,
@@ -92,10 +128,16 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
         # статус остаётся pending, попытки НЕ сгорают — после пополнения
         # очередь уйдёт сама, без ручного retry и без мёртвых писем.
         #
-        # Если баланс недоступен (оба индексатора молчат) — логируем, но
-        # ПРОБУЕМ отправить: liteclient работает через прямое TCP-соединение
-        # к liteserver, а не через HTTP API. Пусть liteserver отвергнет сам,
-        # если средств мало — это надёжнее, чем висеть в очереди навсегда.
+        # «Не знаю» раньше обходило предохранитель: баланс не прочитан —
+        # слали всё равно, надеясь, что liteserver отвергнет сам. Логика была
+        # про доступность («в очередь нельзя вечно висеть»), но плата —
+        # неизвестная: по пограничному балансу сжигается газ на отвергнутые
+        # внешние сообщения, попытки копятся на отправке, которой не было, и
+        # строка уезжает в dead-letter с причиной «не хватает средств»,
+        # хотя проверить это было нечем. Неизвестность — это не «пусто» и не
+        # «хватает», это «отправить не можем решить», а значит — не шлём.
+        # Третий источник (liteserver напрямую) держит такой момент редким:
+        # баланс читается там же, откуда уйдёт сам перевод.
         sendable = [payout for payout in payouts if payout.dest_address]
         if (
             sendable
@@ -110,24 +152,31 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                 logger.warning("Баланс казначея перед циклом не прочитан: %s", exc)
                 balance = None
             if balance is None:
-                logger.warning(
-                    "Баланс казначея недоступен (оба индексатора молчат) — "
-                    "попытка отправки через liteclient напрямую (%d выплат)",
-                    len(sendable),
+                balance = await _balance_via_liteserver()
+            if balance is None:
+                reason = (
+                    "баланс казначея неизвестен: TonAPI, Toncenter и liteserver молчат — "
+                    "отправка отложена до восстановления связи"
                 )
-            if balance is not None:
-                fee_nano = to_nano(settings.payout_fee_gram)
-                needed = sum(p.amount_nanotons for p in sendable) + fee_nano * len(sendable)
-                if balance < needed:
-                    reason = (
-                        f"казначей подкачан: нужно {needed / 1e9:.4f} Gram (с газом), "
-                        f"есть {balance / 1e9:.4f} — пополни баланс, очередь уйдёт сама"
-                    )
-                    logger.warning("Диспетчер: %s", reason)
-                    for payout in sendable:
-                        payout.last_error = reason[:200]
-                    await session.commit()
-                    return 0
+                logger.warning(
+                    "Диспетчер: %s (выплат в очереди: %d)", reason, len(sendable)
+                )
+                for payout in sendable:
+                    payout.last_error = reason[:200]
+                await session.commit()
+                return 0
+            fee_nano = to_nano(settings.payout_fee_gram)
+            needed = sum(p.amount_nanotons for p in sendable) + fee_nano * len(sendable)
+            if balance < needed:
+                reason = (
+                    f"казначей подкачан: нужно {needed / 1e9:.4f} Gram (с газом), "
+                    f"есть {balance / 1e9:.4f} — пополни баланс, очередь уйдёт сама"
+                )
+                logger.warning("Диспетчер: %s", reason)
+                for payout in sendable:
+                    payout.last_error = reason[:200]
+                await session.commit()
+                return 0
         # Атомарный клейм «взятых в работу» ДО вещания. Условный UPDATE по
         # status='pending' — единственный процесс (одна копия диспетчера)
         # переведёт строку в sending: rowcount==1. Вторая копия (двойной
