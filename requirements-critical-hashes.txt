@@ -24,6 +24,6 @@ pytoniq==0.1.43
 #   pytoniq-0.1.43-py3-none-any.whl sha256:922c1721124bf7214e0b7044fba2a439e006367778611c0ce813cbe5b00079d3
 #   pytoniq-0.1.43.tar.gz sha256:b4b1c8fed2f9d2f1b6f0ab4b3f1fc5503a0088630d8081f817807ff31e608606
 
-pytoniq-core==0.1.46
+pytoniq-core==0.2.0
 #   pytoniq_core-0.1.46-py3-none-any.whl sha256:0a284c8b68f9fed9d54e4dad871238d844339183bf985a614796360e36e1b95e
 #   pytoniq_core-0.1.46.tar.gz sha256:c8e3cf9ccb1852780a725cd51ba7a66a28122eb39c8b9bb97dcdc5bd02c24734
