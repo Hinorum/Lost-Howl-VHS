@@ -626,6 +626,26 @@ class PreparedDay(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class StoryCassette(Base):
+    """Кассета сюжета в базе — единственный долговечный источник плёнки.
+
+    На Render файловая система эфемерна: перезапуск деплоя стирал все правки
+    кассет, и монтаж нового месяца приходилось заливать заново. Диск остался
+    кэшем зеркала (его читает синхронный движок), а источник правды живёт
+    здесь: payload — нормализованный JSON кассеты, backup — слепок перед
+    последней перезаписью (Undo хранителя).
+    """
+
+    __tablename__ = "story_cassettes"
+
+    name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    payload: Mapped[str] = mapped_column(Text)
+    backup: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class MemoryHit(Base):
     """Отметка внимательности: игрок узнал тихий след давнего дня в каноне.
 

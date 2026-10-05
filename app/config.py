@@ -290,7 +290,12 @@ class Settings(BaseSettings):
 
     # Каталог библиотеки сюжетных кассет (*.json, стандарт
     # docs/story_cassette_design.md). Пусто — библиотека в app/story/cassettes/.
+    # Это КЭШ-зеркало: источник правды — таблица story_cassettes (app/story/store.py),
+    # потому что на Render диск эфемерен и правки /panel не переживали рестарт.
     story_cassettes_dir: str = ""
+    # Выключатель базового хранения кассет: false — только файлы (локальная
+    # разработка без БД). При недоступной базе вызовы сами деградируют в диск.
+    story_cassettes_db: bool = True
 
     revote_enabled: bool = True
     revote_stars: int = 25
