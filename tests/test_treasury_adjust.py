@@ -80,6 +80,17 @@ async def _wipe_pause() -> None:
         await db.commit()
 
 
+async def _wipe_halt() -> None:
+    """Kill switch исходящих выплат не должен пережить тест и убить сборку."""
+    async with SessionLocal() as db:
+        await db.execute(
+            WatcherState.__table__.delete().where(
+                WatcherState.key.in_([ops.PAYOUT_HALT_KEY, ops.PAYOUT_HALT_REASON_KEY])
+            )
+        )
+        await db.commit()
+
+
 async def _wipe_money_rows() -> None:
     """Корректировки, возвраты и seed-леджер не перетекают между тестами."""
     async with SessionLocal() as db:
@@ -618,6 +629,34 @@ async def test_set_game_paused_is_idempotent() -> None:
             assert await ops.paused_reason(session) is None
     finally:
         await _wipe_pause()
+
+
+async def test_set_payouts_halted_is_idempotent() -> None:
+    """Kill switch исходящих выплат: включение, снятие и no-op повтора.
+
+    Ждём ровно той же дисциплины, что у паузы: двойной /halt-payouts не
+    затирает уже записанную причину, а повторное снятие не создаёт ложного
+    «изменено» — именно по этому флагу команды решают, писать ли оператору
+    «уже остановлены».
+    """
+    await _wipe_halt()
+    try:
+        async with SessionLocal() as session:
+            assert await ops.is_payouts_halted(session) is False
+            assert await ops.payout_halt_reason(session) is None
+            assert (
+                await ops.set_payouts_halted(session, True, "подозрительная активность")
+                is True
+            )
+            assert await ops.is_payouts_halted(session) is True
+            # Повтор — no-op: вторая команда не перетирает причину.
+            assert await ops.set_payouts_halted(session, True, "другое") is False
+            assert await ops.payout_halt_reason(session) == "подозрительная активность"
+            assert await ops.set_payouts_halted(session, False) is True
+            assert await ops.is_payouts_halted(session) is False
+            assert await ops.payout_halt_reason(session) is None
+    finally:
+        await _wipe_halt()
 
 
 # ---------- Команда и кнопки /adjust ----------

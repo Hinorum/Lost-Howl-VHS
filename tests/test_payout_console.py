@@ -25,10 +25,12 @@ from app.handlers.payout import (
     _stakes_panel_text,
     cmd_blockchain,
     cmd_fundout,
+    cmd_halt_payouts,
     cmd_incoming,
     cmd_mirror,
     cmd_payout,
     cmd_payouts,
+    cmd_resume_payouts,
     cmd_return,
     cmd_revenue,
     cmd_stakes,
@@ -177,6 +179,92 @@ async def test_payouts_empty_queue_is_good_news(monkeypatch) -> None:
     monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
     await _wipe(Payout)
     assert "Долгов нет" in await _payouts_text()
+
+
+async def test_payouts_reports_the_kill_switch(monkeypatch) -> None:
+    """/payouts обязан сказать, что очередь стоит по воле оператора.
+
+    Без этой строки остановленная вручную очередь и упавшая выглядят
+    одинаково: строки на месте, а причину пришлось бы искать в логах —
+    то есть ровно в тот момент, когда её ищут срочно.
+    """
+    from app.ops import set_payouts_halted
+
+    monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
+    await _wipe(Payout)
+    async with SessionLocal() as db:
+        db.add(
+            Payout(
+                kind="prize",
+                amount_nanotons=to_nano(0.25),
+                dest_address="0:" + "cd" * 32,
+                status="pending",
+                attempts=0,
+            )
+        )
+        await db.commit()
+    try:
+        quiet = await _payouts_text()
+        assert "/resume-payouts" not in quiet, "баннер лишний, пока очередь жива"
+
+        async with SessionLocal() as db:
+            await set_payouts_halted(db, True, "подозрительная активность")
+        text = await _payouts_text()
+        assert "ОСТАНОВЛЕНЫ" in text
+        assert "подозрительная активность" in text
+        assert "/resume-payouts" in text
+        # Баннер ПЕРЕД списком: иначе читается как «строки есть», а не
+        # «строки есть, но их не трогают».
+        assert text.index("ОСТАНОВЛЕНЫ") < text.index("Неотправленные выплаты")
+    finally:
+        async with SessionLocal() as db:
+            await set_payouts_halted(db, False)
+        await _wipe(Payout)
+
+
+async def test_halt_and_resume_payouts_commands(monkeypatch) -> None:
+    """Ручка kill switch: гейт, причина из хвоста команды, снятие.
+
+    Повторный /halt-payouts не должен перетирать причину и обязан сказать
+    оператору, что ничего не изменилось, — иначе вторая команда выглядит
+    как первая и непонятно, сработала ли она.
+    """
+    from app.ops import is_payouts_halted, payout_halt_reason
+
+    monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
+
+    outsider = make_message("/halt-payouts тест", uid=1)
+    await cmd_halt_payouts(outsider)
+    assert "только для хранителя" in said(outsider)
+    async with SessionLocal() as db:
+        assert await is_payouts_halted(db) is False, "не-админ не должен двигать флаг"
+
+    try:
+        first = make_message("/halt-payouts подозрительная активность")
+        await cmd_halt_payouts(first)
+        assert "ОСТАНОВЛЕНЫ" in said(first)
+        assert "подозрительная активность" in said(first)
+
+        again = make_message("/halt-payouts другая причина")
+        await cmd_halt_payouts(again)
+        assert "уже остановлены" in said(again)
+        async with SessionLocal() as db:
+            assert await payout_halt_reason(db) == "подозрительная активность"
+
+        resumed = make_message("/resume-payouts")
+        await cmd_resume_payouts(resumed)
+        assert "возобновлена" in said(resumed)
+        async with SessionLocal() as db:
+            assert await is_payouts_halted(db) is False
+
+        idle = make_message("/resume-payouts")
+        await cmd_resume_payouts(idle)
+        assert "и так была разрешена" in said(idle)
+    finally:
+        async with SessionLocal() as db:
+            from app.ops import set_payouts_halted
+
+            await set_payouts_halted(db, False)
 
 
 async def test_payout_spam_and_retry_paths(monkeypatch) -> None:

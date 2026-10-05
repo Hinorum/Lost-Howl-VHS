@@ -67,6 +67,14 @@ PAUSE_KEY = "game_paused_iso"
 PAUSE_REASON_KEY = "game_paused_reason"
 MONEY_MODE_KEY = "money_mode_on"
 
+# Kill switch исходящих выплат (/halt-payouts). Сознательно ОТДЕЛЬНЫЙ от
+# PAUSE_KEY ключ: пауза останавливает игру, но очередь выплат продолжает
+# разгребаться (см. текст /pause), а здесь останавливается сама отправка
+# денег. Состояние живёт в watcher_state — переживает рестарт и видно
+# каждой копии диспетчера, а не только той, что приняла команду.
+PAYOUT_HALT_KEY = "payouts_halted_iso"
+PAYOUT_HALT_REASON_KEY = "payouts_halted_reason"
+
 # --- Лидерборды (app/leaderboard.py) ---
 
 MARKER_KEY = "leaderboard_settled_through"

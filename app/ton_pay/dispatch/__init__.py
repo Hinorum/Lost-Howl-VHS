@@ -101,6 +101,35 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
     sent = 0
     network = "testnet" if settings.is_testnet else "mainnet"
     async with SessionLocal() as session:
+        # Kill switch хранителя (/halt-payouts) — самая первая проверка цикла,
+        # до клейма строк и до возврата зависших. Деньги не уходят, но очередь
+        # НЕ тонет молча: каждой ожидающей строке пишем причину, чтобы /payouts
+        # отвечал «почему не уходит», а не показывал устаревший текст.
+        # Подтверждения уже ушедших переводов при этом продолжает вести
+        # confirm_broadcast_payouts — он читает цепочь и ничего не отправляет,
+        # останавливать его означало бы потерять судьбу in-flight выплат.
+        from app.ops import is_payouts_halted, payout_halt_reason
+
+        if await is_payouts_halted(session):
+            halt_reason = await payout_halt_reason(session)
+            note = (
+                "исходящие выплаты остановлены (/halt-payouts): " + halt_reason
+                if halt_reason
+                else "исходящие выплаты остановлены (/halt-payouts)"
+            )
+            logger.warning("Диспетчер: %s — очередь не трогаем", note)
+            await session.execute(
+                update(Payout)
+                .where(
+                    Payout.status == "pending",
+                    Payout.dest_address != "",
+                    Payout.amount_nanotons > 0,
+                    Payout.network == network,
+                )
+                .values(last_error=note[:200])
+            )
+            await session.commit()
+            return 0
         # Ретрай: зависшие failed с неисчерпанным лимитом снова в очередь.
         await _reset_retriable(session, network)
         await session.commit()

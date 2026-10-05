@@ -46,6 +46,8 @@ from app.core.registry import (
     OPS_PROBLEMS_KEY,
     PAUSE_KEY,
     PAUSE_REASON_KEY,
+    PAYOUT_HALT_KEY,
+    PAYOUT_HALT_REASON_KEY,
     STUCK_TX_KEY,
     TICK_FAIL_KEY,
     TICK_FAIL_LAST_KEY,
@@ -1292,6 +1294,48 @@ async def set_game_paused(session, paused: bool, reason: str = "") -> bool:
         await _set_state(session, PAUSE_KEY, "")
         await _set_state(session, PAUSE_REASON_KEY, "")
     logger.info("Пауза игры: %s (%s)", "включена" if paused else "снята", reason or "—")
+    return True
+
+
+# ---------- Kill switch исходящих выплат (/halt-payouts) ----------
+
+
+async def is_payouts_halted(session) -> bool:
+    """True, пока отправка исходящих выплат остановлена командой /halt-payouts.
+
+    Пауза игры СЮДА НЕ входит: /pause останавливает дни и возвращает
+    входящие, но очередь выплат продолжает разгребаться — деньги игроков
+    идут дальше. Здесь останавливается отправка как таковая.
+    """
+    return bool(await _get_state(session, PAYOUT_HALT_KEY))
+
+
+async def payout_halt_reason(session) -> str | None:
+    """Причина остановки выплат (для /payouts и логов диспетчера) или None."""
+    reason = await _get_state(session, PAYOUT_HALT_REASON_KEY)
+    return reason or None
+
+
+async def set_payouts_halted(session, halted: bool, reason: str = "") -> bool:
+    """Включает/снимает kill switch. Возвращает True, если состояние изменилось.
+
+    Повторная установка того же состояния — no-op: двойной /halt-payouts не
+    затирает уже записанную причину на «вручную».
+    """
+    if halted == await is_payouts_halted(session):
+        return False
+    if halted:
+        await _set_state(session, PAYOUT_HALT_KEY, _now().isoformat())
+        if reason:
+            await _set_state(session, PAYOUT_HALT_REASON_KEY, reason[:200])
+    else:
+        await _set_state(session, PAYOUT_HALT_KEY, "")
+        await _set_state(session, PAYOUT_HALT_REASON_KEY, "")
+    logger.warning(
+        "Исходящие выплаты: %s (%s)",
+        "ОСТАНОВЛЕНЫ" if halted else "разрешены",
+        reason or "—",
+    )
     return True
 
 

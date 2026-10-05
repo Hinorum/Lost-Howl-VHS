@@ -216,6 +216,60 @@ async def test_dispatch_reads_balance_from_liteserver_when_indexers_silent(
             await db.commit()
 
 
+async def test_halt_payouts_stops_the_cycle_and_resume_lets_it_go(monkeypatch) -> None:
+    """/halt-payouts — настоящий kill switch; /pause им не является.
+
+    Пауза останавливает игру, но очередь выплат продолжает разгребаться, так
+    что экстренной ручки «уйти не должно ничего» не было. Остановленная
+    строка при этом НЕ теряется: остаётся pending, попытки не сгорают, а в
+    last_error появляется причина — иначе /payouts молчал бы о том, что
+    очередь стоит по воле оператора, и её пришлось бы читать из логов.
+    """
+    from app.ops import is_payouts_halted, payout_halt_reason, set_payouts_halted
+
+    async def balance():
+        return to_nano(5), "active", "test"
+
+    monkeypatch.setattr(ton_pay, "fetch_account_state", balance)
+
+    sent: list[str] = []
+
+    async def fake_send(dest, amount, comment):
+        sent.append(dest)
+        return "bcast-marker"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", fake_send)
+
+    async with SessionLocal() as db:
+        payout = await _mk_payout(db, status="pending")
+        try:
+            assert (
+                await set_payouts_halted(db, True, "подозрительная активность") is True
+            )
+            assert await is_payouts_halted(db) is True
+
+            assert await ton_pay.dispatch_pending_payouts(bot=None) == 0
+            assert sent == [], "остановленная очередь не должна ничего слать"
+            await db.refresh(payout)
+            assert payout.status == "pending"
+            assert payout.attempts == 0, "kill switch не жжёт ретрай-бюджет"
+            assert "/halt-payouts" in (payout.last_error or "")
+            assert await payout_halt_reason(db) == "подозрительная активность"
+
+            assert await set_payouts_halted(db, False) is True
+            assert await is_payouts_halted(db) is False
+            assert await ton_pay.dispatch_pending_payouts(bot=None) == 1
+            assert len(sent) == 1, "после снятия очередь уходит сама, без retry"
+            await db.refresh(payout)
+            assert payout.status == "sent" and payout.tx_hash == "bcast-marker"
+        finally:
+            # Состояние общее (watcher_state) — иначе kill switch переживёт
+            # тест и остановит всю следующую сборку.
+            await set_payouts_halted(db, False)
+            await db.delete(payout)
+            await db.commit()
+
+
 async def test_anomaly_flags_deficit_and_drift_and_stays_quiet_when_funded(
     monkeypatch,
 ) -> None:

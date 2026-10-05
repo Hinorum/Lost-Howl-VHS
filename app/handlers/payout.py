@@ -1,5 +1,6 @@
 # Очередь выплат и казна хранителя: /payouts, /payout, /return, /treasury,
-# /fundout и отчёты /incoming, /stakes, /revenue.
+# /fundout, kill switch исходящих /halt-payouts ↔ /resume-payouts и отчёты
+# /incoming, /stakes, /revenue.
 from __future__ import annotations
 
 import logging
@@ -24,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 async def _payouts_text() -> str:
     """Список неотправленных выплат (для /payouts и кнопки пульта)."""
+    from app.ops import is_payouts_halted, payout_halt_reason
+
     async with SessionLocal() as session:
+        halted = await is_payouts_halted(session)
+        halt_reason = await payout_halt_reason(session) if halted else None
         rows = (
             (
                 await session.execute(
@@ -37,9 +42,20 @@ async def _payouts_text() -> str:
             .scalars()
             .all()
         )
+    head: list[str] = []
+    if halted:
+        # Строка стоит ПЕРЕД списком: очередь выглядит живой, а не уходит
+        # только потому, что её остановили вручную, — без этого отчёта
+        # причину пришлось бы искать в логах.
+        why = f": {halt_reason}" if halt_reason else ""
+        head.append(
+            f"{warn_mark('halt')} Исходящие выплаты ОСТАНОВЛЕНЫ{why} — снять: /resume-payouts"
+        )
+        head.append("")
     if not rows:
-        return f"{ok_mark('queue')} Долгов нет: все выплаты ушли или разобраны."
-    lines = ["Неотправленные выплаты:"]
+        tail = f"{ok_mark('queue')} Долгов нет: все выплаты ушли или разобраны."
+        return "\n".join(head + [tail]) if head else tail
+    lines = head + ["Неотправленные выплаты:"]
     for row in rows:
         reason = getattr(row, "last_error", None)
         tail = f" · {reason[:110]}" if reason else ""
@@ -140,6 +156,63 @@ async def cmd_payouts(message: Message) -> None:
         await message.answer("Команда только для хранителя игры.")
         return
     await message.answer(await _payouts_text())
+
+
+@router.message(Command("halt-payouts"), F.chat.type == ChatType.PRIVATE)
+async def cmd_halt_payouts(message: Message) -> None:
+    """Kill switch: остановить отправку исходящих выплат. /halt-payouts [причина].
+
+    Сознательно ОТДЕЛЬНАЯ от /pause ручка. Пауза останавливает игру, но
+    очередь выплат продолжает разгребаться (это написано прямо в ответе
+    /pause): деньги игроков должны уйти. Здесь останавливается именно
+    отправка — вариант «подозрительная активность, пока я проверяю», когда
+    уходить не должно НИЧЕГО.
+
+    Состояние кладётся в watcher_state, а не в память процесса: переживает
+    рестарт и видно каждой копии диспетчера, а не только той, что приняла
+    команду. Подтверждения уже ушедших переводов при этом не останавливаются
+    — иначе судьба in-flight выплат осталась бы неизвестной навсегда.
+    """
+    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
+        await message.answer("Команда только для хранителя игры.")
+        return
+    from app.ops import set_payouts_halted
+
+    words = (message.text or "").split(maxsplit=1)
+    reason = words[1].strip()[:200] if len(words) > 1 else "причина не указана"
+    async with SessionLocal() as session:
+        changed = await set_payouts_halted(session, True, reason)
+    if not changed:
+        await message.answer(
+            f"{warn_mark('halt')} Исходящие выплаты уже остановлены. Снять: /resume-payouts"
+        )
+        return
+    await message.answer(
+        f"{warn_mark('halt')} Исходящие выплаты ОСТАНОВЛЕНЫ: {reason}.\n"
+        "Казна не уходит никуда: приз, возвраты, рейк и копилки остаются в "
+        "очереди, попытки не сгорают, причина видна у каждой строки в /payouts.\n"
+        "Подтверждения уже отправленных переводов продолжают идти.\n"
+        "Снять: /resume-payouts"
+    )
+
+
+@router.message(Command("resume-payouts"), F.chat.type == ChatType.PRIVATE)
+async def cmd_resume_payouts(message: Message) -> None:
+    """Снять kill switch /halt-payouts и разпустить очередь обратно."""
+    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
+        await message.answer("Команда только для хранителя игры.")
+        return
+    from app.ops import set_payouts_halted
+
+    async with SessionLocal() as session:
+        changed = await set_payouts_halted(session, False)
+    if not changed:
+        await message.answer(f"{ok_mark('halt')} Отправка выплат и так была разрешена.")
+        return
+    await message.answer(
+        f"{ok_mark('halt')} Отправка выплат возобновлена: очередь уйдёт сама, "
+        "ручного retry не требуется. Посмотреть: /payouts"
+    )
 
 
 @router.message(Command("payout"), F.chat.type == ChatType.PRIVATE)
