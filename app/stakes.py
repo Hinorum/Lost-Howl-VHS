@@ -385,6 +385,11 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
     Атомарный claim: UPDATE ... WHERE payouts_finalized = false гарантирует,
     что при параллельном вызове (tick + ton-settle) только один поток пройдёт
     дальше. Идемпотентность — по флагу round.payouts_finalized.
+
+    Флаг держит повтор самой финализации, но НЕ держит ручной /return: тот
+    работает со ставкой, а не с раундом, и читает её своим снапшотом. Поэтому
+    перед созданием refund-выплаты каждая ставка берётся условным
+    UPDATE-claim'ом по статусу — см. цикл по stuck.
     """
     if round_row.status != RoundStatus.CLOSED:
         logger.debug("finalize_day_payouts: round %s не CLOSED (%s) — пропуск", round_row.id, round_row.status)
@@ -639,12 +644,30 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
 
     for stake in stuck:
         refund = refund_net_amount(stake.amount_nanotons)
-        if refund > 0:
-            created += add_payout(stake, "refund", refund)
-            # Авто-возврат создан — ставка разобрана. Без этого она навсегда
-            # осталась бы pending/rejected: панель вечно показывала «переводов
-            # не обработано», а часовой алерт звонил по одному и тому же хвосту.
-            stake.status = "refunded"
+        if refund <= 0:
+            continue
+        # Условный UPDATE-claim по ставке: ручной возврат (/return) берёт её
+        # тем же способом, а наш снапшот `stuck` старше — читали ставки до
+        # того, как хендлер успел закоммитить. Без проверки rowcount день
+        # платил бы возврат, а хендлер второй: одна ставка — две выплаты.
+        # Claim закрывает и второй смысл комментария ниже: ставка после него
+        # гарантированно разобрана и не висит вечно pending/rejected.
+        claimed = await session.execute(
+            update(Stake)
+            .where(Stake.id == stake.id, Stake.status.in_(["pending", "rejected"]))
+            .values(status="refunded")
+        )
+        if claimed.rowcount != 1:
+            logger.info(
+                "finalize_day_payouts: ставка %s уже разобрана параллельной операцией — возврат не создаю",
+                stake.id,
+            )
+            continue
+        # Авто-возврат создан — ставка разобрана. Без смены статуса она
+        # навсегда осталась бы pending/rejected: панель вечно показывала
+        # «переводов не обработано», а часовой алерт звонил по одному и тому
+        # же хвосту.
+        created += add_payout(stake, "refund", refund)
 
     # Дозрелые реферальные накопления -> выплаты (идёт в том же коммите дня,
     # чтобы копилка не висела годами: финализация дня — ежедневный крюк).
@@ -742,8 +765,10 @@ async def create_manual_refund(session, stake_id: int) -> str:
     Только для ещё не «засчитанных» ставок status in (pending, rejected) —
     подтверждённые (confirmed) разбираются автоматически при финализации дня,
     и ручной возврат там создал бы двойную выплату. Идемпотентно: если для
-    (round_id, player_id) уже есть незакрытый refund-выплат — не дублируем.
-    Деньги уходят обычной очередью выплат (dispatch_pending_payouts).
+    (round_id, player_id) уже есть незакрытый refund-выплат — не дублируем,
+    а сама ставка берётся условным UPDATE-claim'ом (см. финал функции):
+    финализация дня претендует на неё тем же способом. Деньги уходят обычной
+    очередью выплат (dispatch_pending_payouts).
     """
     stake = await session.get(Stake, stake_id)
     if stake is None:
@@ -790,6 +815,24 @@ async def create_manual_refund(session, stake_id: int) -> str:
     refund = refund_net_amount(stake.amount_nanotons)
     if refund <= 0:
         return "сумма ставки не покрывает газ сети — возвращать нечего"
+    # Атомарный UPDATE-claim по самой ставке — тот же приём, что в
+    # confirm_stake и confirm_aged_pending. Проверки выше живут в НАШЕЙ
+    # транзакции, а финализация дня читает ставки своим снапшотом и по своим
+    # pending/rejected строкам создаёт такую же refund-выплату; метка
+    # claim_once её не держит, потому что берётся только нами. Кто первым
+    # перевёл строку в refunded — тот и заплатил: второй получает rowcount=0 и
+    # выходит вовсе без выплаты. Ставим claim ПЕРЕД созданием выплаты, а не
+    # после: всё окно между чтением статуса и записью должно закрываться.
+    claimed = await session.execute(
+        update(Stake)
+        .where(Stake.id == stake.id, Stake.status.in_(["pending", "rejected"]))
+        .values(status="refunded")
+    )
+    if claimed.rowcount != 1:
+        # Откат снимает и claim_once, и claim по ставке: «полу-меток» нет,
+        # повторная попытка возможна — но статус уже не pending, так что
+        # хендлер получит внятный отказ вместо второй выплаты.
+        return "ставка уже разобрана параллельной операцией (итоги дня или другой возврат) — выплата не создана"
     session.add(
         Payout(
             round_id=stake.round_id,
@@ -800,7 +843,6 @@ async def create_manual_refund(session, stake_id: int) -> str:
             network=current_network(),
         )
     )
-    stake.status = "refunded"
     await session.commit()
     return f"возврат {from_nano(refund):.4g} Gram поставлен в очередь (выплата создана)"
 

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -32,7 +33,17 @@ from app.handlers import (
     on_pre_checkout,
 )
 from app.handlers import panel as panel_mod
-from app.models import Income, Payout, Player, Round, RoundStatus, Stake, WatcherState, WinRule
+from app.models import (
+    Income,
+    Payout,
+    Player,
+    Round,
+    RoundStatus,
+    Stake,
+    Vote,
+    WatcherState,
+    WinRule,
+)
 from app.stakes import register_stake
 from app.ton_utils import normalize_address, to_nano
 from app.ton_watch import Transfer, process_transfer
@@ -314,6 +325,219 @@ async def test_manual_refund_creates_net_payout_and_is_idempotent(ton_on) -> Non
             await db.execute(delete(Stake).where(Stake.tx_hash == "ref-1g"))
             await db.execute(delete(Player).where(Player.id == 930_962))
             await db.execute(delete(Round).where(Round.day_index == 97_961))
+            await db.commit()
+
+
+async def test_manual_refund_racing_day_finalization_pays_once(monkeypatch, ton_on) -> None:
+    """Гонка /return с закрытием дня: одна ставка — одна выплата.
+
+    Окно шире, чем кажется на взгляд: ручной возврат успевает ПРОЧИТАТЬ
+    ставку как pending и пройти все проверки (dup-поиск и claim_once), а в
+    это время тик закрывает день и создаёт свой refund по той же ставке.
+    Обе стороны лили ставку безусловным присваиванием статуса, поэтому в
+    базе оказывались ДВЕ refund-выплаты за одну ставку.
+
+    Пауза стоит на claim_once — последнем асинхронном шаге перед записью:
+    читать ставку хендлер уже успел, писать ещё не начал.
+    """
+    from app import stakes as stakes_mod
+    from app.stakes import create_manual_refund, finalize_day_payouts
+
+    now = datetime.now(UTC)
+    round_id = None
+    try:
+        async with SessionLocal() as db:
+            round_row = Round(
+                day_index=97_964,
+                status=RoundStatus.CLOSED,
+                win_rule=WinRule.MAJORITY,
+                chapter_title="t",
+                chapter_text="x",
+                opens_at=now - timedelta(hours=25),
+                voting_ends_at=now - timedelta(hours=1),
+                tally_ends_at=now,
+            )
+            player = Player(
+                id=930_964,
+                username="refund_race",
+                wallet_address=RAW,
+                wallet_verified=True,
+            )
+            db.add_all([round_row, player])
+            await db.flush()
+            stake = Stake(
+                round_id=round_row.id,
+                player_id=player.id,
+                amount_nanotons=to_nano(1),
+                tx_hash="ref-race",
+                status="pending",
+                network="testnet" if settings.is_testnet else "mainnet",
+            )
+            db.add(stake)
+            await db.commit()
+            stake_id = stake.id
+            round_id = round_row.id
+
+        real_claim_once = stakes_mod.claim_once
+        reached = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def pausing_claim_once(session, key):
+            if key.startswith("manual_refund:"):
+                reached.set()
+                await resume.wait()
+            return await real_claim_once(session, key)
+
+        monkeypatch.setattr(stakes_mod, "claim_once", pausing_claim_once)
+
+        async with SessionLocal() as manual_session:
+            task = asyncio.create_task(create_manual_refund(manual_session, stake_id))
+            await asyncio.wait_for(reached.wait(), timeout=10)
+
+            # В это окно закрывается день — свой refund по той же ставке.
+            async with SessionLocal() as fin_session:
+                fin_round = await fin_session.get(Round, round_id)
+                await finalize_day_payouts(fin_session, fin_round)
+
+            resume.set()
+            result = await asyncio.wait_for(task, timeout=10)
+
+            rows = (
+                await manual_session.execute(
+                    select(Payout).where(
+                        Payout.kind == "refund",
+                        Payout.round_id == round_id,
+                    )
+                )
+            ).scalars().all()
+
+        assert len(rows) == 1, (
+            f"одна ставка дала {len(rows)} refund-выплат (ручной: {result!r}) — двойной возврат"
+        )
+        async with SessionLocal() as db:
+            final_stake = await db.get(Stake, stake_id)
+        assert final_stake is not None and final_stake.status == "refunded"
+    finally:
+        async with SessionLocal() as db:
+            if round_id is not None:
+                await db.execute(delete(Payout).where(Payout.round_id == round_id))
+            await db.execute(delete(Payout).where(Payout.player_id == 930_964))
+            await db.execute(delete(Stake).where(Stake.tx_hash == "ref-race"))
+            await db.execute(delete(Player).where(Player.id == 930_964))
+            await db.execute(delete(Round).where(Round.day_index == 97_964))
+            await db.commit()
+
+
+async def test_day_finalization_refuses_stake_claimed_mid_flight(
+    monkeypatch, ton_on
+) -> None:
+    """Финализация дня не платит ставку, разобранную после её снапшота.
+
+    Снапшот `stuck` берётся сразу после claim'а раунда, а claim по КАЖДОЙ
+    ставке стоит в конце — после подгрузки кошельков, выборки победителей и
+    разбора копилок. В этом окне ручной /return успевает закоммитить свой
+    refund. Флаг payouts_finalized не помогает: он защищает повтор самой
+    финализации, а ручной возврат работает со ставкой, а не с раундом.
+
+    На SQLite такая гонка невозможна в принципе — у базы один писатель и
+    финализация держит write-транзакцию от claim'а раунда до конца. Поэтому
+    ставка здесь переводится в refunded ВНУТРИ той же транзакции, что и
+    финализация: это ровно то состояние, которое увидит условный claim на
+    Postgres, где ставки ничем не залочены.
+    """
+    from app import stakes as stakes_mod
+    from app.stakes import finalize_day_payouts
+
+    now = datetime.now(UTC)
+    round_id = None
+    pending_stake_id = None
+    hooked = False
+    try:
+        async with SessionLocal() as db:
+            round_row = Round(
+                day_index=97_965,
+                status=RoundStatus.CLOSED,
+                win_rule=WinRule.MAJORITY,
+                chapter_title="t",
+                chapter_text="x",
+                opens_at=now - timedelta(hours=25),
+                voting_ends_at=now - timedelta(hours=1),
+                tally_ends_at=now,
+                winner_card=0,
+            )
+            winner = Player(
+                id=930_965, username="race_winner",
+                wallet_address=RAW, wallet_verified=True,
+            )
+            late = Player(
+                id=930_966, username="race_late",
+                wallet_address=STRANGER, wallet_verified=True,
+            )
+            db.add_all([round_row, winner, late])
+            await db.flush()
+            network = "testnet" if settings.is_testnet else "mainnet"
+            db.add_all(
+                [
+                    Vote(round_id=round_row.id, player_id=winner.id, card_position=0),
+                    Stake(
+                        round_id=round_row.id, player_id=winner.id,
+                        amount_nanotons=to_nano(2), tx_hash="race-win",
+                        status="confirmed", network=network,
+                    ),
+                    Stake(
+                        round_id=round_row.id, player_id=late.id,
+                        amount_nanotons=to_nano(1), tx_hash="race-pend",
+                        status="pending", network=network,
+                    ),
+                ]
+            )
+            await db.commit()
+            round_id = round_row.id
+            pending_stake_id = await db.scalar(
+                select(Stake.id).where(Stake.tx_hash == "race-pend")
+            )
+
+        real_claim_once = stakes_mod.claim_once
+
+        async def poaching_claim_once(session, key):
+            nonlocal hooked
+            if key.startswith("pot:") and not hooked:
+                hooked = True
+                # Снапшот `stuck` уже сделан — «ручной возврат» забирает
+                # ставку. Пишем в ту же транзакцию, что и финализация:
+                # commit здесь поднял бы блокировку и сузил гонку.
+                await session.execute(
+                    update(Stake).where(Stake.id == pending_stake_id).values(status="refunded")
+                )
+            return await real_claim_once(session, key)
+
+        monkeypatch.setattr(stakes_mod, "claim_once", poaching_claim_once)
+
+        async with SessionLocal() as session:
+            fin_round = await session.get(Round, round_id)
+            created = await finalize_day_payouts(session, fin_round)
+            rows = (
+                await session.execute(
+                    select(Payout).where(Payout.round_id == round_id)
+                )
+            ).scalars().all()
+
+        assert hooked, "хук на _claim_pot не сработал — тест ничего не проверил"
+        refunds = [p for p in rows if p.kind == "refund"]
+        prizes = [p for p in rows if p.kind == "prize"]
+        assert refunds == [], "день повторно заплатил ставку, уже разобранную параллельно"
+        assert len(prizes) == 1, f"приз победителю должен быть ровно один, got {created}: {prizes}"
+        async with SessionLocal() as db:
+            late_stake = await db.get(Stake, pending_stake_id)
+        assert late_stake.status == "refunded"
+    finally:
+        async with SessionLocal() as db:
+            if round_id is not None:
+                await db.execute(delete(Payout).where(Payout.round_id == round_id))
+                await db.execute(delete(Vote).where(Vote.round_id == round_id))
+            await db.execute(delete(Stake).where(Stake.tx_hash.in_(["race-win", "race-pend"])))
+            await db.execute(delete(Player).where(Player.id.in_([930_965, 930_966])))
+            await db.execute(delete(Round).where(Round.day_index == 97_965))
             await db.commit()
 
 
