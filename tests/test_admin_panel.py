@@ -4,6 +4,7 @@
 нажатием, с кнопкой обновления — без раскрытия игрокам.
 """
 
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -267,6 +268,74 @@ async def test_panel_shows_payout_breakdown_and_unprocessed(session, monkeypatch
             await db.execute(_d(Payout).where(Payout.player_id == uid))
             await db.execute(_d(Round).where(Round.day_index == 97_600))
             await db.execute(_d(Player).where(Player.id == uid))
+            await db.commit()
+
+
+async def test_panel_shows_tick_failures_and_problems(monkeypatch) -> None:
+    """Пульт показывает падения тика и живые тревоги, а не только счётчики.
+
+    Раньше снимок эти два поля отдавал (/health их видел), но пульт их не
+    печатал: владелец смотрел на «пульт в порядке» при падающем тике и не
+    знал, что именно тревожит, пока не открывал /ops. Поле называется
+    last_tick_age, а не last_tick_age_seconds, — это имя снимка.
+    """
+    from sqlalchemy import delete as _d
+
+    from app.core.registry import OPS_PROBLEMS_KEY, TICK_FAIL_KEY
+    from app.models import WatcherState
+
+    monkeypatch.setattr(settings, "admin_ids", "4242")
+    async with SessionLocal() as db:
+        await db.execute(_d(WatcherState).where(
+            WatcherState.key.in_([OPS_PROBLEMS_KEY, TICK_FAIL_KEY])
+        ))
+        db.add(WatcherState(key=TICK_FAIL_KEY, value="4"))
+        db.add(WatcherState(
+            key=OPS_PROBLEMS_KEY,
+            value=json.dumps(["очередь выплат стоит 31 мин"], ensure_ascii=False),
+        ))
+        await db.commit()
+    try:
+        async with SessionLocal() as g:
+            text = await _admin_panel_text(g)
+        assert "Тик падал 4 раз" in text
+        assert "очередь выплат стоит 31 мин" in text
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(_d(WatcherState).where(
+                WatcherState.key.in_([OPS_PROBLEMS_KEY, TICK_FAIL_KEY])
+            ))
+            await db.commit()
+
+
+async def test_panel_truncates_long_problem_list(monkeypatch) -> None:
+    """Длинный список тревог обрезается честно: сказано, сколько не показано.
+
+    Молчаливое усечение выглядит как «проблем ровно три», и владелец
+    заключает, что разобрался, не увидев остальные.
+    """
+    from sqlalchemy import delete as _d
+
+    from app.core.registry import OPS_PROBLEMS_KEY
+    from app.models import WatcherState
+
+    monkeypatch.setattr(settings, "admin_ids", "4242")
+    async with SessionLocal() as db:
+        await db.execute(_d(WatcherState).where(WatcherState.key == OPS_PROBLEMS_KEY))
+        db.add(WatcherState(
+            key=OPS_PROBLEMS_KEY,
+            value=json.dumps([f"проблема номер {n}" for n in range(1, 8)]),
+        ))
+        await db.commit()
+    try:
+        async with SessionLocal() as g:
+            text = await _admin_panel_text(g)
+        assert "проблема номер 1" in text
+        assert "проблема номер 4" not in text
+        assert "ещё 4" in text
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(_d(WatcherState).where(WatcherState.key == OPS_PROBLEMS_KEY))
             await db.commit()
 
 

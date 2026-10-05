@@ -285,6 +285,21 @@ async def _build_panel_text(session) -> str:
     tick_age = snap.get("last_tick_age")
     if tick_age is not None and tick_age > 120:
         lines.append(f"⚠️ Тик отстаёт: {int(tick_age)} с — проверь логи.")
+    # Падения тика и живые тревоги берутся из того же снимка, что и /health,
+    # но владелец смотрит на пульт, а не на /health: без этих строк он видел
+    # «пульт в порядке» при падающем тике и не знал, что именно тревожит.
+    tick_fails = snap.get("tick_failures") or 0
+    if tick_fails:
+        lines.append(f"⚠️ Тик падал {tick_fails} раз подряд — последний цикл упал.")
+    problems = snap.get("problems") or []
+    if problems:
+        # Список бывает длинным, а сообщение Telegram ограничено: берём голову
+        # и честно говорим, сколько не показано, иначе выглядит так, будто
+        # проблем ровно столько.
+        shown = problems[:3]
+        lines.append("🚨 Тревоги: " + " · ".join(shown))
+        if len(problems) > len(shown):
+            lines.append(f"…и ещё {len(problems) - len(shown)} — полный список в /ops.")
     return "\n".join(lines) + _PANEL_FOOTER
 
 
