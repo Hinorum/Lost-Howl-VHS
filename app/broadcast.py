@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Chat, Round, RoundStatus, StatusPost
+from app.models import Chat, Round, RoundStatus, StatusPost, WatcherState
 from app.style import day_mark
 from app.tally import format_results
 
@@ -211,6 +211,7 @@ async def _dm_send_all(
     outcomes = await asyncio.gather(*(worker(pid) for pid in player_ids))
     delivered = sum(1 for ok in outcomes if ok)
     logger.info("%s: доставлено %d из %d игроков", label, delivered, len(player_ids))
+    await record_delivery(f"dm:{label}", delivered, len(player_ids))
     return delivered
 
 
@@ -309,6 +310,32 @@ async def _economics_own_session(row: Round) -> dict:
 
 
 _BROADCAST_PARALLELISM = 8
+
+
+DELIVERY_KEY_PREFIX = "delivery:"
+
+
+async def record_delivery(kind: str, delivered: int, attempted: int) -> None:
+    """Записать «доставлено/попыток» для вида рассылки.
+
+    Ключ `delivery:<kind>:<stamp>`, значение «<delivered>/<attempted>».
+    Позволяет отличить «всем ушло» от «прошло без единого получателя» —
+    разница, которую по логам не видно, потому что рассылка там всегда успешна.
+
+    Метка НИКОГДА не должна ронять рассылку: это телеметрия, а не условие
+    доставки. Ошибка записи уходит в warning и теряется.
+    """
+    if attempted <= 0:
+        return
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, f"{DELIVERY_KEY_PREFIX}{kind}")
+            row = row or WatcherState(key=f"{DELIVERY_KEY_PREFIX}{kind}", value="")
+            row.value = f"{delivered}/{attempted}"
+            session.add(row)
+            await session.commit()
+    except Exception as exc:
+        logger.warning("Метку доставки %s не записали: %s", kind, exc)
 
 
 async def _forget_if_gone(chat_id: int, exc: Exception) -> bool:
@@ -632,6 +659,7 @@ async def announce_new_day(
         len(delivered),
         len(chat_ids),
     )
+    await record_delivery(f"day:{round_row.day_index}", len(delivered), len(chat_ids))
     # Личные дубликаты подписчикам: тот же пакет дня (итоги, обложка, кнопки
     # выбора) в личку. Без /start у игрока бот писать не может — такие молча
     # пропускаются; кнопки голосования работают из лички, как и из группы.
@@ -694,6 +722,7 @@ async def _broadcast_text(
 
         outcomes = await asyncio.gather(*(worker(chat_id) for chat_id in chat_ids))
         delivered = len([c for c in outcomes if c is not None])
+        await record_delivery(f"text:{text[:16]}", delivered, len(chat_ids))
     else:
         delivered = 0
     # Личные дубликаты подписчикам — даже если живых чатов нет.
@@ -725,7 +754,11 @@ async def announce_results(bot: Bot | None, finished: Round) -> int:
     if not text:
         return 0
     delivered = await _broadcast_text(bot, text, parse_mode=ParseMode.HTML)
-    logger.info("Итоги дня %s разосланы: доставлено %d чатов", getattr(finished, "day_index", "?"), delivered)
+    logger.info(
+        "Итоги дня %s разосланы: доставлено %d получателей (чаты и личка вместе)",
+        getattr(finished, "day_index", "?"),
+        delivered,
+    )
     return delivered
 
 
@@ -950,6 +983,7 @@ async def whisper_to_chats(bot: Bot | None, text: str) -> int:
     outcomes = await asyncio.gather(*(worker(c) for c in chat_ids))
     delivered = sum(1 for ok in outcomes if ok)
     failed = len(chat_ids) - delivered
+    await record_delivery("whisper", delivered, len(chat_ids))
     logger.info(
         "Шёпот дня разослан в %d из %d чатов%s",
         delivered,

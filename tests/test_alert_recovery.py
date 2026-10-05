@@ -16,6 +16,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import delete
 
 from app import ops
 from app.core.registry import (
@@ -226,3 +227,91 @@ async def test_check_anomalies_does_not_carry_verdict_between_sweeps(_clean) -> 
     assert first is not second
     assert "очередь выплат стоит 31 мин" not in second
     assert await _state(OPS_PROBLEMS_KEY) is not None
+
+
+async def test_record_delivery_writes_marker() -> None:
+    """Метка доставки — это «доставлено/попыток», а не «рассылка прошла»."""
+    from app.broadcast import record_delivery
+
+    async with SessionLocal() as db:
+        await db.execute(delete(WatcherState).where(WatcherState.key == "delivery:day:7"))
+        await db.commit()
+    try:
+        await record_delivery("day:7", 3, 5)
+        assert await _state("delivery:day:7") == "3/5"
+        # Повтор перезаписывает, а не плодит строки.
+        await record_delivery("day:7", 5, 5)
+        assert await _state("delivery:day:7") == "5/5"
+        # Пустой проход метку не оставляет: «0 из 0» — это не доставка.
+        await record_delivery("day:8", 0, 0)
+        assert await _state("delivery:day:8") is None
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_(["delivery:day:7", "delivery:day:8"])
+                )
+            )
+            await db.commit()
+
+
+async def test_zero_delivery_raises_alarm(_clean) -> None:
+    """Рассылка, не дошедшая ни до кого, — тревога.
+
+    Раньше день, ушедший пустым, был неотличим от доставленного всем: успешный
+    проход рассылки и доставка игроку — разные утверждения, и второе не проверял
+    никто. Тик при этом оставался живым, так что /health говорил «всё хорошо».
+    """
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:9", value="0/4"))
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert any("ни одно сообщение не доставлено" in p for p in problems), problems
+        assert any("day:9" in p for p in problems), problems
+        assert _clean.sent, "тревога должна уйти админу"
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key == "delivery:day:9")
+            )
+            await db.commit()
+
+
+async def test_partial_delivery_is_not_an_alarm(_clean) -> None:
+    """Частичная потеря — норма, а не авария: заблокировавшие бота есть всегда.
+
+    Порог по доле кричал бы постоянно и приучил бы игнорировать тревоги.
+    """
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:10", value="3/4"))
+        db.add(WatcherState(key="delivery:day:11", value="1/9"))
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert not any("не доставлено" in p for p in problems), problems
+        assert not any("Рассылка не дошла" in text for text in _clean.sent), _clean.sent
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_(["delivery:day:10", "delivery:day:11"])
+                )
+            )
+            await db.commit()
+
+
+async def test_unparsable_delivery_marker_is_ignored(_clean) -> None:
+    """Битая метка не должна ронять проверку и не должна выдумывать аварию."""
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:12", value="мусор"))
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert not any("не доставлено" in p for p in problems), problems
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key == "delivery:day:12")
+            )
+            await db.commit()

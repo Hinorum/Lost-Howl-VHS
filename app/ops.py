@@ -25,6 +25,7 @@ from app.core.registry import (
     ALERT_BACKUP_KEY,
     ALERT_BALANCE_KEY,
     ALERT_DEAD_KEY,
+    ALERT_DELIVERY_KEY,
     ALERT_ENTROPY_KEY,
     ALERT_MIRROR_KEY,
     ALERT_QUEUE_KEY,
@@ -936,6 +937,35 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
 # 4. Сверка баланса казначея с учётом БД. Две беды разного рода:
     #    дефицит под очередь (пополни — и всё уйдёт само) и расхождение
     #    с ожиданиями (ручной вывод, потерянные средства, чужой доступ).
+    # 3.9. Рассылка прошла, а не дошла. Метки delivery:* пишут
+    #      «доставлено/попыток» на каждой рассылке; раньше их не существовало,
+    #      поэтому день, ушедший пустым, был неотличим от доставленного всем.
+    #      Тревога только на НУЛЕ: частичные потери — норма (заблокировавшие
+    #      бота, чаты без прав), порог по доле кричал бы без причины.
+    if bot is not None:
+        rows = (
+            await session.execute(
+                select(WatcherState).where(WatcherState.key.like("delivery:%"))
+            )
+        ).scalars().all()
+        lost: list[str] = []
+        for row in rows:
+            head, _, tail = (row.value or "").partition("/")
+            try:
+                if int(tail) > 0 and int(head) == 0:
+                    lost.append(row.key.removeprefix("delivery:"))
+            except ValueError:
+                logger.debug("Метка доставки %s не разобрана: %r", row.key, row.value)
+        if lost:
+            note = "ни одно сообщение не доставлено: " + ", ".join(sorted(lost)[:4])
+            await _raise(
+                session,
+                bot,
+                ALERT_DELIVERY_KEY,
+                note,
+                f"⚠️ Рассылка не дошла: {note}. Проверьте права бота в чатах и /health.",
+            )
+
     if settings.ton_enabled and settings.active_treasury_address:
         balance_note = await _treasury_balance_anomaly(session)
         if balance_note is not None:
