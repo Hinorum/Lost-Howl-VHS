@@ -5,8 +5,11 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramForbiddenError
+
 from app.broadcast import (
     _deliver_day,
+    _dm_send_all,
     active_player_ids,
     announce_new_day,
     announce_results,
@@ -189,6 +192,70 @@ async def test_active_player_ids_respects_flag() -> None:
     finally:
         for pid in (yes, no):
             await _cleanup_player(pid)
+
+
+async def test_blocked_player_is_unsubscribed_like_a_chat() -> None:
+    """Заблокировавший бота отписывается — ровно как чат без прав.
+
+    У чатов для этого есть deactivate_chat, а у игроков не было ничего: forbidden
+    попадал в общий except, писался в лог, и тот же адрес перебирался каждой
+    рассылкой заново и вечно. Докстринг _dm_send_all при этом обещал, что
+    молчать нельзя, — обещание было ложным.
+
+    Побочный, но главный эффект: пока такой адрес в подписке, метка доставки
+    никогда не набирает «N из N», и счётчик врёт постоянно.
+    """
+    blocked, alive = 88_181, 88_182
+    await _add_player(blocked)
+    await _add_player(alive)
+    bot = SimpleNamespace()
+    try:
+        delivered = await _dm_send_all(
+            bot,
+            lambda pid: _refuse(pid, blocked),
+            "Тест",
+        )
+        assert delivered == 1
+        async with SessionLocal() as db:
+            assert (await db.get(Player, blocked)).dm_subscribed is False
+            assert (await db.get(Player, alive)).dm_subscribed is True
+        # И выпадает из подписки, а не просто переживает рассылку.
+        assert blocked not in await active_player_ids()
+    finally:
+        for pid in (blocked, alive):
+            await _cleanup_player(pid)
+        async with SessionLocal() as db:
+            await db.execute(
+                Player.__table__.delete().where(Player.id.in_([blocked, alive]))
+            )
+            await db.commit()
+
+
+async def test_unreachable_player_stays_subscribed() -> None:
+    """Прочие сбои (сеть, таймаут) подписку не трогают.
+
+    Отписать игрока можно только когда Telegram сказал «сюда писать нельзя».
+    Всё остальное — временно, иначе один сбой сети тихо лишил бы игрока
+    рассылки навсегда.
+    """
+    flaky = 88_191
+    await _add_player(flaky)
+    try:
+        async def boom(pid):
+            raise TimeoutError("сеть легла")
+
+        assert await _dm_send_all(SimpleNamespace(), boom, "Тест") == 0
+        async with SessionLocal() as db:
+            assert (await db.get(Player, flaky)).dm_subscribed is True
+    finally:
+        await _cleanup_player(flaky)
+
+
+async def _refuse(pid: int, blocked: int) -> None:
+    if pid == blocked:
+        raise TelegramForbiddenError(
+            method=None, message="bot was blocked by the user"
+        )
 
 
 async def test_deliver_day_private_sends_finished_results(tmp_path, monkeypatch) -> None:

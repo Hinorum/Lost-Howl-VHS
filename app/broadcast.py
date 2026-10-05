@@ -156,6 +156,33 @@ async def deactivate_chat(chat_id: int) -> None:
             logger.info("Чат %s помечен неактивным", chat_id)
 
 
+async def deactivate_player(player_id: int) -> None:
+    """Снять личную рассылку с игрока, которому бот больше не может писать.
+
+    Аналог deactivate_chat для лички. Раньше его не было, и докстринг
+    _dm_send_all обещал обратное: «forbidden — это блокировка бота или удаление
+    аккаунта, и молчать об этом дальше нельзя», — а код молчал, просто логируя
+    warning. Заблокировавший перебирался каждой рассылкой заново и вечно, а
+    метка доставки из-за него не могла набрать «доставлено N из N»: счётчик,
+    который только что появился, врал бы по этой причине постоянно.
+
+    Обратного перехода нет: разблокировавший бота должен нажать /start и
+    переключить личную рассылку сам. Это осознанно — автоматически
+    возвращать подписку тому, кто её не просил, хуже, чем один раз спросить.
+    """
+    from app.models import Player
+
+    async with SessionLocal() as session:
+        row = await session.get(Player, player_id)
+        if row is not None and row.dm_subscribed:
+            row.dm_subscribed = False
+            await session.commit()
+            logger.info(
+                "Игрок %s отписан от личной рассылки: бот больше не может ему писать",
+                player_id,
+            )
+
+
 async def active_player_ids() -> list[int]:
     """Игроки, подписанные на личные дубликаты рассылок (/start → dm_subscribed)."""
     from app.models import Player
@@ -204,6 +231,10 @@ async def _dm_send_all(
                 except Exception as exc2:
                     logger.warning("Игроку %s сообщение не доставлено (после ретрая): %s", player_id, exc2)
                     return False
+            except TelegramForbiddenError:
+                # Бот заблокирован или аккаунт удалён: писать сюда больше некуда.
+                await deactivate_player(player_id)
+                return False
             except Exception as exc:
                 logger.warning("Игроку %s сообщение не доставлено: %s", player_id, exc)
                 return False
