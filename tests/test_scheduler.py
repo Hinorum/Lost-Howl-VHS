@@ -932,6 +932,33 @@ async def test_no_job_is_misfire_below_one_second(monkeypatch) -> None:
         assert not probe.running, "пробный планировщик не остановился"
 
 
+async def test_leftover_scheduler_is_registered_and_stopped(scheduler_guard) -> None:
+    """Страховка conftest ловит чужой планировщик и гасит его на выходе.
+
+    Инцидент: пробный планировщик из test_no_job_is_misfire_below_one_second
+    садился на общий (session-scoped) event loop и без остановки бежал до конца
+    прогона. Для _quiesce_background_tasks он невидим — живёт на TimerHandle, а
+    не в asyncio-задаче. Дальше по цепочке: ton-watch гонял watch_once
+    посреди чужих тестов и съедал страницы скриптованного HTTP соседа, откуда
+    и флейк test_toncenter_pagination_walks_by_offset.
+
+    Сетка обязана работать сама, даже когда тест забыл остановить свой
+    экземпляр: именно это и проверяется ниже.
+    """
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    started, stop = scheduler_guard
+
+    probe = AsyncIOScheduler(timezone="UTC")
+    probe.start()
+    assert probe in started, "старт планировщика не попал в страховую сетку"
+
+    await stop()
+
+    assert not probe.running, "сетка не остановила переживший тест планировщик"
+    assert probe not in started, "остановленный планировщик остался в реестре"
+
+
 async def test_ton_maintenance_isolates_failures(monkeypatch) -> None:
     """Падение одного сервиса не останавливает остальные (каждый в своём try)."""
     from app import scheduler as sched

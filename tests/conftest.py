@@ -45,9 +45,63 @@ sqlite3.register_adapter(_dt.datetime, lambda v: v.isoformat(" "))
 sqlite3.register_adapter(_dt.date, lambda v: v.isoformat())
 
 import pytest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler as _AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models import Base
+
+# Страховка от планировщика, пережившего свой тест.
+#
+# AsyncIOScheduler живёт на loop.call_later (TimerHandle), а не в asyncio-задаче,
+# поэтому _quiesce_background_tasks его не видит: настоящий планировщик,
+# поднятый тестом, садится на общий (session-scoped) event loop и без
+# остановки бежит до конца прогона. Так и было: way-tick писал в общую БД, а
+# ton-watch гонял watch_once -> _collect_transfers и съедал страницы
+# скриптованного HTTP соседнего теста — отсюда flake
+# test_toncenter_pagination_walks_by_offset. Каждый старт регистрируем, а на
+# выходе из теста глушим: даже если тест забыл сам, утекать нечему.
+_started_schedulers: list = []
+_original_scheduler_start = _AsyncIOScheduler.start
+
+
+def _track_scheduler_start(self, paused: bool = False):
+    result = _original_scheduler_start(self, paused)
+    if self not in _started_schedulers:
+        _started_schedulers.append(self)
+    return result
+
+
+_AsyncIOScheduler.start = _track_scheduler_start
+
+
+async def _stop_started_schedulers() -> None:
+    """Остановить планировщики, пережившие свой тест (teardown каждого теста).
+
+    shutdown(wait=False) дополнительно отменяет in-flight задачи джоб
+    (AsyncIOExecutor.shutdown), поэтому заботливо дожидаемся и их.
+    """
+    while _started_schedulers:
+        scheduler = _started_schedulers.pop()
+        if not scheduler.running:
+            continue
+        scheduler.shutdown(wait=False)
+        # shutdown уходит в call_soon_threadsafe — даём циклу отработать
+        # и саму остановку, и отмену уже запущенных джоб.
+        await asyncio.sleep(0.01)
+        assert not scheduler.running, (
+            "планировщик не остановился — он продолжит дёргать джобы "
+            "посреди чужих тестов"
+        )
+
+
+@pytest.fixture
+def scheduler_guard() -> tuple[list, object]:
+    """Реестр и остановка планировщиков, переживших свой тест.
+
+    Отдаётся тесту, чтобы он мог проверить саму страховку: старт должен попасть
+    в реестр, остановка — вытащить оттуда и погасить планировщик.
+    """
+    return _started_schedulers, _stop_started_schedulers
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -118,10 +172,16 @@ async def _quiesce_background_tasks():
     Тесты ничего не теряют: задачи, которые тест хочет дождаться, он ждёт сам.
     Здесь гасим только то, что осталось висеть, и делаем это ДО очистки БД
     следующего теста.
+
+    Отдельно гасится переживший тест планировщик (см. _track_scheduler_start):
+    он живёт на TimerHandle, а не в задаче, и без остановки продолжал бы
+    дёргать way-tick/ton-watch уже в чужом тесте.
     """
     from app.async_utils import _TASKS
 
     yield
+    # Планировщик раньше задач: он сам их порождает, глушим источник первым.
+    await _stop_started_schedulers()
     pending = [task for task in list(_TASKS) if not task.done()]
     for task in pending:
         task.cancel()
