@@ -5,6 +5,7 @@
 2. Идемпотентность: финализация закрытого дня дважды не меняет состояние.
 3. Неотрицательность: ставки, выплаты и копилки не уходят в минус.
 4. Уникальность стейков: один tx_hash не создаёт двух стейков.
+4b. Уникальность выплат: один tx_hash цепочки не обслуживает двух получателей.
 5. Lifecycle выплат: статус 'sent' ⇔ tx_hash IS NOT NULL; pending ⇔ NULL.
 6. Согласованность: Σ подтверждённых стейков = Σ(выходы раунда) + рейк.
 
@@ -237,6 +238,87 @@ async def test_same_player_cannot_stake_twice_in_same_round(session: AsyncSessio
     with pytest.raises(IntegrityError):
         session.add(_stake(1, round_row.id, 4 * 10**9, "tx-2"))
         await session.commit()
+
+
+# ----- Property 4b: один tx_hash = одна выплата --------------------------
+
+
+async def test_duplicate_tx_hash_does_not_create_two_payouts(
+    session: AsyncSession,
+) -> None:
+    """Один и тот же (tx_hash, network) не должен приходиться на две выплаты.
+
+    Частичный unique uq_payout_tx_network — БД-барьер там, где раньше защита
+    была только кодовой (claim_once в ton_watch.refunds и условный UPDATE по
+    status='pending' в диспетчере): пропущенный гейт останавливал бы схема.
+    """
+    session.add(
+        Payout(
+            kind="refund",
+            amount_nanotons=10**9,
+            dest_address="0:aa",
+            tx_hash="tx-dup-p",
+            network="mainnet",
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        session.add(
+            Payout(
+                kind="refund",
+                amount_nanotons=10**9,
+                dest_address="0:bb",
+                tx_hash="tx-dup-p",
+                network="mainnet",
+            )
+        )
+        await session.commit()
+    await session.rollback()
+
+
+async def test_broadcast_markers_and_nulls_are_not_unique(session: AsyncSession) -> None:
+    """bcast:<unix> и NULL в tx_hash уникальностью не обладают.
+
+    Два перевода, разосланные в одну секунду, получают ОДИН и тот же маркер
+    вещания; неотправленные строки хеша не имеют вовсе. Обе ситуации обязаны
+    спокойно уживаться — иначе индекс запрещал бы нормальную работу очереди.
+    """
+    session.add_all(
+        [
+            Payout(
+                kind="prize",
+                amount_nanotons=10**9,
+                dest_address="0:aa",
+                status="sent",
+                tx_hash="bcast:1700000000",
+                network="mainnet",
+            ),
+            Payout(
+                kind="rake",
+                amount_nanotons=10**9,
+                dest_address="0:bb",
+                status="sent",
+                tx_hash="bcast:1700000000",
+                network="mainnet",
+            ),
+            Payout(
+                kind="prize",
+                amount_nanotons=10**9,
+                dest_address="0:cc",
+                status="pending",
+                network="mainnet",
+            ),
+            Payout(
+                kind="prize",
+                amount_nanotons=10**9,
+                dest_address="0:dd",
+                status="pending",
+                network="mainnet",
+            ),
+        ]
+    )
+    await session.commit()
 
 
 # ----- Property 5: lifecycle Payout --------------------------------------

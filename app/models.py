@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -321,6 +322,13 @@ class Stake(Base):
     )
 
 
+# Один хеш цепочки — ровно одна выплата, и только для «настоящих» хешей:
+# NULL означает «ещё не отправлялось», а метка вещания bcast:<unix> общая для
+# всех переводов, разосланных в одну секунду (см. dispatch.send), — она
+# уникальностью обладать не может и выпадает из индекса.
+_PAYOUT_TX_UNIQUE_WHERE = text("tx_hash IS NOT NULL AND tx_hash NOT LIKE 'bcast:%'")
+
+
 class Payout(Base):
     """Исходящий перевод: приз, бонус угадавшему без ставки, возврат ставки,
     авто-возврат «ничейного» перевода или доля казны (рейк и копилка месяца).
@@ -364,6 +372,18 @@ class Payout(Base):
         CheckConstraint("status IN ('pending', 'sending', 'sent', 'failed', 'dismissed')", name="ck_payout_valid_status"),
         Index("ix_payout_dispatch", "status", "network", "dest_address"),
         Index("ix_payout_alert", "status", "network", "alerted"),
+        # БД-барьер от двойной оплаты: раньше единственной защитой был код
+        # (claim_once в ton_watch.refunds, лок + условный UPDATE в диспетчере).
+        # Ловит два класса — повторный авто-возврат на один входящий перевод и
+        # подтверждение одной транзакции сразу за две выплаты.
+        Index(
+            "uq_payout_tx_network",
+            "tx_hash",
+            "network",
+            unique=True,
+            sqlite_where=_PAYOUT_TX_UNIQUE_WHERE,
+            postgresql_where=_PAYOUT_TX_UNIQUE_WHERE,
+        ),
     )
 
 

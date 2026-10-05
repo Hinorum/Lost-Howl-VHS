@@ -110,6 +110,86 @@ def test_upgrade_head_removes_leftover_tx_hash_unique(tmp_path) -> None:
     assert all(u["column_names"] != ["tx_hash"] for u in uniques)
 
 
+def test_upgrade_head_creates_partial_payout_tx_unique(tmp_path) -> None:
+    """Миграция a3f7d19c5b42 ставит частичный unique на (tx_hash, network).
+
+    БД-барьер от двойной оплаты там, где раньше был только код (claim_once
+    в ton_watch.refunds и условный UPDATE по status='pending' в диспетчере).
+    Условие обязано выпускать и NULL, и метку вещания bcast:<unix> — иначе два
+    перевода, разосланные в одну секунду, конфликтовали бы между собой.
+    """
+    db_file = tmp_path / "payout_uq.db"
+    env = dict(os.environ) | {"DATABASE_URL": f"sqlite+aiosqlite:///{db_file}"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    engine = sa.create_engine(f"sqlite:///{db_file}")
+    try:
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='index' AND tbl_name='payouts'"
+            ).fetchall()
+    finally:
+        engine.dispose()
+
+    ddl = {row[0]: row[1] or "" for row in rows}.get("uq_payout_tx_network", "")
+    assert ddl, "частичный unique на payouts.tx_hash не создан миграцией"
+    assert "UNIQUE" in ddl.upper()
+    assert "WHERE tx_hash IS NOT NULL" in ddl
+    assert "bcast" in ddl
+
+
+def test_payout_tx_unique_migration_refuses_to_guess_over_duplicates(tmp_path) -> None:
+    """Если дубли tx_hash уже накопились — миграция падает с перечнем строк.
+
+    Молча обнулить хеш у второй строки нельзя: это вернуло бы её в сверку
+    (tx_hash IS NULL попадает в confirm_broadcast_payouts) и могло привести к
+    повторной отправке. Лучше старт с понятной ошибкой, чем тихая правка
+    данных о деньгах.
+    """
+    # Ревизия ДО барьера: снимаем индекс, кладём дубли, поднимаем обратно.
+    before_barrier = "d8f1a2b3c4d5"
+    db_file = tmp_path / "payout_dups.db"
+    env = dict(os.environ) | {"DATABASE_URL": f"sqlite+aiosqlite:///{db_file}"}
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", *args],
+            capture_output=True,
+            text=True,
+            cwd=str(_REPO_ROOT),
+            env=env,
+        )
+
+    assert run("upgrade", "head").returncode == 0
+    assert run("downgrade", before_barrier).returncode == 0
+
+    engine = sa.create_engine(f"sqlite:///{db_file}")
+    try:
+        with engine.begin() as conn:
+            for pid in (1, 2):
+                conn.exec_driver_sql(
+                    "INSERT INTO payouts (id, kind, amount_nanotons, dest_address, "
+                    "tx_hash, network, status, attempts, alerted) "
+                    f"VALUES ({pid}, 'refund', 1000000000, '0:aa', 'tx-same', "
+                    "'mainnet', 'pending', 0, 0)"
+                )
+    finally:
+        engine.dispose()
+
+    proc = run("upgrade", "head")
+    assert proc.returncode != 0, "миграция обязана отказаться гадать с дублями"
+    assert "Разберись с дублями" in proc.stderr
+    assert "tx-same" in proc.stderr
+
+
 async def test_orphan_column_drop_is_flag_gated(tmp_path, monkeypatch) -> None:
     """Осиротевшая NOT NULL-колонка (старая механика) с flag off не трогается,
     с flag on — удаляется. Раньше init_db сносил её на каждом старте без спроса."""
