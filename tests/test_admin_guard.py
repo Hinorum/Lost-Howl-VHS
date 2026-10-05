@@ -33,12 +33,14 @@ from app.handlers.admin import (
     on_adjust_action,
 )
 from app.handlers.common import router as app_router
+from app.handlers.ops_diag import cmd_ops
 from app.handlers.panel import cmd_cassette, cmd_panel, on_cassette_action, on_panel_action
 from app.handlers.payout import (
     cmd_blockchain,
     cmd_fundout,
     cmd_halt_payouts,
     cmd_incoming,
+    cmd_mirror,
     cmd_payout,
     cmd_payouts,
     cmd_resume_payouts,
@@ -75,6 +77,8 @@ COMMAND_GUARDS = [
     (cmd_stakes, "/stakes"),
     (cmd_revenue, "/revenue"),
     (cmd_blockchain, "/blockchain"),
+    (cmd_mirror, "/mirror reset confirm"),  # гейт обязан стоять до разбора аргументов
+    (cmd_ops, "/ops"),
 ]
 
 CALLBACK_GUARDS = [
