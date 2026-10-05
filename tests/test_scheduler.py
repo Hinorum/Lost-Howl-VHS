@@ -903,18 +903,33 @@ async def test_no_job_is_misfire_below_one_second(monkeypatch) -> None:
     monkeypatch.setattr(sched, "scheduler", probe)
     monkeypatch.setattr(settings, "ton_enabled", True)
 
-    sched.start_scheduler()
+    try:
+        sched.start_scheduler()
 
-    jobs = probe.get_jobs()
-    assert jobs, "ни одна джоба не зарегистрирована — тест ничего не проверил"
-    for job in jobs:
-        assert job.misfire_grace_time is None, (
-            f"{job.id}: misfire_grace_time={job.misfire_grace_time} — запуск "
-            "опоздает больше чем на секунду и будет отброшен молча"
-        )
-    # Смысл проверки выше — про каждый id; убеждаемся, что охватили всё нужное.
-    covered = {job.id for job in jobs}
-    assert {"way-tick", "ops-sweep", "db-backup", "ton-watch", "ton-settle"} <= covered
+        jobs = probe.get_jobs()
+        assert jobs, "ни одна джоба не зарегистрирована — тест ничего не проверил"
+        for job in jobs:
+            assert job.misfire_grace_time is None, (
+                f"{job.id}: misfire_grace_time={job.misfire_grace_time} — запуск "
+                "опоздает больше чем на секунду и будет отброшен молча"
+            )
+        # Смысл проверки выше — про каждый id; убеждаемся, что охватили всё нужное.
+        covered = {job.id for job in jobs}
+        assert {"way-tick", "ops-sweep", "db-backup", "ton-watch", "ton-settle"} <= covered
+    finally:
+        # probe.start() сел на ОБЩИЙ (session-scoped) event loop, и без
+        # остановки планировщик бежит до конца сессии. Он живёт на TimerHandle,
+        # а не в asyncio-задаче, поэтому _quiesce_background_tasks его не видит:
+        # way-tick писал в общую БД, а ton-watch гонял watch_once посреди
+        # чужих тестов и съедал страницы скриптованного HTTP соседа — отсюда
+        # flake test_toncenter_pagination_walks_by_offset.
+        import asyncio
+
+        if probe.running:
+            probe.shutdown(wait=False)
+            # shutdown уходит в call_soon_threadsafe — даём циклу его выполнить.
+            await asyncio.sleep(0)
+        assert not probe.running, "пробный планировщик не остановился"
 
 
 async def test_ton_maintenance_isolates_failures(monkeypatch) -> None:
