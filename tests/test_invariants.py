@@ -277,6 +277,50 @@ async def test_duplicate_tx_hash_does_not_create_two_payouts(
     await session.rollback()
 
 
+async def test_duplicate_tx_hash_rejected_on_postgres() -> None:
+    """Барьер uq_payout_tx_network отклоняет дубль и на прод-диалекте.
+
+    Сиблинг выше гоняется на SQLite: фикстура session заводит свой tmp-движок.
+    Прод — Postgres, и у частичного unique там свой путь (postgresql_where):
+    прогоняем барьер на глобальной БД, когда она Postgres, и скипаемся в
+    обычном sqlite-прогоне — защита от «на SQLite зелёно, в проде молчит».
+    """
+    from sqlalchemy import delete
+
+    from app.db import SessionLocal
+
+    async with SessionLocal() as db:
+        if db.bind is None or db.bind.dialect.name != "postgresql":
+            pytest.skip("проверка прод-диалекта: нужен DATABASE_URL на Postgres")
+        tx_hash = "tx-dup-invariants-pg"
+        db.add(
+            Payout(
+                kind="refund",
+                amount_nanotons=10**9,
+                dest_address="0:aa",
+                tx_hash=tx_hash,
+                network="mainnet",
+            )
+        )
+        await db.commit()
+        db.add(
+            Payout(
+                kind="refund",
+                amount_nanotons=10**9,
+                dest_address="0:bb",
+                tx_hash=tx_hash,
+                network="mainnet",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await db.commit()
+        await db.rollback()
+        # Свою строку убираем сами: модульный truncate чистит БД только на
+        # СЛЕДУЮЩЕМ модуле, а хвост внутри модуля не должен никому мешать.
+        await db.execute(delete(Payout).where(Payout.tx_hash == tx_hash))
+        await db.commit()
+
+
 async def test_broadcast_markers_and_nulls_are_not_unique(session: AsyncSession) -> None:
     """bcast:<unix> и NULL в tx_hash уникальностью не обладают.
 
