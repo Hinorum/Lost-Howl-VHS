@@ -22,6 +22,7 @@ from sqlalchemy import func, select, text
 
 from app.config import settings
 from app.core.registry import (
+    ALERT_ANNOUNCE_EMPTY_KEY,
     ALERT_BACKUP_KEY,
     ALERT_BALANCE_KEY,
     ALERT_DEAD_KEY,
@@ -37,6 +38,7 @@ from app.core.registry import (
     ALERT_TICK_FAIL_KEY,
     ALERT_TICK_KEY,
     ALERT_WATCHER_KEY,
+    ANNOUNCE_EMPTY_DAY_KEY,
     BACKUP_LAST_OK_KEY,
     BEAT_KEY,
     MONEY_MODE_KEY,
@@ -1012,6 +1014,35 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                     f"⚠️ {note.capitalize()}. Рассылка могла не дойти ни разу — "
                     "смотрите логи и права бота в чатах.",
                 )
+
+    # 3.11. Анонс нового дня ушёл в пустоту: нет ни активного чата, ни игрока
+    #       с личной рассылкой. Метрика delivery:* здесь не помощник: «0 из 0»
+    #       не считается доставкой и метку не оставляет (record_delivery), а
+    #       claim дня уже стоит — без этой проверки пустая аудитория
+    #       неотличима от «новость дня увидели все».
+    #       Маркер пишет announce_new_day; здесь он снимается сам, как только
+    #       получатель появился: /bind в чате, вернувшийся игрок, заново
+    #       добавленный бот. Иначе тревога висела бы до следующего анонса.
+    empty_day = await _get_state(session, ANNOUNCE_EMPTY_DAY_KEY)
+    if empty_day is not None:
+        from app.broadcast import announce_audience_size, set_announce_empty_marker
+
+        if await announce_audience_size() > 0:
+            await set_announce_empty_marker(None)
+        else:
+            note = (
+                f"анонс дня {empty_day} не дошёл ни до кого: нет активных чатов "
+                "и подписчиков лички"
+            )
+            await _raise(
+                session,
+                bot,
+                ALERT_ANNOUNCE_EMPTY_KEY,
+                note,
+                f"⚠️ Новость дня {empty_day} не увидел никто — рассылать некому. "
+                "Привяжи нужный чат командой /bind прямо в нём и попроси игроков "
+                "/start в личке (иначе бот не сможет им писать).",
+            )
 
     if settings.ton_enabled and settings.active_treasury_address:
         balance_note = await _treasury_balance_anomaly(session)

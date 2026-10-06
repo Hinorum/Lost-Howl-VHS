@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
 from app.db import SessionLocal
 from app.models import Chat, Round, RoundStatus, StatusPost, WatcherState
 from app.style import day_mark
@@ -369,6 +370,45 @@ async def record_delivery(kind: str, delivered: int, attempted: int) -> None:
         logger.warning("Метку доставки %s не записали: %s", kind, exc)
 
 
+async def announce_audience_size() -> int:
+    """Сколько получателей было бы у анонса нового дня прямо сейчас.
+
+    Чаты (группы и каналы из `chats.active`) плюс игроки, разрешившие личку.
+    Пустая аудитория — это не «рассылка не удалась», а «рассылать некому»:
+    состояние дня при этом выглядит ровно так же, как при доставке всем,
+    поэтому оно обязано быть видно наружу, а не только строкой INFO
+    «доставлено 0 из 0» в логе.
+    """
+    total = len(await active_chat_ids())
+    if settings.player_dm:
+        total += len(await active_player_ids())
+    return total
+
+
+async def set_announce_empty_marker(day_index: int | None) -> None:
+    """Маркер «анонс дня N не имел ни одного получателя» (см. check_anomalies).
+
+    day_index=None — снять маркер: получатель появился. Как и `delivery:*`,
+    это телеметрия, а не условие доставки: сбой записи уходит в warning и не
+    должен ронять рассылку.
+    """
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY)
+            if day_index is None:
+                if row is not None:
+                    await session.delete(row)
+                    await session.commit()
+                return
+            if row is None:
+                row = WatcherState(key=ANNOUNCE_EMPTY_DAY_KEY, value="")
+            row.value = str(day_index)
+            session.add(row)
+            await session.commit()
+    except Exception as exc:
+        logger.warning("Метка пустой аудитории анонса не записана: %s", exc)
+
+
 async def _forget_if_gone(chat_id: int, exc: Exception) -> bool:
     """Чат выбыл из Telegram — помечаем неактивным. True — чат отключён.
 
@@ -673,6 +713,28 @@ async def announce_new_day(
     if bot is None:
         return []
     chat_ids = await active_chat_ids()
+    # Аудитория важнее самой отправки: claim дня уже стоит, и при пустой
+    # аудитории анонс проходит «успешно», никому не доставив ни строчки.
+    # Раньше это читалось как «рассылка не работает» — теперь состояние
+    # помечается, видно в /ops и метрике, а тревога снимается сама, как
+    # только появляется первый получатель.
+    if await announce_audience_size() > 0:
+        await set_announce_empty_marker(None)
+    else:
+        from app.metrics import inc
+
+        inc("announce_no_audience_total")
+        logger.warning(
+            "Анонс дня %s ушёл в пустоту: нет ни активных чатов, ни игроков с "
+            "личной рассылкой — новость не увидит никто (/bind в нужном чате)",
+            round_row.day_index,
+        )
+        await set_announce_empty_marker(round_row.day_index)
+    if not chat_ids:
+        logger.warning(
+            "Анонс дня %s: активных чатов нет — в группу или канал не уйдёт ничего",
+            round_row.day_index,
+        )
     results_text = await results_message(finished) if finished is not None else None
     # Кнопка памяти снята вместе со слоем сюжета (эхо-система удалена).
     remember = False

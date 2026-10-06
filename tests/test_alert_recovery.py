@@ -27,7 +27,7 @@ from app.core.registry import (
     OPS_PROBLEMS_KEY,
 )
 from app.db import SessionLocal
-from app.models import Round, RoundStatus, WatcherState, WinRule
+from app.models import Chat, Round, RoundStatus, WatcherState, WinRule
 
 
 async def _closed_round(day_index: int) -> None:
@@ -341,6 +341,56 @@ async def test_unparsable_delivery_marker_is_ignored(_clean) -> None:
             await db.execute(
                 delete(WatcherState).where(WatcherState.key == "delivery:day:12")
             )
+            await db.commit()
+
+
+async def test_empty_announce_audience_raises_alarm(_clean) -> None:
+    """Анонс дня без единого получателя — тревога, а не «успех».
+
+    Claim дня (announced_at) уже стоит, а метка delivery:* при «0 из 0» не
+    пишется (см. record_delivery) — то есть рассылка, не дошедшая ни до кого,
+    раньше была неотличима от рассылки, дошедшей до всех.
+    """
+    from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+
+    async with SessionLocal() as db:
+        db.add(WatcherState(key=ANNOUNCE_EMPTY_DAY_KEY, value="42"))
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert any("анонс дня 42 не дошёл ни до кого" in p for p in problems), problems
+        assert _clean.sent, "тревога должна уйти админу"
+        assert any("/bind" in text for text in _clean.sent), _clean.sent
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY)
+            )
+            await db.commit()
+
+
+async def test_empty_announce_alarm_clears_when_chat_returns(_clean) -> None:
+    """Привязали чат — метка пустоты гаснет на ближайшем же проходе.
+
+    Иначе тревога висела бы до самого следующего анонса (до суток) после того,
+    как хранитель уже всё починил, и «починилось само» никто бы не услышал.
+    """
+    from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+
+    chat = -100_555_001
+    async with SessionLocal() as db:
+        db.add(WatcherState(key=ANNOUNCE_EMPTY_DAY_KEY, value="43"))
+        db.add(Chat(id=chat, type="channel", active=True))
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert not any("не дошёл ни до кого" in p for p in problems), problems
+        async with SessionLocal() as db:
+            assert await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY) is None
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY))
+            await db.execute(delete(Chat).where(Chat.id == chat))
             await db.commit()
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -629,3 +630,68 @@ async def test_no_asyncio_wait_coroutine_leak() -> None:
     asyncio.sleep с явной паузой, а не через несуществующие таймеры."""
     assert asyncio.isfuture(bc._BROADCAST_PARALLELISM) is False
     assert bc._BROADCAST_PARALLELISM > 0
+
+
+# ── пустая аудитория ─────────────────────────────────────────────────────────
+
+
+async def test_announce_without_audience_leaves_a_trace(monkeypatch, caplog) -> None:
+    """Анонс дня без единого получателя обязан оставить след.
+
+    Claim дня (announced_at) уже стоит ДО отправки, а метка delivery:* при
+    «0 из 0» не пишется — без отдельной метки, предупреждения и счётчика
+    пустая аудитория была неотличима от «новость дня увидели все», и тревоги
+    было некому поднять.
+    """
+    from app import metrics as metrics_mod
+    from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr(bc, "active_chat_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(bc, "active_player_ids", AsyncMock(return_value=[]))
+    metrics_mod.reset()
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.broadcast"):
+            delivered = await bc.announce_new_day(_flaky_bot({}), _round(9305), finished=None)
+        assert delivered == []
+        async with SessionLocal() as db:
+            marker = await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY)
+        assert marker is not None and marker.value == "9305"
+        assert "way_announce_no_audience_total 1" in metrics_mod.render()
+        assert "ушёл в пустоту" in caplog.text
+    finally:
+        metrics_mod.reset()
+        await _wipe(Round)
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY)
+            )
+            await db.commit()
+
+
+async def test_announce_clears_empty_marker_when_audience_returns(monkeypatch) -> None:
+    """Получатель появился — метка пустоты гаснет сама.
+
+    Иначе тревога висела бы до следующего анонса (до суток), даже когда
+    хранитель уже привязал чат или игрок вернулся в личку.
+    """
+    from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+
+    monkeypatch.setattr(settings, "player_dm", False)
+    await _wipe(Chat)
+    chat = 777_705
+    async with SessionLocal() as db:
+        db.add(Chat(id=chat, type="channel", active=True))
+        await db.commit()
+    try:
+        await bc.set_announce_empty_marker(9306)
+        assert await bc.announce_new_day(_flaky_bot({}), _round(9306), finished=None) == [chat]
+        async with SessionLocal() as db:
+            assert await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY) is None
+    finally:
+        await _wipe(Chat, Round)
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY)
+            )
+            await db.commit()
