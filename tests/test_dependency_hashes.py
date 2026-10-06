@@ -195,6 +195,18 @@ def test_critical_packages_are_pinned_in_requirements() -> None:
         assert name in versions, f"{name} не закреплён в requirements.txt"
 
 
+def test_every_pinned_dependency_is_critical() -> None:
+    """Новая прямая зависимость в requirements.txt обязана попасть в CRITICAL.
+
+    Любая из них исполняется в том же процессе, который читает
+    TREASURY_MNEMONIC из окружения, — компрометация любой равна компрометации
+    казны. Забытый пакет — дыра, которая выглядит как зелёный CI.
+    """
+    versions = dh.pinned_versions()
+    missing = set(versions) - set(dh.CRITICAL)
+    assert not missing, f"не входят в CRITICAL: {sorted(missing)}"
+
+
 def test_repo_pin_file_is_consistent_with_requirements() -> None:
     """Пин-файл репозитория соответствует закреплённым версиям.
 
