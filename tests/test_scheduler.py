@@ -13,7 +13,7 @@ from sqlalchemy import delete, func, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Card, PreparedDay, Round, RoundStatus, WinRule
+from app.models import Card, Chat, PreparedDay, Round, RoundStatus, WatcherState, WinRule
 from app.scheduler import tick
 from app.stakes import current_network
 
@@ -51,6 +51,23 @@ async def _cleanup(*day_indexes: int) -> None:
     async with SessionLocal() as db:
         await db.execute(Round.__table__.delete().where(Round.day_index.in_(day_indexes)))
         await db.execute(delete(PreparedDay).where(PreparedDay.day_index.in_([d + 1 for d in day_indexes])))
+        await db.commit()
+
+
+async def _clear_rounds() -> None:
+    """Чистый старт без чужих дней.
+
+    ensure_current_round возвращает ЛЮБОЙ активный раунд, а следующий день
+    считает от самого позднего — утёкший из соседнего теста OPEN-день делает
+    «свой» день несоздаваемым без единой ошибки в коде. Тест, которому важен
+    порядок дней, обязан начинать с пустого поля.
+    """
+    from app.models import Vote as _Vote
+
+    async with SessionLocal() as db:
+        await db.execute(delete(Card))
+        await db.execute(delete(_Vote))
+        await db.execute(delete(Round))
         await db.commit()
 
 
@@ -134,6 +151,91 @@ async def test_tick_finishes_day_and_opens_next() -> None:
     finally:
         await _drain_background()
         await _cleanup(9551, 9552)
+
+
+async def test_tick_delivers_new_day_to_registered_chat(monkeypatch) -> None:
+    """Автопуть рассылки целиком: закрытый день → новый день → пост в чат.
+
+    Это единственный путь, по которому игроки узнают о новом дне — ручной
+    /today его не заменяет. Claim дня (announced_at) ставится ДО отправки,
+    поэтому обрыв на любом шаге выглядел бы как успех: раньше путь проверялся
+    только чтением кода. Здесь проверяется конечный результат — пост реально
+    ушёл в зарегистрированный чат, метка доставки «1/1» и тревоги не поднялись.
+    """
+    from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+
+    day, next_day = 9561, 9562
+    chat_id = -100_992_001
+    # Чистый старт по обоим измерениям: чужой активный раунд из соседнего
+    # теста сделал бы следующий день несоздаваемым (ensure_current_round
+    # возвращает ЛЮБОЙ активный), а чужие чаты — проверку «куда ушло» ложной.
+    await _clear_rounds()
+    async with SessionLocal() as db:
+        await db.execute(delete(Chat))
+        await db.commit()
+    monkeypatch.setattr(settings, "player_dm", False)
+
+    now = datetime.now(UTC)
+    round_id = await _seed(
+        day, RoundStatus.CLOSED, voting_in=timedelta(hours=-3), tally_in=timedelta(minutes=-5)
+    )
+    async with SessionLocal() as db:
+        row = await db.get(Round, round_id)
+        # Метки уже разобранного дня: итоги и очки прошлого дня не должны
+        # уехать в тот же чат фоновыми джобами и засорить проверку.
+        row.results_at = now - timedelta(hours=1)
+        row.awards_at = now - timedelta(hours=1)
+        row.payouts_finalized = True
+        db.add(Chat(id=chat_id, type="channel", active=True, title="Тестовый канал"))
+        await db.commit()
+
+    sent: list[tuple[int, str]] = []
+
+    async def _record(sent_chat_id, text=None, **kwargs):
+        sent.append((sent_chat_id, text or ""))
+        return SimpleNamespace(message_id=len(sent))
+
+    bot = SimpleNamespace(send_message=AsyncMock(side_effect=_record))
+
+    try:
+        await tick(bot)
+        await _drain_background()
+
+        async with SessionLocal() as db:
+            fresh = (
+                await db.execute(select(Round).where(Round.day_index == next_day).limit(1))
+            ).scalar_one_or_none()
+            marker = await db.get(WatcherState, f"delivery:day:{next_day}")
+            empty = await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY)
+            cards = 0 if fresh is None else (
+                await db.execute(
+                    select(func.count()).select_from(Card).where(Card.round_id == fresh.id)
+                )
+            ).scalar_one()
+
+        assert fresh is not None
+        assert fresh.status == RoundStatus.OPEN
+        assert fresh.announced_at is not None
+        assert cards == 3
+        # Пост ушёл именно в зарегистрированный чат, ровно один раз.
+        assert len(sent) == 1
+        assert sent[0][0] == chat_id
+        assert sent[0][1]
+        assert marker is not None and marker.value == "1/1"
+        # Ни «ушёл в пустоту», ни «0 из 1» — тревог поднимать не на что.
+        assert empty is None
+    finally:
+        await _drain_background()
+        await _cleanup(day, next_day)
+        await _clear_rounds()
+        async with SessionLocal() as db:
+            await db.execute(delete(Chat).where(Chat.id == chat_id))
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_([f"delivery:day:{next_day}", ANNOUNCE_EMPTY_DAY_KEY])
+                )
+            )
+            await db.commit()
 
 
 async def test_start_scheduler_registers_only_zero_arg_jobs(monkeypatch) -> None:
@@ -239,16 +341,6 @@ async def _make_round(
         db.add(r)
         await db.commit()
         return r.id
-
-
-async def _clear_rounds() -> None:
-    from app.models import Vote as _Vote
-
-    async with SessionLocal() as db:
-        await db.execute(delete(Card))
-        await db.execute(delete(_Vote))
-        await db.execute(delete(Round))
-        await db.commit()
 
 
 async def test_tick_returns_early_when_paused(monkeypatch) -> None:

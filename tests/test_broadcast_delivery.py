@@ -695,3 +695,29 @@ async def test_announce_clears_empty_marker_when_audience_returns(monkeypatch) -
                 delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY)
             )
             await db.commit()
+
+
+async def test_announce_without_bot_leaves_a_trace(monkeypatch, caplog) -> None:
+    """Третья ветка той же ловушки: bot is None при уже стоящем claim дня.
+
+    Молчаливый `return []` оставлял «объявленный» день без единого следа —
+    ни лога, ни метки, ни счётчика. Метку announce_empty_day здесь сознательно
+    НЕ ставим: её читает check_anomalies, а это джоба того же планировщика.
+    Бота нет — значит тиков нет — тревоги всё равно некому поднять, остаётся
+    то, что видно и без планировщика: лог (Render) и /metrics.
+    """
+    from app import metrics as metrics_mod
+    from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+
+    metrics_mod.reset()
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.broadcast"):
+            delivered = await bc.announce_new_day(None, _round(9307), finished=None)
+        assert delivered == []
+        assert "бот не установлен" in caplog.text
+        assert "way_announce_no_bot_total 1" in metrics_mod.render()
+        async with SessionLocal() as db:
+            assert await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY) is None
+    finally:
+        metrics_mod.reset()
+        await _wipe(Round)

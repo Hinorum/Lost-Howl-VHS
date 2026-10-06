@@ -17,9 +17,10 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import delete
 
+from app import broadcast as bc
 from app import ops
 from app.config import settings
-from app.core.registry import OPS_PROBLEMS_AT_KEY, OPS_PROBLEMS_KEY
+from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY, OPS_PROBLEMS_AT_KEY, OPS_PROBLEMS_KEY
 from app.db import SessionLocal
 from app.handlers import ops_diag
 from app.models import Payout, Round, RoundStatus, WatcherState, WinRule
@@ -134,6 +135,21 @@ async def test_snapshot_reports_cached_problems_without_recomputing(monkeypatch)
     ops.check_anomalies.assert_not_awaited()
 
 
+async def test_snapshot_reports_announce_audience() -> None:
+    """Аудитория рассылки — прямо в снимке.
+
+    Раньше «кому может уйти новый день» было видно только запросом к
+    прод-базе: в /health и /ops пустая аудитория и молчащая рассылка
+    выглядели одинаково — как поломка кода.
+    """
+    payload = await ops.snapshot()
+
+    audience = payload["announce_audience"]
+    assert set(audience) == {"chats", "dm", "total", "empty_day"}
+    assert audience["total"] == audience["chats"] + audience["dm"]
+    assert audience["empty_day"] is None
+
+
 # ---------- Пульт ----------
 
 
@@ -201,6 +217,51 @@ async def test_ops_text_hides_watcher_line_when_ton_disabled(monkeypatch) -> Non
     await ops.check_anomalies(bot=None)
 
     assert "watcher выключен" in await ops_diag._ops_diag_text()
+
+
+# ---------- Аудитория рассылки ----------
+
+
+async def test_ops_text_warns_when_audience_is_empty(monkeypatch) -> None:
+    """«Пустая аудитория» — не «всё хорошо»: пульт обязан назвать причину.
+
+    Именно так выглядел прод-инцидент: день объявлен (claim стоит), пост не
+    ушёл никуда, а пульт молчал — некому было сказать «рассылать некому».
+    """
+    monkeypatch.setattr(settings, "ton_enabled", False)
+    monkeypatch.setattr(bc, "active_chat_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(bc, "active_player_ids", AsyncMock(return_value=[]))
+
+    text = await ops_diag._ops_diag_text()
+
+    assert "Аудитория рассылки: пусто" in text
+    assert "/bind" in text and "/start" in text
+
+
+async def test_ops_text_shows_audience_counts(monkeypatch) -> None:
+    """Разбивка, а не сумма: «нет каналов» и «игроки без /start» чинятся по-разному."""
+    monkeypatch.setattr(settings, "ton_enabled", False)
+    monkeypatch.setattr(bc, "active_chat_ids", AsyncMock(return_value=[-1, -2]))
+    monkeypatch.setattr(bc, "active_player_ids", AsyncMock(return_value=[7]))
+
+    text = await ops_diag._ops_diag_text()
+
+    assert "Аудитория рассылки: 2 чат(ов) · 1 в личку" in text
+
+
+async def test_ops_text_reports_announce_that_hit_empty_audience(monkeypatch) -> None:
+    """Метка дня ещё не снята — пульт показывает её отдельной строкой."""
+    monkeypatch.setattr(settings, "ton_enabled", False)
+    monkeypatch.setattr(bc, "active_chat_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(bc, "active_player_ids", AsyncMock(return_value=[]))
+    async with SessionLocal() as db:
+        db.add(WatcherState(key=ANNOUNCE_EMPTY_DAY_KEY, value="42"))
+        await db.commit()
+
+    text = await ops_diag._ops_diag_text()
+
+    assert "Анонс дня 42 ушёл в пустоту" in text
+    assert "тревога ещё не снята" in text
 
 
 @pytest.mark.parametrize(

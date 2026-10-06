@@ -342,6 +342,20 @@ async def snapshot() -> dict:
                 "status": latest.status.value if isinstance(latest.status, RoundStatus) else str(latest.status),
                 "voting_ends_at": latest.voting_ends_at.isoformat(),
             }
+        # Аудитория рассылки — прямо в снимке. «Новости дня некому показать»
+        # обязано быть видно в /health и /ops без доступа к прод-базе: раньше
+        # единственный способ это узнать был SQL-запрос к чужому Postgres'у,
+        # а молчание рассылки выглядело как поломка кода.
+        from app.broadcast import announce_audience
+
+        audience = await announce_audience()
+        payload["announce_audience"] = {
+            **audience,
+            "total": audience["chats"] + audience["dm"],
+            # День, чей анонс ушёл в пустоту и ещё не снят тревогой; None —
+            # либо всё дошло, либо анонса ещё не было.
+            "empty_day": await _get_state(session, ANNOUNCE_EMPTY_DAY_KEY) or None,
+        }
         return payload
 
 

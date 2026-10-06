@@ -370,19 +370,24 @@ async def record_delivery(kind: str, delivered: int, attempted: int) -> None:
         logger.warning("Метку доставки %s не записали: %s", kind, exc)
 
 
-async def announce_audience_size() -> int:
-    """Сколько получателей было бы у анонса нового дня прямо сейчас.
+async def announce_audience() -> dict[str, int]:
+    """Состав аудитории анонса нового дня: чаты (группы/каналы) плюс личка.
 
-    Чаты (группы и каналы из `chats.active`) плюс игроки, разрешившие личку.
     Пустая аудитория — это не «рассылка не удалась», а «рассылать некому»:
     состояние дня при этом выглядит ровно так же, как при доставке всем,
     поэтому оно обязано быть видно наружу, а не только строкой INFO
-    «доставлено 0 из 0» в логе.
+    «доставлено 0 из 0» в логе. Разбивка нужна отдельно: «нет каналов» и
+    «игроки не делали /start» чинятся по-разному, а сумма этого не показывает.
     """
-    total = len(await active_chat_ids())
-    if settings.player_dm:
-        total += len(await active_player_ids())
-    return total
+    chats = len(await active_chat_ids())
+    dm = len(await active_player_ids()) if settings.player_dm else 0
+    return {"chats": chats, "dm": dm}
+
+
+async def announce_audience_size() -> int:
+    """Сколько получателей было бы у анонса нового дня прямо сейчас."""
+    parts = await announce_audience()
+    return parts["chats"] + parts["dm"]
 
 
 async def set_announce_empty_marker(day_index: int | None) -> None:
@@ -711,6 +716,20 @@ async def announce_new_day(
     сотнях чатов. Возвращает список чатов, куда рассылка прошла успешно.
     """
     if bot is None:
+        # Claim дня (announced_at) уже стоит у вызывающего, поэтому
+        # молчаливый возврат оставлял бы «объявленный» день без единого
+        # следа — ни лога, ни метки, ни счётчика. Метку announce_empty_day
+        # здесь сознательно НЕ ставим: её читает check_anomalies, а это
+        # джоба того же планировщика. Бота нет — значит тиков нет, тревоги
+        # всё равно некому поднять, остаётся то, что видно и без
+        # планировщика: лог (Render) и /metrics (внешний сборщик).
+        logger.warning(
+            "Анонс дня %s пропущен: бот не установлен (set_bot не вызван)",
+            round_row.day_index,
+        )
+        from app.metrics import inc
+
+        inc("announce_no_bot_total")
         return []
     chat_ids = await active_chat_ids()
     # Аудитория важнее самой отправки: claim дня уже стоит, и при пустой

@@ -113,11 +113,37 @@ async def _ops_diag_text() -> str:
             int(data.get("pending_stakes") or 0),
         )
     )
+    lines.append(_audience_line(data.get("announce_audience") or {}))
     lines.append(
         f"Раунд: {_round_line(data)} · аптайм {_age_phrase(data.get('uptime_seconds'))}"
     )
     lines.append("Разбор: /treasury · /payouts · /stakes · /blockchain · /mirror")
     return "\n".join(lines)
+
+
+def _audience_line(audience: dict) -> str:
+    """Кому вообще может уйти новость дня — одним числом и без запроса к БД.
+
+    Ровно тот вопрос, на который раньше приходилось идти в прод-базу: пустая
+    аудитория и молчащая рассылка выглядели как поломка кода. Отдельно
+    показывается и день, чей анонс уже ушёл в пустоту: он остаётся в списке,
+    пока тревога не снимется сама.
+    """
+    total = int(audience.get("total") or 0)
+    if not total:
+        line = (
+            f"{warn_mark('ops')} Аудитория рассылки: пусто — новость дня не увидит "
+            "никто (канал/группа: /bind прямо в чате, игроки: /start)."
+        )
+    else:
+        line = (
+            f"Аудитория рассылки: {int(audience.get('chats') or 0)} чат(ов) · "
+            f"{int(audience.get('dm') or 0)} в личку"
+        )
+    empty_day = audience.get("empty_day")
+    if empty_day:
+        line += f"\n{warn_mark('ops')} Анонс дня {empty_day} ушёл в пустоту — тревога ещё не снята."
+    return line
 
 
 def _round_line(data: dict) -> str:
