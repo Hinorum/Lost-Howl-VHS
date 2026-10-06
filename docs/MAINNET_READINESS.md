@@ -242,7 +242,7 @@
       (`app/handlers/treasury.py:346`). Это осознанный размен в пользу
       «не платить дважды» против «ждать подтверждения перед отметкой».
 - [x] Проверен сценарий «bcast: принято, но транзакция не в блоке за
-      `payout_confirm_timeout_seconds = 7200`»: строка возвращается в
+      `payout_confirm_timeout_seconds = 1200`»: строка возвращается в
       `pending` и уходит заново, **без** двойного платежа (memo-антидубль).
       Реализовано в `confirm_broadcast_payouts` и покрыто восемью тестами
       `tests/test_payout_confirm.py`, включая `test_confirm_requeues_lost_transfer`
@@ -490,8 +490,8 @@
 Пороги, зашитые в код: синк зеркала раз в 180 с (`TREASURY_MIRROR_INTERVAL_SECONDS`),
 тик — раз в 15 с, `PAYOUT_MAX_ATTEMPTS=5`, тревога админу уходит с кулдауном час
 (`app/ops.py:_settle_alerts`). Восстановление строки выплаты из `pending` в очередь
-происходит по `PAYOUT_CONFIRM_TIMEOUT_SECONDS` (1200 с в `.env.example`,
-7200 с в дефолте кода) — если `bcast:`-метка висит дольше, перевод считается
+происходит по `PAYOUT_CONFIRM_TIMEOUT_SECONDS` (1200 с — и в `.env.example`,
+и в дефолте кода) — если `bcast:`-метка висит дольше, перевод считается
 потерянным и уходит заново.
 
 ### 2. Степени отката
