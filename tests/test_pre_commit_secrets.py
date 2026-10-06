@@ -33,6 +33,37 @@ def test_mnemonic_24_words_is_detected():
     assert any("BIP-39" in f for f in findings), findings
 
 
+def test_all_valid_bip39_lengths_are_detected():
+    """12/15/18/21/24 слова — все валидные длины мнемоники должны ловиться."""
+    cs = _load_module()
+    for n in (12, 15, 18, 21, 24):
+        line = 'SEED_PHRASE = "' + " ".join(cs._BIP39_HEAD[:n]) + '"'
+        findings = cs._scan_line(line)
+        assert any(f"BIP-39 mnemonic ({n} words)" in f for f in findings), (n, findings)
+
+
+def test_wrong_length_bip39_sequence_is_not_flagged():
+    """11 и 13 слов из словаря — не мнемоника, валидных длин тут нет."""
+    cs = _load_module()
+    eleven = " ".join(cs._BIP39_HEAD[:11])
+    thirteen = " ".join(cs._BIP39_HEAD[:13])
+    assert cs._scan_line(f'X = "{eleven}"') == []
+    assert cs._scan_line(f'X = "{thirteen}"') == []
+
+
+def test_english_sentence_with_common_words_is_not_flagged():
+    """Предложение из 12 обычных слов с «the» — не BIP-39, ложняк недопустим."""
+    cs = _load_module()
+    line = 'NOTE = "please send the money to my address today before tomorrow ok now"'
+    assert cs._scan_line(line) == []
+
+
+def test_scanner_skips_its_own_wordlist():
+    """Словарь BIP-39 в самом сканере — публичные слова, не секрет."""
+    cs = _load_module()
+    assert cs._scan_file(HOOK_PATH) == []
+
+
 def test_hex_64_with_priv_key_context_is_detected():
     cs = _load_module()
     line = 'PRIV_KEY_HEX = "' + "a" * 64 + '"'

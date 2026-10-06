@@ -197,6 +197,9 @@ _BIP39_HEAD = (
     "yard year yellow you young youth zebra zero zone zoo"
 ).split()
 _BIP39_SET = frozenset(_BIP39_HEAD)
+# Валидные длины мнемоники BIP-39: 12/15/18/21/24 слова. 12-словная утечка
+# так же реальна, как и классические 24, — ловим все размеры.
+_BIP39_LENGTHS = frozenset({12, 15, 18, 21, 24})
 
 
 # 64-символьная hex-строка, в строке сама по себе (не часть большего слова).
@@ -215,11 +218,12 @@ def _scan_line(line: str) -> list[str]:
     """Вернуть список подозрительных фрагментов в строке (без самих значений)."""
     findings: list[str] = []
     # Мнемоника: ищем в каждой строковой константе — иначе ловим переменные
-    # (`MNEMONIC = "..."`), которые портят счёт слов.
+    # (`MNEMONIC = "..."`), которые портят счёт слов. Слова должны быть все
+    # из словаря BIP-39, а длина — валидной (12/15/18/21/24).
     for quoted in re.findall(r"['\"]([^'\"]+)['\"]", line):
         words = quoted.lower().split()
-        if len(words) == 24 and all(w in _BIP39_SET for w in words):
-            findings.append("BIP-39 mnemonic (24 words)")
+        if len(words) in _BIP39_LENGTHS and all(w in _BIP39_SET for w in words):
+            findings.append(f"BIP-39 mnemonic ({len(words)} words)")
             break
     # 2. Hex приватник. Срабатываем только если рядом контекст «priv_key/secret/...»
     # — иначе ловим TON-адреса (`0:<hex64>`) и tx-hash, которые безопасны.
@@ -254,6 +258,11 @@ def _is_base64_private_key(line: str) -> bool:
 
 def _scan_file(path: Path) -> list[tuple[int, str, str]]:
     """Вернуть список (номер_строки, фрагмент, вид_секрета) для файла."""
+    # Собственный файл сканера несёт публичный словарь BIP-39 (2048 слов),
+    # разложенный по строкам ровно по 12–15 слов: «подозрительных» строк тут
+    # десятки, но секретов нет. Пропускаем иначе хук не пройдёт сам себя.
+    if path.resolve() == Path(__file__).resolve():
+        return []
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except (OSError, UnicodeDecodeError):
