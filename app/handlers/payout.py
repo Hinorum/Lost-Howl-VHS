@@ -1,10 +1,13 @@
-# Очередь выплат и казна хранителя: /payouts, /payout, /return, /treasury,
-# /fundout, kill switch исходящих /halt-payouts ↔ /resume-payouts и отчёты
-# /incoming, /stakes, /revenue.
+# Очередь выплат и казна хранителя: /payouts, /payout (включая холостой
+# /payout test), /return, /treasury, /fundout, kill switch исходящих
+# /halt-payouts ↔ /resume-payouts и отчёты /incoming, /stakes, /revenue.
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+from html import escape as html_escape
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
@@ -16,7 +19,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Income, Payout, Player, Round, Stake
 from app.style import money_mark, ok_mark, warn_mark
-from app.ton_utils import from_nano
+from app.ton_utils import friendly_address, from_nano, normalize_address
 
 from .common import router
 
@@ -215,6 +218,209 @@ async def cmd_resume_payouts(message: Message) -> None:
     )
 
 
+# ---------- Холостой перевод (/payout test) ----------
+#
+# Репетиция боевого пути отправки на реальных деньгах: пункт «HTTP-фолбэк на
+# mainnet» и шаг дня X чек-листа готовности. Заменяет собой руками написанный
+# скрипт, которого раньше не существовало вовсе — в день X владелец импровизировал
+# бы с боевым кошельком.
+_TEST_MAX_GRAM = Decimal("0.05")
+_TEST_USAGE = "/payout test <сумма Gram> [confirm] [http]"
+_TEST_MEMO_PREFIX = "payout-test"
+_TEST_POLL_ATTEMPTS = 6
+_TEST_POLL_SECONDS = 5
+
+
+def _parse_test_args(tokens: list[str]) -> tuple[Decimal, bool, bool]:
+    """(сумма Gram, отправлять, принудительный HTTP-канал).
+
+    Назначение НЕ выбирается: только сам кошелёк казны. Холостой перевод не
+    имеет права увести деньги из казны — иначе после репетиции ожидания БД
+    разошлись бы с балансом, и автосверка честно подняла бы тревогу «ручной
+    вывод?». Любая непонятная лексема — отказ до отправки, а не «разберёмся
+    как получится»: опечатка в confirm должна остановить до движения денег.
+    """
+    if not tokens:
+        raise ValueError("нет суммы")
+    try:
+        amount = Decimal(tokens[0].replace(",", "."))
+    except InvalidOperation:
+        raise ValueError(f"сумма «{tokens[0]}» не число") from None
+    if not amount.is_finite():
+        raise ValueError("сумма должна быть конечным числом")
+    if amount <= 0:
+        raise ValueError("сумма должна быть больше нуля")
+    if amount * 1_000_000_000 < 1:
+        raise ValueError("сумма меньше одного нанотона")
+    if amount > _TEST_MAX_GRAM:
+        raise ValueError(
+            f"потолок {_TEST_MAX_GRAM} Gram: это репетиция, а не способ увести деньги"
+        )
+    confirm = force_http = False
+    for token in tokens[1:]:
+        lowered = token.lower()
+        if lowered == "confirm":
+            confirm = True
+        elif lowered == "http":
+            force_http = True
+        else:
+            raise ValueError(f"непонятный аргумент «{token}»")
+    return amount, confirm, force_http
+
+
+async def _test_preflight(amount: Decimal, force_http: bool) -> str:
+    """Блок «что будет отправлено» — всё, что узнаётся без единого движения денег.
+
+    Каждая строка закрывает свой класс отказа, который иначе всплыл бы впервые
+    в день с живыми ставками: пара мнемоник/адрес (без неё BoC не подписать),
+    баланс, seqno через runGetMethod — та самая проверка, на которой держится
+    HTTP-канал, — и сборка BoC оффлайн-кошельком без лайтсерверов.
+    """
+    import app.ton_pay as _tp
+
+    network = "testnet" if settings.is_testnet else "mainnet"
+    lines = [f"🧪 Холостой перевод · {network} · потолок {_TEST_MAX_GRAM} Gram"]
+    wallet = None
+    try:
+        wallet, version = _tp.build_offline_treasury_wallet()
+        lines.append(f"Пара мнемоник/адрес: {version} ✓ · BoC собирается")
+    except Exception as exc:
+        lines.append(f"Пара мнемоник/адрес: {html_escape(str(exc))} ⚠️")
+    try:
+        balance, status, source = await _tp.fetch_account_state()
+    except Exception as exc:
+        balance, status, source = None, None, f"ошибка: {exc}"
+    if balance is None:
+        lines.append(f"Баланс: недоступен ⚠️ · источник {html_escape(str(source))}")
+    else:
+        note = f", статус {status}" if status else ""
+        lines.append(f"Баланс: {from_nano(balance):.4f} Gram{note} · источник {source}")
+    try:
+        seqno = await _tp.http_get_wallet_seqno(wallet)
+        lines.append(f"seqno (runGetMethod по HTTP): {seqno} ✓")
+    except Exception as exc:
+        lines.append(f"seqno не прочитан: {html_escape(str(exc))} ⚠️")
+    dest = settings.active_treasury_address
+    shown = (
+        friendly_address(normalize_address(dest), testnet=settings.is_testnet) if dest else "—"
+    )
+    lines.append(f"Куда: сам кошелёк казны <code>{shown}</code>")
+    lines.append("Деньги вернутся в казну — израсходуется только газ.")
+    lines.append(f"Сколько: {amount} Gram")
+    lines.append(
+        "Канал: "
+        + (
+            "HTTP принудительно — репетиция фолбэка при живых лайтсерверах"
+            if force_http
+            else "обычный (лайтсерверы; сам уйдёт в HTTP-канал, если они мертвы)"
+        )
+    )
+    return "\n".join(lines)
+
+
+async def _test_wait_memo(memo: str) -> str | None:
+    """memo → хеш транзакции: скан истории казначея, до 30 с.
+
+    Тем же путём confirm_broadcast_payouts подтверждает выплаты, поэтому
+    «memo не нашёлся» здесь равносильно «подтверждение не придёт» там — риск
+    sent vs confirmed, который пункт чек-листа и хочет увидеть заранее, а не
+    в день, когда в очереди стоят чужие призы.
+    """
+    import app.ton_pay as _tp
+
+    for attempt in range(_TEST_POLL_ATTEMPTS):
+        tx_map = await _tp.fetch_broadcast_tx_map({memo})
+        if memo in tx_map:
+            return tx_map[memo]
+        if attempt < _TEST_POLL_ATTEMPTS - 1:
+            await asyncio.sleep(_TEST_POLL_SECONDS)
+    return None
+
+
+async def _payout_test(message: Message, tokens: list[str]) -> None:
+    """Холостой перевод: предполёт всегда, отправка только с явным confirm."""
+    try:
+        amount, confirm, force_http = _parse_test_args(tokens)
+    except ValueError as exc:
+        await message.answer(
+            f"{warn_mark('nopay')} Формат: <code>{html_escape(_TEST_USAGE)}</code>\n"
+            f"Причина: {html_escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        report = await _test_preflight(amount, force_http)
+    except Exception as exc:
+        await message.answer(
+            f"{warn_mark('nopay')} Предполёт не прошёл: {html_escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not confirm:
+        await message.answer(
+            f"{report}\n\nНичего не отправлено — это только предполёт. "
+            f"Увести деньги: <code>{html_escape(_TEST_USAGE)} confirm</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    import app.ton_pay as _tp
+
+    dest = settings.active_treasury_address
+    memo = f"{_TEST_MEMO_PREFIX} {int(datetime.now(UTC).timestamp())}"
+    nano = int(amount * 1_000_000_000)
+    await message.answer(
+        f"{report}\n\n⏳ Отправляю… memo ищу в истории казначея до 30 с.",
+        parse_mode=ParseMode.HTML,
+    )
+    engaged_before = _tp.state._http_channel_engaged_at
+    try:
+        # Лок диспетчера обязателен: цикл очереди держит один seqno на пачку,
+        # параллельный перевод с тем же seqno молча потерялся бы.
+        async with _tp.dispatch_lock():
+            if force_http:
+                marker = await _tp._send_ton_transfer_http(dest, nano, memo)
+            else:
+                marker = await _tp.send_ton_transfer(dest, nano, memo)
+    except Exception as exc:
+        await message.answer(
+            f"{warn_mark('nopay')} Отправка не удалась: {html_escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    finally:
+        if force_http:
+            # Принудительная репетиция — не деградация: флаг «канал
+            # задействован» возвращаю как был, иначе диспетчер ушёл бы
+            # хранителю ложным «лайтсерверы недоступны» при живых лайтсерверах.
+            _tp.state._http_channel_engaged_at = engaged_before
+
+    if marker is None:
+        await message.answer(
+            f"{warn_mark('nopay')} Не отправлено: TON выключен или не задана "
+            "мнемоника (send_ton_transfer вернул None).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    tx = await _test_wait_memo(memo)
+    lines = [
+        f"{ok_mark()} Отправлено: <code>{marker}</code>",
+        f"memo: <code>{html_escape(memo)}</code>",
+    ]
+    if tx:
+        lines.append(f"✓ memo в истории казначея → tx <code>{html_escape(tx)}</code>")
+    else:
+        lines.append(
+            "⚠ memo за 30 с в истории не нашёлся — это и есть риск sent vs confirmed: "
+            "деньги могли уйти, а подтверждение не прийти. Глянуть: /treasury, /blockchain."
+        )
+    lines.append(
+        "В /treasury движение попадёт в «self-переводы», а не в тревоги: "
+        "баланс сдвинулся только на газ."
+    )
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 @router.message(Command("payout"), F.chat.type == ChatType.PRIVATE)
 async def cmd_payout(message: Message) -> None:
     """Ручной разбор одной выплаты: /payout <id> spam confirm|retry.
@@ -222,9 +428,17 @@ async def cmd_payout(message: Message) -> None:
     «spam» гасит выплату безвозвратно — только refund (входящий перевод с
     рекламой, возврат которого не нужен), и только с явным словом confirm:
     случайное/мгновенное списание чужого приза недопустимо.
+
+    Отдельная ветка `/payout test` — холостой перевод (репетиция отправки,
+    см. _payout_test): та же защита «только хранитель», но деньги движутся
+    только по явному confirm.
     """
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
         await message.answer("Команда только для хранителя игры.")
+        return
+    raw = (message.text or "").split()
+    if len(raw) > 1 and raw[1].lower() == "test":
+        await _payout_test(message, raw[2:])
         return
     parts = (message.text or "").lower().split()
     if (
