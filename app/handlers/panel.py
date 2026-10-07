@@ -43,6 +43,7 @@ from app.story.editor import (
     restore_backup,
     scenario_yaml,
 )
+from app.story.narrative_lint import lint_groups
 from app.story.schema import Cassette, validate_file
 from app.ton_utils import from_nano
 
@@ -607,6 +608,22 @@ async def _cassette_menu_text(session) -> str:
         )
         if entry.warnings:
             lines.append(f"   ⚠️ {'; '.join(entry.warnings)}")
+        # Повествовательный линт (ротация/дубли/эхо/штампы) раньше жил только
+        # в CLI, и редакционные замечания кассеты существовали вне бота.
+        # Панель даёт счёт по разрядам и по одному примеру из каждого —
+        # полный хвост по-прежнему в cassette_tool lint.
+        groups = [(label, group) for label, group in lint_groups(cassette) if group]
+        total = sum(len(group) for _label, group in groups)
+        if total:
+            counts = " · ".join(f"{label} {len(group)}" for label, group in groups)
+            lines.append(f"   🧾 повествовательный линт: {total} замечаний ({counts})")
+            shown: list[str] = [group[0] for _label, group in groups[:3]]
+            for warning in shown:
+                lines.append(f"     • {warning[:110]}")
+            if total > len(shown):
+                lines.append(
+                    f"     … и ещё {total - len(shown)} (см. cassette_tool lint)"
+                )
     lines.append(
         "\nКассета активна, когда её месяц совпал с текущим; до этого движок "
         "играет шаблон «Путь I/II/III» (стоп на стыке месяцев)."

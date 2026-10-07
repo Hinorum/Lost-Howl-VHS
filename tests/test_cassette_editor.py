@@ -749,6 +749,28 @@ async def test_back_returns_to_library(monkeypatch, tmp_path) -> None:
     assert "mel.json" in text
 
 
+async def test_cassette_menu_shows_narrative_lint(monkeypatch, tmp_path) -> None:
+    """Меню библиотеки показывает повествовательный линт — раньше он жил только в CLI.
+
+    Схема дубль станции не считает (редакционный признак), поэтому без
+    narrative_lint панель молчала о таких замечаниях вовсе: 35 замечаний
+    октябрьской кассеты существовали вне бота.
+    """
+    import json
+
+    source = _enable_library(monkeypatch, tmp_path)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["days"][1]["station"] = payload["days"][0]["station"]
+    source.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    callback = _make_callback("cassette:back")
+    await panel_mod.on_cassette_action(callback)
+    text = callback.message.edit_text.call_args.args[0]
+    assert "повествовательный линт" in text
+    assert "дубль станции" in text, "каждый непустой разряд показывает свой пример"
+    assert "ротация" in text
+    assert "… и ещё" in text, "хвост списка свёрнут, а не потерян молча"
+
+
 def test_chunk_message_splits_long_text() -> None:
     text = "\n".join(f"строка {i} " + "x" * 80 for i in range(200))
     chunks = panel_mod._chunk_message(text)
