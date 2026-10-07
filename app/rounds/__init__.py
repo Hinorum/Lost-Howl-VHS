@@ -2,6 +2,13 @@
 
 Сюжетные модули (rendering, narrative, anchor, materialization) содержат
 минимальные шаблонные реализации: механика работает без LLM/арта.
+
+Запрет: `_plan_and_render` здесь НЕ реэкспортируется. `install_bay()`
+патчит атрибуты `rendering` и `lifecycle` (тот импортировал функцию по
+значению), а пакетный алиас остался бы нетронутым — импорт из
+`app.rounds` обошёл бы кассетный отсек. Разрешённые источники:
+`app.rounds.rendering` (патчится) и `app.story.bay` (сама обёртка).
+Регрессия — test_rounds_package_has_no_plan_and_render_alias.
 """
 from __future__ import annotations
 
@@ -22,10 +29,7 @@ from .materialization import _materialize_round, _stamp_day_money_mode  # noqa: 
 from .narrative import write_epilogue  # noqa: F401
 from .pot import round_pot  # noqa: F401
 from .queries import get_active_round, get_latest_round, get_round  # noqa: F401
-from .rendering import (  # noqa: F401
-    PREPARED_PAYLOAD_VERSION,
-    _plan_and_render,
-)
+from .rendering import PREPARED_PAYLOAD_VERSION  # noqa: F401
 from .time import (  # noqa: F401
     _ROMAN,
     _day_window,

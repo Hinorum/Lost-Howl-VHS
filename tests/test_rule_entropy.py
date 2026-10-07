@@ -21,10 +21,11 @@ import pytest
 
 from app.config import settings
 from app.models import Card, Round, RoundStatus, WinRule
-from app.rounds import (
-    _plan_and_render,
-    create_next_round_detailed,
-)
+from app.rounds import create_next_round_detailed
+
+# Не из пакета: app.rounds._plan_and_render удалён как нетронутый install_bay
+# алиас, обходивший кассетный отсек.
+from app.rounds.rendering import _plan_and_render
 
 NOW = datetime.now(UTC)
 

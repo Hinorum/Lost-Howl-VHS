@@ -111,6 +111,18 @@ def test_install_patches_both_modules_and_restores(tmp_path) -> None:
     assert lifecycle_mod._plan_and_render is original_lifecycle
 
 
+def test_rounds_package_has_no_plan_and_render_alias() -> None:
+    """Пакетный алиас _plan_and_render удалён из app.rounds.
+
+    Он остался бы нетронутым install_bay и обходил кассетный отсек —
+    импорт из пакета обязан падать; работают только app.rounds.rendering
+    (патчится) и app.story.bay (сама обёртка).
+    """
+    import app.rounds as rounds_pkg
+
+    assert not hasattr(rounds_pkg, "_plan_and_render")
+
+
 def test_install_skips_without_library_dir(tmp_path) -> None:
     missing = tmp_path / "net_takogo"
     assert install_bay(missing) is False
