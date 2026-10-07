@@ -653,7 +653,10 @@ class StoryCassette(Base):
     кассет, и монтаж нового месяца приходилось заливать заново. Диск остался
     кэшем зеркала (его читает синхронный движок), а источник правды живёт
     здесь: payload — нормализованный JSON кассеты, backup — слепок перед
-    последней перезаписью (Undo хранителя).
+    последней перезаписью (Undo хранителя), edited_at — отметка правки из
+    /panel: такая строка при деплое побеждает контент репозитория (см.
+    app/story/store.py :: _adopt_disk), а строка без отметки принимает файл
+    с диска — так в базу приезжают новые месяцы и контент-фиксы из git.
     """
 
     __tablename__ = "story_cassettes"
@@ -661,6 +664,9 @@ class StoryCassette(Base):
     name: Mapped[str] = mapped_column(String(80), primary_key=True)
     payload: Mapped[str] = mapped_column(Text)
     backup: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edited_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

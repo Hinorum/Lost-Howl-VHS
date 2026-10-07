@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Payout, Round, RoundStatus, WatcherState
+from app.story import store as story_store
 from app.story.bay import (
     LibraryEntry,
     clear_edit_intent,
@@ -1033,12 +1034,20 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
             if not ok:
                 await callback.answer("\n".join(lines)[:200], show_alert=True)
                 return
+            # Откат — тоже правка: файл на диске уже прежняя версия, переносим
+            # её в базу, иначе деплой вернёт состояние до восстановления.
+            persisted = await story_store.persist(safe, default_cassettes_dir())
             async with SessionLocal() as session:
                 text = await _cassette_menu_text(session)
             await callback.message.edit_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
             )
-            await callback.answer("Кассета восстановлена из бэкапа.")
+            await callback.answer(
+                "Кассета восстановлена из бэкапа."
+                if persisted
+                else "Кассета восстановлена в кэш, но не в базу — правка "
+                "пропадёт при рестарте."
+            )
             return
         elif op == "stop":
             async with SessionLocal() as session:
@@ -1109,6 +1118,16 @@ async def on_cassette_document(message: Message) -> None:
         ok, lines, final_name = False, [f"Не получилось: {exc}"], None
     async with SessionLocal() as session:
         await clear_edit_intent(session)
+    # Долговечность: файл уже на диске — переносим правку в базу (см.
+    # app/story/store.py). Отказ не валит отчёт, но хранитель обязан знать,
+    # что правка пока только в кэше и рестарт её снесёт.
+    if ok and not dry_run and final_name:
+        if not await story_store.persist(final_name, default_cassettes_dir()):
+            lines = [
+                *lines,
+                "⚠️ База кассет не ответила: правка сохранилась ТОЛЬКО В КЭШЕ "
+                "диска и пропадёт при рестарте — повтори сохранение позже.",
+            ]
     scene_file = final_name or (edit_file if edit_file != "<new>" else None)
     has_backup = bool(ok and not dry_run and scene_file and _has_backup(scene_file))
     head = "✅ " if ok else "❌ "

@@ -691,6 +691,38 @@ async def test_document_handler_rejects_broken(monkeypatch, tmp_path) -> None:
     assert source.read_bytes() == before
 
 
+async def test_document_handler_warns_when_db_persist_fails(monkeypatch, tmp_path) -> None:
+    """Правка легла на диск, а база не ответила: отчёт честно говорит про кэш.
+
+    persist вызывается после записи файла; его отказ не валит отчёт (сюжет —
+    не касса), но хранитель обязан увидеть, что правка переживёт рестарт
+    только если база ответит при повторе.
+    """
+    from app.story import store as story_store
+
+    source = _enable_library(monkeypatch, tmp_path)
+    cassette = validate_file(source).cassette
+    text = ed.scenario_yaml(cassette).replace(cassette.title, "Правка без базы")
+
+    async def _download(file=None, destination=None):
+        destination.write(text.encode("utf-8"))
+
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=HOLDER_ID),
+        bot=SimpleNamespace(download=AsyncMock(side_effect=_download)),
+        document=SimpleNamespace(file_id="doc-nodb"),
+        reply=AsyncMock(),
+    )
+    monkeypatch.setattr(story_store, "persist", AsyncMock(return_value=False))
+    async with SessionLocal() as session:
+        await set_edit_intent(session, "mel.json", "month")
+    await panel_mod.on_cassette_document(message)
+    reply = message.reply.call_args.args[0]
+    assert reply.startswith("✅"), "сама правка удалась — деградирует только база"
+    assert "ТОЛЬКО В КЭШЕ" in reply
+    assert validate_file(source).cassette.title == "Правка без базы"
+
+
 async def test_document_handler_ignored_without_intent(monkeypatch, tmp_path) -> None:
     _enable_library(monkeypatch, tmp_path)
 

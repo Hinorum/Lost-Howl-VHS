@@ -293,7 +293,7 @@ async def test_start_scheduler_registers_only_zero_arg_jobs(monkeypatch) -> None
 
     ids = [job_id for job_id, _func, _trigger, _sec in registered]
     assert {"way-tick", "db-backup", "ton-watch", "ton-settle",
-            "ws-cleanup", "vote-reminder"} <= set(ids)
+            "ws-cleanup", "vote-reminder", "story-sync"} <= set(ids)
     watch_trigger, watch_seconds = next(
         (trigger, seconds) for job_id, _fn, trigger, seconds in registered if job_id == "ton-watch"
     )
@@ -304,6 +304,26 @@ async def test_start_scheduler_registers_only_zero_arg_jobs(monkeypatch) -> None
             inspect.signature(fn).bind()
         except TypeError as exc:
             raise AssertionError(f"джоба {job_id} требует аргументы: {exc}") from exc
+
+
+async def test_story_sync_job_never_raises(monkeypatch) -> None:
+    """Джоба зеркала кассет fail-open: и сбой базы, и успех — без исключений.
+
+    APScheduler глушит упавшие джобы, но каждая минута с traceback в логе —
+    шум; сюжет не касса: зеркало и так хранит прошлую копию.
+    """
+    from app import scheduler as sched
+    from app.story import store
+
+    broken = AsyncMock(side_effect=RuntimeError("база легла"))
+    monkeypatch.setattr(store, "sync_from_db", broken)
+    await sched._story_sync_job()  # не должно поднять исключение
+    broken.assert_awaited_once()
+
+    healthy = AsyncMock(return_value=store.SyncResult(written=1))
+    monkeypatch.setattr(store, "sync_from_db", healthy)
+    await sched._story_sync_job()
+    healthy.assert_awaited_once()
 
 
 def test_shutdown_scheduler_safe_when_never_started() -> None:

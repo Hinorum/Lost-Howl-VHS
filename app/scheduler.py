@@ -566,6 +566,30 @@ async def _alert_guarded(job_id: str, func) -> None:
             logger.exception("Алерт о падении «%s» не доставлен", job_id)
 
 
+async def _story_sync_job() -> None:
+    """Выкладка кассет из базы в диск-зеркало: раз в минуту, fail-open.
+
+    Первичная выкладка — bootstrap на старте (app/main.py); здесь берутся
+    чужие правки (второй инстанс, ручная правка строки) и восстановление
+    снесённого с диска файла. Ошибка не поднимается наружу: сюжет — не касса,
+    зеркало и так хранит прошлую копию (см. app/story/store.py).
+    """
+    from app.story import store
+
+    try:
+        result = await store.sync_from_db()
+    except Exception:
+        logger.exception("Синхронизация кассет с базой упала")
+        return
+    if result.written or result.removed or result.failed:
+        logger.info(
+            "Кассеты: зеркало догнало базу (записано %d, удалено %d, сбой: %s)",
+            result.written,
+            result.removed,
+            result.failed,
+        )
+
+
 def shutdown_scheduler() -> None:
     """Остановка без AttributeError, если планировщик так и не стартовал."""
     if scheduler.running:
@@ -618,6 +642,10 @@ def start_scheduler() -> None:
     # Тревоги идут всегда, независимо от TON: при выключенных деньгах они
     # всё равно нужны (очередь, dead-letter, зависший планировщик, бэкап).
     _register_job("ops-sweep", _ops_sweep_guarded, "interval", seconds=120)
+    # Зеркало кассет: база → каталог, раз в минуту (см. app/story/store.py).
+    # При выключенном STORY_CASSETTES_DB джоба остаётся, но молча выходит
+    # до первого запроса к базе.
+    _register_job("story-sync", _story_sync_job, "interval", seconds=60)
     # Суточный бэкап в «мёртвый» час: 04:17 MSK.
     _register_job(
         "db-backup",

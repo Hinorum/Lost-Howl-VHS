@@ -341,6 +341,22 @@ async def _boot_after_lock(bot) -> None:
     (например, один путь забудет вызвать boot_maintenance и пропустит свежий
     бэкап после рестарта).
     """
+    # Зеркало кассет из базы — ДО плеера: install_bay читает каталог
+    # синхронно, выкладка обязана успеть раньше. Шаг необязателен: сбой
+    # хранилища не смеет оставить игру без расписания (fail-open на диске).
+    try:
+        from app.story import store as story_store
+
+        story_sync = await story_store.bootstrap()
+        if story_sync.written or story_sync.removed or story_sync.failed:
+            log.info(
+                "Кассеты из базы: в зеркало записано %d, удалено %d, сбой: %s",
+                story_sync.written,
+                story_sync.removed,
+                story_sync.failed,
+            )
+    except Exception:
+        log.exception("Хранилище кассет не поднялось — движок читает диск")
     # Сюжетный слой (необязателен): проигрыватель кассет включает себя, только
     # если есть каталог библиотеки; сбой установки не смеет ронять игру.
     try:

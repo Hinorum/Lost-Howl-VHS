@@ -100,20 +100,24 @@ async def test_install_stop_handlers_tolerates_missing_signals(monkeypatch) -> N
 
 
 async def test_boot_game_runs_every_step(monkeypatch) -> None:
-    """Порядок старта зафиксирован: планировщик первый (иначе сбой сети
-    оставит игру без тиков), затем тик, прогрев кэшей, бэкап и профиль."""
+    """Порядок старта зафиксирован: зеркало кассет и планировщик первыми
+    (иначе сбой сети оставит игру без тиков), затем тик, прогрев кэшей,
+    бэкап и профиль."""
     scheduler = importlib.import_module("app.scheduler")
     story_bay = importlib.import_module("app.story.bay")
+    story_store = importlib.import_module("app.story.store")
     monkeypatch.setattr(main_module, "set_bot", Mock())
     monkeypatch.setattr(main_module, "start_scheduler", Mock())
     monkeypatch.setattr(main_module, "tick", AsyncMock())
     monkeypatch.setattr(main_module, "apply_profile", AsyncMock())
     monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
     monkeypatch.setattr(story_bay, "install_bay", Mock())
+    monkeypatch.setattr(story_store, "bootstrap", AsyncMock())
 
     bot = SimpleNamespace()
     await main_module.boot_game(bot)
     main_module.set_bot.assert_called_once_with(bot)
+    story_store.bootstrap.assert_awaited_once()
     main_module.tick.assert_awaited_once_with(bot)
     main_module.start_scheduler.assert_called_once()
     main_module.apply_profile.assert_awaited_once_with(bot)
@@ -121,16 +125,21 @@ async def test_boot_game_runs_every_step(monkeypatch) -> None:
 
 
 async def test_boot_game_keeps_going_after_broken_steps(monkeypatch) -> None:
-    """Каждый шаг старта опционален: падение проигрывателя кассет, первого
-    тика, бэкапа или профиля не имеет права оставить игру без расписания."""
+    """Каждый шаг старта опционален: падение хранилища кассет, проигрывателя
+    кассет, первого тика, бэкапа или профиля не имеет права оставить игру
+    без расписания."""
     scheduler = importlib.import_module("app.scheduler")
     story_bay = importlib.import_module("app.story.bay")
+    story_store = importlib.import_module("app.story.store")
     monkeypatch.setattr(main_module, "set_bot", Mock())
     monkeypatch.setattr(main_module, "start_scheduler", Mock())
     monkeypatch.setattr(main_module, "tick", AsyncMock(side_effect=RuntimeError("сеть легла")))
     monkeypatch.setattr(main_module, "apply_profile", AsyncMock(side_effect=RuntimeError("нет фото")))
     monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock(side_effect=OSError("диск")))
     monkeypatch.setattr(story_bay, "install_bay", Mock(side_effect=ValueError("нет каталога")))
+    monkeypatch.setattr(
+        story_store, "bootstrap", AsyncMock(side_effect=RuntimeError("база легла"))
+    )
 
     await main_module.boot_game(SimpleNamespace())
     # Планировщик и профиль по-прежнему запущены/проверены — падения не каскад.

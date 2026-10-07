@@ -48,7 +48,15 @@ import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler as _AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+# Хранилище кассет в базе (app/story/store.py) по умолчанию ВЫКЛЮЧЕНО в тестах:
+# его включают только тесты самого хранилища — им нужны свой каталог и свои
+# строки. При включённом флаге boot-тесты сеяли бы реальную библиотеку в
+# тестовую БД, а панельные толкали бы тестовые файлы (mel.json) в каталог
+# репозитория общим зеркалом — рабочее дерево становилось бы грязным.
+from app.config import settings as _settings
 from app.models import Base
+
+_settings.story_cassettes_db = False
 
 # Страховка от планировщика, пережившего свой тест.
 #
