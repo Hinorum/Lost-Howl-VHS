@@ -74,7 +74,6 @@ app/
 ├── backups.py           # Ротация локальных бэкапов SQLite
 ├── broadcast.py         # Рассылка сообщений по списку чатов
 ├── ops.py               # notify_admins, alert_guarded, health-эндпоинт
-├── disputes.py          # ...
 └── style.py             # Эмодзи/маркдаун-форматирование выводов
 ```
 
