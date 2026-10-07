@@ -96,8 +96,19 @@ def test_parse_accepts_case_insensitive_flags() -> None:
     assert _parse_test_args(["0,001", "HTTP", "Confirm"]) == (Decimal("0.001"), True, True)
 
 
-async def test_outsider_cannot_reach_test_command() -> None:
-    """До любого сетевого шага: чужой не получает ни предполёта, ни отправки."""
+async def test_outsider_cannot_reach_test_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """До любого сетевого шага: чужой не получает ни предполёта, ни отправки.
+
+    ADMIN_IDS задаём сами: CI ставит ADMIN_IDS=1, и на нём id=1 был бы
+    хранителем — тест обязан не зависеть от окружения (тот же приём, что в
+    tests/test_treasury_adjust.py).
+    """
+    monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
+
+    def boom():
+        raise AssertionError("сеть не должна трогаться для чужого")
+
+    monkeypatch.setattr(ton_pay, "build_offline_treasury_wallet", boom)
     message = make_message("/payout test 0.001 confirm", uid=1)
     await cmd_payout(message)
     assert "только для хранителя" in said(message)
