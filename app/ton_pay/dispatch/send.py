@@ -88,6 +88,12 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
             )
         if result != 1:
             raise RuntimeError(f"Лайтсерверы не приняли перевод (результат {result})")
+        if _state._http_channel_engaged_at is not None:
+            # Лайтсерверы снова принимают вещание — канал откатился, флаг
+            # снимается. Иначе алерт «лайтсерверы недоступны» повторялся бы
+            # каждые 6 ч до самого рестарта, обещая возврат, который уже
+            # случился (флаг ставит только уход в HTTP-канал).
+            _state._http_channel_engaged_at = None
         marker = f"bcast:{int(datetime.now(UTC).timestamp())}"
         logger.info("Перевод %d нанотонов к …%s разослан (%s)", amount_nanotons, dest_address[-6:], comment[:40])
         return marker

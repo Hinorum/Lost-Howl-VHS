@@ -71,9 +71,12 @@ _provider = _state._provider
 _wallet = _state._wallet
 _wallet_network = _state._wallet_network
 _DISPATCH_LOCK = _state._DISPATCH_LOCK
-_http_channel_engaged_at = _state._http_channel_engaged_at
-_last_http_channel_alert_at = _state._last_http_channel_alert_at
 _HTTP_CHANNEL_ALERT_COOLDOWN = _state._HTTP_CHANNEL_ALERT_COOLDOWN
+# Флаги `_http_channel_engaged_at` / `_last_http_channel_alert_at` (тип
+# datetime | None) сюда НЕ алиасируем: алиас значимого типа — это снапшот на
+# момент импорта, а пишет их http_channel в state. Так и молчал алерт о
+# переключении на HTTP-канал: писали в state, читали из нулевой копии здесь.
+# Читать и писать — только через `state.<имя>`.
 _warned_no_toncenter_key = _state._warned_no_toncenter_key
 _RECONCILE_PAGE_LIMIT = _state._RECONCILE_PAGE_LIMIT
 _RECONCILE_PAGE_OVERLAP = _state._RECONCILE_PAGE_OVERLAP

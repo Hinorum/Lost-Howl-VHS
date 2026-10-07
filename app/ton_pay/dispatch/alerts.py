@@ -18,17 +18,21 @@ logger = logging.getLogger(__name__)
 async def _alert_http_channel_switch(bot: Bot | None, network: str) -> None:
     """Разово (не чаще раза в кулдаун) сообщает хранителю: казначей пишет
     исходящие через HTTP-канал, лайтсерверы недоступны. Без bot — тихо."""
-    # Доступ к флагам через app.ton_pay — чтобы monkeypatch.setattr(ton_pay,
-    # "_http_channel_engaged_at", ...) из тестов доходил до проверки.
+    # Флаги берём из app.ton_pay.state: их туда пишет http_channel при уходе
+    # в HTTP-канал. Раньше тут стоял алиас `ton_pay._http_channel_engaged_at` —
+    # это снапшот значения на момент импорта (None), который в проде никто не
+    # обновляет: алерт молчал при живом переключении, а тесты проходили, потому
+    # что писали в тот же алиас. Единственный источник правды — state.
     import app.ton_pay as _tp
 
-    if bot is None or _tp._http_channel_engaged_at is None:
+    state = _tp.state
+    if bot is None or state._http_channel_engaged_at is None:
         return
     now = datetime.now(UTC)
-    if _tp._last_http_channel_alert_at is not None:
-        if now - _tp._last_http_channel_alert_at < _tp._HTTP_CHANNEL_ALERT_COOLDOWN:
+    if state._last_http_channel_alert_at is not None:
+        if now - state._last_http_channel_alert_at < state._HTTP_CHANNEL_ALERT_COOLDOWN:
             return
-    _tp._last_http_channel_alert_at = now
+    state._last_http_channel_alert_at = now
     try:
         from app.ops import notify_admins  # локально: ops не импортируется наверху
 

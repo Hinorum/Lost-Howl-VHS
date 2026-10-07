@@ -271,8 +271,8 @@ async def _alert_calls(monkeypatch: pytest.MonkeyPatch, bot) -> list[str]:
 
 async def test_http_channel_alert_fires_once_per_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
     """Хранитель узнаёт о переключении на HTTP-канал, но не чаще раза в кулдаун."""
-    ton_pay._http_channel_engaged_at = None
-    ton_pay._last_http_channel_alert_at = None
+    ton_pay.state._http_channel_engaged_at = None
+    ton_pay.state._last_http_channel_alert_at = None
     bot = object()
 
     try:
@@ -281,7 +281,7 @@ async def test_http_channel_alert_fires_once_per_cooldown(monkeypatch: pytest.Mo
         await ton_pay._alert_http_channel_switch(bot, "testnet")
         assert sent == []
 
-        ton_pay._http_channel_engaged_at = ton_pay.datetime.now(ton_pay.UTC)
+        ton_pay.state._http_channel_engaged_at = ton_pay.datetime.now(ton_pay.UTC)
         await ton_pay._alert_http_channel_switch(bot, "testnet")
         assert len(sent) == 1
         assert "HTTP-канал" in sent[0] and "testnet" in sent[0]
@@ -291,18 +291,70 @@ async def test_http_channel_alert_fires_once_per_cooldown(monkeypatch: pytest.Mo
         assert len(sent) == 1
 
         # После кулдауна можно снова (канал всё ещё на HTTP).
-        ton_pay._last_http_channel_alert_at = ton_pay.datetime.now(ton_pay.UTC) - ton_pay._HTTP_CHANNEL_ALERT_COOLDOWN - ton_pay.timedelta(minutes=1)
+        ton_pay.state._last_http_channel_alert_at = ton_pay.datetime.now(ton_pay.UTC) - ton_pay._HTTP_CHANNEL_ALERT_COOLDOWN - ton_pay.timedelta(minutes=1)
         await ton_pay._alert_http_channel_switch(bot, "testnet")
         assert len(sent) == 2
     finally:
-        ton_pay._http_channel_engaged_at = None
-        ton_pay._last_http_channel_alert_at = None
+        ton_pay.state._http_channel_engaged_at = None
+        ton_pay.state._last_http_channel_alert_at = None
+
+
+async def test_http_channel_alert_reads_flag_written_by_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Регрессия: алерт обязан увидеть флаг, который реально пишет http_channel.
+
+    Флаг ставит `state._http_channel_engaged_at` (http_channel), а алерт читал
+    package-алиас `ton_pay._http_channel_engaged_at` — снапшот None на момент
+    импорта. В проде его никто не обновлял, поэтому при живом уходе в
+    HTTP-канал хранитель не получал ничего, а тесты проходили: они писали в
+    тот же алиас, что и читался. Проверяем сквозной путь «канал поставил →
+    алерт ушёл» ровно тем способом, каким ставит продовый код.
+    """
+    ton_pay.state._http_channel_engaged_at = None
+    ton_pay.state._last_http_channel_alert_at = None
+    bot = object()
+    try:
+        sent = await _alert_calls(monkeypatch, bot)
+        # Ровно так флаг ставит http_channel.py: state.<флаг> = now.
+        ton_pay.state._http_channel_engaged_at = ton_pay.datetime.now(ton_pay.UTC)
+        await ton_pay._alert_http_channel_switch(bot, "mainnet")
+        assert len(sent) == 1
+        assert "HTTP-канал" in sent[0] and "mainnet" in sent[0]
+    finally:
+        ton_pay.state._http_channel_engaged_at = None
+        ton_pay.state._last_http_channel_alert_at = None
+
+
+async def test_liteserver_success_clears_http_channel_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Успех на лайтсерверах снимает флаг: канал откатился, алерт больше не
+    врутит о «мёртвых лайтсерверах» каждые 6 ч до рестарта."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_mnemonic", " ".join(mnemonic_new(24)))
+
+    class _Wallet:
+        async def transfer(self, *, destination, amount, body):
+            return 1
+
+    async def get_wallet():
+        return _Wallet()
+
+    monkeypatch.setattr(ton_pay, "_get_wallet", get_wallet)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
+    monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", ton_pay.datetime.now(ton_pay.UTC))
+
+    marker = await ton_pay.send_ton_transfer("0:" + "55" * 32, to_nano(0.1), comment="x")
+
+    assert marker and marker.startswith("bcast:")
+    assert ton_pay.state._http_channel_engaged_at is None
 
 
 async def test_http_channel_alert_silent_without_bot(monkeypatch: pytest.MonkeyPatch) -> None:
     """Без bot алерт-хелпер не лезет за нотификацией (ядро не требует бота)."""
-    ton_pay._http_channel_engaged_at = ton_pay.datetime.now(ton_pay.UTC)
-    ton_pay._last_http_channel_alert_at = None
+    ton_pay.state._http_channel_engaged_at = ton_pay.datetime.now(ton_pay.UTC)
+    ton_pay.state._last_http_channel_alert_at = None
     called = False
 
     async def fake_notify(b, text):
@@ -314,8 +366,8 @@ async def test_http_channel_alert_silent_without_bot(monkeypatch: pytest.MonkeyP
         await ton_pay._alert_http_channel_switch(None, "testnet")
         assert not called
     finally:
-        ton_pay._http_channel_engaged_at = None
-        ton_pay._last_http_channel_alert_at = None
+        ton_pay.state._http_channel_engaged_at = None
+        ton_pay.state._last_http_channel_alert_at = None
 
 
 def _player_setup() -> tuple[list[str], str]:
