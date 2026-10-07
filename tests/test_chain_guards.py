@@ -18,7 +18,7 @@ from sqlalchemy import select
 from app import ton_pay
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Income, Payout, Round, RoundStatus, Stake, WinRule
+from app.models import Income, Payout, Player, Round, RoundStatus, Stake, WinRule
 from app.ton_utils import to_nano
 
 
@@ -284,6 +284,13 @@ async def test_anomaly_flags_deficit_and_drift_and_stays_quiet_when_funded(
             round_row = (
                 await db.execute(select(Round).where(Round.day_index == 831))
             ).scalar_one()
+            # Игрок — родитель ставок, доходов и выплат: сбрасываем его
+            # отдельным flush(). Между мапперами нет relationship(), поэтому
+            # SQLAlchemy не упорядочивает вставки по FK, и без явного flush
+            # ребёнок ушёл бы раньше родителя — Postgres отверг бы INSERT
+            # (SQLite внешние ключи не проверяет).
+            db.add(Player(id=911))
+            await db.flush()
             db.add_all(
                 [
                     Stake(round_id=round_row.id, player_id=911,
@@ -345,6 +352,13 @@ async def test_income_revotes_counted_in_expected_float(monkeypatch) -> None:
             round_row = (
                 await db.execute(select(Round).where(Round.day_index == 832))
             ).scalar_one()
+            # Игрок — родитель ставок, доходов и выплат: сбрасываем его
+            # отдельным flush(). Между мапперами нет relationship(), поэтому
+            # SQLAlchemy не упорядочивает вставки по FK, и без явного flush
+            # ребёнок ушёл бы раньше родителя — Postgres отверг бы INSERT
+            # (SQLite внешние ключи не проверяет).
+            db.add(Player(id=912))
+            await db.flush()
             db.add_all(
                 [
                     Stake(round_id=round_row.id, player_id=912,

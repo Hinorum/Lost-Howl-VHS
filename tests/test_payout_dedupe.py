@@ -12,6 +12,8 @@ import os
 import time as _t
 from unittest.mock import AsyncMock
 
+from conftest import ensure_player, ensure_round
+
 from app import ton_pay
 from app.config import settings
 from app.db import SessionLocal
@@ -23,6 +25,10 @@ def _comment(payout_id: int) -> str:
 
 
 async def _seed_payout(attempts: int) -> int:
+    # Родители до ребёнка: выплата висит на round_id/player_id, а БД
+    # проверяет ссылки даже на INSERT из тестового сида.
+    await ensure_round(7)
+    await ensure_player(42)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=7,
@@ -42,7 +48,10 @@ async def _seed_payout(attempts: int) -> int:
 async def _seed_payouts(count: int, attempts: int = 0) -> list[int]:
     """Несколько выплат подряд — чтобы проверить поведение ПАЧКИ."""
     ids: list[int] = []
+    await ensure_round(7)
     for index in range(count):
+        # Родители до ребёнка: без них строка payouts не проходит проверку ссылок.
+        await ensure_player(100 + index)
         async with SessionLocal() as session:
             payout = Payout(
                 round_id=7,
@@ -436,10 +445,14 @@ async def test_no_wallet_prize_self_heals_when_player_binds(monkeypatch) -> None
     и платит в тот же момент."""
     monkeypatch.setattr(settings, "ton_enabled", True)
     player_id = 930_001
+    await ensure_round(8)
     async with SessionLocal() as session:
         from app.models import Player
 
         session.add(Player(id=player_id, username="late", wallet_address=""))
+        # Игрок отдельным коммитом: Payout ссылается на players.id, а порядок
+        # вставки разных таблиц в одном flush не гарантирован.
+        await session.commit()
         payout = Payout(round_id=8, player_id=player_id, kind="prize",
                         amount_nanotons=400_000_000, dest_address="", status="pending")
         session.add(payout)
@@ -487,6 +500,7 @@ async def test_empty_treasury_dest_revives_from_owner_env(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", True)
     owner = "0:" + os.urandom(32).hex()
     monkeypatch.setattr(settings, "owner_wallet_address", owner)
+    await ensure_round(7)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=7,
@@ -519,6 +533,7 @@ async def test_empty_treasury_dest_revives_from_owner_env(monkeypatch) -> None:
 async def test_empty_dest_without_owner_fails_with_clear_reason(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "owner_wallet_address", "")
+    await ensure_round(7)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=7,
@@ -552,6 +567,7 @@ async def test_payouts_listing_shows_reason(monkeypatch) -> None:
     from app.handlers import cmd_payouts
 
     monkeypatch.setattr(settings, "admin_ids", "4242")
+    await ensure_round(9)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=9,
@@ -752,6 +768,7 @@ async def test_dead_letter_alert_carries_reason(monkeypatch) -> None:
         async def send_message(self, chat_id, text):
             sent.append((chat_id, text))
 
+    await ensure_round(8)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=8,
@@ -811,6 +828,7 @@ def test_payout_comment_candidates_keep_unique_suffix() -> None:
 
 
 async def _seed_override_payout() -> int:
+    await ensure_round(7)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=7,

@@ -114,7 +114,14 @@ async def _seed_round(
                     tag="care",
                 )
             )
-        for pid, _pos in votes:
+        # Игроки — родители голосов, ставок и выплат. Между мапперами нет
+        # relationship(), поэтому SQLAlchemy не упорядочивает вставки по FK:
+        # родителей сбрасываем явным flush() до детей, иначе Postgres
+        # отвергнет INSERT ребёнка (SQLite внешние ключи не проверяет).
+        pids = {pid for pid, _pos in votes}
+        pids |= {pid for pid, _amount in (stakes or [])}
+        pids |= {pid for pid, _kind, _amount in (payouts or [])}
+        for pid in pids:
             db.add(
                 Player(
                     id=pid,
@@ -123,6 +130,7 @@ async def _seed_round(
                     dm_subscribed=bool(subtitles.get(pid, True)) if subtitles else True,
                 )
             )
+        await db.flush()
         for pid, pos in votes:
             db.add(Vote(round_id=round_row.id, player_id=pid, card_position=pos))
         for pid, amount in stakes or []:

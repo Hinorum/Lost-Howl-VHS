@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from conftest import ensure_player
+from sqlalchemy import delete, select
 
 from app.config import settings
 from app.db import SessionLocal
@@ -29,6 +30,9 @@ def make_message(uid: int, day: int) -> SimpleNamespace:
 
 
 async def _seed_closed_round(session, day_index: int, *, payout_status: str = "pending") -> int:
+    # Родитель выплаты — иначе Postgres не примет INSERT payouts (SQLite FK
+    # не проверяет и исторически позволял игроков «из воздуха»).
+    await ensure_player(7)
     round_row = Round(
         day_index=day_index,
         status=RoundStatus.CLOSED,
@@ -75,9 +79,10 @@ async def test_refinalize_refuses_when_anything_sent(monkeypatch) -> None:
     assert row.payouts_finalized is True
     assert [p.status for p in payouts] == ["sent"]
     async with SessionLocal() as session:
-        await session.delete(await session.get(Round, round_id))
-        payout = (await session.execute(select(Payout).where(Payout.round_id == round_id))).scalar_one()
-        await session.delete(payout)
+        # Ребёнок (выплата) стирается раньше родителя — иначе Postgres
+        # отвергнет DELETE по rounds (SQLite порядок не проверяет).
+        await session.execute(delete(Payout).where(Payout.round_id == round_id))
+        await session.execute(delete(Round).where(Round.id == round_id))
         await session.commit()
 
 
@@ -101,9 +106,10 @@ async def test_refinalize_proceeds_when_nothing_sent(monkeypatch) -> None:
     assert row.payouts_finalized is True
     assert [p.status for p in payouts] == ["dismissed"]
     async with SessionLocal() as session:
-        await session.delete(await session.get(Round, round_id))
-        payout = (await session.execute(select(Payout).where(Payout.round_id == round_id))).scalar_one()
-        await session.delete(payout)
+        # Ребёнок (выплата) стирается раньше родителя — иначе Postgres
+        # отвергнет DELETE по rounds (SQLite порядок не проверяет).
+        await session.execute(delete(Payout).where(Payout.round_id == round_id))
+        await session.execute(delete(Round).where(Round.id == round_id))
         await session.commit()
 
 
@@ -129,7 +135,8 @@ async def test_refinalize_refuses_when_any_payout_moved(monkeypatch, payout_stat
     assert row.payouts_finalized is True  # флаг не сброшен
     assert payout.status == payout_status  # строка не пересоздана и не dismissed
     async with SessionLocal() as session:
-        await session.delete(await session.get(Round, round_id))
-        payout = (await session.execute(select(Payout).where(Payout.round_id == round_id))).scalar_one()
-        await session.delete(payout)
+        # Ребёнок (выплата) стирается раньше родителя — иначе Postgres
+        # отвергнет DELETE по rounds (SQLite порядок не проверяет).
+        await session.execute(delete(Payout).where(Payout.round_id == round_id))
+        await session.execute(delete(Round).where(Round.id == round_id))
         await session.commit()

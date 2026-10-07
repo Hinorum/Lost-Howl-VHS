@@ -988,8 +988,11 @@ async def test_monthly_pot_carried_when_leader_has_no_wallet(
         finally:
             await session.execute(LeaderboardPot.__table__.delete().where(LeaderboardPot.month == month_key))
             await session.execute(WatcherState.__table__.delete().where(WatcherState.key == MARKER_KEY))
-            await session.delete(round_row)
+            # Голоса раньше раунда: отложенный DELETE раунда уходит в flush
+            # до core-удаления голосов (flush сортируется по именам классов),
+            # и ссылка votes→rounds не успела бы сняться.
             await session.execute(Vote.__table__.delete().where(Vote.player_id == pid))
+            await session.delete(round_row)
             player = await session.get(Player, pid)
             if player is not None:
                 await session.delete(player)
@@ -1022,8 +1025,11 @@ async def test_monthly_pot_waits_when_leader_has_no_stake(monkeypatch: pytest.Mo
         finally:
             await session.execute(LeaderboardPot.__table__.delete().where(LeaderboardPot.month == month_key))
             await session.execute(WatcherState.__table__.delete().where(WatcherState.key == MARKER_KEY))
-            await session.delete(round_row)
+            # Голоса раньше раунда: отложенный DELETE раунда уходит в flush
+            # до core-удаления голосов (flush сортируется по именам классов),
+            # и ссылка votes→rounds не успела бы сняться.
             await session.execute(Vote.__table__.delete().where(Vote.player_id == pid))
+            await session.delete(round_row)
             player = await session.get(Player, pid)
             if player is not None:
                 await session.delete(player)
@@ -1396,6 +1402,10 @@ async def test_stuck_refund_alert_is_targeted(monkeypatch: pytest.MonkeyPatch) -
     wallet = "0:" + os.urandom(16).hex()
     async with SessionLocal() as db:
         db.add(Player(id=uid, username=f"u{uid}", wallet_address=wallet))
+        # Родитель отдельным flush: между Player и Payout нет relationship(),
+        # поэтому порядок INSERT в одном flush определяется алфавитом имён
+        # классов — payouts ушёл бы в БД раньше players и не прошёл бы ссылку.
+        await db.flush()
         db.add(
             Payout(round_id=None, player_id=uid, kind="refund",
                    amount_nanotons=to_nano(0.4), dest_address=wallet,

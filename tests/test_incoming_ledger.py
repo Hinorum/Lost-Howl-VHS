@@ -14,7 +14,7 @@ from sqlalchemy import delete, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Income, Payout, Player, Round, RoundStatus, WatcherState, WinRule
+from app.models import Income, Payout, Player, Round, RoundStatus, Stake, WatcherState, WinRule
 from app.ton_utils import normalize_address
 from app.ton_watch import Transfer, _stash_refund, process_transfer
 
@@ -48,11 +48,25 @@ async def _open_round(day_index: int) -> None:
 
 
 async def _wipe(tx_hashes: list[str], day_indexes: list[int]) -> None:
+    """Убрать строки теста вместе с детьми раунда и игрока.
+
+    Ставки, выплаты и журнал входящих ссылаются на раунд и игрока: без их
+    удаления Postgres не отдаст DELETE по rounds/players (SQLite внешние
+    ключи не проверяет, поэтому порядок исторически не соблюдался).
+    """
     async with SessionLocal() as session:
         await session.execute(delete(Income).where(Income.unit_ref.in_(tx_hashes)))
-        await session.execute(
-            delete(Round).where(Round.day_index.in_(day_indexes))
+        round_ids = (
+            (await session.execute(select(Round.id).where(Round.day_index.in_(day_indexes))))
+            .scalars()
+            .all()
         )
+        if round_ids:
+            await session.execute(delete(Stake).where(Stake.round_id.in_(round_ids)))
+            await session.execute(delete(Payout).where(Payout.round_id.in_(round_ids)))
+            await session.execute(delete(Income).where(Income.round_id.in_(round_ids)))
+        await session.execute(delete(Payout).where(Payout.tx_hash.in_(tx_hashes)))
+        await session.execute(delete(Round).where(Round.day_index.in_(day_indexes)))
         await session.execute(delete(Player).where(Player.id.in_([920_001])))
         await session.commit()
 

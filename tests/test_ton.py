@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import stakes as stakes_mod
 from app.config import settings
-from app.models import Payout, Player, Round, RoundStatus, Stake, Vote, WinRule
+from app.models import Income, Payout, Player, Round, RoundStatus, Stake, Vote, WinRule
 from app.ton_utils import friendly_address, from_nano, is_valid_ton_address, normalize_address, to_nano
 from app.weeks import iso_week_key
 
@@ -978,6 +978,10 @@ async def test_repeat_stake_and_closed_day_transfers_are_refunded(
             ).first()._mapping
             assert row["kind"] == "refund" and row["round_id"] is None
         finally:
+            # Журнал входящих держится на раунде и игроке: сначала он, иначе
+            # Postgres не отдаст удаление родителя (SQLite FK не проверяет).
+            await db.execute(Income.__table__.delete().where(Income.unit_ref.in_([hash_dup, hash_late])))
+            await db.execute(Income.__table__.delete().where(Income.round_id == round_row.id))
             await db.execute(Payout.__table__.delete().where(Payout.tx_hash.in_([hash_dup, hash_late])))
             await db.execute(Stake.__table__.delete().where(Stake.round_id == round_row.id))
             await db.delete(round_row)
@@ -1041,6 +1045,10 @@ async def test_submin_already_staked_is_refunded_with_revote_hint(
             sent = bot.send_message.await_args.args[1]
             assert "не распознал комментарий rv" in sent
         finally:
+            # Журнал входящих ссылается на раунд и игрока — сначала он,
+            # иначе Postgres не отдаст удаление родителя (SQLite молчит).
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
+            await db.execute(Income.__table__.delete().where(Income.round_id == round_row.id))
             await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
             await db.execute(Stake.__table__.delete().where(Stake.round_id == round_row.id))
             await db.delete(round_row)
@@ -1093,6 +1101,10 @@ async def test_auto_grant_by_amount_when_memo_missing(
             )
             assert [] == refunds
         finally:
+            # Журнал входящих ссылается на раунд и игрока — сначала он,
+            # иначе Postgres не отдаст удаление родителя (SQLite молчит).
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
+            await db.execute(Income.__table__.delete().where(Income.round_id == round_row.id))
             await db.execute(RevoteGrant.__table__.delete().where(RevoteGrant.unit_ref == tx_hash))
             await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
             await db.execute(Vote.__table__.delete().where(Vote.round_id == round_row.id))
@@ -1132,6 +1144,10 @@ async def test_auto_grant_returns_refund_if_no_vote(
             ).first()._mapping
             assert row["kind"] == "refund"
         finally:
+            # Журнал входящих ссылается на раунд и игрока — сначала он,
+            # иначе Postgres не отдаст удаление родителя (SQLite молчит).
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
+            await db.execute(Income.__table__.delete().where(Income.round_id == round_row.id))
             await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
             await db.delete(round_row)
             player = await db.get(Player, pid)
@@ -1179,6 +1195,12 @@ async def test_failed_revote_payments_are_refunded(monkeypatch: pytest.MonkeyPat
             ).all()
             assert grants == []  # гранты на проваленные оплаты не выдаются
         finally:
+            # Журнал входящих ссылается на раунды и игрока — сначала он,
+            # иначе Postgres не отдаст удаление родителя (SQLite молчит).
+            await db.execute(Income.__table__.delete().where(Income.unit_ref.in_([hash_small, hash_late])))
+            await db.execute(
+                Income.__table__.delete().where(Income.round_id.in_([open_round.id, closed_round.id]))
+            )
             await db.execute(
                 Payout.__table__.delete().where(Payout.tx_hash.in_([hash_small, hash_late]))
             )

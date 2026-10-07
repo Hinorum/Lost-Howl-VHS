@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from conftest import ensure_player
 from sqlalchemy import delete
 
 from app import broadcast as bc
@@ -42,6 +43,9 @@ async def _clean_money_tables():
 
 async def _seed_payout(status: str, kind: str, age_minutes: int, amount: int = 1_000_000_000) -> None:
     now = datetime.now(UTC)
+    # Родитель до выплаты: строка payouts ссылается на игрока, а пульт
+    # проверяет очередь независимо от того, кто её создал.
+    await ensure_player(1)
     async with SessionLocal() as db:
         round_row = Round(
             day_index=96_100,

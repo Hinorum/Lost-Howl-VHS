@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 from sqlalchemy import delete, select
 
 from app.config import settings
-from app.models import Card, Player, RevoteGrant, Round, RoundStatus, Vote, WinRule
+from app.models import Card, Income, Player, RevoteGrant, Round, RoundStatus, Vote, WinRule
 from app.payments import (
     build_revote_payload,
     parse_revote_memo,
@@ -357,6 +357,10 @@ async def test_successful_payment_creates_single_grant(monkeypatch) -> None:
             assert len(grants) == 1
             assert "уже учтена" in message.answer.call_args.args[0]
         finally:
+            # Оплата пишет строку журнала дохода (topup.py) со ссылками на
+            # раунд и игрока — сносим её первой, иначе Postgres откажет в
+            # удалении родителя (SQLite порядок не проверяет).
+            await db.execute(delete(Income).where(Income.unit_ref == charge_id))
             for g in (
                 (await db.execute(select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id)))
                 .scalars()
@@ -407,6 +411,10 @@ async def test_successful_payment_for_closed_day_records_orphan() -> None:
             assert len(grants) == 1 and grants[0].round_id is None
             assert "возврата" in message.answer.call_args.args[0]
         finally:
+            # Оплата пишет строку журнала дохода (topup.py), ссылающуюся на
+            # игрока, — сносим её первой, иначе Postgres откажет в удалении
+            # родителя (SQLite порядок не проверяет).
+            await db.execute(delete(Income).where(Income.unit_ref == charge_id))
             for g in (
                 (await db.execute(_select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id)))
                 .scalars()

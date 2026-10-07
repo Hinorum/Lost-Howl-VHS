@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.broadcast import _deliver_day, announce_new_day
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Card, Chat, Round, RoundStatus, WinRule
+from app.models import Card, Chat, Player, Round, RoundStatus, WinRule
 
 
 def _round(day_index: int, media_dir) -> Round:
@@ -147,6 +147,11 @@ async def test_status_bank_line_shows_amount_only(monkeypatch, tmp_path) -> None
     round_row = _round(9400, tmp_path)
     async with SessionLocal() as db:
         try:
+            # Раунд и игрок — родители ставки: иначе Postgres отвергнет INSERT
+            # stakes по внешнему ключу (SQLite FK не проверяет).
+            db.add(round_row)
+            db.add(Player(id=9_401, username="u9401"))
+            await db.flush()
             db.add(
                 Stake(
                     round_id=round_row.id,
@@ -162,6 +167,9 @@ async def test_status_bank_line_shows_amount_only(monkeypatch, tmp_path) -> None
             assert "ставок" not in text
         finally:
             await db.execute(Stake.__table__.delete().where(Stake.round_id == round_row.id))
+            await db.execute(Card.__table__.delete().where(Card.round_id == round_row.id))
+            await db.execute(Round.__table__.delete().where(Round.id == round_row.id))
+            await db.execute(Player.__table__.delete().where(Player.id == 9_401))
             await db.commit()
 
     # Пустой банк — строка остаётся: банк дня виден с самого открытия.

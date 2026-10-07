@@ -580,70 +580,91 @@ async def test_incoming_journal_shapes(monkeypatch) -> None:
     игрок без username — оба случая обязаны читаться, иначе неизвестный
     перевод нельзя разобрать."""
     monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
-    await _wipe(Income, Player)
+    # Ставки гасим до игроков: чужие ставки из предыдущих тестов модуля
+    # всё ещё ссылаются на players, и чистка игрока упирается бы в ссылку.
+    await _wipe(Income, Stake, Player)
     message = make_message("/incoming")
     await cmd_incoming(message)
     assert "пока нет" in said(message)
 
-    naive_stamp = datetime(2026, 3, 4, 12, 30)
-    async with SessionLocal() as db:
-        db.add_all(
-            [
-                Player(id=21, username="rich", first_name="Богач"),
-                Player(id=22, username=None, first_name="БезНика"),
-                Income(
-                    kind="ton",
-                    amount_stars=0,
-                    amount_nanotons=to_nano(2),
-                    player_id=21,
-                    unit_ref="tx-rich",
-                    note="перевод",
-                    network=current_network(),
-                    created_at=datetime.now(UTC),
-                ),
-                Income(
-                    kind="ton",
-                    amount_stars=0,
-                    amount_nanotons=to_nano(1),
-                    player_id=22,
-                    unit_ref="tx-nick",
-                    note="перевод",
-                    network=current_network(),
-                    created_at=naive_stamp,
-                ),
-                Income(
-                    kind="ton",
-                    amount_stars=0,
-                    amount_nanotons=to_nano(0.5),
-                    player_id=999,
-                    unit_ref="tx-ghost",
-                    note="перевод",
-                    network=current_network(),
-                    created_at=None,
-                ),
-                Income(
-                    kind="ton",
-                    amount_stars=0,
-                    amount_nanotons=to_nano(0.25),
-                    player_id=None,
-                    unit_ref="tx-nowallet",
-                    note="перевод",
-                    network=current_network(),
-                    created_at=datetime.now(UTC),
-                ),
-            ]
-        )
-        await db.commit()
+    # Метка времени берётся с таймзоной: колонка хранит момент, и «голое»
+    # время уехало бы в пояс машины — дата в журнале поплыла бы.
+    fixed_stamp = datetime(2026, 3, 4, 12, 30, tzinfo=UTC)
+    # Игрок 999 заведён без ника и без имени: строка ledger не может быть
+    # сиротой (на неё ссылаются FK), а рисуется она ровно как id999 —
+    # ровно то, что проверяет журнал для «неизвестного» отправителя.
+    try:
+        async with SessionLocal() as db:
+            db.add_all(
+                [
+                    Player(id=21, username="rich", first_name="Богач"),
+                    Player(id=22, username=None, first_name="БезНика"),
+                    Player(id=999, username=None, first_name=None),
+                ]
+            )
+            # Родители отдельным коммитом: в одном flush порядок вставки таблиц
+            # не гарантирован, и incomes ушло бы раньше players.
+            await db.commit()
+        async with SessionLocal() as db:
+            db.add_all(
+                [
+                    Income(
+                        kind="ton",
+                        amount_stars=0,
+                        amount_nanotons=to_nano(2),
+                        player_id=21,
+                        unit_ref="tx-rich",
+                        note="перевод",
+                        network=current_network(),
+                        created_at=datetime.now(UTC),
+                    ),
+                    Income(
+                        kind="ton",
+                        amount_stars=0,
+                        amount_nanotons=to_nano(1),
+                        player_id=22,
+                        unit_ref="tx-nick",
+                        note="перевод",
+                        network=current_network(),
+                        created_at=fixed_stamp,
+                    ),
+                    Income(
+                        kind="ton",
+                        amount_stars=0,
+                        amount_nanotons=to_nano(0.5),
+                        player_id=999,
+                        unit_ref="tx-ghost",
+                        note="перевод",
+                        network=current_network(),
+                        created_at=None,
+                    ),
+                    Income(
+                        kind="ton",
+                        amount_stars=0,
+                        amount_nanotons=to_nano(0.25),
+                        player_id=None,
+                        unit_ref="tx-nowallet",
+                        note="перевод",
+                        network=current_network(),
+                        created_at=datetime.now(UTC),
+                    ),
+                ]
+            )
+            await db.commit()
 
-    filled = make_message("/incoming")
-    await cmd_incoming(filled)
-    text = said(filled)
-    assert "@rich" in text
-    assert "БезНика" in text
-    assert "id999" in text
-    assert "неизвестный кошелёк" in text
-    assert "04.03 12:30 UTC" in text
-    assert "tonscan.org/tx/tx-nowallet" in text
+        filled = make_message("/incoming")
+        await cmd_incoming(filled)
+        text = said(filled)
+        assert "@rich" in text
+        assert "БезНика" in text
+        assert "id999" in text
+        assert "неизвестный кошелёк" in text
+        assert "04.03 12:30 UTC" in text
+        assert "tonscan.org/tx/tx-nowallet" in text
+    finally:
+        # Журнал чистим за собой: следующие тесты модуля гасят только свои
+        # таблицы, а эти строки держат players и заблокировали бы их чистку.
+        await _wipe(Income, Player)
 
 
 async def test_incoming_tolerates_row_without_timestamp(monkeypatch) -> None:

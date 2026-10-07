@@ -13,9 +13,29 @@ from sqlalchemy import delete, func, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Card, Chat, PreparedDay, Round, RoundStatus, WatcherState, WinRule
+from app.models import (
+    Card,
+    Chat,
+    Income,
+    Payout,
+    PreparedDay,
+    RevoteGrant,
+    Round,
+    RoundStatus,
+    Stake,
+    StatusPost,
+    Vote,
+    WatcherState,
+    WinRule,
+)
 from app.scheduler import tick
 from app.stakes import current_network
+
+# Таблицы с ForeignKey на rounds: вокруг дня живут карточки, голоса, ставки,
+# выплаты и посты статуса. Удалять раунд раньше этих строк нельзя — SQLite
+# внешние ключи по умолчанию не проверяет (и молча пропускает нарушение),
+# БД с проверкой — нет.
+_ROUND_CHILDREN = (Card, Vote, Stake, Payout, Income, StatusPost, RevoteGrant)
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +68,16 @@ async def _seed(day_index: int, status: RoundStatus, *, voting_in: timedelta, ta
 
 
 async def _cleanup(*day_indexes: int) -> None:
+    """Снести дни со всем, что на них ссылается.
+
+    Раунд — родитель для карточек, голосов, ставок, выплат и постов статуса:
+    сначала уходят дети, иначе DELETE раунда не проходит проверку ссылок
+    (SQLite её по умолчанию не проверяет и молча пропускает).
+    """
     async with SessionLocal() as db:
+        round_ids = select(Round.id).where(Round.day_index.in_(day_indexes))
+        for table in _ROUND_CHILDREN:
+            await db.execute(delete(table).where(table.round_id.in_(round_ids)))
         await db.execute(Round.__table__.delete().where(Round.day_index.in_(day_indexes)))
         await db.execute(delete(PreparedDay).where(PreparedDay.day_index.in_([d + 1 for d in day_indexes])))
         await db.commit()
@@ -61,12 +90,16 @@ async def _clear_rounds() -> None:
     считает от самого позднего — утёкший из соседнего теста OPEN-день делает
     «свой» день несоздаваемым без единой ошибки в коде. Тест, которому важен
     порядок дней, обязан начинать с пустого поля.
-    """
-    from app.models import Vote as _Vote
 
+    Раунд — родитель для карточек, голосов, ставок, выплат и постов статуса:
+    сначала уходят дети, иначе DELETE FROM rounds остаётся висеть на чужих
+    ссылках и валит очистку соседних тестов (SQLite их не проверяет, БД
+    с проверкой — да).
+    """
     async with SessionLocal() as db:
-        await db.execute(delete(Card))
-        await db.execute(delete(_Vote))
+        round_ids = select(Round.id)
+        for table in _ROUND_CHILDREN:
+            await db.execute(delete(table).where(table.round_id.in_(round_ids)))
         await db.execute(delete(Round))
         await db.commit()
 

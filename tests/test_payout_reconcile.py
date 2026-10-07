@@ -20,6 +20,7 @@ import time
 from unittest.mock import AsyncMock
 
 import pytest
+from conftest import ensure_player, ensure_round
 
 from app import ton_pay
 from app.config import settings
@@ -380,6 +381,10 @@ async def test_empty_200_without_transactions_on_tonapi_also_unknown(monkeypatch
 
 
 async def _seed_payout(attempts: int) -> int:
+    # Родители до ребёнка: выплата висит на round_id/player_id, а БД
+    # проверяет ссылки даже на INSERT из тестового сида.
+    await ensure_round(7)
+    await ensure_player(42)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=7,

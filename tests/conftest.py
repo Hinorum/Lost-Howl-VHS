@@ -154,6 +154,54 @@ async def truncate_all(db) -> None:
         await db.execute(delete(table))
 
 
+async def ensure_player(player_id: int) -> None:
+    """Гарантировать игрока в глобальной БД — родителя для payouts/stakes/votes.
+
+    SQLite внешние ключи не проверяет, поэтому тесты исторически сыпали
+    player_id «из воздуха»: на SQLite зелёно, на Postgres IntegrityError.
+    Хелпер создаёт родителя, если его нет; существующего не трогает.
+    Импорт — `from conftest import ensure_player` (pytest добавляет tests/ в
+    sys.path для модулей без __init__.py).
+    """
+    from app.db import SessionLocal
+    from app.models import Player
+
+    async with SessionLocal() as session:
+        if await session.get(Player, player_id) is None:
+            session.add(Player(id=player_id))
+            await session.commit()
+
+
+async def ensure_round(round_id: int) -> None:
+    """Гарантировать раунд c id=round_id в глобальной БД — родителя для строк.
+
+    Тесты привязаны к фиксированному id раунда (комменты вида way:<day>#<id>,
+    day_index), поэтому день создаётся с day_index=id: приложение держит их
+    выровненными, а расхождение дало бы уникальный конфликт на day_index.
+    Идемпотентно: существующий раунд не трогается.
+    """
+    from app.db import SessionLocal
+    from app.models import Round, RoundStatus, WinRule
+
+    now = datetime.now(UTC)
+    async with SessionLocal() as session:
+        if await session.get(Round, round_id) is None:
+            session.add(
+                Round(
+                    id=round_id,
+                    day_index=round_id,
+                    status=RoundStatus.OPEN,
+                    win_rule=WinRule.MAJORITY,
+                    chapter_title=f"Тестовый день {round_id}",
+                    chapter_text="Тестовая глава",
+                    opens_at=now,
+                    voting_ends_at=now,
+                    tally_ends_at=now,
+                )
+            )
+            await session.commit()
+
+
 @pytest.fixture(autouse=True)
 async def _quiesce_background_tasks():
     """Дождаться фоновых задач, переживших свой тест, и отменить висящие.

@@ -10,6 +10,8 @@ bcast, отсутствующее дольше окна → обратно в о
 import os
 from datetime import UTC, datetime, timedelta
 
+from conftest import ensure_player, ensure_round
+
 from app import ton_pay
 from app.config import settings
 from app.db import SessionLocal
@@ -17,6 +19,11 @@ from app.models import Payout
 
 
 async def _seed_sent_payout(kind: str = "prize", round_id: int | None = 64) -> int:
+    # Родители до ребёнка: строка payouts ссылается на раунд и игрока,
+    # поэтому сначала гарантируем их существование в глобальной БД.
+    if round_id is not None:
+        await ensure_round(round_id)
+    await ensure_player(42)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=round_id,
@@ -157,6 +164,7 @@ async def test_confirm_uses_comment_override(monkeypatch) -> None:
 async def test_confirm_ignores_other_networks(monkeypatch) -> None:
     """Сверка работает только по выплатам активной сети."""
     monkeypatch.setattr(settings, "ton_network", "mainnet")
+    await ensure_round(64)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=64,
@@ -187,6 +195,7 @@ async def test_confirm_ignores_other_networks(monkeypatch) -> None:
 
 async def test_confirm_skips_rows_with_real_hash(monkeypatch) -> None:
     """Уже подтверждённые реальным хешем выплаты сверка не трогает."""
+    await ensure_round(64)
     async with SessionLocal() as session:
         payout = Payout(
             round_id=64,

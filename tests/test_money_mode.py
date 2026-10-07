@@ -3,6 +3,7 @@
 
 from datetime import UTC, datetime, timedelta
 
+from conftest import ensure_player, ensure_round
 from sqlalchemy import select
 
 from app import ops, rounds
@@ -93,6 +94,10 @@ async def test_free_day_hides_bank_line(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", True)
     free_day = _round_row(money_mode=False, day_index=9, _id=87_910, with_cards=True)
     money_day = _round_row(money_mode=True, day_index=10, _id=87_911, with_cards=True)
+    # Ставка висит на раунде и игроке — родителей заводим до вставки ребёнка.
+    # В памяти лежат только копии дней, поэтому день для FK нужен в БД.
+    await ensure_round(87_911)
+    await ensure_player(9)
     async with SessionLocal() as db:
         db.add(Stake(round_id=87_911, player_id=9, amount_nanotons=3_000_000_000, tx_hash="mm1", status="confirmed"))
         await db.commit()
@@ -103,6 +108,9 @@ async def test_free_day_hides_bank_line(tmp_path, monkeypatch) -> None:
         async with SessionLocal() as db:
             await db.execute(Stake.__table__.delete().where(Stake.round_id == 87_911))
             await db.commit()
+        # День гасим за ставкой: открытый день с огромным day_index остался бы
+        # «активным» и переопределил бы гейт денежного режима у соседних тестов.
+        await _delete_round(87_911)
 
 
 async def test_active_day_uses_its_snapshot() -> None:
@@ -238,10 +246,12 @@ async def test_process_transfer_refunds_on_free_day(monkeypatch) -> None:
             ).scalars().all()
             assert stakes == []
     finally:
-        await _delete_round(free_day.id)
+        # Сначала дети, потом раунд: выплаты и доходы ledger ссылаются на день,
+        # и пока они в таблице, день из БД не уходит.
         async with SessionLocal() as session:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "refund", Payout.tx_hash.in_(txs)))
             await session.execute(Income.__table__.delete().where(Income.unit_ref.in_(txs)))
             await session.execute(Stake.__table__.delete().where(Stake.player_id == 920_222))
             await session.execute(Player.__table__.delete().where(Player.id == 920_222))
             await session.commit()
+        await _delete_round(free_day.id)

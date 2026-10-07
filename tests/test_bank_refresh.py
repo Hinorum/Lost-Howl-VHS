@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from conftest import ensure_player
 from sqlalchemy import delete, select
 
 from app import broadcast as bc
@@ -60,6 +61,9 @@ async def _open_round_row(round_id: int) -> Round:
 
 
 async def _stake(round_id: int, amount_nanotons: int, player_id: int = 700_001) -> None:
+    # Родитель до ставки: БД проверяет ссылку player_id, а игрока 700_001
+    # никто из тестов этого модуля не создаёт.
+    await ensure_player(player_id)
     async with SessionLocal() as session:
         session.add(
             Stake(
