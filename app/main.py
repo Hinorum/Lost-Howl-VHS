@@ -71,7 +71,8 @@ async def alive(request: web.Request) -> web.Response:
     приходилось держать в render.yaml открытым текстом (репозиторий публичный,
     значение утекало всем желающим). Здесь нет ни секрета, ни данных: 200
     значит только «процесс отвечает». Операционный снимок — на /health и
-    /metrics, они остаются под HEALTH_TOKEN.
+    /metrics под токеном; вердикт «игра в порядке» для внешнего watchdog,
+    который не умеет слать заголовки, — на /ready.
     """
     return web.json_response({"status": "alive"})
 
@@ -80,8 +81,12 @@ async def health(request: web.Request) -> web.Response:
     """Живость + операционный снимок: тик, очередь выплат, watcher, день.
 
     Сбой снимка (переходное окно миграции, деградация БД) не роняет
-    эндпоинт — Render должен видеть процесс живым; но и «ok» без данных мы
-    не притворяемся: честный статус degraded.
+    эндпоинт: тело честно сообщает degraded, а HTTP-код повторяет вердикт —
+    200 только при status=ok, иначе 503. Раньше код всегда был 200, и
+    внешний watchdog физически не мог отличить «всё хорошо» от «тиков нет
+    второй день»: инцидент 2026-10-01 прошёл мимо всех мониторингов, потому
+    что проверять было нечем. Проба живости Render смотрит на /alive и от
+    этой честности не зависит.
     """
     if not _authorized(request):
         return web.Response(status=401, text="unauthorized")
@@ -92,7 +97,38 @@ async def health(request: web.Request) -> web.Response:
     except Exception as exc:
         log.warning("snapshot упал — отвечаем degraded: %s", exc)
         payload = {"status": "degraded", "detail": "snapshot unavailable"}
-    return web.json_response(payload)
+    return web.json_response(payload, status=_verdict_code(payload))
+
+
+def _verdict_code(payload: dict) -> int:
+    """HTTP-код по вердикту из тела: ok — 200, всё остальное — 503."""
+    return 200 if payload.get("status") == "ok" else 503
+
+
+async def ready(request: web.Request) -> web.Response:
+    """Вердикт здоровья для внешнего watchdog — без токена и без данных.
+
+    Мониторинг, который не умеет передавать заголовок Authorization
+    (UptimeRobot и большинство бесплатных HTTP-чекеров), /health читать не
+    может: там 401 без Bearer-токена, и такой чекер врал бы «плохо»
+    постоянно. Единственный открытый при этом /alive показывает живость
+    процесса — а про инцидент, когда процесс жил, а тики умерли, он
+    промолчал бы ровно так же, как и раньше.
+
+    Поэтому здесь только вердикт: 200 при status=ok, 503 при degraded
+    (включая недоступность снимка). Ни очереди выплат, ни списка тревог, ни
+    возраста тика — по телу не видно ничего, кроме одного бита; подробности
+    остаются под токеном в /health и /ops.
+    """
+    try:
+        from app.ops import snapshot
+
+        verdict = (await snapshot()).get("status")
+    except Exception as exc:
+        log.warning("snapshot для /ready недоступен: %s", exc)
+        verdict = "degraded"
+    payload = {"status": "ok" if verdict == "ok" else "degraded"}
+    return web.json_response(payload, status=_verdict_code(payload))
 
 
 async def metrics(request: web.Request) -> web.Response:
@@ -420,6 +456,7 @@ async def run_webhook(bot, dispatcher) -> None:
     app.router.add_get("/", health)
     app.router.add_get("/alive", alive)
     app.router.add_get("/health", health)
+    app.router.add_get("/ready", ready)
     app.router.add_get("/metrics", metrics)
     SimpleRequestHandler(dispatcher=dispatcher, bot=bot, secret_token=secret).register(app, path=path)
     setup_application(app, dispatcher, bot=bot)

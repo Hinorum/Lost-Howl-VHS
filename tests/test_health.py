@@ -1,5 +1,7 @@
-"""/health: живость без лжи — degraded вместо «ok» без данных."""
+"""/health: живость без лжи — код 503 вместо «200 при degraded».
+/ready — тот же вердикт без токена и без данных, для внешнего watchdog."""
 
+import json
 from types import SimpleNamespace
 
 from app import main as main_module
@@ -16,9 +18,14 @@ async def test_health_returns_snapshot_payload(monkeypatch) -> None:
     assert b'"last_tick_age"' in response.body
 
 
-async def test_health_stays_green_and_honest_when_snapshot_fails(monkeypatch) -> None:
+async def test_health_reports_honest_503_when_snapshot_fails(monkeypatch) -> None:
     """Переходное окно (например, инвалидация планов после миграции) не должно
-    ронять эндпоинт: Render видит живой процесс, а статус честно degraded."""
+    ронять эндпоинт молчанием: тело честно degraded, а код — 503.
+
+    Раньше здесь был 200, и внешний watchdog не мог отличить «всё хорошо»
+    от «снимок недоступен»: проверять было нечем. Проба живости Render
+    смотрит на /alive, поэтому деградация не превращается в рестарт сервиса.
+    """
 
     async def broken_snapshot():
         raise RuntimeError("cached statement plan is invalid")
@@ -26,9 +33,26 @@ async def test_health_stays_green_and_honest_when_snapshot_fails(monkeypatch) ->
     monkeypatch.setattr("app.config.settings.health_require_token", False)
     monkeypatch.setattr("app.ops.snapshot", broken_snapshot)
     response = await main_module.health(SimpleNamespace())
-    assert response.status == 200
+    assert response.status == 503
     assert b'"degraded"' in response.body
     assert b'"ok"' not in response.body
+
+
+async def test_health_503_when_verdict_degraded(monkeypatch) -> None:
+    """Авторизованный чекер получает 503, когда снимок сам о себе говорит
+    degraded: тревоги есть или тики падали. Тело при этом остаётся полным —
+    под токеном видны и причина, и возраст."""
+    monkeypatch.setattr("app.config.settings.health_token", "s3cret")
+
+    async def degraded_snapshot():
+        return {"status": "degraded", "problems": ["очередь выплат стоит 42 мин"]}
+
+    monkeypatch.setattr("app.ops.snapshot", degraded_snapshot)
+    response = await main_module.health(
+        _request(headers={"Authorization": "Bearer s3cret"})
+    )
+    assert response.status == 503
+    assert json.loads(response.body)["problems"] == ["очередь выплат стоит 42 мин"]
 
 
 def _request(
@@ -128,3 +152,69 @@ async def test_alive_never_leaks_snapshot(monkeypatch) -> None:
     assert response.status == 200
     for leaked in (b"problems", b"queue", b"last_tick_age", b"payout"):
         assert leaked not in response.body
+
+
+# ---------- /ready: вердикт для watchdog без заголовков ----------
+
+
+async def test_ready_is_open_without_token(monkeypatch) -> None:
+    """Чекер, не умеющий слать Authorization, всё равно видит вердикт.
+
+    Токен задан — значит, /health для такого мониторинга закрыт (там 401),
+    а /ready отвечает. Именно ради этого мониторинга эндпоинт и существует:
+    до него единственным открытым был /alive, который молчит про мёртвые
+    тики при живом процессе — ровно тот инцидент, что и случился.
+    """
+    monkeypatch.setattr("app.config.settings.health_token", "s3cret")
+
+    async def good_snapshot():
+        return {"status": "ok", "problems": [], "payout_queue": 3}
+
+    monkeypatch.setattr("app.ops.snapshot", good_snapshot)
+    response = await main_module.ready(_request())
+    assert response.status == 200
+    assert b'"ok"' in response.body
+    for leaked in (b"problems", b"payout", b"last_tick", b"queue", b"watcher"):
+        assert leaked not in response.body
+
+
+async def test_ready_returns_503_when_degraded(monkeypatch) -> None:
+    """Мёртвые тики при живом процессе:503 наружу, причина — только под токеном."""
+    monkeypatch.setattr("app.config.settings.health_token", "s3cret")
+
+    async def degraded_snapshot():
+        return {"status": "degraded", "problems": ["тиков нет второй день"]}
+
+    monkeypatch.setattr("app.ops.snapshot", degraded_snapshot)
+    response = await main_module.ready(_request())
+    assert response.status == 503
+    # Вердикт без подробностей: причина тревоги остаётся под токеном в /health.
+    assert response.body == b'{"status": "degraded"}'
+
+
+async def test_ready_degraded_when_snapshot_fails(monkeypatch) -> None:
+    """Снимок недоступен — не «ok»: иначе watchdog молчит ровно в тот
+    момент, когда данные пропали вместе с ним."""
+    async def broken_snapshot():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("app.ops.snapshot", broken_snapshot)
+    response = await main_module.ready(_request())
+    assert response.status == 503
+    assert b'"degraded"' in response.body
+
+
+async def test_ready_survives_locked_health_config(monkeypatch) -> None:
+    """health_require_token=true при пустом токене закрывает /health для всех
+    (fail closed) — /ready обязан отвечать, иначе неверный конфиг убивает и
+    watchdog, то есть мониторинг пропадает вместе с тем, что он охраняет."""
+    monkeypatch.setattr("app.config.settings.health_require_token", True)
+    monkeypatch.setattr("app.config.settings.health_token", "")
+
+    async def good_snapshot():
+        return {"status": "ok"}
+
+    monkeypatch.setattr("app.ops.snapshot", good_snapshot)
+    response = await main_module.ready(_request())
+    assert response.status == 200
+    assert response.body == b'{"status": "ok"}'
