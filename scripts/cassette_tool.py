@@ -478,6 +478,14 @@ def run(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Windows-консоль и pipe в кодировке локали (cp1251) роняют печать
+    # UnicodeEncodeError на замечаниях вроде «нужно ≥3» — линт не долетал
+    # до кода возврата. stdout принудительно в UTF-8 с replace: на UTF-8
+    # терминалах текст чистый, на cp1251 — заменённые знаки вместо краха.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     sys.exit(run(argv))
 
 
