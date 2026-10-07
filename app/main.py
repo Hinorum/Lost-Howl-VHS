@@ -14,6 +14,7 @@ from app.config import settings
 from app.db import init_db
 from app.handlers import build_dispatcher, create_bot
 from app.http_utils import close_http_client, get_http_client
+from app.log_scrub import install as install_log_scrub
 from app.profile import apply_profile
 from app.scheduler import set_bot, start_scheduler, tick
 from app.scheduler_lock import acquire_scheduler_lock, release_scheduler_lock
@@ -29,6 +30,10 @@ def _same_address(left: str, right: str) -> bool:
 
 
 logging.basicConfig(level=logging.INFO)
+# Мнемоника казначея не должна дойти до логов ни от кого: краска ставится
+# сразу после настройки логирования и до старта любых задач, которые могут
+# её упомянуть (см. app/log_scrub.py).
+install_log_scrub()
 # pytoniq именует логгеры по имени класса (client.py: self.__class__.__name__),
 # поэтому лайтсервер пишет в «LiteClient» по строке на каждый shard-блок:
 # getAllShardsInfo/getMasterchainInfo на каждом опросе. На живом прогоне это
