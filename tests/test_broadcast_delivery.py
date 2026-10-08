@@ -721,3 +721,19 @@ async def test_announce_without_bot_leaves_a_trace(monkeypatch, caplog) -> None:
     finally:
         metrics_mod.reset()
         await _wipe(Round)
+
+
+def test_failure_reason_normalizes_for_counter() -> None:
+    """Причина для счётчика устойчива: класс + короткий текст, без переносов.
+
+    Счётчик складывает причины всех получателей тревоги: уникальная строка
+    на чат превратила бы «Причины» в сотни позиций, переносы ломали бы строку
+    метки, а флуд-бакет обязан не зависеть от числа секунд в тексте.
+    """
+    reason = bc.failure_reason(ValueError("битая\nстрока " + "x" * 300))
+    assert reason.startswith("ValueError: ")
+    assert "\n" not in reason
+    assert len(reason) <= 100
+    flood = bc.failure_reason(TelegramRetryAfter(None, "flood", retry_after=7))
+    assert flood == "флуд-контроль: ретрай не помог"
+    assert bc.failure_reason(TelegramRetryAfter(None, "flood", retry_after=3)) == flood

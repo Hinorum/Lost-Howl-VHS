@@ -971,6 +971,9 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
     #      поэтому день, ушедший пустым, был неотличим от доставленного всем.
     #      Тревога только на НУЛЕ: частичные потери — норма (заблокировавшие
     #      бота, чаты без прав), порог по доле кричал бы без причины.
+    #      Почему не доставлено — в delivery_reason:* (кладётся только вместе
+    #      с нулём): факт «не дошло» по логам не разобрать, а причина
+    #      (kicked против сети на Render) решает, куда идти.
     if bot is not None:
         rows = (
             await session.execute(
@@ -986,13 +989,36 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
             except ValueError:
                 logger.debug("Метка доставки %s не разобрана: %r", row.key, row.value)
         if lost:
-            note = "ни одно сообщение не доставлено: " + ", ".join(sorted(lost)[:4])
+            shown = sorted(lost)[:4]
+            note = "ни одно сообщение не доставлено: " + ", ".join(shown)
+            from app.broadcast import DELIVERY_REASON_KEY_PREFIX
+
+            cause_rows = (
+                await session.execute(
+                    select(WatcherState).where(
+                        WatcherState.key.in_(
+                            [f"{DELIVERY_REASON_KEY_PREFIX}{kind}" for kind in shown]
+                        )
+                    )
+                )
+            ).scalars().all()
+            causes = {
+                row.key.removeprefix(DELIVERY_REASON_KEY_PREFIX): (row.value or "")
+                for row in cause_rows
+            }
+            with_cause = [kind for kind in shown if causes.get(kind)]
+            cause_line = ""
+            if with_cause:
+                cause_line = "Причины последнего прохода:\n" + "\n".join(
+                    f"• {kind} — {causes[kind]}" for kind in with_cause
+                ) + "\n"
             await _raise(
                 session,
                 bot,
                 ALERT_DELIVERY_KEY,
                 note,
-                f"⚠️ Рассылка не дошла: {note}. Проверьте права бота в чатах и /health.",
+                f"⚠️ Рассылка не дошла: {note}.\n{cause_line}"
+                "Проверьте права бота в чатах и /health.",
             )
 
     # 3.10. День закрыт и итоги помечены отправленными, а метки доставки нет.

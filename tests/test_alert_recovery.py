@@ -344,6 +344,65 @@ async def test_unparsable_delivery_marker_is_ignored(_clean) -> None:
             await db.commit()
 
 
+async def test_record_delivery_keeps_reason_only_while_zero() -> None:
+    """Причина нулевой доставки живёт рядом с меткой и гаснет вместе с нулём."""
+    from app.broadcast import record_delivery
+
+    try:
+        await record_delivery("day:15", 0, 4, {"доступ закрыт": 3, "сеть": 1})
+        assert await _state("delivery:day:15") == "0/4"
+        reason = await _state("delivery_reason:day:15")
+        assert reason is not None, "причина нулевой доставки обязана сохраниться"
+        assert "доступ закрыт (×3)" in reason and "сеть (×1)" in reason, reason
+        # Доставка пошла — история прошлого прохода не должна уехать в
+        # следующую тревогу задним числом.
+        await record_delivery("day:15", 4, 4, {"доступ закрыт": 4})
+        assert await _state("delivery:day:15") == "4/4"
+        assert await _state("delivery_reason:day:15") is None
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_(["delivery:day:15", "delivery_reason:day:15"])
+                )
+            )
+            await db.commit()
+
+
+async def test_delivery_alarm_carries_last_reason(_clean) -> None:
+    """Тревога «не дошла» называет причину, а не только факт.
+
+    Факт по логам не разобрать (там рассылка всегда «успешна»), а выбор между
+    «kicked» и «сеть на Render» решает, куда идти — в права чатов или в /health.
+    """
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:16", value="0/4"))
+        db.add(
+            WatcherState(
+                key="delivery_reason:day:16",
+                value="доступ к чату закрыт (kicked/бот заблокирован) (×4)",
+            )
+        )
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert any("day:16" in p for p in problems), problems
+        # problems несёт только заметку; полный текст тревоги — в отправке.
+        sent = "\n".join(_clean.sent)
+        assert "Причины последнего прохода" in sent, sent
+        assert "закрыт" in sent, sent
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_(
+                        ["delivery:day:16", "delivery_reason:day:16"]
+                    )
+                )
+            )
+            await db.commit()
+
+
 async def test_empty_announce_audience_raises_alarm(_clean) -> None:
     """Анонс дня без единого получателя — тревога, а не «успех».
 

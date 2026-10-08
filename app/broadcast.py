@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot
@@ -218,6 +219,7 @@ async def _dm_send_all(
     if not player_ids:
         return 0
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
+    reasons: Counter[str] = Counter()
 
     async def worker(player_id: int) -> bool:
         async with semaphore:
@@ -231,19 +233,22 @@ async def _dm_send_all(
                     return True
                 except Exception as exc2:
                     logger.warning("Игроку %s сообщение не доставлено (после ретрая): %s", player_id, exc2)
+                    reasons[failure_reason(exc2)] += 1
                     return False
             except TelegramForbiddenError:
                 # Бот заблокирован или аккаунт удалён: писать сюда больше некуда.
                 await deactivate_player(player_id)
+                reasons["игрок заблокировал бота или аккаунт недоступен"] += 1
                 return False
             except Exception as exc:
                 logger.warning("Игроку %s сообщение не доставлено: %s", player_id, exc)
+                reasons[failure_reason(exc)] += 1
                 return False
 
     outcomes = await asyncio.gather(*(worker(pid) for pid in player_ids))
     delivered = sum(1 for ok in outcomes if ok)
     logger.info("%s: доставлено %d из %d игроков", label, delivered, len(player_ids))
-    await record_delivery(f"dm:{label}", delivered, len(player_ids))
+    await record_delivery(f"dm:{label}", delivered, len(player_ids), reasons)
     return delivered
 
 
@@ -345,14 +350,44 @@ _BROADCAST_PARALLELISM = 8
 
 
 DELIVERY_KEY_PREFIX = "delivery:"
+DELIVERY_REASON_KEY_PREFIX = "delivery_reason:"
 
 
-async def record_delivery(kind: str, delivered: int, attempted: int) -> None:
+def failure_reason(exc: Exception) -> str:
+    """Нормализованная причина отказа доставки для метки `delivery_reason:*`.
+
+    Тревога «рассылка не дошла» называла только факт: по логам причину не
+    прочитать (там рассылка всегда «успешна»), и владелец угадывал, куда идти
+    — в права чатов или в логи Render. Счётчик собирает причины по всем
+    получателям, поэтому строка обязана быть устойчивой, а не уникальной:
+    класс исключения плюс короткий текст без переносов и номеров чатов.
+    """
+    if isinstance(exc, TelegramRetryAfter):
+        # Секунды в тексте сделали бы каждую отправку своей причиной.
+        return "флуд-контроль: ретрай не помог"
+    text = " ".join(str(exc).split())[:80]
+    return f"{type(exc).__name__}: {text}".rstrip(": ")
+
+
+def _reasons_text(reasons: dict[str, int], limit: int = 3) -> str:
+    """Топ причин счётчиком в одну строку метки: «текст (×N); …»."""
+    top = sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    return "; ".join(f"{text} (×{count})" for text, count in top)[:250]
+
+
+async def record_delivery(
+    kind: str, delivered: int, attempted: int, reasons: dict[str, int] | None = None
+) -> None:
     """Записать «доставлено/попыток» для вида рассылки.
 
     Ключ `delivery:<kind>:<stamp>`, значение «<delivered>/<attempted>».
     Позволяет отличить «всем ушло» от «прошло без единого получателя» —
     разница, которую по логам не видно, потому что рассылка там всегда успешна.
+
+    При нулевой доставке рядом кладётся `delivery_reason:<kind>` — почему не
+    дошло (счётчик по получателям). Причина живёт ровно вместе с нулём: как
+    только доставка пошла, строка гаснет, иначе в тревоге висела бы история
+    прошлого прохода задним числом.
 
     Метка НИКОГДА не должна ронять рассылку: это телеметрия, а не условие
     доставки. Ошибка записи уходит в warning и теряется.
@@ -365,6 +400,18 @@ async def record_delivery(kind: str, delivered: int, attempted: int) -> None:
             row = row or WatcherState(key=f"{DELIVERY_KEY_PREFIX}{kind}", value="")
             row.value = f"{delivered}/{attempted}"
             session.add(row)
+            reason_row = await session.get(
+                WatcherState, f"{DELIVERY_REASON_KEY_PREFIX}{kind}"
+            )
+            if delivered == 0 and reasons:
+                if reason_row is None:
+                    reason_row = WatcherState(
+                        key=f"{DELIVERY_REASON_KEY_PREFIX}{kind}", value=""
+                    )
+                reason_row.value = _reasons_text(reasons)
+                session.add(reason_row)
+            elif reason_row is not None:
+                await session.delete(reason_row)
             await session.commit()
     except Exception as exc:
         logger.warning("Метку доставки %s не записали: %s", kind, exc)
@@ -676,12 +723,16 @@ async def _deliver_chat(
     finished: Round | None,
     results_text: str | None,
     remember: bool = False,
+    reasons: Counter[str] | None = None,
 ) -> int | None:
     """Доставка в чат. None — неудача.
 
     Пакета целиком НЕ повторяем: ретрай по флуд-контролю живёт в _send_once,
     на уровне отдельного сообщения. Повтор пакета отправлял итоги дня дважды —
     игрок видел один и тот же результат два раза подряд.
+
+    `reasons` — счётчик причин отказа для метки delivery_reason:* (см.
+    record_delivery): без него тревога «рассылка не дошла» не говорит, почему.
     """
     try:
         if await _deliver_day(
@@ -690,12 +741,16 @@ async def _deliver_chat(
             return chat_id
         return None
     except TelegramForbiddenError:
+        if reasons is not None:
+            reasons["доступ к чату закрыт (kicked/бот заблокирован)"] += 1
         await deactivate_chat(chat_id)
         return None
     except Exception as exc:
         logger.warning(
             "Анонс дня %s не доставлен в чат %s: %s", round_row.day_index, chat_id, exc
         )
+        if reasons is not None:
+            reasons[failure_reason(exc)] += 1
         await _forget_if_gone(chat_id, exc)
         return None
 
@@ -758,10 +813,14 @@ async def announce_new_day(
     # Кнопка памяти снята вместе со слоем сюжета (эхо-система удалена).
     remember = False
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
+    reasons: Counter[str] = Counter()
 
     async def worker(chat_id: int) -> int | None:
         async with semaphore:
-            return await _deliver_chat(bot, chat_id, round_row, finished, results_text, remember=remember)
+            return await _deliver_chat(
+                bot, chat_id, round_row, finished, results_text,
+                remember=remember, reasons=reasons,
+            )
 
     outcomes = await asyncio.gather(*(worker(chat_id) for chat_id in chat_ids))
     delivered = [chat_id for chat_id in outcomes if chat_id is not None]
@@ -771,7 +830,9 @@ async def announce_new_day(
         len(delivered),
         len(chat_ids),
     )
-    await record_delivery(f"day:{round_row.day_index}", len(delivered), len(chat_ids))
+    await record_delivery(
+        f"day:{round_row.day_index}", len(delivered), len(chat_ids), reasons
+    )
     # Личные дубликаты подписчикам: тот же пакет дня (итоги, обложка, кнопки
     # выбора) в личку. Без /start у игрока бот писать не может — такие молча
     # пропускаются; кнопки голосования работают из лички, как и из группы.
@@ -813,6 +874,7 @@ async def _broadcast_text(
         logger.warning("_broadcast_text: нет активных чатов для рассылки (все деактивированы?)")
     if chat_ids:
         semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
+        reasons: Counter[str] = Counter()
 
         async def worker(chat_id: int) -> int | None:
             async with semaphore:
@@ -827,19 +889,22 @@ async def _broadcast_text(
                         return chat_id
                     except Exception as exc2:
                         logger.warning("Текст не доставлен в чат %s (после ретрая): %s", chat_id, exc2)
+                        reasons[failure_reason(exc2)] += 1
                         return None
                 except TelegramForbiddenError:
+                    reasons["доступ к чату закрыт (kicked/бот заблокирован)"] += 1
                     await deactivate_chat(chat_id)
                     return None
                 except Exception as exc:
                     logger.warning("Текст не доставлен в чат %s: %s", chat_id, exc)
+                    reasons[failure_reason(exc)] += 1
                     if any(mark in str(exc).lower() for mark in _FORGET_MARKS):
                         await deactivate_chat(chat_id)
                     return None
 
         outcomes = await asyncio.gather(*(worker(chat_id) for chat_id in chat_ids))
         delivered = len([c for c in outcomes if c is not None])
-        await record_delivery(kind, delivered, len(chat_ids))
+        await record_delivery(kind, delivered, len(chat_ids), reasons)
     else:
         delivered = 0
     # Личные дубликаты подписчикам — даже если живых чатов нет.
@@ -1068,6 +1133,7 @@ async def whisper_to_chats(bot: Bot | None, text: str) -> int:
         return 0
     chat_ids = await active_chat_ids()
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
+    reasons: Counter[str] = Counter()
 
     async def worker(chat_id: int) -> bool:
         async with semaphore:
@@ -1081,12 +1147,15 @@ async def whisper_to_chats(bot: Bot | None, text: str) -> int:
                     return True
                 except Exception as exc2:
                     logger.warning("Шёпот дня не доставлен в чат %s (после ретрая): %s", chat_id, exc2)
+                    reasons[failure_reason(exc2)] += 1
                     return False
             except TelegramForbiddenError:
+                reasons["доступ к чату закрыт (kicked/бот заблокирован)"] += 1
                 await deactivate_chat(chat_id)
                 return False
             except Exception as exc:
                 lowered = str(exc).lower()
+                reasons[failure_reason(exc)] += 1
                 if any(mark in lowered for mark in _FORGET_MARKS):
                     await deactivate_chat(chat_id)
                 else:
@@ -1105,7 +1174,7 @@ async def whisper_to_chats(bot: Bot | None, text: str) -> int:
     outcomes = await asyncio.gather(*(worker(c) for c in chat_ids))
     delivered = sum(1 for ok in outcomes if ok)
     failed = len(chat_ids) - delivered
-    await record_delivery("whisper", delivered, len(chat_ids))
+    await record_delivery("whisper", delivered, len(chat_ids), reasons)
     logger.info(
         "Шёпот дня разослан в %d из %d чатов%s",
         delivered,
