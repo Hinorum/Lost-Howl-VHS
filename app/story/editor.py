@@ -71,9 +71,8 @@ def day_view_text(cassette: Cassette, day: int, road: str = "main") -> str:
         header += f" · дорога {road}"
     header += f" · {item.station} ==="
     lines = [header, item.chapter_title, "", item.chapter_text, ""]
-    if item.dilemma:
-        lines.append(f"(что предстоит решить) {item.dilemma}")
-        lines.append("")
+    lines.append(f"(что предстоит решить) {item.dilemma}")
+    lines.append("")
     for position in (0, 1, 2):
         echo = (item.prev or {}).get(position)
         if echo:

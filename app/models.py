@@ -153,10 +153,10 @@ class Round(Base):
     chapter_title: Mapped[str] = mapped_column(String(300))
     chapter_text: Mapped[str] = mapped_column(Text)
     # Блок «что предстоит решить» (проблема/дилемма/вопрос дня) — снимок поля
-    # dilemma кассеты на момент создания раунда, как и глава. Раунд с ним
-    # показывает в посте эхо → сюжет → дилемму, а три варианта уходят
-    # в кнопки под названиями карт. Null — старая структура: витрина трёх
-    # карт в посте, кнопки «Сцена I/II/III» (см. broadcast.status_text).
+    # dilemma кассеты на момент создания раунда, как и глава: правка кассеты
+    # не двигает уже открытый пост. Структура поста одна — эхо → сюжет →
+    # дилемма, варианты выбора только в кнопках (см. broadcast.status_text).
+    # NULL — только переходные строки до миграции c4e8a1b7d9f2.
     dilemma: Mapped[str | None] = mapped_column(Text, nullable=True)
     opens_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     voting_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

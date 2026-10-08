@@ -350,7 +350,8 @@ async def test_results_post_stake_decided_text(session: AsyncSession) -> None:
     assert "Тропа B" in text
     assert "Кадр дня уцелел по счёту Gram" in text
     assert "на волоске" not in text
-    # Строки сцен пронумерованы римскими — как кнопки «Сцена I/II/III».
+    # Строки сцен пронумерованы римскими — та же нумерация, что и в итогах
+    # дня (scene_label: «I. «название»»), позиция кнопки = позиция карты.
     assert "I: Тропа A: 5" in text
     assert "II: Тропа B: 1" in text
     assert "III: Тропа C: 0" in text

@@ -34,6 +34,7 @@ def _day(index: int) -> dict:
         "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
         "chapter_text": "Стая собирается у котла и смотрит на рельсы.",
+        "dilemma": f"Что решит день {index}?",
         "cards": [
             {
                 "position": 0,
@@ -175,7 +176,7 @@ async def test_plan_day_uses_active_cassette(
         assert payload["chapter_title"] == "Глава 11"  # 11 мая
         assert [card["position"] for card in payload["cards"]] == [0, 1, 2]
         assert payload["cards"][0]["title"] == "Путь А 11"
-        assert payload["dilemma"] is None  # кассета без дилеммы — старая структура
+        assert payload["dilemma"] == "Что решит день 11?"  # 11 мая
     finally:
         uninstall_bay()
 
@@ -184,8 +185,7 @@ async def test_dilemma_reaches_round_column(session, tmp_path, monkeypatch) -> N
     """Полный мост «кассета → payload → колонка раунда» для блока дилеммы.
 
     Снимок дня, как глава: открытый пост не меняется от правки кассеты
-    задним числом; день без дилеммы материализуется с пустой колонкой —
-    пост остаётся в прежней структуре с витриной.
+    задним числом.
     """
     from app.rounds.materialization import _materialize_round
 
@@ -209,12 +209,6 @@ async def test_dilemma_reaches_round_column(session, tmp_path, monkeypatch) -> N
         assert rendered["dilemma"] == "К воде или за топливом?"
         round_row = await _materialize_round(session, rendered, latest=None)
         assert round_row.dilemma == "К воде или за топливом?"
-
-        legacy_payload = dict(rendered)
-        legacy_payload.pop("dilemma")
-        legacy_payload["day_index"] = 8
-        legacy_round = await _materialize_round(session, legacy_payload, latest=None)
-        assert legacy_round.dilemma is None
     finally:
         uninstall_bay()
 

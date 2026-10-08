@@ -25,6 +25,7 @@ def _day(index: int, **overrides) -> dict:
         "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
         "chapter_text": "Стая собирается у котла. Огонь лижет бак, дождь трогает крыши. Пути ждут до рассвета.",
+        "dilemma": "Куда пойдёт стая на рассвете?",
         "cards": [
             {
                 "position": 0,
@@ -138,13 +139,14 @@ def test_field_length_limits_rejected() -> None:
     assert not validate_payload(payload).ok
 
 
-def test_dilemma_optional_and_limited() -> None:
-    """Блок дилеммы — опциональный: без него кассета валидна (старая
-    структура поста), длиннее лимита — отвергается (блок обязан целиком
-    влезать в пост, режется он только многоточием-страховкой)."""
+def test_dilemma_required_and_limited() -> None:
+    """Блок дилеммы обязателен (одна структура дня для всех кассет) и не
+    длиннее лимита: пост обязан показывать его целиком."""
     payload = _payload("2026-04", 30)
-    assert validate_payload(payload).ok
+    del payload["days"][0]["dilemma"]
+    assert not validate_payload(payload).ok
 
+    payload = _payload("2026-04", 30)
     payload["days"][0]["dilemma"] = "Куда пойдёт стая: к воде или за топливом?"
     assert validate_payload(payload).ok
 
@@ -184,7 +186,7 @@ def test_field_limits_tighten_to_display() -> None:
 
 
 def test_style_vitrina_budget_warns() -> None:
-    """Три описания длиннее одного экрана витрины — мягкое замечание."""
+    """Три описания длиннее одного экрана — мягкое замечание."""
     payload = _payload("2026-04", 30)
     for card in payload["days"][0]["cards"]:
         card["description"] = "д" * 240

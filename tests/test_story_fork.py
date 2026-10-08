@@ -25,6 +25,7 @@ def _day(index: int, chapter: str | None = None) -> dict:
         "station": f"Колодец {index}",
         "chapter_title": chapter,
         "chapter_text": "Стая слушает шорох плёнки.",
+        "dilemma": "Что ответит стая шороху?",
         "cards": [
             {
                 "position": 0,

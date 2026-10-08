@@ -34,28 +34,27 @@ _FORGET_MARKS = ("forbidden", "not found", "kicked", "deactivated", "migrated")
 
 def cards_keyboard(
     round_id: int,
+    cards,
     remember: bool = False,
     day_index: int | None = None,
-    cards=None,
 ) -> InlineKeyboardMarkup:
     """Три кнопки голосования под постом дня.
 
-    С картами дня — подписываем сами варианты: кнопка несёт название сцены
-    (короткое действие из кассеты), а не «Сцена I». Название длиннее лимита
-    Telegram обрезается по словам, как и в посте. Последствия в кнопку не
-    попадают — их текст дня не показывает; канон живёт в consequence и
-    всплывает в итогах. Без карт (легаси-вызовы, тесты) — прежние подписи.
+    Единственная структура дня: варианты выбора живут только здесь, поэтому
+    карта обязательна. Подпись — название сцены из кассеты (короткое
+    действие), длиннее лимита Telegram обрезается по словам. Последствия в
+    кнопку не попадают — их текст дня не показывает; канон живёт
+    в consequence и всплывает в итогах.
     """
-    labels = ["Сцена I", "Сцена II", "Сцена III"]
-    if cards:
-        titles = {card.position: (card.title or "").strip() for card in cards}
-        for position in range(3):
-            title = titles.get(position) or ""
-            if not title:
-                continue
-            if len(title) > _BUTTON_TEXT_MAX:
-                title = _clamp(title, _BUTTON_TEXT_MAX - 1)
-            labels[position] = title
+    titles = {card.position: (card.title or "").strip() for card in cards}
+    labels = []
+    for position in range(3):
+        # Позиции 0–2 гарантирует схема кассеты; `or` — страховка от битой
+        # строки в базе, чтобы рассылка не падала на отправке.
+        label = titles.get(position) or f"Сцена {POSITIONS[position]}"
+        if len(label) > _BUTTON_TEXT_MAX:
+            label = _clamp(label, _BUTTON_TEXT_MAX - 1)
+        labels.append(label)
     rows = [
         [
             InlineKeyboardButton(text=labels[position], callback_data=f"vote:{round_id}:{position}")
@@ -117,27 +116,19 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
         phase = "⏳ Подсчёт: итоги через мгновение."
     else:
         phase = "🌙 День закрыт."
-    # Пути голосования читаются словами: заголовок + суть каждого.
-    # (Раньше описания жили в подписях трёх фото-карт — генерацию карт
-    # убрали, и текст снова стал носителем смысла развилки.)
-    # Компактный профиль: контракт кассеты просит карту не длиннее 260 знаков
-    # (поле description, схема ≤260), а показ здесь даёт ровно этот задел —
-    # текст развилки не режется многоточием.
     # Экранирование — ПОСЛЕ обрезки, а не до: сущность (&amp;) нельзя рвать,
     # а кламп режет по словам. Разметку ждут все вызывающие status_text
-    # (везде parse_mode=HTML), а глава и карты — текст кассеты, не наш: сырой
-    # `<` или `&` из правки в /panel Telegram отвергает ЦЕЛИКОМ, и пакет дня
-    # не доходит ни в один чат, ни в одну личку — «0 из N» без единого
-    # виноватого получателя. Ровно это уже чинили в tally._tg_escape.
-    cards = "\n".join(
-        f"{POSITIONS[card.position]}. {html.escape(_clamp(card.title, 80), quote=False)} — "
-        f"{html.escape(_clamp(card.description, 260), quote=False)}"
-        for card in sorted(round_row.cards, key=lambda item: item.position)
-    )
-    # День с дилеммой — новая структура поста: варианты голосования живут
-    # только в кнопках (их подписи — названия карт, см. cards_keyboard),
-    # поэтому витрина трёх карт не набирается. День без поля — прежняя
-    # витрина, пока кассету не перепишут под неё.
+    # (везде parse_mode=HTML), а текст кассеты — не наш: сырой `<` или `&`
+    # из правки в /panel Telegram отвергает ЦЕЛИКОМ, и пакет дня не доходит
+    # ни в один чат, ни в одну личку — «0 из N» без единого виноватого
+    # получателя. Ровно это уже чинили в tally._tg_escape.
+    #
+    # Единственная структура дня: эхо вчерашнего выбора (в начале главы) →
+    # сюжет → блок «что предстоит решить». Три варианта живут только
+    # в кнопках (их подписи — названия карт, см. cards_keyboard) — витрины
+    # в тексте больше нет. NULL дилеммы — переходные строки, созданные до
+    # миграции c4e8a1b7d9f2: пост остаётся читаемым, блок появится
+    # со следующего открытого дня.
     dilemma = getattr(round_row, "dilemma", None) or ""
     bank_line = ""
     if settings.ton_enabled and getattr(round_row, "money_mode", True) is not False:
@@ -173,12 +164,9 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
     # Хвост поста (правило дня, банк, дедлайн) неприкосновенен: при упоре в
     # потолок режется «верх», а не обещание игроку сроков исхода голосования.
     tail = f"\n\n{phase}{bank_line}\n{deadline}"
-    if dilemma:
-        # Эхо и сюжет уже стоят в head/story; дилемма замыкает повествование
-        # ровно там, где игрок должен выбрать действие.
-        core = f"{head}{story}{html.escape(_clamp(dilemma, _DILEMMA_CLAMP), quote=False)}"
-    else:
-        core = f"{head}{story}{cards}"
+    # Эхо и сюжет уже стоят в head/story; дилемма замыкает повествование
+    # ровно там, где игрок должен сделать выбор.
+    core = f"{head}{story}{html.escape(_clamp(dilemma, _DILEMMA_CLAMP), quote=False)}"
     budget = _MAX_TEXT_LEN - len(tail)
     if len(core) > budget:
         core = _clamp(core, budget)

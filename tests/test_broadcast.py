@@ -23,6 +23,7 @@ def _round(day_index: int, media_dir) -> Round:
         win_rule=WinRule.MAJORITY,
         chapter_title="День проверки рассылки",
         chapter_text="Текст.",
+        dilemma="Каким кадром останется день?",
 
 
         opens_at=datetime.now(UTC),
@@ -177,19 +178,22 @@ async def test_status_bank_line_shows_amount_only(monkeypatch, tmp_path) -> None
     assert "Банк дня: 0.00 Gram" in text
 
 
-async def test_status_carries_paths_and_media_is_empty(tmp_path) -> None:
-    """Шаблонный день: пути читаются текстом статуса, медиа дня отключено."""
+async def test_status_keeps_paths_out_of_text(tmp_path) -> None:
+    """Варианты в текст поста не идут — только в кнопки (см. cards_keyboard):
+    пост несёт сюжет и дилемму, а не витрину трёх карт."""
     from app.broadcast import status_text
 
     round_row = _round(9300, tmp_path)
     status = await status_text(round_row)
-    for position in range(3):
-        assert f"{['I', 'II', 'III'][position]}. Путь {position} — описание" in status
+    assert "I. Путь 0" not in status
+    assert "описание" not in status
+    assert "Каким кадром останется день?" in status
     assert len(status) <= 4096
 
 
-async def test_status_carries_story_between_title_and_paths(tmp_path) -> None:
-    """Глава кассеты видна живым текстом: заголовок → проза → тропы."""
+async def test_status_carries_story_between_title_and_dilemma(tmp_path) -> None:
+    """Единственная структура дня: заголовок → сюжет (эхо в его начале) →
+    блок «что предстоит решить»."""
     from app.broadcast import status_text
 
     round_row = _round(9302, tmp_path)
@@ -198,8 +202,8 @@ async def test_status_carries_story_between_title_and_paths(tmp_path) -> None:
     assert "Текст." in status
     title_at = status.index("День проверки рассылки")
     story_at = status.index("Текст.")
-    paths_at = status.index("I. Путь 0")
-    assert title_at < story_at < paths_at
+    dilemma_at = status.index("Каким кадром останется день?")
+    assert title_at < story_at < dilemma_at
 
 
 async def test_status_escapes_cassette_text(tmp_path) -> None:
@@ -215,35 +219,35 @@ async def test_status_escapes_cassette_text(tmp_path) -> None:
     round_row = _round(9304, tmp_path)
     round_row.chapter_title = "Свет & тень <ночи>"
     round_row.chapter_text = "Стая помнит R&D и <следы>."
-    round_row.cards[0].title = "Путь <0>"
-    round_row.cards[1].description = "описание & канон"
+    round_row.dilemma = "Мост & река: <куда> пойти?"
     status = await status_text(round_row)
     assert "Свет &amp; тень &lt;ночи&gt;" in status
     assert "Стая помнит R&amp;D и &lt;следы&gt;." in status
-    assert "I. Путь &lt;0&gt;" in status
-    assert "описание &amp; канон" in status
+    assert "Мост &amp; река: &lt;куда&gt; пойти?" in status
     assert "<ночи>" not in status
     assert "<следы>" not in status
-    assert "<0>" not in status
+    assert "<куда>" not in status
 
 
-async def test_status_dilemma_day_replaces_card_vitrine(tmp_path) -> None:
-    """День с дилеммой: пост несёт блок «что предстоит решить», витрина трёх
-    карт в текст не идёт — варианты живут только в кнопках (их подписи —
-    названия карт, см. cards_keyboard). День без поля — прежняя витрина,
-    пока кассету не перепишут (регресс для текущей библиотеки)."""
+async def test_status_single_structure_needs_dilemma(tmp_path) -> None:
+    """Единственная структура дня: сюжет → блок «что предстоит решить»,
+    без витрины трёх карт — варианты выбора только в кнопках."""
     from app.broadcast import status_text
 
     round_row = _round(9306, tmp_path)
-    round_row.dilemma = "Кому отдать последнюю миску: старому или щенку?"
     status = await status_text(round_row)
-    assert "Кому отдать последнюю миску" in status
+    assert "Каким кадром останется день?" in status
     assert "I. Путь 0" not in status
     # Механика дня цела: правило/дедлайн хвоста поста не задеты.
     assert "Сцена дня" in status
 
+    # NULL дилеммы — переходные строки до миграции c4e8a1b7d9f2: пост
+    # остаётся читаемым (сюжет и хвост на месте), падения нет.
     round_row.dilemma = None
-    assert "I. Путь 0" in await status_text(round_row)
+    legacy = await status_text(round_row)
+    assert "Текст." in legacy
+    assert "I. Путь 0" not in legacy
+    assert "Сцена дня" in legacy
 
 
 async def test_status_keeps_deadline_when_core_overflows(tmp_path, monkeypatch) -> None:
@@ -252,8 +256,8 @@ async def test_status_keeps_deadline_when_core_overflows(tmp_path, monkeypatch) 
     from app.broadcast import status_text
 
     round_row = _round(9303, tmp_path)
-    for card in round_row.cards:
-        card.description = "д" * 60
+    round_row.chapter_text = "д" * 500
+    round_row.dilemma = "д" * 400
     monkeypatch.setattr(broadcast, "_MAX_TEXT_LEN", 300)
     status = await status_text(round_row)
     vote = round_row.voting_ends_at.strftime("%H:%M")

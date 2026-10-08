@@ -146,26 +146,30 @@ def test_clamp_handles_text_without_spaces() -> None:
     assert clamped == "0" * 10 + "…"
 
 
+def _cards() -> list[SimpleNamespace]:
+    return [SimpleNamespace(position=position, title=f"Путь {position}") for position in range(3)]
+
+
 def test_cards_keyboard_remember_button_encodes_day() -> None:
     """Кнопка памяти несёт и PK раунда, и day_index: после /resetgame они
     разъезжаются, и без второго поля эхо ищется не в том дне."""
-    plain = bc.cards_keyboard(7)
+    plain = bc.cards_keyboard(7, cards=_cards())
     assert [b.callback_data for b in plain.inline_keyboard[0]] == [
         "vote:7:0",
         "vote:7:1",
         "vote:7:2",
     ]
-    with_remember = bc.cards_keyboard(7, remember=True)
+    with_remember = bc.cards_keyboard(7, cards=_cards(), remember=True)
     button = with_remember.inline_keyboard[1][0]
     assert button.callback_data == "remember:7:7"
-    explicit = bc.cards_keyboard(7, remember=True, day_index=80_123)
+    explicit = bc.cards_keyboard(7, cards=_cards(), remember=True, day_index=80_123)
     assert explicit.inline_keyboard[1][0].callback_data == "remember:7:80123"
 
 
 def test_cards_keyboard_signs_buttons_with_scene_titles() -> None:
-    """Кнопки несут названия сцен из кассеты, а не «Сцена I»: игрок выбирает
-    конкретное действие. Длинное название обрезается в пределах лимита
-    кнопки Telegram; без карт — прежние подписи (легаси-вызовы)."""
+    """Подписи кнопок — названия сцен из кассеты: игрок выбирает конкретное
+    действие. Длинное название обрезается в пределах лимита кнопки Telegram;
+    последствий в кнопке нет — их текст дня не показывает."""
     cards = [
         SimpleNamespace(position=0, title="Идти к реке"),
         SimpleNamespace(position=1, title="Слушать эхо"),
@@ -175,8 +179,6 @@ def test_cards_keyboard_signs_buttons_with_scene_titles() -> None:
     assert labels[:2] == ["Идти к реке", "Слушать эхо"]
     assert len(labels[2]) <= 64
     assert labels[2].endswith("…")
-    legacy = [b.text for b in bc.cards_keyboard(7).inline_keyboard[0]]
-    assert legacy == ["Сцена I", "Сцена II", "Сцена III"]
 
 
 async def test_status_text_for_closed_and_tallying_phases() -> None:

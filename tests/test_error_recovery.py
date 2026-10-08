@@ -220,6 +220,7 @@ def _transient_round(tmp_path) -> Round:
         win_rule=WinRule.MAJORITY,
         chapter_title="День проверки /today",
         chapter_text="Текст.",
+        dilemma="Каким кадром останется день?",
 
 
         opens_at=datetime.now(UTC),
@@ -261,7 +262,8 @@ async def test_today_delivers_status_text_without_media(monkeypatch, tmp_path) -
     message.answer_media_group.assert_not_awaited()
     assert message.answer.await_count == 1
     status_text_sent = message.answer.call_args.args[0]
-    assert "I. Путь 0" in status_text_sent
+    assert "День проверки /today" in status_text_sent
+    assert "I. Путь 0" not in status_text_sent
 
 
 async def test_today_normal_path_sends_status(monkeypatch, tmp_path) -> None:

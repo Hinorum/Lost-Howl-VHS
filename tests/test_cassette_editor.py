@@ -51,6 +51,7 @@ def _mk_cassette(
             "station": f"станция {i}",
             "chapter_title": f"глава {i}",
             "chapter_text": f"текст {i}",
+            "dilemma": f"Что решит день {i}?",
             "cards": [
                 {"position": 0, "title": f"ход {i}a", "description": "описание", "consequence": "канон"},
                 {"position": 1, "title": f"ход {i}b", "description": "описание", "consequence": "канон"},
@@ -89,15 +90,18 @@ def _write_cassette(directory: Path, name: str = "mel.json") -> Path:
 
 
 def test_day_view_text_shows_dilemma() -> None:
-    """Кадр дня для чтения (панель/CLI) несёт блок «что предстоит решить»,
-    когда он есть, — автор видит структуру поста ещё до рендера."""
+    """Кадр дня для чтения (панель/CLI) несёт блок «что предстоит решить» —
+    автор видит структуру поста ещё до рендера."""
     cassette = _mk_cassette()
-    cassette.days[0].dilemma = "Остаться у котла или пойти к реке?"
-    view = ed.day_view_text(cassette, 1)
-    assert "(что предстоит решить) Остаться у котла или пойти к реке?" in view
+    assert (
+        "(что предстоит решить) Что решит день 1?" in ed.day_view_text(cassette, 1)
+    )
 
-    cassette.days[0].dilemma = None
-    assert "что предстоит решить" not in ed.day_view_text(cassette, 1)
+    cassette.days[0].dilemma = "Остаться у котла или пойти к реке?"
+    assert (
+        "(что предстоит решить) Остаться у котла или пойти к реке?"
+        in ed.day_view_text(cassette, 1)
+    )
 
 
 def test_scenario_roundtrip_via_editor(tmp_path) -> None:

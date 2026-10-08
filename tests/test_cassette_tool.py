@@ -30,6 +30,7 @@ def _mk_cassette(month: str = "2026-02", days_n: int = 28) -> dict:
                 "station": f"станция {i}",
                 "chapter_title": f"глава {i}",
                 "chapter_text": f"текст {i}",
+                "dilemma": f"Что решит день {i}?",
                 "cards": [
                     {"position": 0, "title": f"ход {i}a", "description": "описание", "consequence": "канон"},
                     {"position": 1, "title": f"ход {i}b", "description": "описание", "consequence": "канон"},
@@ -282,6 +283,7 @@ def _clean_cassette_payload(month: str = "2026-12", n: int = 31) -> dict:
                 "station": f"станция {i}",
                 "chapter_title": f"глава {i}",
                 "chapter_text": f"текст {i}",
+                "dilemma": f"Что решит день {i}?",
                 "prev": (
                     {p: "Мимо след вчерашнего дня" for p in (0, 1, 2)}
                     if i > 1

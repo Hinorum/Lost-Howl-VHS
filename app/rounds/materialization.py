@@ -39,7 +39,7 @@ async def _materialize_round(
         rule_entropy=payload.get("rule_entropy") or None,
         chapter_title=payload["chapter_title"],
         chapter_text=payload["chapter_text"],
-        dilemma=payload.get("dilemma"),
+        dilemma=payload["dilemma"],
         opens_at=opens_at,
         voting_ends_at=voting_ends_at,
         tally_ends_at=tally_ends_at,
