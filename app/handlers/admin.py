@@ -382,7 +382,10 @@ async def cmd_dispute(message: Message) -> None:
                 reason = " ".join(parts[4:]) if len(parts) > 4 else ""
                 reply = await dispute_mod.open_dispute(session, round_id, pid, reason)
             elif verb == "resolve" or verb == "reject":
-                if len(parts) < 2:
+                # Гарант `< 3`, а не `< 2`: с двумя частями (/dispute resolve)
+                # проверка проходила, а parts[2] ронял IndexError — команда
+                # падала вместо подсказки формата.
+                if len(parts) < 3:
                     await message.answer("Формат: /dispute resolve <id> [примечание]")
                     return
                 try:
