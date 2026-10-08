@@ -184,3 +184,53 @@ async def test_disabled_flag_turns_store_into_noop(library, monkeypatch) -> None
     assert (result.written, result.removed, result.failed) == (0, 0, False)
     assert await _row(name) is None
     assert await store.persist(name) is True
+    # Ручной слепок при выключенном флаге — тоже честный no-op без базы.
+    assert await store.persist_backup(name) is True
+
+
+async def test_persist_backup_stores_snapshot_without_touching_edited_at(library) -> None:
+    """Кнопка «Снять бэкап»: слепок уходит в базу, payload и edited_at не двигаются."""
+    name = "store-snap-2099-10.json"
+    _write_cassette(library, name, "2099-10", 31, "v1")
+    await store.bootstrap()
+    _write_cassette(library, name, "2099-10", 31, "edited")
+    assert await store.persist(name)
+    payload_before, edited_at, _bak = await _row(name)
+    assert edited_at is not None
+    (library / f"{name}.bak").write_text('{"слепок": true}', encoding="utf-8")
+
+    assert await store.persist_backup(name)
+
+    payload, edited_at_after, backup = await _row(name)
+    assert payload == payload_before, "слепок — не правка: контент не меняется"
+    assert edited_at_after == edited_at, "провенанс строки портить нельзя"
+    assert backup == '{"слепок": true}'
+
+
+async def test_persist_backup_seeds_row_for_untracked_file(library) -> None:
+    """Файла ещё нет в базе — строка поднимается с диска, edited_at остаётся None."""
+    name = "store-snap-2099-11.json"
+    _write_cassette(library, name, "2099-11", 30, "seed")
+    (library / f"{name}.bak").write_text("{}", encoding="utf-8")
+
+    assert await store.persist_backup(name)
+
+    payload, edited_at, backup = await _row(name)
+    assert edited_at is None
+    assert (library / name).read_text(encoding="utf-8") == payload
+    assert backup == "{}"
+
+
+async def test_persist_backup_refuses_missing_or_broken_snapshot(library) -> None:
+    """Нет слепка или он не JSON — в базу не идёт, строка не трогается."""
+    name = "store-snap-2099-12.json"
+    _write_cassette(library, name, "2099-12", 31, "keep")
+    await store.bootstrap()
+
+    assert await store.persist_backup(name) is False  # слепка нет
+
+    (library / f"{name}.bak").write_text("{бито", encoding="utf-8")
+    assert await store.persist_backup(name) is False
+    _payload, edited_at, backup = await _row(name)
+    assert backup is None
+    assert edited_at is None

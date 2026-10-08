@@ -42,6 +42,7 @@ from app.story.editor import (
     day_yaml,
     restore_backup,
     scenario_yaml,
+    snapshot_backup,
 )
 from app.story.narrative_lint import lint_groups
 from app.story.schema import Cassette, validate_file
@@ -726,6 +727,7 @@ def _scene_keyboard(
     ]
     if awaiting:
         rows.append([_cb("⏹ Отменить загрузку", f"cassette:stop:{file_name}")])
+    rows.append([_cb("💾 Снять бэкап", f"cassette:snapshot:{file_name}")])
     if has_backup:
         rows.append([_cb("🗄 Вернуть бэкап", f"cassette:restore:{file_name}")])
     rows.append([_cb("🔙 К библиотеке", "cassette:back")])
@@ -1041,6 +1043,44 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 parse_mode=ParseMode.HTML,
                 reply_markup=_new_keyboard(),
             )
+        elif op == "snapshot":
+            safe = _safe_cassette_name(file_name)
+            path = default_cassettes_dir() / safe if safe else None
+            if path is None or not path.is_file():
+                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
+                return
+            had_backup = _has_backup(file_name)  # до снятия слепка
+            ok, lines = snapshot_backup(safe, default_cassettes_dir())
+            if not ok:
+                await callback.answer("\n".join(lines)[:200], show_alert=True)
+                return
+            # Слепок — не правка контента: в базу уходит только колонка backup,
+            # edited_at не двигается (иначе деплой навсегда закрыл бы строку).
+            persisted = await story_store.persist_backup(safe, default_cassettes_dir())
+            entry = _library_entry(file_name)
+            if not had_backup and entry is not None and entry.cassette is not None:
+                # Клавиатура изменилась (появилась «Вернуть бэкап») — перерисуем
+                # экран; при уже имеющемся слепке сообщение не изменилось,
+                # и повторный edit_text упал бы на «message is not modified».
+                async with SessionLocal() as session:
+                    edit_file, _unused = await get_edit_intent(session)
+                status = await _scene_status(entry)
+                await callback.message.edit_text(
+                    f"{_scene_text(entry, status)}{_scene_badge(edit_file == file_name)}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_scene_keyboard(
+                        file_name,
+                        awaiting=(edit_file == file_name),
+                        has_backup=True,
+                    ),
+                )
+            await callback.answer(
+                "Слепок снят: состояние кассеты зафиксировано."
+                if persisted
+                else "Слепок снят только на диске — в базу не ушёл, "
+                "пропадёт при рестарте."
+            )
+            return
         elif op == "restore":
             safe = _safe_cassette_name(file_name)
             path = default_cassettes_dir() / safe if safe else None

@@ -365,3 +365,27 @@ def restore_backup(file_name: str, directory: Path) -> tuple[bool, list[str]]:
         return False, lines
     shutil.copy2(bak, path)
     return True, [f"Кассета {file_name} восстановлена из {file_name}.bak."]
+
+
+def snapshot_backup(file_name: str, directory: Path) -> tuple[bool, list[str]]:
+    """Ручной слепок текущего состояния кассеты (точка отката без правки).
+
+    Обычный слепок снимается автоматически перед каждой правкой из панели;
+    кнопка «Снять бэкап» фиксирует состояние по требованию — например, перед
+    изменением, которое придёт не из панели (деплой, правка руками). Слепок
+    один, как и у «Вернуть бэкап»: прежний `.bak` перезаписывается.
+    """
+    if not is_safe_cassette_name(file_name):
+        return False, ["Недопустимое имя файла."]
+    path = directory / file_name
+    if not path.is_file():
+        return False, [f"Кассеты {file_name} нет в библиотеке — нечего запоминать."]
+    had = path.with_name(path.name + ".bak").is_file()
+    try:
+        _backup(path)
+    except OSError:
+        return False, [f"Слепок {file_name}.bak не записался — нет доступа к файлу."]
+    lines = [f"Слепок {file_name}.bak снят: текущее состояние зафиксировано."]
+    if had:
+        lines.append("Прежний слепок перезаписан.")
+    return True, lines

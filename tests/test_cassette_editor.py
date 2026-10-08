@@ -633,6 +633,54 @@ async def test_restore_callback_without_backup(monkeypatch, tmp_path) -> None:
     assert "Бэкапа" in callback.answer.call_args.args[0]
 
 
+async def test_snapshot_callback_takes_backup_without_edit(monkeypatch, tmp_path) -> None:
+    """«💾 Снять бэкап»: слепок текущего состояния без единой правки."""
+    source = _enable_library(monkeypatch, tmp_path)
+
+    callback = _make_callback("cassette:snapshot:mel.json")
+    await panel_mod.on_cassette_action(callback)
+
+    assert callback.answer.call_args.args[0] == (
+        "Слепок снят: состояние кассеты зафиксировано."
+    )
+    bak = tmp_path / "mel.json.bak"
+    assert bak.is_file()
+    assert bak.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+    assert validate_file(source).cassette is not None, "содержимое не изменилось"
+    # На экране плёнки появилась кнопка отката.
+    labels = _flat(callback.message.edit_text.call_args.kwargs["reply_markup"])
+    assert "🗄 Вернуть бэкап" in labels
+    assert "💾 Снять бэкап" in labels
+
+
+async def test_snapshot_second_click_overwrites_and_skips_rerender(
+    monkeypatch, tmp_path
+) -> None:
+    """Повторный снимок перезаписывает слепок; edit_text не дёргается — тост хватит."""
+    source = _enable_library(monkeypatch, tmp_path)
+    (tmp_path / "mel.json.bak").write_text("старый слепок", encoding="utf-8")
+
+    callback = _make_callback("cassette:snapshot:mel.json")
+    await panel_mod.on_cassette_action(callback)
+
+    bak = tmp_path / "mel.json.bak"
+    assert bak.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+    assert "Слепок снят" in callback.answer.call_args.args[0]
+    callback.message.edit_text.assert_not_called()
+
+
+async def test_snapshot_rejects_unsafe_name(monkeypatch, tmp_path) -> None:
+    """Имя с выходом из каталога отсекается до работы с файлом."""
+    _enable_library(monkeypatch, tmp_path)
+
+    callback = _make_callback("cassette:snapshot:../evil.json")
+    await panel_mod.on_cassette_action(callback)
+
+    assert "Некорректное имя кассеты." in callback.answer.call_args.args[0]
+    callback.message.edit_text.assert_not_called()
+    assert not (tmp_path.parent / "evil.json.bak").exists()
+
+
 async def test_document_handler_applies_day_edit(monkeypatch, tmp_path) -> None:
     """Документ «фрагмент дня» компилируется и кладётся в кассету, намерение гаснет."""
     source = _enable_library(monkeypatch, tmp_path)

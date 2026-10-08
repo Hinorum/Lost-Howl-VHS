@@ -1,5 +1,5 @@
-# Хранитель: жизненный цикл дня (/advance, /resetgame), диалог разбирательства,
-# сверка фонда (/adjust) и стоп-кран (/pause, /resume).
+# Хранитель: жизненный цикл дня (/advance, /resetgame), снимок БД (/backup),
+# диалог разбирательства, сверка фонда (/adjust) и стоп-кран (/pause, /resume).
 from __future__ import annotations
 
 import json
@@ -290,6 +290,52 @@ async def cmd_resetgame(message: Message) -> None:
     await message.answer(
         f"{ok_mark('reset')} Игра обнулена. День {new_round.day_index} объявлен в чатах. "
         f"{mode} Голосование до {new_round.voting_ends_at:%H:%M} UTC."
+    )
+
+
+@router.message(Command("backup"), F.chat.type == ChatType.PRIVATE)
+async def cmd_backup(message: Message) -> None:
+    """Ручной снимок БД из Телеграма: репетиция восстановления, страховка.
+
+    Автоматика уже есть (cron db-backup, снимок на старте, офсайтовый
+    GitHub Actions) — команда даёт снимок по требованию: перед ручными
+    операциями и для репетиции восстановления на тестовом стенде.
+    """
+    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
+        await message.answer("Команда только для хранителя игры.")
+        return
+    await message.answer("⏳ Снимаю снимок базы…")
+    try:
+        from app.backups import backup_now
+
+        dest = await backup_now()
+    except Exception:
+        logger.exception("Ручной бэкап по /backup не удался")
+        await message.answer(
+            f"{warn_mark('queue')} Бэкап не удался (см. лог бота). "
+            "Ежедневный cron db-backup это не отменяет."
+        )
+        return
+    if dest is None:
+        await message.answer(
+            f"{warn_mark('queue')} Снимок не создан: pg_dump недоступен в окружении "
+            "или файл БД не найден (см. лог). Cron db-backup и GitHub Actions "
+            "продолжают работать."
+        )
+        return
+    size = dest.stat().st_size
+    size_text = (
+        f"{size / 1024:.0f} КБ" if size < 1024 * 1024 else f"{size / (1024 * 1024):.1f} МБ"
+    )
+    await message.answer(
+        f"{ok_mark('go')} Снимок БД: <code>{dest.name}</code> ({size_text}). "
+        "Файл непустой, таблицы читаются, отметка свежести обновлена.\n"
+        "⚠️ Папка <code>data/backups</code> на Render эфемерна: копии пропадают "
+        "при деплое и ротируются (KEEP=7). Долговечная копия — офсайтовый "
+        "GitHub Actions db-backup (01:30 UTC).\n"
+        "Кассеты (story_cassettes) в дампе есть — для репетиции восстановления "
+        "на стенде этого достаточно.",
+        parse_mode=ParseMode.HTML,
     )
 
 

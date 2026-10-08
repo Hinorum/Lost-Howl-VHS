@@ -342,3 +342,58 @@ async def persist(file_name: str, directory: Path | None = None) -> bool:
         )
         return False
     return True
+
+
+async def persist_backup(file_name: str, directory: Path | None = None) -> bool:
+    """Сохранить слепок `.bak` в базу, не меняя payload и edited_at.
+
+    Ручная кнопка «Снять бэкап» — не правка контента: ей нет причин
+    отмечать строку правленной (иначе деплой навсегда перестал бы принимать
+    для неё контент-фиксы из репозитория). В базу идёт только колонка
+    backup — долговечная копия слепка, переживающая рестарт и деплой.
+    """
+    if not enabled():
+        return True
+    if not is_safe_cassette_name(file_name):
+        logger.error("Кассета %s: недопустимое имя — слепок не сохраняем", file_name)
+        return False
+    directory = directory or default_cassettes_dir()
+    path = directory / file_name
+    backup = _read_backup(path)
+    if backup is None:
+        logger.error("Слепок кассеты %s не найден — в базу не сохраняем", file_name)
+        return False
+    try:
+        json.loads(backup)  # слепок в зеркале базы тоже обязан быть JSON
+    except ValueError as exc:
+        logger.error("Слепок кассеты %s не сохранится в базу: %s", file_name, exc)
+        return False
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(StoryCassette, file_name)
+            if row is None:
+                # Строки ещё нет (кассету не правили из панели): поднимаем её
+                # целиком, payload берём с диска — как это делает adopt.
+                payload = _read(path)
+                if payload is None:
+                    logger.error("Кассета %s не читается — слепок не сохраняем", file_name)
+                    return False
+                session.add(
+                    StoryCassette(
+                        name=file_name,
+                        payload=payload,
+                        backup=backup,
+                        edited_at=None,
+                        updated_at=_now(),
+                    )
+                )
+            else:
+                row.backup = backup
+                row.updated_at = _now()
+            await session.commit()
+    except Exception:
+        logger.exception(
+            "Слепок кассеты %s остался только на диске — база недоступна", file_name
+        )
+        return False
+    return True

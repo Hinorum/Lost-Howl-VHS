@@ -23,6 +23,7 @@ import app.handlers.panel as panel_mod
 from app.handlers.admin import (
     cmd_adjust,
     cmd_advance,
+    cmd_backup,
     cmd_dispute,
     cmd_disputes,
     cmd_finalize,
@@ -56,6 +57,7 @@ ADMIN_TEXT = "только для хранителя"
 
 COMMAND_GUARDS = [
     (cmd_advance, "/advance"),
+    (cmd_backup, "/backup"),
     (cmd_resetgame, "/resetgame"),
     (cmd_dispute, "/dispute open 3 1 x"),  # admin-глагол open — гейт срабатывает до разбора
     (cmd_disputes, "/disputes"),
