@@ -334,6 +334,12 @@ async def test_backup_alarm_names_the_offsite_chain(monkeypatch) -> None:
         assert "GitHub Actions" in joined, joined
         assert "db-backup" in joined, joined
         assert "BACKUP_PASSPHRASE" in joined, joined
+        # Дата в тревоге настоящая, а не «?»: раньше в _human_ts (форматер
+        # unix-времени) передавали datetime, int() падал и тревога скрывала,
+        # когда бэкап был.
+        expect = datetime.fromisoformat(stale).astimezone().strftime("%d.%m %H:%M")
+        assert f"был {expect}" in joined, joined
+        assert "был ?" not in joined, joined
     finally:
         ops._problems_in_flight.clear()
         ops._problem_entry.clear()

@@ -588,7 +588,9 @@ async def _check_backup_freshness(session, bot) -> None:
                 bot,
                 ALERT_BACKUP_KEY,
                 f"нет успешного бэкапа {age_h:.0f} ч",
-                f"⚠️ Последний успешный бэкап БД был {_human_ts(last_ok)}, "
+                # _human_ts ждёт unix-время; раньше сюда передавали сам datetime,
+                # int() падал, и тревога честно врала «был ?» вместо даты.
+                f"⚠️ Последний успешный бэкап БД был {_human_ts(last_ok.timestamp())}, "
                 f"это {age_h:.0f} ч назад (порог {_BACKUP_STALE_AFTER_HOURS} ч). "
                 "Восстанавливать будет нечего.\n"
                 "Это тревога про ЛОКАЛЬНЫЙ pg_dump на Render (cron db-backup, "
