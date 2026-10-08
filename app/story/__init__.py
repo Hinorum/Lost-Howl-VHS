@@ -3,7 +3,7 @@
 Пакет живёт отдельно от движка: экономика и блокчейн не знают о сюжете.
 Единственный стык — подмена источника дня в app/rounds/rendering.py
 (см. bay.py :: install_bay). Контракт и структура — в
-docs/story_cassette_design.md; канон мира — docs/story_world_manifest.md.
+docs/lost_howl_prompts.md (§1); канон мира — docs/story_world_manifest.md.
 
 Состав минимален:
 - schema.py — контракт и валидация кассеты (месяц «YYYY-MM», 28–31 день);
