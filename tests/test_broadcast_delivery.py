@@ -496,7 +496,7 @@ async def test_announce_results_propagates_build_failure(monkeypatch) -> None:
     транзакцию, день остаётся без маркера, и восстановитель дошлёт его позже.
     Пустой текст без исключения — это другое (нечего слать) и остаётся нулём.
     """
-    monkeypatch.setattr(bc, "results_body", AsyncMock(side_effect=RuntimeError("БД лежит")))
+    monkeypatch.setattr(bc, "results_message", AsyncMock(side_effect=RuntimeError("БД лежит")))
     bot = SimpleNamespace(send_message=AsyncMock())
     with pytest.raises(RuntimeError):
         await bc.announce_results(bot, _round(9404))
@@ -504,17 +504,33 @@ async def test_announce_results_propagates_build_failure(monkeypatch) -> None:
     # Без бота — тихий ноль, исключение тут не при чём.
     assert await bc.announce_results(None, _round(9404)) == 0
     # Собрался пустой пост — тоже ноль, но без исключения.
-    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value=""))
+    monkeypatch.setattr(bc, "results_message", AsyncMock(return_value=""))
     assert await bc.announce_results(SimpleNamespace(), _round(9404)) == 0
 
 
-async def test_announce_results_broadcasts_body(monkeypatch) -> None:
-    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="ИТОГИ"))
+async def test_announce_results_broadcasts_message(monkeypatch) -> None:
+    monkeypatch.setattr(bc, "results_message", AsyncMock(return_value="ИТОГИ"))
     sent = AsyncMock(return_value=7)
     monkeypatch.setattr(bc, "_broadcast_text", sent)
     finished = _round(9405)
     assert await bc.announce_results(SimpleNamespace(), finished) == 7
     assert sent.await_args.args[1] == "ИТОГИ"
+
+
+async def test_announce_results_carries_epilogue(monkeypatch) -> None:
+    """Ежедневные итоги несут канон дня: эпилог (consequence) в том же посте.
+
+    Анонс итогов раньше шёл через «сухой» results_body — без эпилога: наследие
+    нейро-эры, где эпилог писался асинхронно и в автопереходе не наступал.
+    Канон уцелевшей карты обязан доехать до игроков вместе со счётом дня.
+    """
+    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="СУХИЕ ИТОГИ"))
+    sent = AsyncMock(return_value=1)
+    monkeypatch.setattr(bc, "_broadcast_text", sent)
+    finished = _round(9415)
+    finished.epilogue_text = "Канон дня."
+    await bc.announce_results(SimpleNamespace(), finished)
+    assert sent.await_args.args[1] == "СУХИЕ ИТОГИ\n\nКанон дня."
 
 
 async def test_announce_results_marks_delivery_by_day(monkeypatch) -> None:
@@ -525,7 +541,7 @@ async def test_announce_results_marks_delivery_by_day(monkeypatch) -> None:
     а потому что совпало с текстом. Смена текста, обрезка, другой язык — и
     привязка к дню рассыпается, а с ней и тревога «у дня N нет отметки».
     """
-    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="ИТОГИ"))
+    monkeypatch.setattr(bc, "results_message", AsyncMock(return_value="ИТОГИ"))
     bot = SimpleNamespace(send_message=AsyncMock(return_value=1))
     async with SessionLocal() as db:
         db.add(Chat(id=-9406, type="group", active=True))
