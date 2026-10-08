@@ -259,7 +259,6 @@ async def day_economics(session: AsyncSession, round_row: Round) -> dict:
         "week_today": round_row.weekly_nanotons or 0,
         "referral_today": round_row.referral_nanotons or 0,
         "week_total": 0,
-        "board_today": 0,
         "bank_total": 0,
         "fund_total": 0,
         "refunded": False,
@@ -276,18 +275,19 @@ async def day_economics(session: AsyncSession, round_row: Round) -> dict:
     if not players and not stats["pot"]:
         return stats
 
-    # Combine leaderboard + prize sums into one query
-    kind_rows = await session.execute(
-        select(Payout.kind, func.coalesce(func.sum(Payout.amount_nanotons), 0))
-        .where(
-            Payout.round_id == round_row.id,
-            Payout.kind.in_(["leaderboard", "prize"]),
-        )
-        .group_by(Payout.kind)
+    # Призовые дня — единственная «детальная» выплата раунда: премия
+    # лидерборда месяцами живёт отдельно (round_id=None, копилка месяца),
+    # поэтому в разбивке раунда ей нечему появляться.
+    prize_sum = int(
+        (
+            await session.execute(
+                select(func.coalesce(func.sum(Payout.amount_nanotons), 0)).where(
+                    Payout.round_id == round_row.id,
+                    Payout.kind == "prize",
+                )
+            )
+        ).scalar_one()
     )
-    kind_map = {k: int(v) for k, v in kind_rows.all()}
-    board_today = kind_map.get("leaderboard", 0)
-    prize_sum = kind_map.get("prize", 0)
     bank_row = await session.execute(select(func.coalesce(func.sum(LeaderboardPot.nanotons), 0)))
     stats["bank_total"] = int(bank_row.scalar_one())
     week_row = await session.execute(
@@ -302,8 +302,6 @@ async def day_economics(session: AsyncSession, round_row: Round) -> dict:
         select(func.coalesce(func.sum(PackFund.nanotons), 0))
     )
     stats["fund_total"] = int(fund_row.scalar_one())
-    if board_today or stats["bank_total"]:
-        stats["board_today"] = board_today
 
     if round_row.winner_card is not None:
         winners_subq = select(Vote.player_id).where(
