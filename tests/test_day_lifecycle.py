@@ -14,9 +14,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError, NoInspectionAvailable
 
 from app.config import settings
+from app.core.registry import RUN_START_KEY
 from app.db import SessionLocal
 from app.handlers import admin as admin_mod
 from app.handlers import cmd_advance, cmd_resetgame
@@ -27,6 +29,7 @@ from app.models import (
     MemoryHit,
     Payout,
     Player,
+    PreparedDay,
     RevoteGrant,
     Round,
     RoundStatus,
@@ -39,6 +42,7 @@ from app.models import (
 from app.ops import PAUSE_KEY, set_game_paused
 from app.rounds import heal_stale_rounds
 from app.rounds import lifecycle as lifecycle_mod
+from app.rounds import materialization as materialization_mod
 
 ADMIN_ID = 4242
 
@@ -551,3 +555,301 @@ def test_every_round_foreign_key_table_is_wiped() -> None:
     source = inspect.getsource(__import__("app.rounds", fromlist=["reset_game"]).reset_game)
     for name in ("Income", "MemoryHit"):
         assert f"delete({name})" in source
+
+
+# ---------- Слепые ветки жизненного цикла: сбои открытия дня, гонки, heal ----------
+
+
+async def test_ensure_current_round_keeps_recent_closed(session) -> None:
+    """Закрытый день с живым таймером подсчёта не порождает новый (строки 219-220)."""
+    round_row = _round(9970, RoundStatus.CLOSED, voting_in_minutes=30)
+    round_row.winner_card = 0
+    session.add(round_row)
+    await session.commit()
+    kept_id = round_row.id
+    got = await lifecycle_mod.ensure_current_round(session)
+    assert got.id == kept_id
+
+
+async def test_public_round_view_hides_counts_until_closed() -> None:
+    open_round = _round(9960, RoundStatus.OPEN, voting_in_minutes=600)
+    view = lifecycle_mod.public_round_view(open_round)
+    assert "winner_card" not in view  # счёт дня в открытом доступе не светится
+    assert "vote_counts" not in view
+    assert len(view["cards"]) == 3
+
+    closed_round = _round(9961, RoundStatus.CLOSED, voting_in_minutes=-30)
+    closed_round.winner_card = 2
+    closed_round.vote_counts_json = '{"0": 1, "1": 0, "2": 3}'
+    view = lifecycle_mod.public_round_view(closed_round)
+    assert view["winner_card"] == 2
+    assert view["vote_counts"] == {"0": 1, "1": 0, "2": 3}
+
+
+async def test_open_day_fails_fast_when_latest_round_unreadable(session, monkeypatch) -> None:
+    """Сбой чтения раундов на первом шаге: rollback + честный re-raise (59-62)."""
+
+    async def boom(_sess):
+        raise RuntimeError("нет соединения")
+
+    monkeypatch.setattr(lifecycle_mod, "get_latest_round", boom)
+    with pytest.raises(RuntimeError, match="нет соединения"):
+        await lifecycle_mod.create_next_round_detailed(session)
+
+
+async def test_open_day_fails_fast_when_round_query_broken(session, monkeypatch) -> None:
+    """Сбой запроса day_index: лог + rollback + re-raise (строки 73-76)."""
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("нет раундов")
+
+    monkeypatch.setattr(lifecycle_mod, "select", boom)
+    with pytest.raises(RuntimeError, match="нет раундов"):
+        await lifecycle_mod.create_next_round_detailed(session)
+
+
+async def test_open_day_fails_fast_when_prepared_day_query_broken(session, monkeypatch) -> None:
+    """Сбой чтения заготовки дня: лог + rollback + re-raise (строки 82-85)."""
+    monkeypatch.setattr(lifecycle_mod, "PreparedDay", object)
+    with pytest.raises(NoInspectionAvailable):
+        await lifecycle_mod.create_next_round_detailed(session)
+
+
+async def test_open_day_drops_stale_prepared_day(offline_all, session) -> None:
+    """Устаревшая заготовка под целевой день выбрасывается до открытия (86-89)."""
+    latest = (
+        await session.execute(
+            select(Round.day_index).order_by(Round.day_index.desc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    target = (latest or 0) + 1
+    session.add(PreparedDay(day_index=target, payload='{"устарело": true}'))
+    await session.commit()
+    round_row, created = await lifecycle_mod.create_next_round_detailed(session)
+    assert created is True and round_row.day_index == target
+    stale = await session.get(PreparedDay, target)
+    assert stale is None  # строки 86-89: устаревшая заготовка удалена
+
+
+async def test_open_day_materialize_race_returns_existing(offline_all, session, monkeypatch) -> None:
+    """IntegrityError при материализации: откат и возврат существующего дня (111-116)."""
+
+    async def race(_sess, _payload, _latest):
+        raise IntegrityError("INSERT rounds", {}, Exception("гонка открытия"))
+
+    monkeypatch.setattr(lifecycle_mod, "_materialize_round", race)
+
+    # а) в базе есть раунды → возвращается существующий (строка 116)
+    seed = _round(9910, RoundStatus.OPEN, voting_in_minutes=600)
+    session.add(seed)
+    await session.commit()
+    got, created = await lifecycle_mod.create_next_round_detailed(session)
+    assert created is False and got.id == seed.id
+
+    # б) база «пуста» для тика → re-raise, сбой увиден (строки 114-115)
+    monkeypatch.setattr(lifecycle_mod, "get_latest_round", AsyncMock(return_value=None))
+    with pytest.raises(IntegrityError):
+        await lifecycle_mod.create_next_round_detailed(session)
+
+
+async def test_open_day_commit_race_returns_existing(offline_all, session, monkeypatch) -> None:
+    """Конфликт вставки всплывает на commit (а не раньше): 117-124."""
+    older = _round(9919, RoundStatus.CLOSED, voting_in_minutes=-30)
+    anchor = _round(9920, RoundStatus.OPEN, voting_in_minutes=600)
+    session.add_all([older, anchor])
+    await session.commit()
+    older_id, anchor_id = older.id, anchor.id
+    # Старый раунд отсоединяем: иначе add(дубликат) — identity-conflict (SAWarning).
+    session.expunge(older)
+
+    async def collide(sess, _payload, _latest):
+        # PK берём у СТАРОГО раунда: якорь get_latest подгрузит в карту
+        # идентичности, а конфликт с ним SQLAlchemy штумует SAWarning.
+        duplicate = Round(
+            id=older_id,
+            day_index=9921,
+            status=RoundStatus.OPEN,
+            win_rule=WinRule.MAJORITY,
+            chapter_title="X",
+            chapter_text="X",
+            opens_at=datetime.now(UTC),
+            voting_ends_at=datetime.now(UTC) + timedelta(hours=20),
+            tally_ends_at=datetime.now(UTC) + timedelta(hours=21),
+        )
+        sess.add(duplicate)
+        return duplicate
+
+    monkeypatch.setattr(lifecycle_mod, "_materialize_round", collide)
+    # Без запроса состояния внутри _stamp автофлеш не сработает раньше commit.
+    monkeypatch.setattr(
+        materialization_mod, "money_mode_enabled", AsyncMock(return_value=True)
+    )
+    got, created = await lifecycle_mod.create_next_round_detailed(session)
+    assert created is False and got.id == anchor_id
+
+
+async def test_finish_tally_returns_when_not_tallying(session) -> None:
+    """Не-TALLYING день: подсчёт не трогаем, отдаём как есть (строки 373-375)."""
+    round_row = _round(9941, RoundStatus.OPEN, voting_in_minutes=600)
+    session.add(round_row)
+    await session.commit()
+    loaded, closed_here = await lifecycle_mod.finish_tally(session, round_row)
+    assert closed_here is False
+    assert loaded.status == RoundStatus.OPEN
+
+
+async def test_finish_tally_malformed_tie_entropy_falls_back(session) -> None:
+    """Нечитаемый жребий блока не валит подсчёт: заметка без ссылки (415-420)."""
+    round_row = _round(9930, RoundStatus.TALLYING, voting_in_minutes=-30)
+    round_row.tie_entropy = "мусор-без-двоеточия"
+    session.add(Player(id=991001))
+    session.add(Player(id=991002))
+    session.add(round_row)
+    await session.flush()
+    session.add(Vote(round_id=round_row.id, player_id=991001, card_position=0))
+    session.add(Vote(round_id=round_row.id, player_id=991002, card_position=1))
+    await session.commit()
+    loaded, closed_here = await lifecycle_mod.finish_tally(session, round_row)
+    assert closed_here is True
+    assert loaded.status == RoundStatus.CLOSED
+    assert loaded.tie_note and "жребий блока" not in loaded.tie_note
+
+
+async def test_finish_tally_lost_update_race(session) -> None:
+    """Проигравшая гонку закрытия сторона откатывается и отдаёт состояние (452-455)."""
+    round_row = _round(9940, RoundStatus.TALLYING, voting_in_minutes=-30)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+        # конкурирующий процесс закрыл день; инстанс отстал со статусом TALLYING
+        loaded_status = round_row.status  # грузим значение до отсоединения
+        assert loaded_status == RoundStatus.TALLYING
+        db.expunge(round_row)
+        await db.commit()
+        async with SessionLocal() as other:
+            await other.execute(
+                update(Round).where(Round.id == round_row.id).values(status=RoundStatus.CLOSED)
+            )
+            await other.commit()
+        loaded, closed_here = await lifecycle_mod.finish_tally(db, round_row)
+        assert closed_here is False
+        assert loaded is not None and loaded.id == round_row.id
+    await _wipe([9940])
+
+
+async def test_finish_tally_commit_race_on_duplicate_story_beat(session) -> None:
+    """Конфликт канона (day_index уникален): commit падает, закрытие откатывается (475-478)."""
+    round_row = _round(9950, RoundStatus.TALLYING, voting_in_minutes=-30)
+    session.add(round_row)
+    session.add(
+        StoryBeat(
+            day_index=9950,
+            winning_title="занято",
+            winning_text="x",
+            win_rule="majority",
+            vote_counts="{}",
+        )
+    )
+    await session.commit()
+    # Отсоединяем до гонки: rollback() истекает прикреплённые инстансы, а чтение
+    # атрибута с истёкшего объекта — lazy load вне greenlet (MissingGreenlet).
+    round_row_id = round_row.id
+    session.expunge(round_row)
+    loaded, closed_here = await lifecycle_mod.finish_tally(session, round_row)
+    assert closed_here is False
+    assert loaded is not None and loaded.id == round_row_id
+    assert loaded.status == RoundStatus.TALLYING  # закрытие откатилось
+
+
+async def test_close_voting_lost_claim_race(session) -> None:
+    """Второй закрывающий молча уходит: UPDATE не захватил день (строки 329-330)."""
+    round_row = _round(9980, RoundStatus.OPEN, voting_in_minutes=-30)
+    async with SessionLocal() as db1:
+        db1.add(round_row)
+        await db1.commit()
+        assert round_row.status == RoundStatus.OPEN  # кэш значений до отсоединения
+        db1.expunge(round_row)
+        await db1.commit()
+        async with SessionLocal() as other:
+            await other.execute(
+                update(Round).where(Round.id == round_row.id).values(status=RoundStatus.TALLYING)
+            )
+            await other.commit()
+        got = await lifecycle_mod.close_voting(db1, round_row)
+        assert got is round_row
+        status = (
+            await db1.execute(select(Round.status).where(Round.id == round_row.id))
+        ).scalar_one()
+        assert status == RoundStatus.TALLYING
+    await _wipe([9980])
+
+
+async def test_heal_survives_finalize_failure(session, monkeypatch) -> None:
+    """Сбой финализации ставок вылеченного дня: warning + rollback, лечение живёт (264-271)."""
+    stale = _round(750, RoundStatus.OPEN, voting_in_minutes=-30)
+    current = _round(751, RoundStatus.OPEN, voting_in_minutes=600)
+    session.add_all([stale, current])
+    await session.commit()
+
+    import app.stakes as stakes_mod
+
+    monkeypatch.setattr(
+        stakes_mod,
+        "finalize_day_payouts",
+        AsyncMock(side_effect=RuntimeError("касса упала")),
+    )
+    try:
+        healed = await heal_stale_rounds(session)
+        assert healed >= 1
+        statuses = dict(
+            (await session.execute(select(Round.day_index, Round.status))).all()
+        )
+        assert statuses[750] == RoundStatus.CLOSED  # подсчёт прошёл несмотря на сбой
+    finally:
+        await _wipe([750, 751])
+
+
+async def test_heal_survives_epilogue_failure(session, monkeypatch) -> None:
+    """Сбой эпилога вылеченного дня: warning + rollback, лечение живёт (274-279)."""
+    stale = _round(760, RoundStatus.OPEN, voting_in_minutes=-30)
+    current = _round(761, RoundStatus.OPEN, voting_in_minutes=600)
+    session.add_all([stale, current])
+    await session.commit()
+
+    monkeypatch.setattr(
+        lifecycle_mod, "write_epilogue", AsyncMock(side_effect=RuntimeError("хвост оборвался"))
+    )
+    try:
+        healed = await heal_stale_rounds(session)
+        assert healed >= 1
+        statuses = dict(
+            (await session.execute(select(Round.day_index, Round.status))).all()
+        )
+        assert statuses[760] == RoundStatus.CLOSED
+    finally:
+        await _wipe([760, 761])
+
+
+async def test_reset_game_full_wipe_rewrites_anchor(offline_all, session) -> None:
+    """keep_story=False стирает канон; повторный сброс перезаписывает якорь (165, 178)."""
+    session.add(
+        StoryBeat(
+            day_index=9902,
+            winning_title="t",
+            winning_text="x",
+            win_rule="majority",
+            vote_counts="{}",
+        )
+    )
+    await session.commit()
+    first = await lifecycle_mod.reset_game(session)  # строка 165: delete(StoryBeat)
+    assert first.day_index == 1
+    assert (await session.execute(select(StoryBeat))).scalar_one_or_none() is None
+    row = await session.get(WatcherState, RUN_START_KEY)
+    first_anchor = row.value if row is not None else None
+    assert first_anchor  # якорь свежего забега записан (строка 176)
+
+    second = await lifecycle_mod.reset_game(session)  # строка 178: перезапись якоря
+    assert second.day_index == 1
+    row = await session.get(WatcherState, RUN_START_KEY)
+    assert row is not None and row.value
