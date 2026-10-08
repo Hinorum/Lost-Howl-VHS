@@ -159,6 +159,8 @@ def _style_warnings(cassette: Cassette) -> list[str]:
     for road, days in _roads(cassette):
         for day in days:
             fields = [day.chapter_title, day.chapter_text, day.station]
+            if day.dilemma:
+                fields.append(day.dilemma)
             if day.diary:
                 fields.append(day.diary)
             if day.prev:

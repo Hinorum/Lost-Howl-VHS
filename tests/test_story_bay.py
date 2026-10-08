@@ -175,6 +175,46 @@ async def test_plan_day_uses_active_cassette(
         assert payload["chapter_title"] == "Глава 11"  # 11 мая
         assert [card["position"] for card in payload["cards"]] == [0, 1, 2]
         assert payload["cards"][0]["title"] == "Путь А 11"
+        assert payload["dilemma"] is None  # кассета без дилеммы — старая структура
+    finally:
+        uninstall_bay()
+
+
+async def test_dilemma_reaches_round_column(session, tmp_path, monkeypatch) -> None:
+    """Полный мост «кассета → payload → колонка раунда» для блока дилеммы.
+
+    Снимок дня, как глава: открытый пост не меняется от правки кассеты
+    задним числом; день без дилеммы материализуется с пустой колонкой —
+    пост остаётся в прежней структуре с витриной.
+    """
+    from app.rounds.materialization import _materialize_round
+
+    monkeypatch.setattr(bay, "datetime", _FakeDatetime)  # сегодня: 2026-05-11
+    days = [_day(i) for i in range(1, 32)]
+    days[10]["dilemma"] = "К воде или за топливом?"
+    payload = {
+        "cassette_id": "may-dilemma",
+        "month": "2026-05",
+        "title": "Кассета с дилеммой",
+        "logline": "день с блоком выбора.",
+        "days": days,
+    }
+    (tmp_path / "may-dilemma.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    await set_next_cassette(session, "may-dilemma.json")
+    assert install_bay(tmp_path) is True
+    try:
+        rendered = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        assert rendered["dilemma"] == "К воде или за топливом?"
+        round_row = await _materialize_round(session, rendered, latest=None)
+        assert round_row.dilemma == "К воде или за топливом?"
+
+        legacy_payload = dict(rendered)
+        legacy_payload.pop("dilemma")
+        legacy_payload["day_index"] = 8
+        legacy_round = await _materialize_round(session, legacy_payload, latest=None)
+        assert legacy_round.dilemma is None
     finally:
         uninstall_bay()
 

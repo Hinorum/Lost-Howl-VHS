@@ -162,6 +162,23 @@ def test_cards_keyboard_remember_button_encodes_day() -> None:
     assert explicit.inline_keyboard[1][0].callback_data == "remember:7:80123"
 
 
+def test_cards_keyboard_signs_buttons_with_scene_titles() -> None:
+    """Кнопки несут названия сцен из кассеты, а не «Сцена I»: игрок выбирает
+    конкретное действие. Длинное название обрезается в пределах лимита
+    кнопки Telegram; без карт — прежние подписи (легаси-вызовы)."""
+    cards = [
+        SimpleNamespace(position=0, title="Идти к реке"),
+        SimpleNamespace(position=1, title="Слушать эхо"),
+        SimpleNamespace(position=2, title="О" * 80),
+    ]
+    labels = [b.text for b in bc.cards_keyboard(7, cards=cards).inline_keyboard[0]]
+    assert labels[:2] == ["Идти к реке", "Слушать эхо"]
+    assert len(labels[2]) <= 64
+    assert labels[2].endswith("…")
+    legacy = [b.text for b in bc.cards_keyboard(7).inline_keyboard[0]]
+    assert legacy == ["Сцена I", "Сцена II", "Сцена III"]
+
+
 async def test_status_text_for_closed_and_tallying_phases() -> None:
     """Фаза дня читается из статуса: «подсчёт» и «день закрыт» — разные
     сообщения, а не одна и та же строка."""

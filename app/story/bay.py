@@ -371,6 +371,7 @@ async def _plan_and_render(
         logger.debug("Эхо вчерашнего дня не добавлено", exc_info=True)
     payload["chapter_title"] = day.chapter_title
     payload["chapter_text"] = chapter_text
+    payload["dilemma"] = day.dilemma
     payload["cards"] = [card.model_dump() for card in day.cards]
     return payload
 

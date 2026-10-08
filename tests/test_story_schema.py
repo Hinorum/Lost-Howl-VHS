@@ -138,6 +138,20 @@ def test_field_length_limits_rejected() -> None:
     assert not validate_payload(payload).ok
 
 
+def test_dilemma_optional_and_limited() -> None:
+    """Блок дилеммы — опциональный: без него кассета валидна (старая
+    структура поста), длиннее лимита — отвергается (блок обязан целиком
+    влезать в пост, режется он только многоточием-страховкой)."""
+    payload = _payload("2026-04", 30)
+    assert validate_payload(payload).ok
+
+    payload["days"][0]["dilemma"] = "Куда пойдёт стая: к воде или за топливом?"
+    assert validate_payload(payload).ok
+
+    payload["days"][0]["dilemma"] = "д" * (FIELD_LIMITS["dilemma"] + 1)
+    assert not validate_payload(payload).ok
+
+
 def test_empty_card_fields_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["title"] = ""

@@ -455,7 +455,12 @@ async def cmd_today(message: Message) -> None:
     await message.answer(
         await status_text(round_row, show_title=True),
         parse_mode=ParseMode.HTML,
-        reply_markup=cards_keyboard(round_row.id, remember=False, day_index=round_row.day_index),
+        reply_markup=cards_keyboard(
+            round_row.id,
+            remember=False,
+            day_index=round_row.day_index,
+            cards=round_row.cards,
+        ),
     )
 
 
@@ -651,7 +656,10 @@ async def _menu_today(callback: CallbackQuery) -> None:
         await status_text(round_row, show_title=True),
         parse_mode=ParseMode.HTML,
         reply_markup=cards_keyboard(
-            round_row.id, remember=False, day_index=round_row.day_index
+            round_row.id,
+            remember=False,
+            day_index=round_row.day_index,
+            cards=round_row.cards,
         ),
     )
     await callback.answer()

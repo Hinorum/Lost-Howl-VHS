@@ -27,15 +27,39 @@ logger = logging.getLogger(__name__)
 POSITIONS = ("I", "II", "III")
 _MAX_TEXT_LEN = 3900
 _TITLE_CLAMP = 80
+_DILEMMA_CLAMP = 400  # == FIELD_LIMITS["dilemma"]: лимит схемы равен показу
+_BUTTON_TEXT_MAX = 64  # текст inline-кнопки Telegram — до 64 знаков
 _FORGET_MARKS = ("forbidden", "not found", "kicked", "deactivated", "migrated")
 
 
-def cards_keyboard(round_id: int, remember: bool = False, day_index: int | None = None) -> InlineKeyboardMarkup:
+def cards_keyboard(
+    round_id: int,
+    remember: bool = False,
+    day_index: int | None = None,
+    cards=None,
+) -> InlineKeyboardMarkup:
+    """Три кнопки голосования под постом дня.
+
+    С картами дня — подписываем сами варианты: кнопка несёт название сцены
+    (короткое действие из кассеты), а не «Сцена I». Название длиннее лимита
+    Telegram обрезается по словам, как и в посте. Последствия в кнопку не
+    попадают — их текст дня не показывает; канон живёт в consequence и
+    всплывает в итогах. Без карт (легаси-вызовы, тесты) — прежние подписи.
+    """
+    labels = ["Сцена I", "Сцена II", "Сцена III"]
+    if cards:
+        titles = {card.position: (card.title or "").strip() for card in cards}
+        for position in range(3):
+            title = titles.get(position) or ""
+            if not title:
+                continue
+            if len(title) > _BUTTON_TEXT_MAX:
+                title = _clamp(title, _BUTTON_TEXT_MAX - 1)
+            labels[position] = title
     rows = [
         [
-            InlineKeyboardButton(text="Сцена I", callback_data=f"vote:{round_id}:0"),
-            InlineKeyboardButton(text="Сцена II", callback_data=f"vote:{round_id}:1"),
-            InlineKeyboardButton(text="Сцена III", callback_data=f"vote:{round_id}:2"),
+            InlineKeyboardButton(text=labels[position], callback_data=f"vote:{round_id}:{position}")
+            for position in range(3)
         ],
     ]
     if remember:
@@ -110,6 +134,11 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
         f"{html.escape(_clamp(card.description, 260), quote=False)}"
         for card in sorted(round_row.cards, key=lambda item: item.position)
     )
+    # День с дилеммой — новая структура поста: варианты голосования живут
+    # только в кнопках (их подписи — названия карт, см. cards_keyboard),
+    # поэтому витрина трёх карт не набирается. День без поля — прежняя
+    # витрина, пока кассету не перепишут под неё.
+    dilemma = getattr(round_row, "dilemma", None) or ""
     bank_line = ""
     if settings.ton_enabled and getattr(round_row, "money_mode", True) is not False:
         from app.db import SessionLocal
@@ -144,7 +173,12 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
     # Хвост поста (правило дня, банк, дедлайн) неприкосновенен: при упоре в
     # потолок режется «верх», а не обещание игроку сроков исхода голосования.
     tail = f"\n\n{phase}{bank_line}\n{deadline}"
-    core = f"{head}{story}{cards}"
+    if dilemma:
+        # Эхо и сюжет уже стоят в head/story; дилемма замыкает повествование
+        # ровно там, где игрок должен выбрать действие.
+        core = f"{head}{story}{html.escape(_clamp(dilemma, _DILEMMA_CLAMP), quote=False)}"
+    else:
+        core = f"{head}{story}{cards}"
     budget = _MAX_TEXT_LEN - len(tail)
     if len(core) > budget:
         core = _clamp(core, budget)
@@ -558,7 +592,10 @@ async def _deliver_day(
     # (Telegram принимает его только от двух вложений, см. историю 2dfc1a).
     status_body = await status_text(round_row, show_title=True)
     markup = cards_keyboard(
-        round_row.id, remember=remember, day_index=round_row.day_index
+        round_row.id,
+        remember=remember,
+        day_index=round_row.day_index,
+        cards=round_row.cards,
     )
 
     if outgoing_results:
@@ -673,7 +710,9 @@ async def refresh_day_bank(bot: Bot | None = None) -> None:
         if loaded is None:
             return
         text = await status_text(loaded, show_title=True)
-        keyboard = cards_keyboard(loaded.id, remember=False, day_index=loaded.day_index)
+        keyboard = cards_keyboard(
+            loaded.id, remember=False, day_index=loaded.day_index, cards=loaded.cards
+        )
 
         for row in rows:
             try:

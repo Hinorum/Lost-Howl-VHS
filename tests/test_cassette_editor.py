@@ -88,6 +88,18 @@ def _write_cassette(directory: Path, name: str = "mel.json") -> Path:
 # --- ядро: месяц и фрагмент дня -------------------------------------------
 
 
+def test_day_view_text_shows_dilemma() -> None:
+    """Кадр дня для чтения (панель/CLI) несёт блок «что предстоит решить»,
+    когда он есть, — автор видит структуру поста ещё до рендера."""
+    cassette = _mk_cassette()
+    cassette.days[0].dilemma = "Остаться у котла или пойти к реке?"
+    view = ed.day_view_text(cassette, 1)
+    assert "(что предстоит решить) Остаться у котла или пойти к реке?" in view
+
+    cassette.days[0].dilemma = None
+    assert "что предстоит решить" not in ed.day_view_text(cassette, 1)
+
+
 def test_scenario_roundtrip_via_editor(tmp_path) -> None:
     """Кассета → YAML → кассета: модель та же, JSON на диске читается движком."""
     source = _write_cassette(tmp_path)

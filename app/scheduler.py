@@ -690,22 +690,22 @@ def _reminder_text(stake_mode: bool, rule_phrase: str, stakes: tuple[int, int]) 
     """
     body = f"🐺 Голосование закрывается через час.\n🎬 Сцена дня: {rule_phrase}."
     if not stake_mode:
-        return f"{body}\nПуть ещё не выбран — жми «Сцена I/II/III» под постом дня."
+        return f"{body}\nПуть ещё не выбран — жми кнопку сцены под постом дня."
     confirmed, pending = stakes
     if confirmed > 0:
         words = (
             f"Твоя ставка {confirmed / 1e9:.2f} Gram уже принята, но путь ещё "
-            "не выбран — жми «Сцена I/II/III» под постом дня."
+            "не выбран — жми кнопку сцены под постом дня."
         )
     elif pending > 0:
         words = (
             f"Твоя ставка {pending / 1e9:.2f} Gram подтверждается (обычно до минуты), "
-            "а путь ещё не выбран — жми «Сцена I/II/III» под постом дня."
+            "а путь ещё не выбран — жми кнопку сцены под постом дня."
         )
     else:
         words = (
             "Ставка не сделана и путь не выбран: переведи Gram казначею и жми "
-            "«Сцена I/II/III» под постом дня."
+            "кнопку сцены под постом дня."
         )
     return f"{body}\n{words}"
 

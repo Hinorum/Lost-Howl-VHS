@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 FIELD_LIMITS = {
     "chapter_title": 80,
     "chapter_text": 700,
+    "dilemma": 400,
     "card_title": 80,
     "card_description": 260,
     "card_consequence": 220,
@@ -167,6 +168,13 @@ class DayModel(BaseModel):
     station: str = Field(min_length=1)
     chapter_title: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_title"])
     chapter_text: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_text"])
+    dilemma: str | None = Field(
+        default=None,
+        max_length=FIELD_LIMITS["dilemma"],
+        description="Блок «что предстоит решить»: проблема/дилемма/вопрос дня. "
+        "Пост показывает его после сюжета ВМЕСТО витрины трёх карт; сами "
+        "варианты уходят в кнопки под названиями карт, без последствий.",
+    )
     cards: list[CardModel] = Field(min_length=3, max_length=3)
     prev: dict[int, str] | None = Field(
         default=None,
@@ -529,6 +537,8 @@ def _taboo_hits(cassette: Cassette) -> list[str]:
         all_days.extend(fork.days)
     for day in all_days:
         parts = [day.chapter_title, day.chapter_text, day.station]
+        if day.dilemma:
+            parts.append(day.dilemma)
         for card in day.cards:
             parts.extend((card.title, card.description, card.consequence))
         haystack = " ".join(parts).lower()

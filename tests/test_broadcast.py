@@ -227,6 +227,25 @@ async def test_status_escapes_cassette_text(tmp_path) -> None:
     assert "<0>" not in status
 
 
+async def test_status_dilemma_day_replaces_card_vitrine(tmp_path) -> None:
+    """День с дилеммой: пост несёт блок «что предстоит решить», витрина трёх
+    карт в текст не идёт — варианты живут только в кнопках (их подписи —
+    названия карт, см. cards_keyboard). День без поля — прежняя витрина,
+    пока кассету не перепишут (регресс для текущей библиотеки)."""
+    from app.broadcast import status_text
+
+    round_row = _round(9306, tmp_path)
+    round_row.dilemma = "Кому отдать последнюю миску: старому или щенку?"
+    status = await status_text(round_row)
+    assert "Кому отдать последнюю миску" in status
+    assert "I. Путь 0" not in status
+    # Механика дня цела: правило/дедлайн хвоста поста не задеты.
+    assert "Сцена дня" in status
+
+    round_row.dilemma = None
+    assert "I. Путь 0" in await status_text(round_row)
+
+
 async def test_status_keeps_deadline_when_core_overflows(tmp_path, monkeypatch) -> None:
     """При переполнении поста режется «верх», а дедлайн/правило дня всегда целы."""
     from app import broadcast
