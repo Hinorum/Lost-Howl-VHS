@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import stakes as stakes_mod
 from app.config import settings
 from app.models import Payout, Player, Round, RoundStatus, Stake, Vote, WinRule
-from app.tally import day_economics
+from app.tally import day_economics, format_economics
 from app.ton_utils import to_nano
 
 
@@ -246,3 +246,38 @@ async def test_auto_refund_marks_stake_refunded(session: AsyncSession) -> None:
     )
     assert len(refunds) == 1
     assert stake.status == "refunded"
+
+
+def test_format_economics_shows_week_cut() -> None:
+    """Срез дня в копилку недели виден: банк дня и распределённое сходятся.
+
+    Без строки игрок видел «банк 20 G», а распределено меньше — и разница
+    читалась как ошибка кассы.
+    """
+    text = format_economics(
+        {
+            "pot": to_nano(20),
+            "week_today": to_nano(0.4),
+            "fund_total": to_nano(0.2),
+            "referral_today": 0,
+            "refunded": False,
+        }
+    )
+    assert "Банк дня: 20.00 Gram" in text
+    assert "В копилку недели ушло: 0.40 Gram" in text
+    assert text.index("Банк дня") < text.index("копилку недели")
+
+
+def test_format_economics_hides_empty_week_cut() -> None:
+    """Нулевой срез (день без копилки) строку копилки не показывает."""
+    text = format_economics(
+        {
+            "pot": to_nano(5),
+            "week_today": 0,
+            "fund_total": 0,
+            "referral_today": 0,
+            "refunded": False,
+        }
+    )
+    assert "копилку недели" not in text
+    assert "Банк дня: 5.00 Gram" in text
