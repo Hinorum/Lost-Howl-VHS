@@ -202,6 +202,31 @@ async def test_status_carries_story_between_title_and_paths(tmp_path) -> None:
     assert title_at < story_at < paths_at
 
 
+async def test_status_escapes_cassette_text(tmp_path) -> None:
+    """Текст кассеты уходит в HTML-пост экранированным, а не сырым.
+
+    Сырой `<`/`&` из правки в /panel Telegram отвергает всё сообщение целиком:
+    пакет дня не дошёл бы ни в один чат, ни в одну личку («0 из N»), хотя
+    виноватого получателя среди них нет. Обрезка — ДО экранирования, чтобы
+    сущность (&amp;) не порвалась клампом.
+    """
+    from app.broadcast import status_text
+
+    round_row = _round(9304, tmp_path)
+    round_row.chapter_title = "Свет & тень <ночи>"
+    round_row.chapter_text = "Стая помнит R&D и <следы>."
+    round_row.cards[0].title = "Путь <0>"
+    round_row.cards[1].description = "описание & канон"
+    status = await status_text(round_row)
+    assert "Свет &amp; тень &lt;ночи&gt;" in status
+    assert "Стая помнит R&amp;D и &lt;следы&gt;." in status
+    assert "I. Путь &lt;0&gt;" in status
+    assert "описание &amp; канон" in status
+    assert "<ночи>" not in status
+    assert "<следы>" not in status
+    assert "<0>" not in status
+
+
 async def test_status_keeps_deadline_when_core_overflows(tmp_path, monkeypatch) -> None:
     """При переполнении поста режется «верх», а дедлайн/правило дня всегда целы."""
     from app import broadcast

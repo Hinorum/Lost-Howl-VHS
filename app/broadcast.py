@@ -99,8 +99,15 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
     # Компактный профиль: контракт кассеты просит карту не длиннее 260 знаков
     # (поле description, схема ≤260), а показ здесь даёт ровно этот задел —
     # текст развилки не режется многоточием.
+    # Экранирование — ПОСЛЕ обрезки, а не до: сущность (&amp;) нельзя рвать,
+    # а кламп режет по словам. Разметку ждут все вызывающие status_text
+    # (везде parse_mode=HTML), а глава и карты — текст кассеты, не наш: сырой
+    # `<` или `&` из правки в /panel Telegram отвергает ЦЕЛИКОМ, и пакет дня
+    # не доходит ни в один чат, ни в одну личку — «0 из N» без единого
+    # виноватого получателя. Ровно это уже чинили в tally._tg_escape.
     cards = "\n".join(
-        f"{POSITIONS[card.position]}. {_clamp(card.title, 80)} — {_clamp(card.description, 260)}"
+        f"{POSITIONS[card.position]}. {html.escape(_clamp(card.title, 80), quote=False)} — "
+        f"{html.escape(_clamp(card.description, 260), quote=False)}"
         for card in sorted(round_row.cards, key=lambda item: item.position)
     )
     bank_line = ""
@@ -124,12 +131,13 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
         deadline = f"🗳 Голосование до {voting_at:%H:%M} UTC — итоги и новый день придут сразу после"
     head = ""
     if show_title:
-        head += f"{day_mark(str(round_row.id))} {_clamp(round_row.chapter_title, _TITLE_CLAMP)}\n\n"
+        title = html.escape(_clamp(round_row.chapter_title, _TITLE_CLAMP), quote=False)
+        head += f"{day_mark(str(round_row.id))} {title}\n\n"
     # Глава кассеты живым текстом между заголовком и развилкой: сначала стая
     # слышит день, потом видит три сцены. Жёсткий потолок кассеты — 700 знаков
     # (schema.py), обрезка по словам ниже лишь страхует легаси-раунды без кассеты.
     story = (
-        f"{_clamp(round_row.chapter_text, 1500)}\n\n"
+        f"{html.escape(_clamp(round_row.chapter_text, 1500), quote=False)}\n\n"
         if getattr(round_row, "chapter_text", "")
         else ""
     )
