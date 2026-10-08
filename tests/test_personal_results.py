@@ -71,6 +71,19 @@ def test_build_loss_refund(monkeypatch) -> None:
     assert "0.5 Gram возвращается: 0.495 Gram" in text
 
 
+def test_build_loss_stake_stays_in_bank(monkeypatch) -> None:
+    """Проигравшая подтверждённая ставка названа проигрышем, а не зачислением.
+
+    Старая формулировка «принята в банк дня» читалась как «зачислена», и в
+    момент проигрыша игрок не видел, что ставка не уцелела.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    text = _build_player_result_text(_round(5, winner=1), _CARDS, 0, _stake(), [])
+    assert "Твоя сцена не победила" in text
+    assert "не уцелела — деньги остались в банке дня" in text
+    assert "принята в банк" not in text
+
+
 def test_build_unstaked_voice(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", True)
     text = _build_player_result_text(_round(3, winner=2), _CARDS, 2, None, [])
