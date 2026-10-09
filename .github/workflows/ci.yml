@@ -72,7 +72,7 @@ jobs:
         # изменение, а не дрожание окружения. Покрытие -- это floor, не цель:
         # качественные тесты важнее числа; конкретные сценарии описаны в
         # docs/architecture.md.
-        run: python -m pytest -q --cov=app --cov-report=term-missing --cov-fail-under=85
+        run: python -m pytest -q --cov=app --cov-report=term-missing --cov-fail-under=88
 
   # Уязвимость в прод-зависимости не виден НИ ОДНИМ другим шагом: пин
   # `pkg==1.2.3` защищает от перезалива артефактов, но не от Advisory,
