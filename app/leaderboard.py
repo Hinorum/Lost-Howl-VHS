@@ -982,8 +982,10 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
             if anchor is not None:
                 a_year, a_month = (int(part) for part in anchor["key"].split("-"))
                 start_date = date(a_year, a_month, max(1, min(int(anchor["dom"]), 31)))
-                if period_start <= start_date < period_end:
-                    span_days = (period_end - start_date).days
+                # Границы недели — datetime, якорь — date: сравниваем как даты,
+                # иначе TypeError уводит в except и порог никогда не снимается.
+                if period_start.date() <= start_date < period_end.date():
+                    span_days = (period_end.date() - start_date).days
                     if 1 <= span_days <= 3:
                         relaxed = True
                         logger.info(

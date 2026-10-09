@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.core.registry import WEEK_CLAIM_WINDOW_KEY
+from app.core.registry import RUN_START_KEY, WEEK_CLAIM_WINDOW_KEY
 from app.db import SessionLocal
 from app.leaderboard import (
     WEEK_READY_KEY,
@@ -27,6 +29,7 @@ from app.leaderboard import (
 )
 from app.models import (
     LeaderboardClaim,
+    MemoryHit,
     Payout,
     Player,
     Round,
@@ -37,6 +40,7 @@ from app.models import (
     WeeklyPot,
     WinRule,
 )
+from app.rounds.anchor import default_anchor
 from app.ton_utils import to_nano
 from app.weeks import iso_week_key, parse_prize_pcts, previous_week_key, week_bounds
 
@@ -1058,5 +1062,268 @@ async def test_settle_week_tie_reopens_stale_window(monkeypatch: pytest.MonkeyPa
                 if player is not None:
                     await session.delete(player)
             await session.commit()
+
+
+# --- Слепые ветки недельной выплаты: якорь, копилки, церемония ----------------
+
+
+async def _cleanup_week_scene(
+    session: AsyncSession, rounds: list[Round], pids: list[int]
+) -> None:
+    """Сносит все следы недельной сцены (общий finally для краёв)."""
+    await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
+    await session.execute(
+        WatcherState.__table__.delete().where(
+            WatcherState.key.in_(
+                [WEEKLY_MARKER_KEY, WEEK_CLAIM_WINDOW_KEY, WEEK_READY_KEY, RUN_START_KEY]
+            )
+        )
+    )
+    await session.execute(WeeklyPot.__table__.delete())
+    for round_row in rounds:
+        await session.execute(Vote.__table__.delete().where(Vote.round_id == round_row.id))
+        await session.execute(Stake.__table__.delete().where(Stake.round_id == round_row.id))
+        await session.delete(round_row)
+    for pid in pids:
+        player = await session.get(Player, pid)
+        if player is not None:
+            await session.delete(player)
+    await session.commit()
+
+
+async def _wipe_week_keys(session: AsyncSession) -> None:
+    """Чистит ключи watcher'а и копилки перед постановкой своей сцены."""
+    await session.execute(
+        WatcherState.__table__.delete().where(
+            WatcherState.key.in_(
+                [WEEKLY_MARKER_KEY, WEEK_CLAIM_WINDOW_KEY, WEEK_READY_KEY, RUN_START_KEY]
+            )
+        )
+    )
+    await session.execute(WeeklyPot.__table__.delete())
+    await session.commit()
+
+
+async def test_settle_week_without_pots_advances_marker() -> None:
+    """Копилок прошлых недель нет: метка всё равно двигается, False (947-950)."""
+    week_key = previous_week_key()
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        await _set_week_ready(session, week_key)
+        try:
+            assert await settle_week_if_due(bot=None) is False
+            marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
+            assert marker is not None and marker.value == week_key
+        finally:
+            await _cleanup_week_scene(session, [], [])
+
+
+async def test_settle_week_waits_for_unfinished_day() -> None:
+    """Незакрытый день недели: платить рано, метка не двигается (969-970)."""
+    week_key = previous_week_key()
+    prev_start, _ = week_bounds(week_key)
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        round_row = await _seed_closed_round(
+            session, 890_000, prev_start + timedelta(days=1, hours=11)
+        )
+        round_row.status = RoundStatus.OPEN
+        session.add(WeeklyPot(week=week_key, nanotons=to_nano(5)))
+        await _set_week_ready(session, week_key)
+        await session.commit()
+        try:
+            assert await settle_week_if_due(bot=None) is False
+            marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
+            assert marker is None or marker.value == ""
+        finally:
+            await _cleanup_week_scene(session, [round_row], [])
+
+
+async def test_settle_week_short_start_relaxes_min_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Сброс за 1-3 дня до понедельника: порог 4 дня снят (983-992)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 4)
+    week_key = previous_week_key()
+    prev_start, period_end = week_bounds(week_key)
+    start = period_end - timedelta(days=2)  # суббота перед концом недели
+    pid = 891_001
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        session.add(
+            Player(
+                id=pid,
+                username=f"p{pid}",
+                wallet_address="0:" + os.urandom(32).hex(),
+                wallet_verified=True,
+            )
+        )
+        round_row = await _seed_closed_round(
+            session, 891_000, prev_start + timedelta(days=2, hours=11)
+        )
+        session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+        _set_stake(session, round_row, pid)
+        session.add(WeeklyPot(week=week_key, nanotons=to_nano(10)))
+        await _set_week_ready(session, week_key)
+        session.add(
+            WatcherState(key=RUN_START_KEY, value=json.dumps(default_anchor(start)))
+        )
+        await session.commit()
+        try:
+            # 1 день голосования < weekly_min_days=4 — спасает только якорь.
+            assert await settle_week_if_due(bot=None) is True
+            payouts = (
+                await session.execute(select(Payout).where(Payout.kind == "weekly"))
+            ).scalars().all()
+            assert [p.player_id for p in payouts] == [pid]
+        finally:
+            await _cleanup_week_scene(session, [round_row], [pid])
+
+
+async def test_settle_week_corrupt_anchor_keeps_strict_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Битый якорь не валит расчёт (993): порог остаётся строгим, метка стоит."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 4)
+    week_key = previous_week_key()
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        session.add(WeeklyPot(week=week_key, nanotons=to_nano(5)))
+        await _set_week_ready(session, week_key)
+        session.add(WatcherState(key=RUN_START_KEY, value=json.dumps({"key": 12345, "dom": 5})))
+        await session.commit()
+        try:
+            assert await settle_week_if_due(bot=None) is False
+            marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
+            assert marker is None or marker.value == ""
+        finally:
+            await _cleanup_week_scene(session, [], [])
+
+
+async def test_settle_week_dust_rolls_into_existing_pot_surviving_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Пыль катится в СУЩЕСТВУЮЩУЮ копилку (1073); сбой номинации (1079-1080)
+    и рассылки церемонии (1107-1108) не валят выплату."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 1)
+    monkeypatch.setattr(
+        "app.leaderboard._memory_nomination",
+        AsyncMock(side_effect=RuntimeError("память упала")),
+    )
+    monkeypatch.setattr(
+        "app.broadcast.whisper_to_chats",
+        AsyncMock(side_effect=RuntimeError("рассылка упала")),
+    )
+    week_key = previous_week_key()
+    prev_start, _ = week_bounds(week_key)
+    pid = 892_001
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        session.add(
+            Player(
+                id=pid,
+                username=f"p{pid}",
+                wallet_address="0:" + os.urandom(32).hex(),
+                wallet_verified=True,
+            )
+        )
+        round_row = await _seed_closed_round(
+            session, 892_000, prev_start + timedelta(days=1, hours=11)
+        )
+        session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+        _set_stake(session, round_row, pid)
+        pot_total = to_nano(0.01)  # вся доля ниже min_payout (0.02 Gram)
+        session.add(WeeklyPot(week=week_key, nanotons=pot_total))
+        current_week = iso_week_key(datetime.now(UTC))
+        session.add(WeeklyPot(week=current_week, nanotons=to_nano(0.7)))
+        await _set_week_ready(session, week_key)
+        await session.commit()
+        bot = SimpleNamespace(send_message=AsyncMock())
+        try:
+            assert await settle_week_if_due(bot=bot) is True
+            current = (
+                await session.execute(select(WeeklyPot).where(WeeklyPot.week == current_week))
+            ).scalar_one()
+            assert current.nanotons == to_nano(0.7) + pot_total  # 1073: +=
+            payouts = (
+                await session.execute(select(Payout).where(Payout.kind == "weekly"))
+            ).scalars().all()
+            assert payouts == []
+            marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
+            assert marker is not None and marker.value == week_key
+        finally:
+            await _cleanup_week_scene(session, [round_row], [pid])
+
+
+async def test_settle_week_ceremony_carries_memory_nomination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Церемония несёт номинацию памяти (1097, «1 находка» — 902), шёпот в чаты
+    уходит (1103-1106), сбой алерта админу — warning без падения (1110-1115)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 1)
+    monkeypatch.setattr(settings, "admin_ids", "7777")
+    whisper = AsyncMock()
+    monkeypatch.setattr("app.broadcast.whisper_to_chats", whisper)
+    week_key = previous_week_key()
+    prev_start, _ = week_bounds(week_key)
+    pid = 893_001
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        session.add(
+            Player(
+                id=pid,
+                username=f"p{pid}",
+                wallet_address="0:" + os.urandom(32).hex(),
+                wallet_verified=True,
+            )
+        )
+        round_row = await _seed_closed_round(
+            session, 893_000, prev_start + timedelta(days=1, hours=11)
+        )
+        session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+        session.add(MemoryHit(player_id=pid, round_id=round_row.id))
+        _set_stake(session, round_row, pid)
+        session.add(WeeklyPot(week=week_key, nanotons=to_nano(10)))
+        await _set_week_ready(session, week_key)
+        await session.commit()
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("Telegram лёг")))
+        try:
+            assert await settle_week_if_due(bot=bot) is True
+            assert whisper.await_count == 1
+            ceremony = whisper.await_args.args[1]
+            assert "🏆 Итоги недели Стаи" in ceremony
+            assert "🧠 Самый памятливый пёс недели" in ceremony  # 1097
+            assert "1 находка" in ceremony  # 902
+            assert bot.send_message.await_count >= 1  # 1110-1115
+        finally:
+            await session.execute(
+                MemoryHit.__table__.delete().where(MemoryHit.round_id == round_row.id)
+            )
+            await session.commit()
+            await _cleanup_week_scene(session, [round_row], [pid])
+
+
+async def test_memory_nomination_pluralizes_genitive_counts(
+    session: AsyncSession,
+) -> None:
+    """Склонение рода для количества находок: 5 — «находок» (906)."""
+    from app.leaderboard import _memory_nomination
+
+    base = datetime(2020, 3, 2, tzinfo=UTC)
+    pid = 894_500
+    rounds: list[Round] = []
+    for i in range(5):
+        round_row = await _seed_closed_round(session, 894_000 + i, base + timedelta(days=i))
+        session.add(MemoryHit(player_id=pid, round_id=round_row.id))
+        rounds.append(round_row)
+    await session.commit()
+
+    nomination = await _memory_nomination(session, base, base + timedelta(days=10))
+    assert nomination is not None
+    assert "5 находок" in nomination  # ветка else (906)
 
 

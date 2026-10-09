@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -30,9 +32,19 @@ from app.core.registry import (
 )
 from app.db import SessionLocal
 from app.leaderboard import (
+    _claim_times,
+    _load_claim_window,
+    _notify_tied_players,
+    _open_claim_window,
+    _prize_tied_groups,
+    _resolve_claim_window,
+    _top_correct_voters,
+    _weighted_amounts,
     is_last_day_of_month,
     is_last_day_of_week,
     mark_leaderboards_for_finished,
+    mark_month_leaderboard_ready,
+    mark_week_leaderboard_ready,
     previous_month_key,
     settle_month_if_due,
     settle_week_if_due,
@@ -529,3 +541,321 @@ async def test_month_boundary_tied_fourth_promoted_by_claim(monkeypatch: pytest.
                 if player is not None:
                     await session.delete(player)
             await session.commit()
+
+
+# --- Слепые ветки: утилиты, окно Claim, метки готовности, месячные края -------
+
+
+async def test_notify_tied_players_covers_kinds_and_failures() -> None:
+    """DM tied-игрокам: оба kind-а, кнопка Claim, сбой доставки не валит (369-394)."""
+    await _notify_tied_players(None, "week", "2026-W41", [1])  # 369-370: bot None
+    bot = SimpleNamespace(send_message=AsyncMock())
+    await _notify_tied_players(bot, "week", "2026-W41", [])  # 369-370: пусто
+    assert bot.send_message.await_count == 0
+
+    await _notify_tied_players(bot, "week", "2026-W41", [101, 102])
+    assert bot.send_message.await_count == 2
+    call = bot.send_message.await_args_list[0]
+    assert call.args[0] == 101
+    assert "недели 2026-W41" in call.args[1]  # 372, 376-382
+    kb = call.kwargs["reply_markup"]
+    assert kb.inline_keyboard[0][0].callback_data == "claim:week"  # 387-389
+
+    broken = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("сеть лежит")))
+    await _notify_tied_players(broken, "month", "2026-10", [201])  # 390-394
+    assert broken.send_message.await_count == 1
+    month_call = broken.send_message.await_args_list[0]
+    assert "месяца 2026-10" in month_call.args[1]  # 374
+    month_kb = month_call.kwargs["reply_markup"]
+    assert month_kb.inline_keyboard[0][0].text == "🗓 Заявить приз месяца"  # 385
+
+
+async def test_claim_window_overwrites_and_garbage_is_none(session: AsyncSession) -> None:
+    """Повторное открытие перезаписывает окно (329); битый JSON — окна нет (342-343)."""
+    await _open_claim_window(session, "week", "2025-W01", [1, 2])
+    await session.commit()
+    await _open_claim_window(session, "week", "2025-W02", [3])  # строка 329
+    await session.commit()
+    window = await _load_claim_window(session, "week")
+    assert window is not None
+    assert window["period"] == "2025-W02" and window["players"] == [3]
+
+    row = await session.get(WatcherState, WEEK_CLAIM_WINDOW_KEY)
+    assert row is not None
+    row.value = "это не json"
+    await session.commit()
+    assert await _load_claim_window(session, "week") is None  # 342-343
+
+
+async def test_resolve_claim_window_disabled_clears_window(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """claim_enabled=False: старое окно снимается, ничья не блокирует (418-419)."""
+    monkeypatch.setattr(settings, "leaderboard_claim_enabled", False)
+    session.add(
+        WatcherState(
+            key=WEEK_CLAIM_WINDOW_KEY,
+            value=json.dumps(
+                {"period": "2025-W01", "players": [1], "opened_at": datetime.now(UTC).isoformat()}
+            ),
+        )
+    )
+    await session.commit()
+    placed = [(1, 5, to_nano(1), "w-1"), (2, 5, to_nano(1), "w-2")]
+    ok = await _resolve_claim_window(
+        session, None, "week", "2025-W02", placed, top_k=3, claims={}, now=datetime.now(UTC)
+    )
+    assert ok is True
+    assert await _load_claim_window(session, "week") is None  # 418: окно очищено
+
+
+async def test_resolve_claim_window_opens_and_notifies_on_tie(session: AsyncSession) -> None:
+    """Ничья без окна: окно открывается, tied получают DM (440-446, включая 444)."""
+    bot = SimpleNamespace(send_message=AsyncMock())
+    placed = [(1, 5, to_nano(1), "w-1"), (2, 5, to_nano(1), "w-2")]
+    ok = await _resolve_claim_window(
+        session, bot, "week", "2026-W41", placed, top_k=3, claims={}, now=datetime.now(UTC)
+    )
+    assert ok is False
+    window = await _load_claim_window(session, "week")
+    assert window is not None and window["players"] == [1, 2]
+    assert bot.send_message.await_count == 2  # 444: DM ушли
+
+
+async def test_resolve_claim_window_repairs_opened_at(session: AsyncSession) -> None:
+    """Наивная дата приводится к UTC (452); битая = now — окно ждёт (453-454)."""
+    now = datetime.now(UTC)
+    placed = [(1, 5, to_nano(1), "w-1"), (2, 5, to_nano(1), "w-2")]
+    session.add(
+        WatcherState(
+            key=WEEK_CLAIM_WINDOW_KEY,
+            value=json.dumps(
+                {
+                    "period": "2026-W41",
+                    "players": [1, 2],
+                    "opened_at": now.replace(tzinfo=None).isoformat(),
+                }
+            ),
+        )
+    )
+    await session.commit()
+    ok = await _resolve_claim_window(
+        session, None, "week", "2026-W41", placed, top_k=3, claims={}, now=now
+    )
+    assert ok is False  # дедлайн не прошёл — ждём Claim (459-461)
+
+    row = await session.get(WatcherState, WEEK_CLAIM_WINDOW_KEY)
+    assert row is not None
+    row.value = json.dumps(
+        {"period": "2026-W41", "players": [1, 2], "opened_at": "позавчера-примерно"}
+    )
+    await session.commit()
+    ok = await _resolve_claim_window(
+        session, None, "week", "2026-W41", placed, top_k=3, claims={}, now=now
+    )
+    assert ok is False  # opened_at=now → окно ещё живо (453-454)
+
+
+async def test_mark_ready_overwrites_and_skips_broken_finished(
+    session: AsyncSession,
+) -> None:
+    """Повторная метка перезаписывается (540, 555); finished без opens_at — выход (567)."""
+    await mark_week_leaderboard_ready(session, "2025-W01")
+    await mark_week_leaderboard_ready(session, "2025-W02")  # ветка else (555)
+    row = await session.get(WatcherState, WEEK_READY_KEY)
+    assert row is not None and row.value == "2025-W02"
+
+    await mark_month_leaderboard_ready(session, "2025-01")
+    await mark_month_leaderboard_ready(session, "2025-02")  # ветка else (540)
+    row = await session.get(WatcherState, MONTH_READY_KEY)
+    assert row is not None and row.value == "2025-02"
+
+    await mark_leaderboards_for_finished(session, None)
+    await mark_leaderboards_for_finished(session, SimpleNamespace(opens_at=None, day_index=1))
+
+
+async def test_rank_helpers_on_empty_inputs(session: AsyncSession) -> None:
+    """Пустые окна/списки: без ошибок отдают пустые результаты (161, 251, 282)."""
+    past = (datetime(2001, 1, 1, tzinfo=UTC), datetime(2001, 1, 3, tzinfo=UTC))
+    assert await _top_correct_voters(session, *past) == []  # 161
+    assert await _claim_times(session, "week", []) == {}  # 251
+    assert _prize_tied_groups([], top_k=3) == []  # 282
+
+
+def test_weighted_amounts_without_weights_is_empty() -> None:
+    """Пустой список весов — сумм к распределению нет (860)."""
+    assert _weighted_amounts(to_nano(1), [9001], []) == []
+
+
+async def _cleanup_month_scene(
+    session: AsyncSession, rounds: list[Round], pids: list[int]
+) -> None:
+    """Сносит все следы месячной сцены (общий finally для краёв)."""
+    await session.execute(Payout.__table__.delete().where(Payout.kind == "leaderboard"))
+    await session.execute(
+        WatcherState.__table__.delete().where(
+            WatcherState.key.in_([MARKER_KEY, MONTH_READY_KEY, MONTH_CLAIM_WINDOW_KEY])
+        )
+    )
+    await session.execute(LeaderboardPot.__table__.delete())
+    for round_row in rounds:
+        await session.execute(Vote.__table__.delete().where(Vote.round_id == round_row.id))
+        await session.execute(Stake.__table__.delete().where(Stake.round_id == round_row.id))
+        await session.delete(round_row)
+    for pid in pids:
+        player = await session.get(Player, pid)
+        if player is not None:
+            await session.delete(player)
+    await session.commit()
+
+
+async def test_month_settle_waits_for_unfinished_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Незакрытый день месяца: метка не двигается (650-651)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    base = 830_000
+    async with SessionLocal() as session:
+        rounds, _prev = await _seed_month_scene(session, base, {base: 5}, 0.5)
+        try:
+            rounds[0].status = RoundStatus.OPEN
+            await session.commit()
+            assert await settle_month_if_due(bot=None) is False
+            marker = await session.get(WatcherState, MARKER_KEY)
+            assert marker is None or marker.value == ""
+        finally:
+            await _cleanup_month_scene(session, rounds, [base])
+
+
+async def test_month_candidates_without_wallet_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ни у одного лидера нет кошелька: копилка ждёт, метка стоит (693-698)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    base = 840_000
+    async with SessionLocal() as session:
+        rounds, prev_key = await _seed_month_scene(session, base, {base: 5, base + 1: 3}, 0.5)
+        try:
+            for pid in (base, base + 1):
+                player = await session.get(Player, pid)
+                assert player is not None
+                player.wallet_address = None
+            await session.commit()
+            assert await settle_month_if_due(bot=None) is False
+            marker = await session.get(WatcherState, MARKER_KEY)
+            assert marker is None or marker.value == ""
+            pot = (
+                await session.execute(
+                    select(LeaderboardPot).where(LeaderboardPot.month == prev_key)
+                )
+            ).scalar_one()
+            assert pot.nanotons == to_nano(0.5)
+        finally:
+            await _cleanup_month_scene(session, rounds, [base, base + 1])
+
+
+async def test_month_bad_weights_hold_pot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """monthly_prize_weights без чисел: ошибка конфига, горш не тронут (706-714)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "monthly_prize_weights", "не-числа")
+    base = 850_000
+    async with SessionLocal() as session:
+        rounds, prev_key = await _seed_month_scene(session, base, {base: 5, base + 1: 3}, 0.5)
+        try:
+            assert await settle_month_if_due(bot=None) is False
+            marker = await session.get(WatcherState, MARKER_KEY)
+            assert marker is None or marker.value == ""
+            pot = (
+                await session.execute(
+                    select(LeaderboardPot).where(LeaderboardPot.month == prev_key)
+                )
+            ).scalar_one()
+            assert pot.nanotons == to_nano(0.5)
+        finally:
+            await _cleanup_month_scene(session, rounds, [base, base + 1])
+
+
+async def test_month_classic_mode_without_payable_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Классика top_k=1: платить некому — метка не двигается (741-749)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "monthly_prize_top_k", 1)
+    base = 860_000
+    async with SessionLocal() as session:
+        rounds, _prev = await _seed_month_scene(session, base, {base: 5, base + 1: 3}, 0.5)
+        try:
+            for pid in (base, base + 1):
+                player = await session.get(Player, pid)
+                assert player is not None
+                player.wallet_address = None
+            await session.commit()
+            assert await settle_month_if_due(bot=None) is False
+            marker = await session.get(WatcherState, MARKER_KEY)
+            assert marker is None or marker.value == ""
+        finally:
+            await _cleanup_month_scene(session, rounds, [base, base + 1])
+
+
+async def test_month_empty_payments_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Страховка пустых выплат не двигает метку (756-763)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "monthly_prize_top_k", 1)
+    monkeypatch.setattr("app.leaderboard.split_equal", lambda _total, _ids: {})
+    base = 870_000
+    async with SessionLocal() as session:
+        rounds, prev_key = await _seed_month_scene(session, base, {base: 5, base + 1: 3}, 0.5)
+        try:
+            assert await settle_month_if_due(bot=None) is False
+            marker = await session.get(WatcherState, MARKER_KEY)
+            assert marker is None or marker.value == ""
+            pot = (
+                await session.execute(
+                    select(LeaderboardPot).where(LeaderboardPot.month == prev_key)
+                )
+            ).scalar_one()
+            assert pot.nanotons == to_nano(0.5)
+        finally:
+            await _cleanup_month_scene(session, rounds, [base, base + 1])
+
+
+async def test_month_dust_recarries_into_existing_current_pot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Пыль прибавляется к УЖЕ существующей копилке текущего месяца (781-791)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "monthly_prize_top_k", 2)
+    monkeypatch.setattr(settings, "monthly_prize_weights", "70,30")
+    base = 880_000
+    current_month = datetime.now(UTC).strftime("%Y-%m")
+    async with SessionLocal() as session:
+        rounds, _prev = await _seed_month_scene(session, base, {base: 5, base + 1: 3}, 0.05)
+        session.add(LeaderboardPot(month=current_month, nanotons=to_nano(0.3)))
+        await session.commit()
+        try:
+            assert await settle_month_if_due(bot=None) is True
+            pot = (
+                await session.execute(
+                    select(LeaderboardPot).where(LeaderboardPot.month == current_month)
+                )
+            ).scalar_one()
+            recarry = to_nano(0.05) - to_nano(0.05) * 70 // 100
+            assert pot.nanotons == to_nano(0.3) + recarry
+        finally:
+            await _cleanup_month_scene(session, rounds, [base, base + 1])
+
+
+async def test_month_admin_alert_survives_send_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Сбой отправки алерта админу не валит месячную выплату (824-827)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "monthly_prize_top_k", 1)
+    monkeypatch.setattr(settings, "admin_ids", "7777")
+    base = 890_000
+    async with SessionLocal() as session:
+        rounds, prev_key = await _seed_month_scene(session, base, {base: 5, base + 1: 3}, 0.5)
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("Telegram лёг")))
+        try:
+            assert await settle_month_if_due(bot=bot) is True
+            assert bot.send_message.await_count >= 1  # дошли до send (825)
+            marker = await session.get(WatcherState, MARKER_KEY)
+            assert marker is not None and marker.value == prev_key
+            payouts = (
+                await session.execute(select(Payout).where(Payout.kind == "leaderboard"))
+            ).scalars().all()
+            assert len(payouts) == 1
+        finally:
+            await _cleanup_month_scene(session, rounds, [base, base + 1])
