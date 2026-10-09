@@ -13,7 +13,6 @@ from app.config import settings
 from app.models import (
     Card,
     Income,
-    MemoryHit,
     Payout,
     Player,
     PreparedDay,
@@ -158,7 +157,6 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
     await session.execute(delete(StatusPost))
     await session.execute(delete(RevoteGrant))
     await session.execute(delete(Income))
-    await session.execute(delete(MemoryHit))
     await session.execute(delete(Card))
     await session.execute(delete(PreparedDay))
     if not keep_story:

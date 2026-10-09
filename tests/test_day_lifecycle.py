@@ -26,7 +26,6 @@ from app.models import (
     Card,
     Chat,
     Income,
-    MemoryHit,
     Payout,
     Player,
     PreparedDay,
@@ -91,7 +90,6 @@ async def _wipe(days: list[int]) -> None:
         await db.execute(delete(Vote))
         await db.execute(delete(Stake))
         await db.execute(delete(Income))
-        await db.execute(delete(MemoryHit))
         await db.execute(delete(RevoteGrant))
         await db.execute(delete(Payout))
         for round_row in (
@@ -358,10 +356,10 @@ async def test_announce_new_day_is_text_only(monkeypatch, tmp_path) -> None:
 # ---------- Сброс игры: FK-полный wipe (инцидент incomes_round_id_fkey) ----------
 
 
-async def test_resetgame_wipes_income_and_memory_links(offline_all) -> None:
+async def test_resetgame_wipes_income_links(offline_all) -> None:
     """Регрессия: Income.round_id держит FK на rounds — сброс падал
     ForeignKeyViolation и молча откатывался целиком."""
-    from app.models import Income, MemoryHit
+    from app.models import Income
 
     player_id = 880_001
     round_row = _round(900, RoundStatus.CLOSED, voting_in_minutes=-40)
@@ -371,7 +369,6 @@ async def test_resetgame_wipes_income_and_memory_links(offline_all) -> None:
         db.add(round_row)
         await db.flush()
         db.add(Income(kind="ton", amount_nanotons=1, round_id=round_row.id, unit_ref="r1"))
-        db.add(MemoryHit(player_id=player_id, round_id=round_row.id))
         await db.commit()
 
     message = _message("/resetgame confirm keepstory")
@@ -381,7 +378,6 @@ async def test_resetgame_wipes_income_and_memory_links(offline_all) -> None:
     assert any("Игра обнулена" in t for t in texts)
     async with SessionLocal() as db:
         assert (await db.execute(select(Income))).scalars().all() == []
-        assert (await db.execute(select(MemoryHit))).scalars().all() == []
         days = (
             await db.execute(select(Round.day_index).order_by(Round.day_index.asc()))
         ).scalars().all()
@@ -553,8 +549,7 @@ def test_every_round_foreign_key_table_is_wiped() -> None:
                     f"таблица {table.name} ссылается на rounds, но не стирается в reset_game"
                 )
     source = inspect.getsource(__import__("app.rounds", fromlist=["reset_game"]).reset_game)
-    for name in ("Income", "MemoryHit"):
-        assert f"delete({name})" in source
+    assert "delete(Income)" in source
 
 
 # ---------- Слепые ветки жизненного цикла: сбои открытия дня, гонки, heal ----------

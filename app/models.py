@@ -678,17 +678,3 @@ class StoryCassette(Base):
     )
 
 
-class MemoryHit(Base):
-    """Отметка внимательности: игрок узнал тихий след давнего дня в каноне.
-
-    Бот никогда не подтверждает и не опровергает догадку — только копит
-    счётчик «Память пути» на будущую прогрессию. Одна отметка на игрока в день.
-    """
-
-    __tablename__ = "memory_hits"
-
-    player_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    round_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-

@@ -867,43 +867,7 @@ def _weighted_amounts(total_nanotons: int, payable: list, weights: list[int]) ->
     return amounts
 
 
-async def _memory_nomination(session, period_start: datetime, period_end: datetime) -> str | None:
-    """«Самый памятливый пёс недели»: максимум находок памяти в окне недели.
 
-    Косметика церемонии: ничего не платит и не влияет на копилки.
-    """
-    from app.models import MemoryHit
-
-    row = (
-        await session.execute(
-            select(MemoryHit.player_id, func.count())
-            .join(Round, Round.id == MemoryHit.round_id)
-            .where(
-                Round.opens_at >= period_start,
-                Round.opens_at < period_end,
-            )
-            .group_by(MemoryHit.player_id)
-            .order_by(func.count().desc(), MemoryHit.player_id.asc())
-            .limit(1)
-        )
-    ).first()
-    if row is None or not row[1]:
-        return None
-    pid, count = int(row[0]), int(row[1])
-    player = await session.get(Player, pid)
-    name = (
-        (player.username if player and player.username else None)
-        or (player.first_name if player else None)
-        or f"игрок {pid}"
-    )
-    mod10, mod100 = count % 10, count % 100
-    if mod10 == 1 and mod100 != 11:
-        word = "находка"
-    elif mod10 in (2, 3, 4) and mod100 not in (12, 13, 14):
-        word = "находки"
-    else:
-        word = "находок"
-    return f"🧠 Самый памятливый пёс недели: {name} — {count} {word} памяти."
 
 
 async def settle_week_if_due(bot: Bot | None = None) -> bool:
@@ -1075,10 +1039,6 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
 
         await session.execute(delete(WeeklyPot).where(WeeklyPot.week <= prev_key))
         marker.value = prev_key
-        try:
-            nomination = await _memory_nomination(session, period_start, period_end)
-        except Exception:
-            nomination = None
         await session.commit()
 
     logger.info(
@@ -1094,8 +1054,6 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         "При равенстве верных сцен Стая смотрит на вклад Gram, а затем — "
         "кто раньше всех заявил о месте."
     )
-    if nomination:
-        lines.append(nomination)
     if rolled > 0:
         lines.append("Незаполненные места недели перешли в копилку новой.")
     lines.append("Неделя началась заново — копилка копится с нуля. Удачи!")

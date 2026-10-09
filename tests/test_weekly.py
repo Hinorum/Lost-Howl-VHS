@@ -29,7 +29,6 @@ from app.leaderboard import (
 )
 from app.models import (
     LeaderboardClaim,
-    MemoryHit,
     Payout,
     Player,
     Round,
@@ -1205,14 +1204,11 @@ async def test_settle_week_corrupt_anchor_keeps_strict_threshold(
 async def test_settle_week_dust_rolls_into_existing_pot_surviving_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Пыль катится в СУЩЕСТВУЮЩУЮ копилку (1073); сбой номинации (1079-1080)
-    и рассылки церемонии (1107-1108) не валят выплату."""
+    """Пыль катится в СУЩЕСТВУЮЩУЮ копилку (1073); сбой рассылки церемонии
+    (1107-1108) не валит выплату. Памятливость снята вместе с memory_hits —
+    поэтому проверяем только «рассылка упала»."""
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "weekly_min_days", 1)
-    monkeypatch.setattr(
-        "app.leaderboard._memory_nomination",
-        AsyncMock(side_effect=RuntimeError("память упала")),
-    )
     monkeypatch.setattr(
         "app.broadcast.whisper_to_chats",
         AsyncMock(side_effect=RuntimeError("рассылка упала")),
@@ -1256,75 +1252,6 @@ async def test_settle_week_dust_rolls_into_existing_pot_surviving_failures(
             assert marker is not None and marker.value == week_key
         finally:
             await _cleanup_week_scene(session, [round_row], [pid])
-
-
-async def test_settle_week_ceremony_carries_memory_nomination(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Церемония несёт номинацию памяти (1097, «1 находка» — 902), шёпот в чаты
-    уходит (1103-1106), сбой алерта админу — warning без падения (1110-1115)."""
-    monkeypatch.setattr(settings, "ton_enabled", True)
-    monkeypatch.setattr(settings, "weekly_min_days", 1)
-    monkeypatch.setattr(settings, "admin_ids", "7777")
-    whisper = AsyncMock()
-    monkeypatch.setattr("app.broadcast.whisper_to_chats", whisper)
-    week_key = previous_week_key()
-    prev_start, _ = week_bounds(week_key)
-    pid = 893_001
-    async with SessionLocal() as session:
-        await _wipe_week_keys(session)
-        session.add(
-            Player(
-                id=pid,
-                username=f"p{pid}",
-                wallet_address="0:" + os.urandom(32).hex(),
-                wallet_verified=True,
-            )
-        )
-        round_row = await _seed_closed_round(
-            session, 893_000, prev_start + timedelta(days=1, hours=11)
-        )
-        session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
-        session.add(MemoryHit(player_id=pid, round_id=round_row.id))
-        _set_stake(session, round_row, pid)
-        session.add(WeeklyPot(week=week_key, nanotons=to_nano(10)))
-        await _set_week_ready(session, week_key)
-        await session.commit()
-        bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("Telegram лёг")))
-        try:
-            assert await settle_week_if_due(bot=bot) is True
-            assert whisper.await_count == 1
-            ceremony = whisper.await_args.args[1]
-            assert "🏆 Итоги недели Стаи" in ceremony
-            assert "🧠 Самый памятливый пёс недели" in ceremony  # 1097
-            assert "1 находка" in ceremony  # 902
-            assert bot.send_message.await_count >= 1  # 1110-1115
-        finally:
-            await session.execute(
-                MemoryHit.__table__.delete().where(MemoryHit.round_id == round_row.id)
-            )
-            await session.commit()
-            await _cleanup_week_scene(session, [round_row], [pid])
-
-
-async def test_memory_nomination_pluralizes_genitive_counts(
-    session: AsyncSession,
-) -> None:
-    """Склонение рода для количества находок: 5 — «находок» (906)."""
-    from app.leaderboard import _memory_nomination
-
-    base = datetime(2020, 3, 2, tzinfo=UTC)
-    pid = 894_500
-    rounds: list[Round] = []
-    for i in range(5):
-        round_row = await _seed_closed_round(session, 894_000 + i, base + timedelta(days=i))
-        session.add(MemoryHit(player_id=pid, round_id=round_row.id))
-        rounds.append(round_row)
-    await session.commit()
-
-    nomination = await _memory_nomination(session, base, base + timedelta(days=10))
-    assert nomination is not None
-    assert "5 находок" in nomination  # ветка else (906)
 
 
 async def test_settle_week_one_day_participant_qualifies_by_default(
