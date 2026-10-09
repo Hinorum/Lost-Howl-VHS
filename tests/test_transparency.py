@@ -102,7 +102,7 @@ async def test_wallet_view_shows_distribution_and_dyor(session, monkeypatch) -> 
     assert "Распределение фонда дня" in text
     for marker in ("95%", "1%", "2%", "0,5%", "Фонд Стаи", "копилка месяца", "пригласившим"):
         assert marker in text
-    assert "возвращаются целиком" in text
+    assert "возвращаются (минус газ сети)" in text
     assert "DYOR" in text
 
 

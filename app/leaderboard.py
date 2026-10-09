@@ -368,13 +368,12 @@ async def _notify_tied_players(
     """Отправляет DM tied-игрокам с кнопкой Claim."""
     if bot is None or not tied_player_ids:
         return
-    human = (
-        f"недели {period}"
-        if kind == "week"
-        else f"месяца {period}"
-    )
+    from app.handlers import _human_claim_period
+
+    human = _human_claim_period(kind, period)
+    label = f"недели ({human})" if kind == "week" else f"месяца ({human})"
     text = (
-        f"🏆 Ничья за призовые места leaderboard {human}!\n\n"
+        f"🏆 Ничья за призовые места leaderboard {label}!\n\n"
         "Ты и ещё кто-то набрали одинаковые верные сцены и вклад Gram. "
         "Чтобы решить, кто выше — нажми кнопку заявки ниже. "
         "Кто раньше нажал — тот выше. "

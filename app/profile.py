@@ -64,18 +64,11 @@ def _build_commands() -> tuple[list[BotCommand], list[BotCommand]]:
         BotCommand(command="start", description="Как играть: PLAY кассеты"),
         BotCommand(command="today", description="Карты дня"),
         BotCommand(command="score", description="Карточка Стаи: титул и серия"),
+        BotCommand(command="rank", description="Карточка Стаи (то же, что /score)"),
     ]
-    if settings.revote_enabled:
-        private.append(
-            BotCommand(
-                command="change",
-                description=(
-                    "Перемотать кадр (⭐ или Gram)"
-                    if settings.ton_enabled
-                    else f"Перемотать кадр (⭐ {settings.revote_stars})"
-                ),
-            )
-        )
+    if settings.revote_enabled and settings.ton_enabled:
+        # В бесплатной версии /change безусловно отказывает — не рекламируем.
+        private.append(BotCommand(command="change", description="Перемотать кадр (⭐ или Gram)"))
     if settings.ton_enabled:
         private += [
             BotCommand(command="wallet", description="Привязать кошелёк Gram"),

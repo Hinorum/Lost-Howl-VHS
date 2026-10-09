@@ -44,16 +44,14 @@ def _commands_help() -> list[str]:
     lines = [
         "<b>Команды Стаи</b>",
         "/start — вставить кассету: как играть и памятка",
-        "/menu — пульт LOST HOWL: всё по кнопкам",
+        f"/menu — пульт {settings.world_name}: всё по кнопкам",
         "/today — кадр дня: варианты и выбор",
         "/score — карточка Стаи: титул, серия и голоса за неделю и месяц",
+        "/rank — карточка Стаи (то же, что /score)",
     ]
-    if settings.revote_enabled:
-        lines.append(
-            "/change — перемотать кадр (⭐ или Gram)"
-            if settings.ton_enabled
-            else f"/change — перемотать кадр (⭐ {settings.revote_stars})"
-        )
+    if settings.revote_enabled and settings.ton_enabled:
+        # В бесплатной версии /change безусловно отказывает (topup) — не рекламируем.
+        lines.append("/change — перемотать кадр (⭐ или Gram)")
     if settings.ton_enabled:
         from app.handlers.wallet import _pct_text
 
@@ -201,11 +199,21 @@ async def cmd_start(message: Message) -> None:
         "из хлама. Раз в месяц хранитель вставляет в лоток кассету —",
         "фанфик по «Lost Dogs: The Way»: стая псов ищет дом в разбитом городе.",
         "",
-        "Каждый день — один кадр в трёх вариантах. Ты выбираешь его",
-        "голосом или ставкой Gram. Жребий дня решает, какой кадр уцелеет:",
-        "день Большинства — с самой большой суммой Gram, день Меньшинства — с самой малой,",
-        "день Середины — со средней суммой Gram. Уцелевший кадр едет в сценарий дальше.",
+        "Каждый день — один кадр в трёх вариантах.",
     ]
+    if settings.ton_enabled:
+        lines += [
+            "Ты выбираешь его голосом или ставкой Gram. Жребий дня решает,",
+            "какой кадр уцелеет: день Большинства — с самой большой суммой Gram,",
+            "день Меньшинства — с самой малой, день Середины — со средней суммой Gram.",
+        ]
+    else:
+        lines += [
+            "Ты выбираешь его голосом. Жребий дня решает, какой кадр уцелеет:",
+            "день Большинства — за кадром с наибольшим числом голосов,",
+            "день Меньшинства — за наименьшим, день Середины — за средним.",
+        ]
+    lines.append("Уцелевший кадр едет в сценарий дальше.")
     if settings.ton_enabled:
         lines.append(
             "🐾 Как поставить Gram на кадр — /stake. Голос без ставки тоже ведёт "
@@ -520,7 +528,16 @@ async def _score_text(user) -> str:
         f"🗓 Голосов в месяце: {rank['month_votes']} · верных: {rank['month_correct']}",
     ]
     if settings.ton_enabled:
-        lines.append("🏆 Топ-3 верных сцен недели и месяца делят копилки Gram (доли 50/30/20)")
+        w_pcts = "/".join(
+            part.strip() for part in settings.weekly_prize_pcts.split(",") if part.strip()
+        )
+        m_pcts = "/".join(
+            part.strip() for part in settings.monthly_prize_weights.split(",") if part.strip()
+        )
+        lines.append(
+            f"🏆 Топ-3 верных сцен недели и месяца делят копилки Gram "
+            f"(доли недели {w_pcts}, месяца {m_pcts})"
+        )
     lines.append("")
     lines.append("🐾 Лестница титулов (верных сцен подряд):")
     ladder = [f"{t.correct_needed} {t.name}" for t in TITLES[1:]]
@@ -837,11 +854,22 @@ async def on_vote(callback: CallbackQuery) -> None:
             )
             return
         if outcome == "no_grant":
-            hint = (
-                f"Твой выбор уже записан. Перемотать кадр — ⭐{settings.revote_stars}, команда /change."
-            )
-            if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
-                hint = "Твой выбор уже записан. Перемотка кадра платная — через личку бота: /change."
+            # Обещаем /change только когда он реально продаётся: в бесплатной
+            # версии и в день без ставок команда безусловно отказывает.
+            hint = "Твой выбор уже записан."
+            if getattr(round_row, "money_mode", True) is False:
+                hint += " Сегодня версия без ставок — кадр не перемотать."
+            elif settings.ton_enabled:
+                if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
+                    hint = (
+                        "Твой выбор уже записан. Перемотка кадра платная — "
+                        "через личку бота: /change."
+                    )
+                else:
+                    hint = (
+                        f"Твой выбор уже записан. Перемотать кадр — "
+                        f"⭐{settings.revote_stars}, команда /change."
+                    )
             await callback.answer(hint[:200], show_alert=True)
             return
     texts = {

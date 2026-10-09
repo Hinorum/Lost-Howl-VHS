@@ -93,7 +93,7 @@ def _economy_text() -> str:
         f"• {_pct_text(settings.referral_pct)}% — пригласившим: с подтверждённых ставок приведённых "
         f"игроков, копится до порога (см. /invite и /referral)\n"
         f"• {_pct_text(settings.owner_rake_pct)}% — налог «Децентрализованному Богу»\n"
-        "\nЕсли на верную сцену не поставил никто — все ставки возвращаются целиком."
+        "\nЕсли на верную сцену не поставил никто — все ставки возвращаются (минус газ сети)."
     )
 
 
@@ -188,7 +188,8 @@ def _win_calc_text() -> str:
         f"Одинокий верный игрок забирает весь пул: банк 5 G при ставке 0.5 G → "
         f"выигрыш {pool2:.2f} G (×{coef2:.1f}).\n"
         f"Доля меньше {settings.min_payout_gram:g} G не станет переводом — она капнет "
-        "в копилку недели. На верную сцену не поставил никто — все ставки возвращаются целиком."
+        f"в копилку недели. На верную сцену не поставил никто — все ставки "
+        f"возвращаются (минус газ сети ~{fee:g} G)."
     )
 
 
@@ -211,9 +212,8 @@ async def _wallet_view_text(user) -> str:
                     "\n\n⚠️ Кошелёк ещё не подтверждён — с него не считаются ставки.\n"
                     f"Подтверди владение: отправь с него перевод казначею (/stake) "
                     f"от {settings.refund_min_gram:g} Gram с комментарием "
-                    f"<code>bv:{player.wallet_verify_code}</code>. "
-                    f"Сумма от {settings.refund_min_gram:g} Gram вернётся целиком; "
-                    "меньше — не вернётся (газ возврата дороже пыли)."
+                    f"<code>bv:{player.wallet_verify_code}</code> — "
+                    "сумма проверочного перевода вернётся целиком."
                 )
         else:
             body = (
@@ -319,12 +319,15 @@ async def _bind_wallet(message: Message, address: str) -> bool:
             f"{ok_mark(str(uid))} Кошелёк привязан — осталось подтвердить, что он твой.\n"
             f"Отправь с него перевод казначею (адрес: /stake) с комментарием:\n"
             f"<code>bv:{player.wallet_verify_code}</code>\n"
-            f"от {settings.refund_min_gram:g} Gram — сумма вернётся целиком; "
-            "перевод меньше не вернётся (газ возврата дороже). Играть со ставками можно "
-            "только после подтверждения — перевод до него вернётся обратно."
+            f"от {settings.refund_min_gram:g} Gram — сумма проверочного перевода "
+            "вернётся целиком. Играть со ставками можно только после подтверждения — "
+            "перевод до него вернётся обратно."
         )
     else:
-        confirmation = f"{ok_mark(str(uid))} Кошелёк привязан. Теперь переводы с него будут считаться твоими ставками."
+        confirmation = (
+            f"{ok_mark(str(uid))} Кошелёк привязан. В бесплатной версии ставок нет — "
+            "игра идёт голосами."
+        )
     if message.chat.type == ChatType.PRIVATE:
         await message.answer(confirmation)
     else:
@@ -475,7 +478,8 @@ _STAKE_HOWTO = (
     "Порядок не важен: голос и перевод засчитываются в любой последовательности, "
     "важно успеть до дедлайна «Голосование до». Одна ставка на игрока в день. "
     "Перевод, не ставший ставкой (нет кошелька, ставка уже есть, день закрылся), "
-    "вернётся автоматически. Исключение — зона платы за перемотку кадра "
+    "вернётся автоматически — если он от {rmin:g} Gram (пыль дешевле газа "
+    "возврата и остаётся в казне). Исключение — зона платы за перемотку кадра "
     "({revote:g}…{min:g} Gram): если игрок уже выбрал кадр сегодня, перевод "
     "зачтётся как оплата перемотки и без мемо."
 )
@@ -497,6 +501,7 @@ async def _stake_view_text(user) -> str:
         mark=money_mark(str(user.id)),
         min=settings.stake_min_ton,
         revote=settings.revote_ton,
+        rmin=settings.refund_min_gram,
         treasury=settings.active_treasury_address or "(адрес казначея ещё не настроен)",
     )
     status = ""
@@ -675,8 +680,9 @@ def _format_top(
             ticket = "🎟" if eligible else "🔒"
             lines.append(f"{medal} {ticket} {name} — {count} верн.")
     lines.append(
-        f"🎟 прошёл отбор · 🔒 не хватает требований (кошелёк, "
-        f"{max(1, settings.weekly_min_days)} {_days_word(max(1, settings.weekly_min_days))} "
+        f"🎟 прошёл отбор · 🔒 не хватает требований (подтверждённый кошелёк, "
+        f"≥1 верная сцена, {max(1, settings.weekly_min_days)} "
+        f"{_days_word(max(1, settings.weekly_min_days))} "
         f"голосования и ставка за неделю) · "
         "топ-3 делят копилку (ничья — больший вклад Gram, затем кто первый заявит о месте) · "
         "выплата в понедельник"
@@ -691,7 +697,7 @@ def _format_top(
             ticket = "🎟" if eligible else "🔒"
             lines.append(f"{place}. {ticket} {name} — {count} верн.")
     lines.append(
-        "🎟 прошёл отбор · 🔒 не хватает требований (кошелёк и ставка в месяце) · "
+        "🎟 прошёл отбор · 🔒 не хватает требований (подтверждённый кошелёк и ставка в месяце) · "
         "топ-3 делят копилку (ничья — вклад Gram, затем кто первый заявит о месте) · "
         "выплата 1-го"
     )
@@ -779,6 +785,7 @@ async def _top_text() -> str:
                     select(Player.id).where(
                         Player.id.in_([pid for pid, _c, _d, _g in week_raw]),
                         Player.wallet_address.is_not(None),
+                        Player.wallet_verified.is_(True),
                     )
                 )
             ).scalars().all()
@@ -790,6 +797,7 @@ async def _top_text() -> str:
                 correct,
                 pid in wallets
                 and pid in week_staked
+                and correct > 0
                 and days >= max(1, settings.weekly_min_days),
             )
             for pid, correct, days, _gram in week_raw
@@ -810,6 +818,7 @@ async def _top_text() -> str:
                     select(Player.id).where(
                         Player.id.in_(month_pids),
                         Player.wallet_address.is_not(None),
+                        Player.wallet_verified.is_(True),
                     )
                 )
             ).scalars().all()

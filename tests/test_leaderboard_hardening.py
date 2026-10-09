@@ -547,7 +547,7 @@ async def test_month_boundary_tied_fourth_promoted_by_claim(monkeypatch: pytest.
 
 
 async def test_notify_tied_players_covers_kinds_and_failures() -> None:
-    """DM tied-игрокам: оба kind-а, кнопка Claim, сбой доставки не валит (369-394)."""
+    """DM tied-игрокам: оба kind-а, кнопка Claim, сбой доставки не валит (369-393)."""
     await _notify_tied_players(None, "week", "2026-W41", [1])  # 369-370: bot None
     bot = SimpleNamespace(send_message=AsyncMock())
     await _notify_tied_players(bot, "week", "2026-W41", [])  # 369-370: пусто
@@ -557,17 +557,18 @@ async def test_notify_tied_players_covers_kinds_and_failures() -> None:
     assert bot.send_message.await_count == 2
     call = bot.send_message.await_args_list[0]
     assert call.args[0] == 101
-    assert "недели 2026-W41" in call.args[1]  # 372, 376-382
+    # Период — по-человечески (даты недели), а не сырой ключ 2026-W41.
+    assert "недели (с 05.10 по 11.10)" in call.args[1]  # 374-381
     kb = call.kwargs["reply_markup"]
-    assert kb.inline_keyboard[0][0].callback_data == "claim:week"  # 387-389
+    assert kb.inline_keyboard[0][0].callback_data == "claim:week"  # 386-388
 
     broken = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("сеть лежит")))
-    await _notify_tied_players(broken, "month", "2026-10", [201])  # 390-394
+    await _notify_tied_players(broken, "month", "2026-10", [201])  # 389-393
     assert broken.send_message.await_count == 1
     month_call = broken.send_message.await_args_list[0]
-    assert "месяца 2026-10" in month_call.args[1]  # 374
+    assert "месяца (октября 2026)" in month_call.args[1]  # 374
     month_kb = month_call.kwargs["reply_markup"]
-    assert month_kb.inline_keyboard[0][0].text == "🗓 Заявить приз месяца"  # 385
+    assert month_kb.inline_keyboard[0][0].text == "🗓 Заявить приз месяца"  # 382-385
 
 
 async def test_claim_window_overwrites_and_garbage_is_none(session: AsyncSession) -> None:

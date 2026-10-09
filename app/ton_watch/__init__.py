@@ -313,7 +313,7 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                         bot,
                         player.id,
                         f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-                        "сегодня бесплатный день — перемотка кадра ничего не стоит, деньги не сгорят.",
+                        "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
                     )
                 else:
                     await _dm_stake(
@@ -334,7 +334,7 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                     bot,
                     player.id,
                     f"💎 Перемотка кадра оплачена ({from_nano(transfer.value_nanotons):g} Gram, "
-                    "без мемо — зачтено по сумме). Нажми другой вариант — кадр перемотан.",
+                    "без мемо — зачтено по сумме). Нажми другой вариант — кадр перемотается.",
                 )
                 return "revote_ok"
             if auto_status == "no_vote":
@@ -375,7 +375,7 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                     bot,
                     player.id,
                     f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-                    "сегодня бесплатный день — перемотка кадра бесплатна, платить не нужно.",
+                    "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
                 )
                 return "revote_auto_money_off"
         round_result = await session.execute(
@@ -429,8 +429,8 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                 await _dm_stake(
                     bot,
                     player.id,
-                    f"↩️ Перевод {amount} Gram возвращается: сегодня бесплатный день — "
-                    "ставки не принимаются, деньги не сгорят. Завтра день снова со ставками.",
+                    f"↩️ Перевод {amount} Gram возвращается: сегодня версия без ставок — "
+                    "ставки не принимаются. Поставить можно в день со ставками.",
                 )
             else:
                 reason = "ставка на этот день уже есть" if result == "already_staked" else "день уже закрылся"
