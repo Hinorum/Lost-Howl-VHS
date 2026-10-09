@@ -20,7 +20,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import LeaderboardPot, Player, Round, Stake, WatcherState
+from app.models import LeaderboardPot, Player, Round, RoundStatus, Stake, WatcherState
 from app.rounds import get_active_round
 from app.style import hint_mark, money_mark, ok_mark, strip_html, warn_mark
 from app.ton_utils import (
@@ -550,6 +550,29 @@ def _stake_pay_keyboard() -> InlineKeyboardMarkup | None:
             [InlineKeyboardButton(text="📋 Скопировать адрес", callback_data="stake:copy")],
         ]
     )
+
+
+async def _post_vote_stake_markup(
+    session, player: Player, round_row: Round
+) -> InlineKeyboardMarkup | None:
+    """Клавиатура ставки под подтверждением голоса — короткий путь в игровой день.
+
+    Показываем, только когда ставка ещё не внесена и её реально могут принять:
+    день открыт, режим со ставками, TON включён, кошелёк привязан. Тогда путь
+    «проголосовал → кнопка кошелька с подставленным адресом (или копирование)»
+    вместо обходной через /stake. Если ставка уже есть — не спамим кнопками.
+    """
+    if (
+        not settings.ton_enabled
+        or not settings.active_treasury_address
+        or round_row.status != RoundStatus.OPEN
+        or getattr(round_row, "money_mode", True) is False
+        or not player.wallet_address
+    ):
+        return None
+    if await _today_stake_line(session, player.id) is not None:
+        return None
+    return _stake_pay_keyboard()
 
 
 @router.callback_query(F.data == "stake:copy")

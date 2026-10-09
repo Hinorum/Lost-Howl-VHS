@@ -811,10 +811,21 @@ async def on_vote(callback: CallbackQuery) -> None:
             # открывал диалог с ботом — алерт был и так показан.
             if settings.player_dm:
                 try:
+                    from app.handlers.wallet import _post_vote_stake_markup
+
+                    text = f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены."
+                    markup = await _post_vote_stake_markup(session, player, round_row)
+                    if markup is not None:
+                        text += (
+                            "\n\n💳 Ставку на выбор вноси прямо здесь: кнопка кошелька "
+                            "откроет перевод с подставленным адресом, а «Скопировать "
+                            "адрес» пригодится для любого другого кошелька."
+                        )
                     await callback.bot.send_message(
                         callback.from_user.id,
-                        f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены.",
+                        text,
                         parse_mode=ParseMode.HTML,
+                        reply_markup=markup,
                     )
                 except Exception as exc:
                     logger.debug("Личное подтверждение выбора игроку %s не доставлено: %s", callback.from_user.id, exc)

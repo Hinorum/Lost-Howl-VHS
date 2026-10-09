@@ -16,7 +16,7 @@ from sqlalchemy import delete, select
 from app.config import settings
 from app.db import SessionLocal
 from app.handlers import on_vote
-from app.models import Player, Round, RoundStatus, Vote, WinRule
+from app.models import Player, Round, RoundStatus, Stake, Vote, WinRule
 
 
 def _open_round(day_index: int) -> Round:
@@ -181,6 +181,95 @@ async def test_group_vote_dm_blocked_does_not_crash(monkeypatch) -> None:
 async def _wipe(rid: int, pid: int) -> None:
     async with SessionLocal() as db:
         await db.execute(delete(Vote).where(Vote.round_id == rid))
+        await db.execute(delete(Stake).where(Stake.round_id == rid))
         await db.execute(delete(Round).where(Round.id == rid))
         await db.execute(delete(Player).where(Player.id == pid))
         await db.commit()
+
+
+async def test_vote_dm_carries_stake_shortcut(monkeypatch) -> None:
+    """Подтверждение голоса несёт кнопки ставки: адрес в один тап, без /stake.
+
+    Короткий путь игрового дня: проголосовал → кнопка кошелька с подставленным
+    адресом (или копирование) прямо в этом сообщении.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", "UQ" + "a" * 46)
+    rid, pid = await _seed_round(8111)
+    async with SessionLocal() as db:
+        pl = await db.get(Player, pid)
+        assert pl is not None
+        pl.wallet_address = "UQ" + "b" * 46
+        await db.commit()
+    send_dm = AsyncMock()
+    callback = _callback(pid=pid, chat_type="supergroup", bot=Mock(send_message=send_dm))
+    callback.data = f"vote:{rid}:1"
+    try:
+        await on_vote(callback)
+        send_dm.assert_awaited_once()
+        call = send_dm.await_args
+        assert "Твой выбор этого дня" in call.args[1]
+        assert "Ставку на выбор вноси прямо здесь" in call.args[1]
+        markup = call.kwargs["reply_markup"]
+        assert markup is not None, "клавиатура ставки не прикреплена"
+        cbs = [
+            b.callback_data
+            for row in markup.inline_keyboard
+            for b in row
+            if b.callback_data
+        ]
+        assert "stake:copy" in cbs
+        urls = [b.url for row in markup.inline_keyboard for b in row if b.url]
+        assert urls, "кнопки кошельков с адресом отсутствуют"
+    finally:
+        await _wipe(rid, pid)
+
+
+async def test_vote_dm_omits_shortcut_when_staked(monkeypatch) -> None:
+    """Ставка уже внесена — подтверждение без кнопок (не спамим)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", "UQ" + "a" * 46)
+    rid, pid = await _seed_round(8112)
+    async with SessionLocal() as db:
+        pl = await db.get(Player, pid)
+        assert pl is not None
+        pl.wallet_address = "UQ" + "b" * 46
+        db.add(
+            Stake(
+                round_id=rid,
+                player_id=pid,
+                amount_nanotons=500_000_000,
+                tx_hash="sv-1",
+                status="confirmed",
+            )
+        )
+        await db.commit()
+    send_dm = AsyncMock()
+    callback = _callback(pid=pid, chat_type="supergroup", bot=Mock(send_message=send_dm))
+    callback.data = f"vote:{rid}:0"
+    try:
+        await on_vote(callback)
+        send_dm.assert_awaited_once()
+        call = send_dm.await_args
+        assert call.kwargs["reply_markup"] is None
+        assert "Ставку на выбор" not in call.args[1]
+    finally:
+        await _wipe(rid, pid)
+
+
+async def test_vote_dm_no_shortcut_without_linked_wallet(monkeypatch) -> None:
+    """Кошелёк не привязан — кнопок ставки нет: сначала /wallet."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", "UQ" + "a" * 46)
+    rid, pid = await _seed_round(8113)
+    send_dm = AsyncMock()
+    callback = _callback(pid=pid, chat_type="supergroup", bot=Mock(send_message=send_dm))
+    callback.data = f"vote:{rid}:2"
+    try:
+        await on_vote(callback)
+        send_dm.assert_awaited_once()
+        call = send_dm.await_args
+        assert call.kwargs["reply_markup"] is None
+        assert "Ставку на выбор" not in call.args[1]
+    finally:
+        await _wipe(rid, pid)
