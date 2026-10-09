@@ -32,46 +32,30 @@ _BUTTON_TEXT_MAX = 64  # текст inline-кнопки Telegram — до 64 з�
 _FORGET_MARKS = ("forbidden", "not found", "kicked", "deactivated", "migrated")
 
 
-def cards_keyboard(
-    round_id: int,
-    cards,
-    remember: bool = False,
-    day_index: int | None = None,
-) -> InlineKeyboardMarkup:
-    """Три кнопки голосования под постом дня.
+def cards_keyboard(round_id: int, cards) -> InlineKeyboardMarkup:
+    """Три кнопки голосования под постом дня — столбиком, по одной в строке.
 
-    Единственная структура дня: варианты выбора живут только здесь, поэтому
-    карта обязательна. Подпись — название сцены из кассеты (короткое
-    действие), длиннее лимита Telegram обрезается по словам. Последствия в
-    кнопку не попадают — их текст дня не показывает; канон живёт
-    в consequence и всплывает в итогах.
+    Каждая кнопка занимает всю ширину клавиатуры, поэтому длинные названия
+    сцен не сжимаются, как в одном ряду из трёх: лимит Telegram по длине
+    текста (≈ 64) больше не узкое место, а защитный кап от очень длинных
+    card.title. Подпись — название сцены из кассеты (короткое действие),
+    длиннее капа — обрезается по словам. Последствия в кнопку не попадают —
+    их текст дня не показывает; канон живёт в consequence и всплывает
+    в итогах.
     """
     titles = {card.position: (card.title or "").strip() for card in cards}
-    labels = []
+    rows: list[list[InlineKeyboardButton]] = []
     for position in range(3):
         # Позиции 0–2 гарантирует схема кассеты; `or` — страховка от битой
         # строки в базе, чтобы рассылка не падала на отправке.
         label = titles.get(position) or f"Сцена {POSITIONS[position]}"
         if len(label) > _BUTTON_TEXT_MAX:
             label = _clamp(label, _BUTTON_TEXT_MAX - 1)
-        labels.append(label)
-    rows = [
-        [
-            InlineKeyboardButton(text=labels[position], callback_data=f"vote:{round_id}:{position}")
-            for position in range(3)
-        ],
-    ]
-    if remember:
-        # Кнопка памяти живёт только в дни, когда в главу реально всплыло эхо.
-        # Кодируем и PK раунда (для отметки MemoryHit), и его day_index (для
-        # поиска всплывших эхо) — после /resetgame id уже не равен day_index.
-        if day_index is None:
-            day_index = round_id
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🧠 Я помню этот след",
-                    callback_data=f"remember:{round_id}:{day_index}",
+                    text=label,
+                    callback_data=f"vote:{round_id}:{position}",
                 )
             ]
         )
@@ -556,7 +540,6 @@ async def _deliver_day(
     round_row: Round,
     finished: Round | None,
     results_text: str | None = None,
-    remember: bool = False,
     is_dm: bool = False,
 ) -> bool:
     """Полный пакет дня в один чат. Итоги передаются готовым текстом:
@@ -579,12 +562,7 @@ async def _deliver_day(
     # вместе с реальной генерацией — тогда понадобится и send_media_group
     # (Telegram принимает его только от двух вложений, см. историю 2dfc1a).
     status_body = await status_text(round_row, show_title=True)
-    markup = cards_keyboard(
-        round_row.id,
-        remember=remember,
-        day_index=round_row.day_index,
-        cards=round_row.cards,
-    )
+    markup = cards_keyboard(round_row.id, cards=round_row.cards)
 
     if outgoing_results:
         # Итоги дня — только текстом. Фото победившей ветки не постим: это был
@@ -698,9 +676,7 @@ async def refresh_day_bank(bot: Bot | None = None) -> None:
         if loaded is None:
             return
         text = await status_text(loaded, show_title=True)
-        keyboard = cards_keyboard(
-            loaded.id, remember=False, day_index=loaded.day_index, cards=loaded.cards
-        )
+        keyboard = cards_keyboard(loaded.id, cards=loaded.cards)
 
         for row in rows:
             try:
@@ -757,7 +733,6 @@ async def _deliver_chat(
     round_row: Round,
     finished: Round | None,
     results_text: str | None,
-    remember: bool = False,
     reasons: Counter[str] | None = None,
 ) -> int | None:
     """Доставка в чат. None — неудача.
@@ -771,7 +746,7 @@ async def _deliver_chat(
     """
     try:
         if await _deliver_day(
-            bot, chat_id, round_row, finished, results_text, remember=remember
+            bot, chat_id, round_row, finished, results_text
         ):
             return chat_id
         return None
@@ -845,8 +820,6 @@ async def announce_new_day(
             round_row.day_index,
         )
     results_text = await results_message(finished) if finished is not None else None
-    # Кнопка памяти снята вместе со слоем сюжета (эхо-система удалена).
-    remember = False
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
     reasons: Counter[str] = Counter()
 
@@ -854,7 +827,7 @@ async def announce_new_day(
         async with semaphore:
             return await _deliver_chat(
                 bot, chat_id, round_row, finished, results_text,
-                remember=remember, reasons=reasons,
+                reasons=reasons,
             )
 
     outcomes = await asyncio.gather(*(worker(chat_id) for chat_id in chat_ids))
@@ -875,7 +848,7 @@ async def announce_new_day(
         delivered_dm = await _dm_send_all(
             bot,
             lambda pid: _deliver_day(
-                bot, pid, round_row, finished, results_text, remember=remember, is_dm=True
+                bot, pid, round_row, finished, results_text, is_dm=True
             ),
             f"Личный пакет дня {round_row.day_index}",
         )

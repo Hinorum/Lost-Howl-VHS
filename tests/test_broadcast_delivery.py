@@ -150,32 +150,33 @@ def _cards() -> list[SimpleNamespace]:
     return [SimpleNamespace(position=position, title=f"Путь {position}") for position in range(3)]
 
 
-def test_cards_keyboard_remember_button_encodes_day() -> None:
-    """Кнопка памяти несёт и PK раунда, и day_index: после /resetgame они
-    разъезжаются, и без второго поля эхо ищется не в том дне."""
-    plain = bc.cards_keyboard(7, cards=_cards())
-    assert [b.callback_data for b in plain.inline_keyboard[0]] == [
+def test_cards_keyboard_puts_each_vote_button_in_its_own_row() -> None:
+    """Три кнопки голосования идут столбиком, по одной в строке: на мобиле
+    длинные названия сцен не сжимаются, как в одной строке из трёх.
+    callback_data по-прежнему несёт position для отметки голоса."""
+    rows = bc.cards_keyboard(7, cards=_cards()).inline_keyboard
+    assert [row[0].callback_data for row in rows] == [
         "vote:7:0",
         "vote:7:1",
         "vote:7:2",
     ]
-    with_remember = bc.cards_keyboard(7, cards=_cards(), remember=True)
-    button = with_remember.inline_keyboard[1][0]
-    assert button.callback_data == "remember:7:7"
-    explicit = bc.cards_keyboard(7, cards=_cards(), remember=True, day_index=80_123)
-    assert explicit.inline_keyboard[1][0].callback_data == "remember:7:80123"
+    # Ровно три строки, в каждой — ровно одна кнопка.
+    assert len(rows) == 3
+    for row in rows:
+        assert len(row) == 1
 
 
 def test_cards_keyboard_signs_buttons_with_scene_titles() -> None:
     """Подписи кнопок — названия сцен из кассеты: игрок выбирает конкретное
-    действие. Длинное название обрезается в пределах лимита кнопки Telegram;
+    действие. Длинное название обрезается в пределах защитного капа Telegram;
     последствий в кнопке нет — их текст дня не показывает."""
     cards = [
         SimpleNamespace(position=0, title="Идти к реке"),
         SimpleNamespace(position=1, title="Слушать эхо"),
         SimpleNamespace(position=2, title="О" * 80),
     ]
-    labels = [b.text for b in bc.cards_keyboard(7, cards=cards).inline_keyboard[0]]
+    rows = bc.cards_keyboard(7, cards=cards).inline_keyboard
+    labels = [row[0].text for row in rows]
     assert labels[:2] == ["Идти к реке", "Слушать эхо"]
     assert len(labels[2]) <= 64
     assert labels[2].endswith("…")

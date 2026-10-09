@@ -207,9 +207,7 @@ async def cmd_advance(message: Message) -> None:
         await message.answer(
             await status_text(nxt, show_title=True),
             parse_mode=ParseMode.HTML,
-            reply_markup=cards_keyboard(
-                nxt.id, remember=False, day_index=nxt.day_index, cards=nxt.cards
-            ),
+            reply_markup=cards_keyboard(nxt.id, cards=nxt.cards),
         )
 
 
