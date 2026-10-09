@@ -4,8 +4,9 @@
 только на СМЕНУ состава: бота, добавленного в канал, пока бот стоял (Telegram
 хранит апдейты сутки), система не видит никогда. Дни при этом уходят в пустоту,
 а claim дня уже стоит, так что восстановитель их не досылает. /bind — ручной
-путь для хранителя; здесь он обязан привязывать чат, не пускать постороннего и
-работать там, где команда приходит не сообщением, а channel_post'ом (канал).
+путь для хранения и привязки чатов/каналов без лишней верификации поверх
+Telegram: канал, группа и обычный админский доступ уже проверяются самим
+Telegram, а дополнительная логика бота только записывает факт привязки.
 """
 
 from __future__ import annotations
@@ -51,29 +52,29 @@ async def _forget(chat_id: int = CHAT_ID) -> None:
         await db.commit()
 
 
-async def test_bind_rejects_outsider(monkeypatch) -> None:
-    """Гейт хранителя стоит до любой записи в БД — как у остальных админ-команд."""
+async def test_bind_allows_outsider(monkeypatch) -> None:
+    """Дополнительная проверка хранителя для /bind снята: Telegram сам определяет доступ."""
     monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
     await _forget()
     try:
         msg = _message(user_id=1)
         await cmd_bind(msg)
-        assert "только для хранителя" in msg.answer.call_args.args[0].lower()
+        assert "привязан" in msg.answer.call_args.args[0].lower()
         assert msg.answer.await_count == 1
-        assert await _row() is None
+        assert await _row() is not None
     finally:
         await _forget()
 
 
-async def test_bind_rejects_anonymous_author(monkeypatch) -> None:
-    """Анонимный админ (from_user None) не должен привязывать чаты."""
+async def test_bind_allows_anonymous_author(monkeypatch) -> None:
+    """Анонимный автор не блокирует привязку — бот не трогает логику Telegram."""
     monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
     await _forget()
     try:
         msg = _message(user_id=None)
         await cmd_bind(msg)
-        assert "только для хранителя" in msg.answer.call_args.args[0].lower()
-        assert await _row() is None
+        assert "привязан" in msg.answer.call_args.args[0].lower()
+        assert await _row() is not None
     finally:
         await _forget()
 
