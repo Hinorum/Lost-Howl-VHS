@@ -51,6 +51,17 @@ def _pct_text(value: float) -> str:
     return text.replace(".", ",")
 
 
+def _days_word(count: int) -> str:
+    """Русское склонение «день» при числе: 1 день, 2-4 дня, 5+ дней."""
+    mod100 = count % 100
+    mod10 = count % 10
+    if mod10 == 1 and mod100 != 11:
+        return "день"
+    if 2 <= mod10 <= 4 and not 12 <= mod100 <= 14:
+        return "дня"
+    return "дней"
+
+
 def _economy_text() -> str:
     """Распределение фонда дня — по живым настройкам, без дублей."""
     pcts = "/".join(part.strip() for part in settings.weekly_prize_pcts.split(",") if part.strip())
@@ -73,7 +84,8 @@ def _economy_text() -> str:
         f"(газ сети ~{settings.payout_fee_gram:g} Gram за перевод вычитается из пула заранее)\n"
         f"• {_pct_text(settings.pack_fund_pct)}% — Фонд Стаи: накопительный, разыгрывается хранителем\n"
         f"• {_pct_text(settings.weekly_pot_pct)}% — копилка недели: в понедельник топ-3 по верным сценам "
-        f"делит её ({pcts}%: сильнейший — больше); нужны кошелёк, {settings.weekly_min_days}+ дней "
+        f"делит её ({pcts}%: сильнейший — больше); нужны кошелёк, {settings.weekly_min_days}+ "
+        f"{_days_word(settings.weekly_min_days)} "
         f"голосования и ставка за неделю; ничья — больший вклад Gram, затем кто раньше заявил о месте\n"
         f"• {_pct_text(settings.leaderboard_rake_pct)}% — копилка месяца: топ-3 лидеров /top делят её "
         f"({m_pcts}%), нужны кошелёк и ставка в месяце; ничья — вклад Gram, затем кто "
@@ -641,7 +653,8 @@ def _format_top(
             lines.append(f"{medal} {ticket} {name} — {count} верн.")
     lines.append(
         f"🎟 прошёл отбор · 🔒 не хватает требований (кошелёк, "
-        f"{max(1, settings.weekly_min_days)} дней голосования и ставка за неделю) · "
+        f"{max(1, settings.weekly_min_days)} {_days_word(max(1, settings.weekly_min_days))} "
+        f"голосования и ставка за неделю) · "
         "топ-3 делят копилку (ничья — больший вклад Gram, затем кто первый заявит о месте) · "
         "выплата в понедельник"
     )

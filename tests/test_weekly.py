@@ -1327,3 +1327,44 @@ async def test_memory_nomination_pluralizes_genitive_counts(
     assert "5 находок" in nomination  # ветка else (906)
 
 
+async def test_settle_week_one_day_participant_qualifies_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Указ: порога 4 дней больше нет — дефолт min_days=1, одного дня хватает.
+
+    Настройку НЕ пинаем: проверяем сам дефолт конфига; если порог поднимут
+    снова, тест сломается первым.
+    """
+    assert settings.weekly_min_days == 1
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    week_key = previous_week_key()
+    prev_start, _ = week_bounds(week_key)
+    pid = 895_001
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        session.add(
+            Player(
+                id=pid,
+                username=f"p{pid}",
+                wallet_address="0:" + os.urandom(32).hex(),
+                wallet_verified=True,
+            )
+        )
+        round_row = await _seed_closed_round(
+            session, 895_000, prev_start + timedelta(days=3, hours=11)
+        )
+        session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+        _set_stake(session, round_row, pid)
+        session.add(WeeklyPot(week=week_key, nanotons=to_nano(10)))
+        await _set_week_ready(session, week_key)
+        await session.commit()
+        try:
+            assert await settle_week_if_due(bot=None) is True
+            payouts = (
+                await session.execute(select(Payout).where(Payout.kind == "weekly"))
+            ).scalars().all()
+            assert [p.player_id for p in payouts] == [pid]
+        finally:
+            await _cleanup_week_scene(session, [round_row], [pid])
+
+
