@@ -93,7 +93,6 @@ async def track_chat(event: ChatMemberUpdated) -> None:
     logger.info("Чат %s (%s): статус бота %s, active=%s", chat.id, chat.type, status, active)
 
 
-_BIND_TEXT_FORBIDDEN = "Только для хранителя."
 _BIND_TEXT_PRIVATE = (
     "Привязывай прямо в нужном чате: напиши /bind в группе или канале — "
     "туда и уйдут новости дня."
@@ -104,18 +103,12 @@ _BIND_TEXT_OK = "✅ Чат привязан к рассылке: новости
 @router.message(Command("bind"))
 @router.channel_post(Command("bind"))
 async def cmd_bind(message: Message) -> None:
-    """Ручная привязка чата к рассылке — для хранителя.
+    """Ручная привязка чата к рассылке.
 
-    Единственный автоматический путь, my_chat_member, срабатывает только на
-    СМЕНУ состава: бота, добавленного в канал, пока бот стоял (Telegram хранит
-    апдейты сутки), система не видит никогда — и дни уходят в пустоту, пока
-    claim дня уже стоит. /bind закрывает эту дыру вручную — под тем же
-    гейтом, что и остальные админ-команды; в канале команда приходит как
-    channel_post, поэтому хендлер зарегистрирован на оба observer'а.
+    Telegram уже проверяет права доступа к чату/каналу; дополнительная
+    верификация на уровне бота здесь не нужна, иначе обычная привязка канала
+    начинает зависеть от кастомной логики вместо встроенной модели Telegram.
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer(_BIND_TEXT_FORBIDDEN)
-        return
     chat = message.chat
     if chat.type == ChatType.PRIVATE:
         await message.answer(_BIND_TEXT_PRIVATE)
@@ -735,7 +728,7 @@ async def cmd_finalize(message: Message) -> None:
                 total_prize = sum(s.amount_nanotons for s in winning_stakes)
                 lines.append(f"Победители со ставкой: {len(winning_stakes)}, сумма ставок: {total_prize}n")
             else:
-                lines.append("Победителей со ставкой: 0 — все ставки будут возвращены")
+                lines.append("Победители со ставкой: 0 — все ставки будут возвращены")
                 if winner_ids:
                     lines.append(f"  (Угадали: {', '.join(f'P{pid}' for pid in winner_ids)}, но ставки не сделали)")
 
