@@ -94,7 +94,8 @@ WEEK_READY_KEY = "week_leaderboard_ready"
 WEEK_CLAIM_WINDOW_KEY = "claim_window:week"
 MONTH_CLAIM_WINDOW_KEY = "claim_window:month"
 
-# --- Сезон / сюжет (app/season.py, app/story/bay.py) ---
+# --- Сезон / сюжет (якорь забега — app/rounds/anchor.py, кассеты — app/story/bay.py,
+# назначение — app/handlers/panel.py) ---
 
 RUN_START_KEY = "run_season_anchor"
 # «Следующая» кассета из библиотеки app/story/cassettes/, назначенная в /panel:
@@ -107,7 +108,7 @@ STORY_CASSETTE_NEXT_KEY = "story_cassette_next"
 # команды /cassette или отдельной кнопкой отмены — хранитель не застревает.
 STORY_CASSETTE_EDIT_KEY = "story_cassette_edit"
 
-# --- TON-watcher (app/ton_watch.py) ---
+# --- TON-watcher (пакет app/ton_watch/) ---
 
 CURSOR_KEY = "ton_watch_cursor_utime"
 BEAT_KEY = "ton_watch_beat_iso"

@@ -155,16 +155,9 @@ async def resolve_dead_payout(session, payout_id: int, action: str) -> str | Non
     return payout.status
 
 
-async def _fetch_remote_json(url: str) -> dict:
-    """DEPRECATED: тонкая обёртка над wallet.fetch_remote_json для обратной
-    совместимости тестов; новый код импортирует из wallet напрямую."""
-
-    return await fetch_remote_json(url)
-
-
 async def _get_wallet():
-    """DEPRECATED: тонкая обёртка над wallet.get_wallet для обратной совместимости
-    тестов и внутренних вызовов __init__. Новый код импортирует из wallet."""
+    """Точка подмены кошелька: dispatch вызывает через app.ton_pay, чтобы
+    monkeypatch.setattr(ton_pay, "_get_wallet", ...) доходил до отправки."""
 
     return await get_wallet()
 
@@ -243,7 +236,6 @@ from .wallet import (  # noqa: F401  # noqa: E402,F401
     build_offline_treasury_wallet,
     build_offline_wallet,
     detect_wallet_version,
-    fetch_remote_json,
     get_wallet,
     wallet_address,
 )

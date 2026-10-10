@@ -72,7 +72,6 @@ __all__ = [
     "get_latest_round",
     "get_round",
     "PREPARED_PAYLOAD_VERSION",
-    "_plan_and_render",
     "_ROMAN",
     "_day_window",
     "_next_hour_slot",

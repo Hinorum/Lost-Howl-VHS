@@ -80,11 +80,6 @@ def _player_id() -> int:
     return int(os.environ["E2E_PLAYER_ID"])
 
 
-def _require_player_env() -> None:
-    if "E2E_PLAYER_MNEMONIC" not in os.environ:
-        raise RuntimeError("Нет E2E_PLAYER_MNEMONIC: охранный гейт должен был остановить прогон")
-
-
 def _stake_wait_seconds() -> int:
     raw = os.getenv("E2E_STAKE_TIMEOUT_SECONDS", "")
     return int(raw) if raw.isdigit() else 180
