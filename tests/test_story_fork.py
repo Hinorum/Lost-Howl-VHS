@@ -30,21 +30,18 @@ def _day(index: int, chapter: str | None = None) -> dict:
             {
                 "position": 0,
                 "title": f"Юг {index}",
-                "description": "Тёплый след.",
                 "consequence": "Стая пошла на юг.",
                 "tag": "care",
             },
             {
                 "position": 1,
                 "title": f"Запад {index}",
-                "description": "Ветер с полей.",
                 "consequence": "Стая пошла на запад.",
                 "tag": "care",
             },
             {
                 "position": 2,
                 "title": f"Крыша {index}",
-                "description": "Близко и высоко.",
                 "consequence": "Стая осталась на крыше.",
                 "tag": "care",
             },

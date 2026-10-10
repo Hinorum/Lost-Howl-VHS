@@ -302,7 +302,6 @@ def public_round_view(round_row: Round) -> dict:
             {
                 "position": card.position,
                 "title": card.title,
-                "description": card.description,
             }
             for card in sorted(round_row.cards, key=lambda item: item.position)
         ],

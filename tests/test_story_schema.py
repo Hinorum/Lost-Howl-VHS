@@ -30,21 +30,18 @@ def _day(index: int, **overrides) -> dict:
             {
                 "position": 0,
                 "title": f"Путь А {index}",
-                "description": "Громкий, очевидный путь.",
                 "consequence": "Стая пошла путём А и нашла свет.",
                 "tag": "care",
             },
             {
                 "position": 1,
                 "title": f"Путь Б {index}",
-                "description": "Тихий, рискованный путь.",
                 "consequence": "Стая ушла путём Б и нашла тень.",
                 "tag": "care",
             },
             {
                 "position": 2,
                 "title": f"Путь В {index}",
-                "description": "Середина, компромисс.",
                 "consequence": "Стая осталась и дождалась утра.",
                 "tag": "care",
             },
@@ -131,10 +128,6 @@ def test_field_length_limits_rejected() -> None:
     assert not validate_payload(payload).ok
 
     payload = _payload("2026-04", 30)
-    payload["days"][0]["cards"][0]["description"] = "д" * (FIELD_LIMITS["card_description"] + 1)
-    assert not validate_payload(payload).ok
-
-    payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["consequence"] = "с" * (FIELD_LIMITS["card_consequence"] + 1)
     assert not validate_payload(payload).ok
 
@@ -181,18 +174,7 @@ def test_field_limits_tighten_to_display() -> None:
     """Капы схемы = потолкам показа в app/broadcast.py: пост дня не режется «…»."""
     assert FIELD_LIMITS["chapter_title"] == 80
     assert FIELD_LIMITS["card_title"] == 80
-    assert FIELD_LIMITS["card_description"] == 260
     assert FIELD_LIMITS["card_consequence"] == 220
-
-
-def test_style_vitrina_budget_warns() -> None:
-    """Три описания длиннее одного экрана — мягкое замечание."""
-    payload = _payload("2026-04", 30)
-    for card in payload["days"][0]["cards"]:
-        card["description"] = "д" * 240
-    result = validate_payload(payload)
-    assert result.ok
-    assert any("одним экраном" in warning for warning in result.warnings)
 
 
 def test_style_chapter_long_warns() -> None:
@@ -213,36 +195,13 @@ def test_style_chapter_single_sentence_warns() -> None:
     assert any("одним предложением" in warning for warning in result.warnings)
 
 
-def test_style_tautology_warns() -> None:
-    """Заголовок, повторённый слово в слово в описании карты («вскрыть крышу»)."""
-    payload = _payload("2026-04", 30)
-    payload["days"][0]["cards"][0]["title"] = "Вскрыть крышу"
-    payload["days"][0]["cards"][0]["description"] = "Снять обшивку, вскрыть крышу и подать свет."
-    result = validate_payload(payload)
-    assert result.ok
-    assert any(
-        "«Вскрыть крышу»" in warning and "масло масленое" in warning
-        for warning in result.warnings
-    )
-
-
-def test_style_object_repeat_not_flagged() -> None:
-    """Путь законно называет предмет сцены («Починить антенну»/«антенна») — не тавтология."""
-    payload = _payload("2026-04", 30)
-    payload["days"][0]["cards"][0]["title"] = "Починить антенну"
-    payload["days"][0]["cards"][0]["description"] = "Антенна ловит шум, а не голос."
-    result = validate_payload(payload)
-    assert result.ok
-    assert not any("масло масленое" in warning for warning in result.warnings)
-
-
 def test_style_clean_payload_no_style_warnings() -> None:
     """Свежий день без перегибов не тянет стилевых замечаний."""
     result = validate_payload(_payload("2026-04", 30))
     assert result.ok
     assert not any(
         word in warning
-        for word in ("одним экраном", "мягкий порог", "одним предложением", "масло масленое")
+        for word in ("мягкий порог", "одним предложением")
         for warning in result.warnings
     )
 

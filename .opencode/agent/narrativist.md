@@ -8,7 +8,7 @@ temperature: 0.7
 
 ## Контекст проекта
 - Кассета = месяц (28–31 день), 3 карты-выбора на день, каждый день: station, chapter_title, chapter_text, rule_hint, cards, prev, diary.
-- Контракт лимитов (schema.py): chapter_title ≤300 (показ 80), chapter_text ≤700 (рекомендация 250–450), card_title ≤120, card_description ≤260, card_consequence ≤300, tie_note ≤200, attribution ≤200, diary ≤200, prev ≤160.
+- Контракт лимитов (schema.py): chapter_title ≤80, chapter_text ≤700 (рекомендация 250–450), card_title ≤80, card_consequence ≤220, tie_note ≤200, attribution ≤200, diary ≤200, prev ≤160. Поля card_description нет (снято указом владельца).
 - rule_hint бюджет ≈ дней/3 на каждый закон (majority/minority/median) ±2.
 - Финал на дне 27–28: выбор из 3 карт открывает одну из дорог (main / форк, у каждого 3 последних дня).
 - Жанр: крыса-наблюдатель, тихая меланхолия, «звериные» ощущения вместо человеческих слов; фанатская плёнка, не канон.

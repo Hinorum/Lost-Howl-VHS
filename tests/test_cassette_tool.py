@@ -32,9 +32,9 @@ def _mk_cassette(month: str = "2026-02", days_n: int = 28) -> dict:
                 "chapter_text": f"текст {i}",
                 "dilemma": f"Что решит день {i}?",
                 "cards": [
-                    {"position": 0, "title": f"ход {i}a", "description": "описание", "consequence": "канон"},
-                    {"position": 1, "title": f"ход {i}b", "description": "описание", "consequence": "канон"},
-                    {"position": 2, "title": f"ход {i}c", "description": "описание", "consequence": "канон"},
+                    {"position": 0, "title": f"ход {i}a", "consequence": "канон"},
+                    {"position": 1, "title": f"ход {i}b", "consequence": "канон"},
+                    {"position": 2, "title": f"ход {i}c", "consequence": "канон"},
                 ],
             }
         )
@@ -293,7 +293,6 @@ def _clean_cassette_payload(month: str = "2026-12", n: int = 31) -> dict:
                     {
                         "position": p,
                         "title": f"ход {i}-{p}",
-                        "description": "описание у котла",
                         "consequence": f"канон {i}-{p}",
                         "tag": tag,
                     }

@@ -31,7 +31,7 @@ async def test_start_explains_schedule_and_disclaimer(monkeypatch, tmp_path) -> 
         image = tmp_path / f"card{i}.jpg"
         image.write_bytes(b"jpeg")
         fake_round.cards.append(
-            Card(position=i, title=f"T{i}", description="d", consequence="c",
+            Card(position=i, title=f"T{i}", consequence="c",
                  tag="care")
         )
     monkeypatch.setattr(h, "_ensure_round", AM(return_value=fake_round))
@@ -124,7 +124,7 @@ async def test_status_text_shows_results_time() -> None:
         tally_ends_at=now + timedelta(hours=24),
     )
     round_row.cards = [
-        Card(position=0, title="T", description="d", consequence="c", tag="care")
+        Card(position=0, title="T", consequence="c", tag="care")
     ]
     text = await status_text(round_row)
     assert "Голосование до:" in text and "Итоги и новый день:" in text

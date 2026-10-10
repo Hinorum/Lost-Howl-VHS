@@ -122,7 +122,6 @@ async def _seed_round(
                     round_id=round_row.id,
                     position=position,
                     title=title,
-                    description="описание",
                     consequence="канон",
                     tag="care",
                 )

@@ -33,7 +33,6 @@ def _round(day_index: int) -> Round:
             Card(
                 position=position,
                 title=f"Тропа {position}",
-                description="д",
                 consequence="Канон дня.",
             )
         )

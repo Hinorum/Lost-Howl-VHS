@@ -166,7 +166,7 @@ def _style_warnings(cassette: Cassette) -> list[str]:
             if day.prev:
                 fields.extend(day.prev.values())
             for card in day.cards:
-                fields.extend((card.title, card.description, card.consequence))
+                fields.extend((card.title, card.consequence))
             haystack = " ".join(fields)
             as_if = len(re.findall(r"\b(?:как\s+будто|будто)\b", haystack, re.IGNORECASE))
             if as_if > 1:

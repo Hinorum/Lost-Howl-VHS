@@ -47,7 +47,6 @@ def _round(day_index: int = 9300) -> Round:
                 round_id=round_row.id,
                 position=position,
                 title=f"Путь {position}",
-                description="описание",
                 consequence="канон",
                 tag="care",
             )

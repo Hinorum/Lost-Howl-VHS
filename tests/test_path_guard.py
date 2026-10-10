@@ -173,7 +173,6 @@ def _valid_cassette_text() -> bytes:
                 {
                     "position": position,
                     "title": f"ход {position}",
-                    "description": "описание",
                     "consequence": "канон",
                 }
                 for position in (0, 1, 2)

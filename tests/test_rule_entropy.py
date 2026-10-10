@@ -52,7 +52,6 @@ def _round(*, rule_entropy: str | None = None) -> Round:
             Card(
                 position=position,
                 title=f"Тропа {position}",
-                description="д",
                 consequence="Канон дня.",
             )
         )

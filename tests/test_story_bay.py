@@ -39,21 +39,18 @@ def _day(index: int) -> dict:
             {
                 "position": 0,
                 "title": f"Путь А {index}",
-                "description": "Громкий путь.",
                 "consequence": "Стая пошла путём А.",
                 "tag": "care",
             },
             {
                 "position": 1,
                 "title": f"Путь Б {index}",
-                "description": "Тихий путь.",
                 "consequence": "Стая ушла путём Б.",
                 "tag": "care",
             },
             {
                 "position": 2,
                 "title": f"Путь В {index}",
-                "description": "Середина.",
                 "consequence": "Стая осталась.",
                 "tag": "care",
             },

@@ -53,9 +53,9 @@ def _mk_cassette(
             "chapter_text": f"текст {i}",
             "dilemma": f"Что решит день {i}?",
             "cards": [
-                {"position": 0, "title": f"ход {i}a", "description": "описание", "consequence": "канон"},
-                {"position": 1, "title": f"ход {i}b", "description": "описание", "consequence": "канон"},
-                {"position": 2, "title": f"ход {i}c", "description": "описание", "consequence": "канон"},
+                {"position": 0, "title": f"ход {i}a", "consequence": "канон"},
+                {"position": 1, "title": f"ход {i}b", "consequence": "канон"},
+                {"position": 2, "title": f"ход {i}c", "consequence": "канон"},
             ],
         }
         for i in range(1, days_n + 1)

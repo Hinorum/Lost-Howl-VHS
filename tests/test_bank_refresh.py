@@ -45,7 +45,6 @@ async def _persist_round(day_index: int, *, status: RoundStatus = RoundStatus.OP
                 Card(
                     position=position,
                     title=f"Путь {position}",
-                    description="описание",
                     consequence="канон",
                     tag="care",
                 )

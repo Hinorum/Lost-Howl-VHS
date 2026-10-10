@@ -23,21 +23,18 @@ _TEMPLATE_CARDS: list[dict] = [
     {
         "position": 0,
         "title": "Сцена I",
-        "description": "Первая сцена для голоса стаи.",
         "consequence": "Стая выбрала первую сцену.",
         "tag": "care",
     },
     {
         "position": 1,
         "title": "Сцена II",
-        "description": "Вторая сцена для голоса стаи.",
         "consequence": "Стая выбрала вторую сцену.",
         "tag": "care",
     },
     {
         "position": 2,
         "title": "Сцена III",
-        "description": "Третья сцена для голоса стаи.",
         "consequence": "Стая выбрала третью сцену.",
         "tag": "care",
     },

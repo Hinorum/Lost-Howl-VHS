@@ -74,7 +74,6 @@ def _round(day_index: int, status: RoundStatus, *, voting_in_minutes: int) -> Ro
             Card(
                 position=position,
                 title=f"Тропа {position}",
-                description="д",
                 consequence="Канон дня.",
             )
         )
@@ -329,7 +328,7 @@ async def test_announce_new_day_is_text_only(monkeypatch, tmp_path) -> None:
         tally_ends_at=datetime.now(UTC) + timedelta(hours=21),
     )
     round_row.cards.append(
-        Card(position=0, title="t", description="d", consequence="c")
+        Card(position=0, title="t", consequence="c")
     )
     async with SessionLocal() as db:
         db.add(Chat(id=555_777, type="group", active=True))

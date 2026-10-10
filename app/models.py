@@ -260,7 +260,8 @@ class Card(Base):
     round_id: Mapped[int] = mapped_column(ForeignKey("rounds.id"), index=True)
     position: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(120))
-    description: Mapped[str] = mapped_column(Text)
+    # description (авторская суть развилки) удалён миграцией e3a7c1d59f42: в
+    # пост дня не шёл, варианты несут кнопки — названия карт.
     # image_path удалён миграцией d5f8a1c39b02: арт не делается (build_day_post
     # пуст), поле было NOT NULL без дефолта и роняло INSERT карточек.
     consequence: Mapped[str] = mapped_column(Text)

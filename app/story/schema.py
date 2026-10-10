@@ -36,14 +36,13 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 # лимит равен обрезке в app/broadcast.py — глава до 1500 → мы жёстче 700,
 # dilemma 400 == показу 400, заголовки 80 == показу 80 (ничего не режется
 # многоточием); consequence 220 — итог пути звучит коротко, а не пересказом
-# дня. description 260 — авторский слой (панель, линт, public view): в пост
-# дня он не идёт, варианты в нём несут кнопки.
+# дня. Поля card.description больше нет (снято указом владельца): в пост дня
+# оно не шло, варианты несут кнопки — названия карт.
 FIELD_LIMITS = {
     "chapter_title": 80,
     "chapter_text": 700,
     "dilemma": 400,
     "card_title": 80,
-    "card_description": 260,
     "card_consequence": 220,
     "attribution": 200,
     "track_name": 32,
@@ -56,11 +55,8 @@ FIELD_LIMITS = {
 MAX_FORKS = 4
 
 # Стилевые пороги (мягкие warning'и, не ошибки). Калибр — текущая библиотека
-# кассет (суммы описаний до ~500, главы до ~550 знаков), поэтому пороги ловят
-# ЗАМЕТНО более тяжёлый текст, а не нюансы «хорошего слога».
-# Сумма трёх описаний дня: авторская суть развилки (панель, линт, public view)
-# укладывается в один экран; в пост дня описания не идут — там блок дилеммы.
-_CARD_DESCRIPTION_BUDGET = 700
+# кассет (главы до ~550 знаков), поэтому пороги ловят ЗАМЕТНО более тяжёлый
+# текст, а не нюансы «хорошего слога».
 _CHAPTER_TOO_LONG = 600  # выше этого кадр тянется (жёсткий кап — 700 из FIELD_LIMITS)
 _CHAPTER_TOO_SHORT = 140  # короче и в одно предложение — «заголовок», не кадр
 
@@ -102,19 +98,6 @@ def _prev_overlap(left: str, right: str) -> float:
     return len(a & b) / len(a | b) if a and b else 0.0
 
 
-def _tautology_hit(title: str, description: str) -> str | None:
-    """Заголовок карты, слово в слово повторённый в СВОЁМ описании карты —
-    буквальное «масло масленое». Повтор корней-предметов («крышу»/«крышей»)
-    умышленно не ловим: путь законно называет предмет сцены, там нужен
-    авторский глаз, а не автомат.
-    """
-    folded = title.casefold().strip()
-    if len(folded) < 8:
-        return None
-    if folded in description.casefold():
-        return title
-    return None
-
 # Стоп-слова: реальные бренды/криптобиржи/обещания дохода. Канон «Lost Dogs:
 # The Way» (Догтаун, имена персонажей) ДОЗВОЛЕН: кассеты — открытый фанфик,
 # его обязательное клеймо живёт в attribution. Эвристика — подстрока в нижнем
@@ -153,7 +136,6 @@ class CardModel(BaseModel):
 
     position: int
     title: str = Field(min_length=1, max_length=FIELD_LIMITS["card_title"])
-    description: str = Field(min_length=1, max_length=FIELD_LIMITS["card_description"])
     consequence: str = Field(min_length=1, max_length=FIELD_LIMITS["card_consequence"])
     tag: str = "care"
 
@@ -469,14 +451,10 @@ class Cassette(BaseModel):
         return warnings
 
     def style_warnings(self) -> list[str]:
-        """Стилевые замечания (warning, не ошибка): описания и глава читаются легко.
+        """Стилевые замечания (warning, не ошибка): глава дня читается легко.
 
-        * Бюджет описаний: сумма трёх описаний дня > _CARD_DESCRIPTION_BUDGET —
-          авторский блок обязана влезать в один экран, а не три абзаца.
         * Кадр дня: глава не растянута (жёсткий кап — FIELD_LIMITS, тут мягкий
           порог) и не выглядит заголовком (короче порога одним предложением).
-        * Тавтология описания: заголовок карты дословно повторён в её же описании —
-          «масло масленое»; заголовок должен звать действие, а не пересказывать сцену.
         """
         warnings: list[str] = []
 
@@ -485,13 +463,6 @@ class Cassette(BaseModel):
             return max(1, len(parts))
 
         def _guard_day(day: DayModel, label: str) -> None:
-            descriptions = sum(len(card.description) for card in day.cards)
-            if descriptions > _CARD_DESCRIPTION_BUDGET:
-                warnings.append(
-                    f"{label}: описания трёх карт = {descriptions} знаков "
-                    f"(> {_CARD_DESCRIPTION_BUDGET}) — авторский блок должен "
-                    "читаться одним экраном, разведи карты по существу развилки"
-                )
             chapter = len(day.chapter_text)
             if chapter > _CHAPTER_TOO_LONG:
                 warnings.append(
@@ -504,14 +475,6 @@ class Cassette(BaseModel):
                     f"{label}: глава одним предложением — выглядит заголовком, "
                     "добавь 1–3 предложения обстановки, чтобы кадр заработал"
                 )
-            for card in day.cards:
-                hit = _tautology_hit(card.title, card.description)
-                if hit is not None:
-                    warnings.append(
-                        f"{label}, карта {card.position}: заголовок «{hit}» повторён "
-                        "слово в слово в описании — масло масленое, назови карту как "
-                        "поступок, а не пересказ сцены"
-                    )
 
         for day in self.days:
             _guard_day(day, f"день {day.day_index}")
@@ -544,7 +507,7 @@ def _taboo_hits(cassette: Cassette) -> list[str]:
         if day.dilemma:
             parts.append(day.dilemma)
         for card in day.cards:
-            parts.extend((card.title, card.description, card.consequence))
+            parts.extend((card.title, card.consequence))
         haystack = " ".join(parts).lower()
         for word in TABOO_WORDS:
             if word.lower() in haystack:

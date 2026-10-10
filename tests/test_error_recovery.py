@@ -235,7 +235,6 @@ def _transient_round(tmp_path) -> Round:
                 round_id=round_row.id,
                 position=position,
                 title=f"Путь {position}",
-                description="описание",
                 consequence="канон",
                 tag="care",
             )
