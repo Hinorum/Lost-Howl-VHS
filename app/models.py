@@ -292,7 +292,6 @@ class StoryBeat(Base):
     day_index: Mapped[int] = mapped_column(Integer, unique=True)
     winning_title: Mapped[str] = mapped_column(String(120))
     winning_text: Mapped[str] = mapped_column(Text)
-    hook_text: Mapped[str | None] = mapped_column(String(700), default=None)  # (легаси) крючок главы: больше не пишется, кассеты самостоятельны
     win_rule: Mapped[str] = mapped_column(String(32))
     vote_counts: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
