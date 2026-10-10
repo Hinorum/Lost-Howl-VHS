@@ -197,7 +197,7 @@ async def test_tie_note_reaches_results_post(
     session, monkeypatch: __import__("pytest").MonkeyPatch
 ) -> None:
     """Конечная связь: tie_note с блоком реально уходит в пост итогов (format_results)."""
-    from app.broadcast import results_message
+    from app.broadcast import results_body
 
     monkeypatch.setattr(settings, "ton_enabled", True)
 
@@ -213,7 +213,7 @@ async def test_tie_note_reaches_results_post(
         loaded.status = RoundStatus.TALLYING
         await finish_tally(session, loaded)
         closed = await session.get(Round, round_row.id)
-        text = await results_message(closed, session)
+        text = await results_body(closed, session)
         assert "блока TON №93123949" in text
         assert "93123949" in text  # seqno блока виден игрокам — можно перепроверить
         assert "tonviewer.com/block/" in text
@@ -221,9 +221,13 @@ async def test_tie_note_reaches_results_post(
         await session.rollback()
 
 
-async def test_epilogue_escaped_in_results_html(session) -> None:
-    """Эпилог сюжетного слоя — не доверенный HTML: в пост итогов идёт экранированным."""
-    from app.broadcast import results_message
+async def test_epilogue_stays_out_of_results_post(session) -> None:
+    """Эпилог (canon дня) снят из поста итогов — указ владельца.
+
+    epilogue_text остаётся в БД (им маркируется готовность лидерборда
+    к выплате), но в пост не идёт — ни сырым, ни экранированным.
+    """
+    from app.broadcast import results_body
 
     round_row = await _seed_tied_day(session, 860)
     try:
@@ -233,8 +237,8 @@ async def test_epilogue_escaped_in_results_html(session) -> None:
         loaded.epilogue_text = "<b>хитрость</b> & <i>вставка</i>"
         await session.commit()
 
-        text = await results_message(loaded, session)
-        assert "<b>хитрость</b>" not in text  # сырой HTML не попадает в пост
-        assert "&lt;b&gt;хитрость&lt;/b&gt; &amp; &lt;i&gt;вставка&lt;/i&gt;" in text
+        text = await results_body(loaded, session)
+        assert "хитрость" not in text
+        assert "вставка" not in text
     finally:
         await session.rollback()

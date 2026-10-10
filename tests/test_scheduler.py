@@ -293,7 +293,7 @@ async def test_start_scheduler_registers_only_zero_arg_jobs(monkeypatch) -> None
 
     ids = [job_id for job_id, _func, _trigger, _sec in registered]
     assert {"way-tick", "db-backup", "ton-watch", "ton-settle",
-            "ws-cleanup", "vote-reminder", "story-sync"} <= set(ids)
+            "ws-cleanup", "vote-reminder", "story-sync", "story-diary"} <= set(ids)
     watch_trigger, watch_seconds = next(
         (trigger, seconds) for job_id, _fn, trigger, seconds in registered if job_id == "ton-watch"
     )
@@ -1327,6 +1327,68 @@ async def test_vote_reminder_sends_dms_once_per_day(monkeypatch) -> None:
             await db.commit()
         await sched._vote_reminder_job()
         assert sends.await_count == 1
+    finally:
+        await _clear_rounds()
+
+
+async def test_story_diary_job_sends_once_per_day(monkeypatch) -> None:
+    """Дневник дня — отдельной рассылкой в 17:00 UTC (указ владельца).
+
+    Уходит посреди текущего дня чатам и личкой (announce_day_diary),
+    маркер на дату даёт одну рассылку в сутки; следующий день — снова уходит.
+    """
+    from app import scheduler as sched
+
+    await _clear_rounds()
+    await _make_round(9851, RoundStatus.OPEN)
+
+    announce = AsyncMock(return_value=3)
+    monkeypatch.setattr(sched, "announce_day_diary", announce)
+    monkeypatch.setattr(sched, "_bot", Mock())
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    diary_now = datetime(2026, 6, 1, 17, 0, tzinfo=UTC)
+    monkeypatch.setattr(sched, "_now", lambda: diary_now)
+
+    try:
+        await sched._story_diary_job()
+        assert announce.await_count == 1
+
+        # Повтор в тот же день — маркер занят, дубля нет.
+        await sched._story_diary_job()
+        assert announce.await_count == 1
+
+        # Следующий день: маркер свеж — рассылка уходит снова.
+        monkeypatch.setattr(sched, "_now", lambda: diary_now + timedelta(days=1))
+        await sched._story_diary_job()
+        assert announce.await_count == 2
+    finally:
+        await _clear_rounds()
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key.like("job:story-diary:%"))
+            )
+            await db.commit()
+
+
+async def test_story_diary_job_silently_skips(monkeypatch) -> None:
+    """Без бота, без открытого дня и на паузе — дневник не рассылается,
+    а маркер не занимается (после снятия паузы рассылка ещё возможна)."""
+    from app import scheduler as sched
+
+    await _clear_rounds()
+    try:
+        monkeypatch.setattr(sched, "_bot", None)
+        await sched._story_diary_job()  # без бота — тихий выход
+
+        monkeypatch.setattr(sched, "_bot", Mock())
+        announce = AsyncMock()
+        monkeypatch.setattr(sched, "announce_day_diary", announce)
+        await sched._story_diary_job()  # открытого дня нет — тихий выход
+
+        await _make_round(9852, RoundStatus.OPEN)
+        monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=True))
+        await sched._story_diary_job()  # пауза глушит рассылку
+        announce.assert_not_awaited()
     finally:
         await _clear_rounds()
 

@@ -269,10 +269,12 @@ async def _dm_send_all(
 
 
 async def results_body(finished: Round, session=None) -> str:
-    """Сухие итоги + экономика дня + плагины (БЕЗ нейро-эпилога).
+    """Сухие итоги + экономика дня + плагины.
 
-    Быстрая, только БД — это то, что уходит пользователям СРАЗУ после вскрытия
-    итогов, пока эпилог ещё пишется нейросетью. session можно передать готовую.
+    Это весь пост итогов: дневник кассеты уходит отдельной рассылкой в
+    17:00 (джоба story-diary), эпилог каноном остаётся в epilogue_text
+    и в пост не идёт (указ владельца). Быстрая, только БД — это то, что
+    уходит пользователям СРАЗУ после вскрытия. session можно передать готовую.
     """
     from app.tally import day_economics, format_economics, format_plugin_results
 
@@ -292,7 +294,7 @@ async def results_body(finished: Round, session=None) -> str:
         logger.warning("Карты дня %s не подгружены для итогов", getattr(finished, "day_index", "?"), exc_info=True)
 
     # Ставки по путям и коэффициент считается один раз — и в реальной рассылке
-    # (announce_new_day зовёт results_message БЕЗ сессии), поэтому открываем свою.
+    # (announce_new_day зовёт results_body БЕЗ сессии), поэтому открываем свою.
     # Без этого пути и коэффициент в итогах просто не появлялись.
     economics_stats: dict | None = None
     try:
@@ -314,21 +316,8 @@ async def results_body(finished: Round, session=None) -> str:
                 text += f"\n\n{economics}"
         except Exception:
             logger.exception("Экономика дня %s не посчитана", getattr(finished, "day_index", "?"))
-    # Запись дневника кассеты (ПОВ-контраст): читается из активной кассеты
-    # месяца по дате и дню закрытого раунда. Нет кассеты / нет поля / сбой —
-    # дневника нет, сухие итоги не зависят от сюжетного слоя (fail-open).
-    try:
-        from app.story import bay as story_bay
-
-        if session is not None:
-            diary = await story_bay.day_diary(session, finished)
-        else:
-            async with SessionLocal() as _diary_db:
-                diary = await story_bay.day_diary(_diary_db, finished)
-        if diary:
-            text += f"\n\n📖 {html.escape(diary)}"
-    except Exception:
-        logger.debug("Дневник дня не добавлен в итоги", exc_info=True)
+    # Дневник кассеты из поста снят (указ владельца): уходит отдельной
+    # рассылкой в 17:00 UTC (джоба story-diary → announce_day_diary).
     # Плагиновые строки итогов (echoes, relations, bestiary и т.д.)
     try:
         plugin_text = await format_plugin_results(finished, session)
@@ -339,20 +328,26 @@ async def results_body(finished: Round, session=None) -> str:
     return text
 
 
-async def results_message(finished: Round, session=None) -> str:
-    """Полные итоги дня: сухой блок + экономика + эпилог (если готов).
+async def day_diary_message(session, round_row: Round) -> str:
+    """Текст дневника дня для отдельной рассылки (17:00); «» — дневника нет.
 
-    Эпилог — текст сюжетного слоя с разметкой от нейросети; в HTML-пост он
-    попадает экранированным целиком (это простой текст, своих тегов нет).
-
-    session можно передать готовую (тесты, вызовы внутри транзакции);
-    иначе открывается своя краткоживущая сессия.
+    Дневник (поле diary активной кассеты месяца, ПОВ-контраст) снят из поста
+    итогов и уходит своим постом посреди дня — джоба story-diary. Формат
+    тот же, что был в итогах: «📖 {diary}», HTML-экранированный: дневник —
+    не доверенный текст, своих тегов у него нет.
     """
-    text = await results_body(finished, session)
-    epilogue = getattr(finished, "epilogue_text", "") or ""
-    if epilogue:
-        text += f"\n\n{html.escape(epilogue)}"
-    return text
+    from app.story import bay as story_bay
+
+    try:
+        diary = await story_bay.day_diary(session, round_row)
+    except Exception:
+        logger.warning(
+            "Дневник дня %s не прочитан", getattr(round_row, "day_index", "?"), exc_info=True
+        )
+        return ""
+    if not diary:
+        return ""
+    return f"📖 {html.escape(diary)}"
 
 
 async def _economics_own_session(row: Round) -> dict:
@@ -556,7 +551,7 @@ async def _deliver_day(
     outgoing_results: str | None = None
     if finished is not None:
         if results_text is None:
-            results_text = await results_message(finished)
+            results_text = await results_body(finished)
         outgoing_results = results_text or None
 
     # Медиа дня нет: build_day_post() всегда возвращал пустой список, поэтому
@@ -862,7 +857,7 @@ async def announce_new_day(
             "Анонс дня %s: активных чатов нет — в группу или канал не уйдёт ничего",
             round_row.day_index,
         )
-    results_text = await results_message(finished) if finished is not None else None
+    results_text = await results_body(finished) if finished is not None else None
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
     reasons: Counter[str] = Counter()
 
@@ -968,15 +963,13 @@ async def _broadcast_text(
 
 
 async def announce_results(bot: Bot | None, finished: Round) -> int:
-    """Постит СРАЗУ итоги прошлого дня (с каноном дня, без нового дня).
+    """Постит СРАЗУ итоги прошлого дня (без нового дня).
 
     Отделено от announce_new_day, чтобы итоги уходили пользователям немедленно
-    после вскрытия, не дожидаясь контента нового дня. Эпилог здесь обязателен:
-    раньше он писался нейросетью асинхронно, и пост шёл «сухим» (results_body),
-    а полные итоги в автопереходе так и не наступали. Теперь эпилог — это
-    consequence уцелевшей карты, записанный при закрытии раунда (lifecycle),
-    поэтому канон дня обязан доехать до игроков в том же посте, что и счёт со
-    ставками. Возвращает число доставленных чатов.
+    после вскрытия, не дожидаясь контента нового дня. Дневник кассеты и эпилог
+    из поста сняты (указ владельца): дневник уходит отдельной рассылкой в
+    17:00 UTC (story-diary), канон дня (consequence) остаётся в epilogue_text.
+    Возвращает число доставленных чатов.
     """
     if bot is None:
         return 0
@@ -987,7 +980,7 @@ async def announce_results(bot: Bot | None, finished: Round) -> int:
     # игрок узнаёт победителя и судьбу своей ставки; потерять их молча нельзя.
     # Оба вызывающих (_announce_results_job и _retry_results_job) уже откатывают
     # транзакцию и оставляют день без маркера, так что он уйдёт следующим тиком.
-    text = await results_message(finished)
+    text = await results_body(finished)
     if not text:
         return 0
     delivered = await _broadcast_text(
@@ -999,6 +992,34 @@ async def announce_results(bot: Bot | None, finished: Round) -> int:
     logger.info(
         "Итоги дня %s разосланы: доставлено %d получателей (чаты и личка вместе)",
         getattr(finished, "day_index", "?"),
+        delivered,
+    )
+    return delivered
+
+
+async def announce_day_diary(bot: Bot | None, round_row: Round) -> int:
+    """Дневник дня отдельным постом (17:00 UTC, джоба story-diary).
+
+    Дневник снят из поста итогов (указ владельца) и уходит своей рассылкой:
+    чатам и личными дубликатами подписчикам — как итоги. Пустой дневник
+    (нет кассеты/поля/сбой чтения) — тихий ноль, рассылки нет.
+    Возвращает число доставленных получателей (чаты и личка вместе).
+    """
+    if bot is None:
+        return 0
+    async with SessionLocal() as session:
+        text = await day_diary_message(session, round_row)
+    if not text:
+        return 0
+    delivered = await _broadcast_text(
+        bot,
+        text,
+        parse_mode=ParseMode.HTML,
+        kind=f"diary:{getattr(round_row, 'day_index', '?')}",
+    )
+    logger.info(
+        "Дневник дня %s разослан: %d получателей (чаты и личка вместе)",
+        getattr(round_row, "day_index", "?"),
         delivered,
     )
     return delivered

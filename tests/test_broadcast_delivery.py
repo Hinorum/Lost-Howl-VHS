@@ -197,7 +197,7 @@ async def test_status_text_for_closed_and_tallying_phases() -> None:
 async def test_finished_results_text_computed_once_per_chat(monkeypatch) -> None:
     """Экономика дня считается один раз на рассылку, а не на каждый чат."""
     results = AsyncMock(return_value="ИТОГИ")
-    monkeypatch.setattr(bc, "results_message", results)
+    monkeypatch.setattr(bc, "results_body", results)
     finished = _round(9299)
     finished.status = RoundStatus.CLOSED
     bot = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock(), send_media_group=AsyncMock())
@@ -382,10 +382,9 @@ async def test_dm_send_all_only_narrows_audience_and_count(monkeypatch) -> None:
 
 
 async def test_results_body_survives_broken_session(monkeypatch) -> None:
-    """Каждый слой итогов (карты, экономика, дневник, плагины) — необязательный.
+    """Каждый слой итогов (карты, экономика, плагины) — необязательный.
     Падение любого оставляет читаемый пост, а не пустоту и не исключение."""
     tally = importlib.import_module("app.tally")
-    story_bay = importlib.import_module("app.story.bay")
 
     class _Broken:
         async def execute(self, _stmt):
@@ -400,7 +399,6 @@ async def test_results_body_survives_broken_session(monkeypatch) -> None:
     monkeypatch.setattr(tally, "day_economics", AsyncMock(return_value={"path_stakes": {}, "multiplier": 1.0}))
     monkeypatch.setattr(tally, "format_economics", Mock(return_value=""))
     monkeypatch.setattr(tally, "format_plugin_results", AsyncMock(return_value="плагины"))
-    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(side_effect=RuntimeError("нет кассеты")))
 
     finished = _round(9400)
     finished.status = RoundStatus.CLOSED
@@ -412,9 +410,7 @@ async def test_results_body_survives_broken_session(monkeypatch) -> None:
 async def test_results_body_without_economics_keeps_dry_results(monkeypatch) -> None:
     """Сбой подсчёта экономики убирает коэффициент, но не сухие итоги."""
     tally = importlib.import_module("app.tally")
-    story_bay = importlib.import_module("app.story.bay")
     monkeypatch.setattr(tally, "day_economics", AsyncMock(side_effect=RuntimeError("нет ставок")))
-    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(return_value=""))
     monkeypatch.setattr(tally, "format_plugin_results", AsyncMock(return_value=""))
     finished = _round(9401)
     finished.status = RoundStatus.CLOSED
@@ -425,29 +421,45 @@ async def test_results_body_without_economics_keeps_dry_results(monkeypatch) -> 
 async def test_results_body_survives_broken_economics_format(monkeypatch) -> None:
     """Форматирование экономики — тоже мягкий слой."""
     tally = importlib.import_module("app.tally")
-    story_bay = importlib.import_module("app.story.bay")
     monkeypatch.setattr(tally, "day_economics", AsyncMock(return_value={"path_stakes": {}, "multiplier": 2.0}))
     monkeypatch.setattr(tally, "format_economics", Mock(side_effect=ValueError("битый формат")))
     monkeypatch.setattr(tally, "format_plugin_results", AsyncMock(side_effect=RuntimeError("плагины сломаны")))
-    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(return_value="дневник"))
     finished = _round(9402)
     finished.status = RoundStatus.CLOSED
     text = await bc.results_body(finished, session=SimpleNamespace())
-    assert "дневник" in text
+    assert text.strip()
 
 
-async def test_results_body_appends_diary(monkeypatch) -> None:
-    """Дневник кассеты экранируется и попадает в пост — но его отсутствие
-    не должно ломать итоги."""
-    tally = importlib.import_module("app.tally")
+async def test_day_diary_message_escapes_html(monkeypatch) -> None:
+    """Дневник снят из поста итогов и собирается для своей рассылки (17:00):
+    формат «📖 …», HTML-экранированный; нет дневника/сбой — пустая строка."""
     story_bay = importlib.import_module("app.story.bay")
-    monkeypatch.setattr(tally, "day_economics", AsyncMock(return_value=None))
-    monkeypatch.setattr(tally, "format_plugin_results", AsyncMock(return_value=""))
     monkeypatch.setattr(story_bay, "day_diary", AsyncMock(return_value="<заметка> & эхо"))
-    finished = _round(9403)
-    finished.status = RoundStatus.CLOSED
-    text = await bc.results_body(finished, session=SimpleNamespace())
-    assert "&lt;заметка&gt; &amp; эхо" in text
+    assert await bc.day_diary_message(SimpleNamespace(), _round(9403)) == "📖 &lt;заметка&gt; &amp; эхо"
+    # Fail-open: сбой чтения кассеты или пустое поле — «», рассылки не будет.
+    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(side_effect=RuntimeError("нет кассеты")))
+    assert await bc.day_diary_message(SimpleNamespace(), _round(9403)) == ""
+    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(return_value=""))
+    assert await bc.day_diary_message(SimpleNamespace(), _round(9403)) == ""
+
+
+async def test_announce_day_diary_broadcasts_or_stays_silent(monkeypatch) -> None:
+    """Дневник дня — отдельная рассылка (джоба story-diary): чатам и личкой
+    через _broadcast_text; пустой дневник или бот-None — тихий ноль."""
+    story_bay = importlib.import_module("app.story.bay")
+    sent = AsyncMock(return_value=5)
+    monkeypatch.setattr(bc, "_broadcast_text", sent)
+    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(return_value="дневник"))
+    assert await bc.announce_day_diary(SimpleNamespace(), _round(9403)) == 5
+    assert sent.await_args.args[1] == "📖 дневник"
+
+    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(return_value=""))
+    sent.reset_mock()
+    assert await bc.announce_day_diary(SimpleNamespace(), _round(9403)) == 0
+    sent.assert_not_awaited()
+    # Без бота — тоже тихий ноль.
+    monkeypatch.setattr(story_bay, "day_diary", AsyncMock(return_value="дневник"))
+    assert await bc.announce_day_diary(None, _round(9403)) == 0
 
 
 # ── текстовая рассылка и шёпот ──────────────────────────────────────────────
@@ -531,7 +543,7 @@ async def test_announce_results_propagates_build_failure(monkeypatch) -> None:
     транзакцию, день остаётся без маркера, и восстановитель дошлёт его позже.
     Пустой текст без исключения — это другое (нечего слать) и остаётся нулём.
     """
-    monkeypatch.setattr(bc, "results_message", AsyncMock(side_effect=RuntimeError("БД лежит")))
+    monkeypatch.setattr(bc, "results_body", AsyncMock(side_effect=RuntimeError("БД лежит")))
     bot = SimpleNamespace(send_message=AsyncMock())
     with pytest.raises(RuntimeError):
         await bc.announce_results(bot, _round(9404))
@@ -539,12 +551,12 @@ async def test_announce_results_propagates_build_failure(monkeypatch) -> None:
     # Без бота — тихий ноль, исключение тут не при чём.
     assert await bc.announce_results(None, _round(9404)) == 0
     # Собрался пустой пост — тоже ноль, но без исключения.
-    monkeypatch.setattr(bc, "results_message", AsyncMock(return_value=""))
+    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value=""))
     assert await bc.announce_results(SimpleNamespace(), _round(9404)) == 0
 
 
 async def test_announce_results_broadcasts_message(monkeypatch) -> None:
-    monkeypatch.setattr(bc, "results_message", AsyncMock(return_value="ИТОГИ"))
+    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="ИТОГИ"))
     sent = AsyncMock(return_value=7)
     monkeypatch.setattr(bc, "_broadcast_text", sent)
     finished = _round(9405)
@@ -552,12 +564,12 @@ async def test_announce_results_broadcasts_message(monkeypatch) -> None:
     assert sent.await_args.args[1] == "ИТОГИ"
 
 
-async def test_announce_results_carries_epilogue(monkeypatch) -> None:
-    """Ежедневные итоги несут канон дня: эпилог (consequence) в том же посте.
+async def test_announce_results_without_epilogue(monkeypatch) -> None:
+    """Эпилог (canon дня) снят из поста итогов — указ владельца.
 
-    Анонс итогов раньше шёл через «сухой» results_body — без эпилога: наследие
-    нейро-эры, где эпилог писался асинхронно и в автопереходе не наступал.
-    Канон уцелевшей карты обязан доехать до игроков вместе со счётом дня.
+    epilogue_text остаётся в БД (им маркируется готовность лидерборда
+    к выплате), но в пост игрокам не дописывается — туда идут только
+    сухие итоги с экономикой (дневник — отдельной рассылкой в 17:00).
     """
     monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="СУХИЕ ИТОГИ"))
     sent = AsyncMock(return_value=1)
@@ -565,7 +577,8 @@ async def test_announce_results_carries_epilogue(monkeypatch) -> None:
     finished = _round(9415)
     finished.epilogue_text = "Канон дня."
     await bc.announce_results(SimpleNamespace(), finished)
-    assert sent.await_args.args[1] == "СУХИЕ ИТОГИ\n\nКанон дня."
+    # Текст уходит ровно тем, что собрал results_body — без дописывания.
+    assert sent.await_args.args[1] == "СУХИЕ ИТОГИ"
 
 
 async def test_announce_results_marks_delivery_by_day(monkeypatch) -> None:
@@ -576,7 +589,7 @@ async def test_announce_results_marks_delivery_by_day(monkeypatch) -> None:
     а потому что совпало с текстом. Смена текста, обрезка, другой язык — и
     привязка к дню рассыпается, а с ней и тревога «у дня N нет отметки».
     """
-    monkeypatch.setattr(bc, "results_message", AsyncMock(return_value="ИТОГИ"))
+    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="ИТОГИ"))
     bot = SimpleNamespace(send_message=AsyncMock(return_value=1))
     async with SessionLocal() as db:
         db.add(Chat(id=-9406, type="group", active=True))

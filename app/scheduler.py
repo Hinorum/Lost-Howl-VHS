@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.async_utils import spawn
-from app.broadcast import announce_audience_size, announce_new_day
+from app.broadcast import announce_audience_size, announce_day_diary, announce_new_day
 from app.config import settings
 from app.db import SessionLocal
 from app.models import RoundStatus, WatcherState
@@ -690,6 +690,12 @@ def start_scheduler() -> None:
         "vote-reminder", _vote_reminder_job, "cron",
         hour=10, minute=0, timezone="UTC",
     )
+    # Дневник дня — отдельной рассылкой (указ владельца: снят из итогов):
+    # 17:00 UTC, посреди игрового дня.
+    _register_job(
+        "story-diary", _story_diary_job, "cron",
+        hour=17, minute=0, timezone="UTC",
+    )
     scheduler.start()
 
 
@@ -829,3 +835,35 @@ async def _vote_reminder_job() -> None:
             )
     except Exception as exc:
         logger.warning("Ошибка напоминания о голосовании: %s", exc)
+
+
+async def _story_diary_job() -> None:
+    """Дневник дня отдельной рассылкой в 17:00 UTC (указ владельца).
+
+    Дневник снят из поста итогов и уходит своим постом посреди дня: чатам
+    и личными дубликатами подписчикам — как итоги. Читается дневник
+    ТЕКУЩЕГО открытого дня (кассета по opens_at.date()). Маркер на дату
+    (claim_once, как в vote-reminder): одна рассылка в сутки; дневника нет
+    (нет кассеты/поля) — рассылки нет, маркер уже занят и повтор бессмыслен.
+    Пауза глушит рассылку, как и прочие анонсы.
+    """
+    bot = _bot
+    if bot is None:
+        return
+    try:
+        from app.ops import claim_once, is_game_paused
+
+        async with SessionLocal() as session:
+            if await is_game_paused(session):
+                return
+            current = await get_active_round(session)
+            if current is None or current.status != RoundStatus.OPEN:
+                return
+            if not await claim_once(session, f"job:story-diary:{_now().strftime('%Y-%m-%d')}"):
+                return
+            # Маркер — своей транзакцией (как в vote-reminder): рассылка
+            # не должна откатываться вместе с чтением.
+            await session.commit()
+        await announce_day_diary(bot, current)
+    except Exception as exc:
+        logger.warning("Ошибка рассылки дневника дня: %s", exc)
