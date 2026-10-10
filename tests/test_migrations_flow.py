@@ -562,7 +562,6 @@ async def test_orm_writes_rounds_without_server_default(db_path: Path):
             pot_nanotons=0,
             rake_nanotons=0,
             payouts_finalized=False,
-            epilogue_text="e",
             weekly_nanotons=0,
             money_mode=True,
         )
@@ -1006,7 +1005,6 @@ async def test_postgres_orm_writes_rounds_without_server_default(pg_url: str):
                 pot_nanotons=0,
                 rake_nanotons=0,
                 payouts_finalized=False,
-                epilogue_text="e",
                 weekly_nanotons=0,
                 money_mode=True,
             )

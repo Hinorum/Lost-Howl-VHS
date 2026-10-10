@@ -1,6 +1,6 @@
 """Пакет rounds: жизненный цикл дня, голосование и выплаты.
 
-Сюжетные модули (rendering, narrative, anchor, materialization) содержат
+Сюжетные модули (rendering, anchor, materialization) содержат
 минимальные шаблонные реализации: механика работает без LLM/арта.
 
 Запрет: `_plan_and_render` здесь НЕ реэкспортируется. `install_bay()`
@@ -26,7 +26,6 @@ from .lifecycle import (  # noqa: F401
     unclaim_announcement,
 )
 from .materialization import _materialize_round, _stamp_day_money_mode  # noqa: F401
-from .narrative import write_epilogue  # noqa: F401
 from .pot import round_pot  # noqa: F401
 from .queries import get_active_round, get_latest_round, get_round  # noqa: F401
 from .rendering import PREPARED_PAYLOAD_VERSION  # noqa: F401
@@ -66,7 +65,6 @@ __all__ = [
     "reset_game",
     "_materialize_round",
     "_stamp_day_money_mode",
-    "write_epilogue",
     "round_pot",
     "get_active_round",
     "get_latest_round",

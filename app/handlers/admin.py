@@ -37,7 +37,6 @@ from app.rounds import (
     get_active_round,
     reset_game,
     utc_aware,
-    write_epilogue,
 )
 from app.style import money_mark, ok_mark, warn_mark
 from app.tally import award_points
@@ -172,7 +171,6 @@ async def cmd_advance(message: Message) -> None:
                 await award_points(session, round_row)
                 from app.stakes import finalize_day_payouts
                 await finalize_day_payouts(session, round_row)
-                await write_epilogue(session, round_row)
                 from app.leaderboard import mark_leaderboards_for_finished
                 await mark_leaderboards_for_finished(session, round_row)
             nxt, created = await create_next_round_detailed(
@@ -184,7 +182,6 @@ async def cmd_advance(message: Message) -> None:
                 await award_points(session, round_row)
                 from app.stakes import finalize_day_payouts
                 await finalize_day_payouts(session, round_row)
-                await write_epilogue(session, round_row)
                 from app.leaderboard import mark_leaderboards_for_finished
                 await mark_leaderboards_for_finished(session, round_row)
             nxt, created = await create_next_round_detailed(

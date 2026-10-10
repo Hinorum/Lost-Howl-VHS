@@ -560,7 +560,10 @@ async def mark_leaderboards_for_finished(session, finished) -> None:
 
     Общий шаг планировщика (_finalize_new_day_job) И ручного /advance: если
     последний день недели/месяца закрыт вручную, без меток копилки останутся
-    навсегда незакрытыми (приз забрать нельзя).
+    навсегда незакрытыми (приз забрать нельзя). Флаг ставится на факте
+    закрытия дня (эпилог снесён — указ владельца): последний день периода
+    закрывается уже за его границей, и без метки выплата ждала бы его
+    бесконечно.
     """
     if finished is None or getattr(finished, "opens_at", None) is None:
         return
@@ -571,14 +574,14 @@ async def mark_leaderboards_for_finished(session, finished) -> None:
         month_key = finished.opens_at.strftime("%Y-%m")
         await mark_month_leaderboard_ready(session, month_key)
         logger.info(
-            "Эпилог дня %s — последний день месяца %s: лидерборд готов к выплате",
+            "День %s — последний день месяца %s: лидерборд готов к выплате",
             day_index, month_key,
         )
     if is_last_day_of_week(finished.opens_at):
         week_key = iso_week_key(finished.opens_at)
         await mark_week_leaderboard_ready(session, week_key)
         logger.info(
-            "Эпилог дня %s — последний день недели %s: недельный лидерборд готов к выплате",
+            "День %s — последний день недели %s: недельный лидерборд готов к выплате",
             day_index, week_key,
         )
 
@@ -590,15 +593,16 @@ async def settle_month_if_due(bot: Bot | None = None) -> bool:
 
 
 async def _settle_month_locked(bot: Bot | None = None) -> bool:
-    """Выплачивает копилку прошедших месяцев, если эпилог последнего дня записан.
+    """Выплачивает копилку прошедших месяцев, если последний день месяца закрыт.
 
     Возвращает True, если выплата создана. Идемпотентно по метке в watcher_state:
     повторные вызовы в том же месяце ничего не делают.
 
     Выплата возможна ТОЛЬКО после установки флага month_leaderboard_ready,
-    который ставится в _finalize_new_day_job() при записи эпилога последнего дня
-    месяца. Это гарантирует, что лидерборд не сработает раньше завершения
-    нарративной части дня.
+    который ставится в _finalize_new_day_job() при закрытии последнего дня
+    месяца (mark_leaderboards_for_finished). Это гарантирует, что лидерборд
+    не сработает раньше финализации последнего дня — он-то и закрывается
+    уже за границей месяца (1-го числа в 11:00 UTC).
     """
     now = datetime.now(UTC)
     prev_key = previous_month_key(now)
@@ -610,11 +614,11 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
         if settled_through >= prev_key:
             return False  # этот месяц уже закрыт (или вообще ещё не наступил)
 
-        # Флаг готовности: эпилог последнего дня месяца записан.
+        # Флаг готовности: последний день месяца закрыт (финализирован).
         ready_marker = await session.get(WatcherState, MONTH_READY_KEY)
         ready_month = ready_marker.value if ready_marker is not None else ""
         if ready_month < prev_key:
-            # Эпилог ещё не записан — лидерборд ждёт.
+            # Последний день ещё не закрыт — лидерборд ждёт.
             return False
 
         pots = (
@@ -877,13 +881,13 @@ async def settle_week_if_due(bot: Bot | None = None) -> bool:
 
 
 async def _settle_week_locked(bot: Bot | None = None) -> bool:
-    """Выплачивает копилку прошедших недель топ-3, если эпилог последнего дня записи.
+    """Выплачивает копилку прошедших недель топ-3, если последний день недели закрыт.
 
     Возвращает True, если выплата создана. Идемпотентно по метке в
     watcher_state; платить некому — метка не двигается, копилка ждёт.
 
     Выплата возможна ТОЛЬКО после установки флага week_leaderboard_ready,
-    который ставится в _finalize_new_day_job() при записи эпилога последнего дня
+    который ставится в _finalize_new_day_job() при закрытии последнего дня
     недели (воскресенья).
     """
     now = datetime.now(UTC)
@@ -895,11 +899,11 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         if settled_through >= prev_key:
             return False
 
-        # Флаг готовности: эпилог последнего дня недели записан.
+        # Флаг готовности: последний день недели закрыт (финализирован).
         ready_marker = await session.get(WatcherState, WEEK_READY_KEY)
         ready_week = ready_marker.value if ready_marker is not None else ""
         if ready_week < prev_key:
-            # Эпилог ещё не записан — лидерборд ждёт.
+            # Последний день ещё не закрыт — лидерборд ждёт.
             return False
 
         pots = (

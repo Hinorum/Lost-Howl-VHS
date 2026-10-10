@@ -721,11 +721,6 @@ async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> Non
     from app import scheduler as sched
 
     rid = await _make_round(9711, RoundStatus.CLOSED)
-    epilogues = []
-    async def fake_epilogue(session, finished):
-        epilogues.append(finished.day_index)
-        return "текст"
-    monkeypatch.setattr("app.rounds.write_epilogue", fake_epilogue)
     marks = []
     async def fake_mark(session, finished):
         marks.append(finished.day_index)
@@ -765,7 +760,7 @@ async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> Non
 
     try:
         await sched._finalize_new_day_job(rid, wait_results=wait_results())
-        assert epilogues and marks
+        assert marks  # флаг лидерборда ставится на факте закрытия дня
         assert waited == [True]  # анонс ждёт доставку итогов
         assert announced and len(announced) == 1
         async with SessionLocal() as db:
@@ -1008,7 +1003,6 @@ async def test_finalize_new_day_job_swallows_failures(monkeypatch) -> None:
     from app import scheduler as sched
 
     rid = await _make_round(9712, RoundStatus.CLOSED)
-    monkeypatch.setattr("app.rounds.write_epilogue", AsyncMock())
     monkeypatch.setattr("app.leaderboard.mark_leaderboards_for_finished", AsyncMock())
 
     async def boom_create(session, *, base_day_index):

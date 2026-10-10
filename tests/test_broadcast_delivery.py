@@ -564,23 +564,6 @@ async def test_announce_results_broadcasts_message(monkeypatch) -> None:
     assert sent.await_args.args[1] == "ИТОГИ"
 
 
-async def test_announce_results_without_epilogue(monkeypatch) -> None:
-    """Эпилог (canon дня) снят из поста итогов — указ владельца.
-
-    epilogue_text остаётся в БД (им маркируется готовность лидерборда
-    к выплате), но в пост игрокам не дописывается — туда идут только
-    сухие итоги с экономикой (дневник — отдельной рассылкой в 17:00).
-    """
-    monkeypatch.setattr(bc, "results_body", AsyncMock(return_value="СУХИЕ ИТОГИ"))
-    sent = AsyncMock(return_value=1)
-    monkeypatch.setattr(bc, "_broadcast_text", sent)
-    finished = _round(9415)
-    finished.epilogue_text = "Канон дня."
-    await bc.announce_results(SimpleNamespace(), finished)
-    # Текст уходит ровно тем, что собрал results_body — без дописывания.
-    assert sent.await_args.args[1] == "СУХИЕ ИТОГИ"
-
-
 async def test_announce_results_marks_delivery_by_day(monkeypatch) -> None:
     """Метка доставки итогов обязана называть день.
 

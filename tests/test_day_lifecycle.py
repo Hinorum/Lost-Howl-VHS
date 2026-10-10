@@ -803,27 +803,6 @@ async def test_heal_survives_finalize_failure(session, monkeypatch) -> None:
         await _wipe([750, 751])
 
 
-async def test_heal_survives_epilogue_failure(session, monkeypatch) -> None:
-    """Сбой эпилога вылеченного дня: warning + rollback, лечение живёт (274-279)."""
-    stale = _round(760, RoundStatus.OPEN, voting_in_minutes=-30)
-    current = _round(761, RoundStatus.OPEN, voting_in_minutes=600)
-    session.add_all([stale, current])
-    await session.commit()
-
-    monkeypatch.setattr(
-        lifecycle_mod, "write_epilogue", AsyncMock(side_effect=RuntimeError("хвост оборвался"))
-    )
-    try:
-        healed = await heal_stale_rounds(session)
-        assert healed >= 1
-        statuses = dict(
-            (await session.execute(select(Round.day_index, Round.status))).all()
-        )
-        assert statuses[760] == RoundStatus.CLOSED
-    finally:
-        await _wipe([760, 761])
-
-
 async def test_reset_game_full_wipe_rewrites_anchor(offline_all, session) -> None:
     """keep_story=False стирает канон; повторный сброс перезаписывает якорь (165, 178)."""
     session.add(

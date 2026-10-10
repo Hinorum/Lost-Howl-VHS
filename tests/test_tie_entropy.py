@@ -221,24 +221,13 @@ async def test_tie_note_reaches_results_post(
         await session.rollback()
 
 
-async def test_epilogue_stays_out_of_results_post(session) -> None:
-    """Эпилог (canon дня) снят из поста итогов — указ владельца.
+def test_epilogue_field_is_gone_from_models() -> None:
+    """Эпилог-механика снесена целиком (указ владельца): поля нет ни в модели
+    Round, ни в пакете rounds — канон дня хранится только в StoryBeat."""
+    from app.models import Round
 
-    epilogue_text остаётся в БД (им маркируется готовность лидерборда
-    к выплате), но в пост не идёт — ни сырым, ни экранированным.
-    """
-    from app.broadcast import results_body
+    assert not hasattr(Round, "epilogue_text")
 
-    round_row = await _seed_tied_day(session, 860)
-    try:
-        loaded = await session.get(Round, round_row.id)
-        loaded.status = RoundStatus.CLOSED
-        loaded.winner_card = 0
-        loaded.epilogue_text = "<b>хитрость</b> & <i>вставка</i>"
-        await session.commit()
+    from app import rounds as rounds_pkg
 
-        text = await results_body(loaded, session)
-        assert "хитрость" not in text
-        assert "вставка" not in text
-    finally:
-        await session.rollback()
+    assert not hasattr(rounds_pkg, "write_epilogue")

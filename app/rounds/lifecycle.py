@@ -27,7 +27,6 @@ from app.models import (
 )
 
 from .materialization import _materialize_round, _stamp_day_money_mode
-from .narrative import write_epilogue
 from .queries import get_active_round, get_latest_round, get_round
 from .rendering import _plan_and_render
 from .time import _ROMAN, _now, utc_aware
@@ -267,14 +266,6 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
                     # Частично вставленные Payout не должны «до-коммититься»
                     # следующим успешным днём — откатываем их транзакционный хвост.
                     await session.rollback()
-                try:
-                    await write_epilogue(session, finished)
-                except Exception:
-                    logger.warning(
-                        "Эпилог вылеченного дня %s не удался", day,
-                        exc_info=True,
-                    )
-                    await session.rollback()
                 healed += 1
                 logger.info(
                     "Вылечен застрявший день %s: подсчёт завершён, "
@@ -439,10 +430,6 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
             vote_counts_json=counts_json,
             stake_counts_json=stake_counts_json,
             tie_note=tie_note,
-            # Канон дня — уцелевший consequence: пост итогов читает epilogue_text
-            # (broadcast.results_body), выставить его надо в момент закрытия, а не
-            # в write_epilogue — тот срабатывает уже после рассылки итогов.
-            epilogue_text=winning_card.consequence[:700],
             status=RoundStatus.CLOSED,
         )
     )
@@ -454,7 +441,6 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
     round_row.vote_counts_json = counts_json
     round_row.stake_counts_json = stake_counts_json
     round_row.tie_note = tie_note
-    round_row.epilogue_text = winning_card.consequence[:700]
     round_row.status = RoundStatus.CLOSED
     # Канон дня — только победивший кадр. Крючка для следующей кассеты больше
     # нет: каждая кассета — самостоятельная история, месяц не обязан ничем.

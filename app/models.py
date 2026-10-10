@@ -211,8 +211,9 @@ class Round(Base):
     # из /panel — новая версия вступает со СЛЕДУЮЩЕГО дня, а этот флаг
     # замораживает решение текущего дня (банк, /stake, /change).
     money_mode: Mapped[bool] = mapped_column(Boolean, default=True)
-    # Эпилог дня от нейросети: чем отозвался победивший путь (пусто — не написан).
-    epilogue_text: Mapped[str] = mapped_column(String(700), default="")
+    # Эпилог дня (epilogue_text) снесён — указ владельца: канон хранится
+    # в StoryBeat (журнал пути), флаги лидерборда ставятся на факте закрытия
+    # дня, а не на тексте (дроп — миграция a1d4f8c27b93).
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (

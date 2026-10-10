@@ -345,25 +345,23 @@ async def _finalize_new_day_job(
     Итоги уже разосланы отдельно (_announce_results_job); если wait_results
     передан, анонс нового дня откладывается до полной доставки итогов — чтобы
     игроки видели сначала хронологический итог, а не рассказ следующего дня.
-    Здесь: write_epilogue (бэкафилл канона в БД) → флаг лидерборда (последний день
-    недели/месяца) → новый день (инлайн-генерация) → анонс. Канон дней уже записан
-    при закрытии раунда (```lifecycle.finish_tally```) и разошёлся в посте итогов;
-    write_epilogue лишь страхует дни без эпилога.
+    Здесь: флаг лидерборда (последний день недели/месяца закрыт) → новый день
+    (инлайн-генерация) → анонс. Канон дней пишется при закрытии раунда
+    (```lifecycle.finish_tally``` → StoryBeat); эпилог снесён (указ владельца).
     Свои краткоживущие сессии (нельзя переиспользовать сессию тика — она
     за пределами этого контекста).
     """
     from app.models import Round
 
     try:
-        from app.rounds import create_next_round_detailed, get_round, write_epilogue
+        from app.rounds import create_next_round_detailed, get_round
 
-        # 1. Эпилог подтверждает выбор и закрепляется в БД (идемпотентно).
-        # cards грузим сразу: write_epilogue ходит по ним синхронно, ленивая
-        # подгрузка вне await дала бы MissingGreenlet.
+        # 1. Последний день недели/месяца — флаг готовности лидерборда; он
+        # ставится на факте закрытия дня (эпилог снесён — указ владельца).
         async with SessionLocal() as session:
             finished = (
                 await session.execute(
-                    select(Round).where(Round.id == finished_id).options(selectinload(Round.cards))
+                    select(Round).where(Round.id == finished_id)
                 )
             ).scalar_one_or_none()
             if finished is None:
@@ -372,8 +370,6 @@ async def _finalize_new_day_job(
             # Индекс дня берём из живой сессии: ниже finished расцепляется —
             # читать его day_index из отвязанного объекта было бы ошибкой.
             finished_day_index = finished.day_index
-            await write_epilogue(session, finished)
-            # Если последний день недели/месяца — ставим флаг готовности лидерборда.
             from app.leaderboard import mark_leaderboards_for_finished
 
             await mark_leaderboards_for_finished(session, finished)
