@@ -815,6 +815,23 @@ async def announce_new_day(
             round_row.day_index,
         )
         await set_announce_empty_marker(round_row.day_index)
+        # Пустая аудитория ≠ состоявшийся анонс: снимаем claim (announced_at).
+        # Стоящая метка означала бы, что день объявлен, а восстановитель
+        # видит только announced_at IS NULL — и когда получатель появится
+        # позже (привязанный чат, вернувшийся игрок), пост не вернулся бы
+        # никогда. Отправлять-то по-прежнему некому, дубля не будет.
+        try:
+            from app.rounds import unclaim_announcement
+
+            async with SessionLocal() as unclaim_session:
+                await unclaim_announcement(unclaim_session, round_row.id)
+        except Exception:
+            logger.warning(
+                "Claim дня %s не снят после пустого анонса — день не "
+                "дождётся появившегося получателя",
+                round_row.day_index,
+                exc_info=True,
+            )
     if not chat_ids:
         logger.warning(
             "Анонс дня %s: активных чатов нет — в группу или канал не уйдёт ничего",

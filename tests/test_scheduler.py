@@ -841,6 +841,7 @@ async def test_retry_new_day_job_announces_only_open_unannounced(monkeypatch) ->
     bot = object()
     monkeypatch.setattr(sched, "_bot", bot)
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    monkeypatch.setattr(sched, "announce_audience_size", AsyncMock(return_value=2))
     missing = await _make_round(9725, RoundStatus.OPEN)
     claimed = await _make_round(9726, RoundStatus.OPEN)
     tallying = await _make_round(9727, RoundStatus.TALLYING)
@@ -882,6 +883,48 @@ async def test_retry_new_day_job_respects_pause(monkeypatch) -> None:
         await _cleanup(missing)
 
 
+async def test_retry_new_day_job_waits_for_first_recipient(monkeypatch) -> None:
+    """Пустая аудитория: досылка молчит, но объявляет день, как только
+    появился первый получатель (привязанный чат, вернувшийся игрок).
+
+    Анонс «в никуда» снимает claim (ветка пустоты в announce_new_day) — без
+    гейта восстановитель крутился бы каждые 15 секунд вхолостую, а с ним
+    день лежит без поста ровно до момента, когда кому-то есть что показывать,
+    и уходит ближайшим же тиком.
+    """
+    from app import scheduler as sched
+
+    bot = object()
+    monkeypatch.setattr(sched, "_bot", bot)
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    pending = await _make_round(9734, RoundStatus.OPEN)
+    seen: list[int] = []
+
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    audience = AsyncMock(return_value=0)
+    monkeypatch.setattr(sched, "announce_audience_size", audience)
+    try:
+        await sched._retry_new_day_job()
+        assert seen == []  # получателей нет — ни шума, ни claim'а
+        async with SessionLocal() as db:
+            row = await db.get(Round, pending)
+            assert row is not None and row.announced_at is None
+
+        audience.return_value = 1
+        await sched._retry_new_day_job()
+        # Проверяем именно свой день: в общей тестовой БД остаются OPEN-строки
+        # от других тестов, их догон не входит в предмет проверки.
+        assert pending in seen
+        async with SessionLocal() as db:
+            row = await db.get(Round, pending)
+            assert row is not None and row.announced_at is not None
+    finally:
+        await _cleanup(pending)
+
+
 async def test_retry_jobs_skip_history(monkeypatch) -> None:
     """Регрессия прода: дни за пределами окна догона НЕ переигрываются.
 
@@ -905,6 +948,7 @@ async def test_retry_jobs_skip_history(monkeypatch) -> None:
 
     monkeypatch.setattr(sched, "_bot", object())
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    monkeypatch.setattr(sched, "announce_audience_size", AsyncMock(return_value=2))
     results: list[int] = []
     new_days: list[int] = []
 

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.async_utils import spawn
-from app.broadcast import announce_new_day
+from app.broadcast import announce_audience_size, announce_new_day
 from app.config import settings
 from app.db import SessionLocal
 from app.models import RoundStatus, WatcherState
@@ -215,6 +215,9 @@ async def _retry_new_day_job() -> None:
     day-1 при самом первом запуске) оставляют OPEN-день без поста: тик видит
     только переход previous→current, а /advance помечает день навсегда. Здесь
     открытые дни без announced_at объявляются заново (лимит 5 за тик).
+    Сюда же попадает день, чей анонс ушёл в пустую аудиторию: announce_new_day
+    снимает claim, а гейт по получателям не даёт досылке крутиться вхолостую,
+    пока получателей нет (см. ветку пустоты в announce_new_day).
 
     Ловим только НЕДАВНИЕ дни (catchup_cutoff): announced_at добавлен
     миграцией без бэкфилла, так что у всей истории маркер NULL — без границы
@@ -227,6 +230,12 @@ async def _retry_new_day_job() -> None:
 
         async with SessionLocal() as session:
             if await is_game_paused(session):
+                return
+            if await announce_audience_size() == 0:
+                # Получателей нет (чаты не привязаны, личка не подписана):
+                # claim снимает announce_new_day, но досылка без аудитории —
+                # это пустая гонка каждые 15 секунд. Ждём первого получателя,
+                # день уйдёт на ближайшем же тике после его появления.
                 return
             pending = (
                 await session.execute(

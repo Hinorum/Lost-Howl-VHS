@@ -671,27 +671,37 @@ async def test_no_asyncio_wait_coroutine_leak() -> None:
 
 
 async def test_announce_without_audience_leaves_a_trace(monkeypatch, caplog) -> None:
-    """Анонс дня без единого получателя обязан оставить след.
+    """Анонс дня без единого получателя обязан оставить след И СНЯТЬ claim.
 
-    Claim дня (announced_at) уже стоит ДО отправки, а метка delivery:* при
+    Claim дня (announced_at) стоит ДО отправки, а метка delivery:* при
     «0 из 0» не пишется — без отдельной метки, предупреждения и счётчика
     пустая аудитория была неотличима от «новость дня увидели все», и тревоги
-    было некому поднять.
+    было некому поднять. А ещё пустая аудитория ≠ состоявшийся анонс:
+    снятый claim отдаёт день восстановителю, и он досылается, как только
+    получатель появится (привязанный чат, вернувшийся игрок).
     """
     from app import metrics as metrics_mod
     from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+    from app.rounds import claim_announcement
 
     monkeypatch.setattr(settings, "player_dm", True)
     monkeypatch.setattr(bc, "active_chat_ids", AsyncMock(return_value=[]))
     monkeypatch.setattr(bc, "active_player_ids", AsyncMock(return_value=[]))
     metrics_mod.reset()
+    round_row = _round(9305)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+        assert await claim_announcement(db, round_row)  # claim, как в тике
     try:
         with caplog.at_level(logging.WARNING, logger="app.broadcast"):
-            delivered = await bc.announce_new_day(_flaky_bot({}), _round(9305), finished=None)
+            delivered = await bc.announce_new_day(_flaky_bot({}), round_row, finished=None)
         assert delivered == []
         async with SessionLocal() as db:
             marker = await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY)
+            fresh = await db.get(Round, round_row.id)
         assert marker is not None and marker.value == "9305"
+        assert fresh is not None and fresh.announced_at is None
         assert "way_announce_no_audience_total 1" in metrics_mod.render()
         assert "ушёл в пустоту" in caplog.text
     finally:
