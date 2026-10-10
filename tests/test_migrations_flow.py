@@ -587,12 +587,32 @@ def test_single_head_and_reachable_revisions():
     assert len(script.get_bases()) == 1, f"у истории несколько base'ов: {script.get_bases()}"
 
     revisions = {revision.revision for revision in script.walk_revisions()}
+    # Обход вниз от head по ВСЕМ предкам: у merge-ревизии down_revision —
+    # кортеж (склейка двух веток), и каждая ветка обязана попасть в цепочку.
+    # Общий предок двух веток (diamond) посещается дважды — это не цикл,
+    # поэтому различаем «уже посещён» (chain) и «стоит в текущем пути»
+    # (visiting): первое — пропускаем, второе — падаем.
     chain: set[str] = set()
-    current: str | None = heads[0]
-    while current is not None:
-        assert current not in chain, f"цикл в истории ревизий: {current}"
-        chain.add(current)
-        current = script.get_revision(current).down_revision
+    visiting: set[str] = set()
+
+    def walk(revision_id: str) -> None:
+        assert revision_id not in visiting, f"цикл в истории ревизий: {revision_id}"
+        if revision_id in chain:
+            return
+        visiting.add(revision_id)
+        down = script.get_revision(revision_id).down_revision
+        if down is None:
+            parents: tuple[str, ...] = ()
+        elif isinstance(down, str):
+            parents = (down,)
+        else:
+            parents = down
+        for parent in parents:
+            walk(parent)
+        visiting.discard(revision_id)
+        chain.add(revision_id)
+
+    walk(heads[0])
 
     unreachable = sorted(revisions - chain)
     assert unreachable == [], f"ревизии не достижимы от head: {unreachable}"

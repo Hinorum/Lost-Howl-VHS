@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 POSITIONS = ("I", "II", "III")
@@ -34,9 +34,8 @@ def status_text(cassette_day: dict) -> str:
     story = f"{html.escape(cassette_day['chapter_text'], quote=False)}\n\n"
     dilemma = html.escape(cassette_day["dilemma"], quote=False)
     # phase + дедлайн — без БД; для демо берём дефолт «сразу».
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     voting_at = now + timedelta(hours=18)
-    tally_at = voting_at + timedelta(seconds=30)
     phase = "🎬 Сцена дня: большинство решит. Счёт скрыт до конца сцены."
     deadline = f"🗳 Голосование до {voting_at:%H:%M} UTC — итоги и новый день придут сразу после"
     tail = f"\n\n{phase}\n{deadline}"
@@ -78,9 +77,9 @@ def main() -> None:
 
         print("\nКЛАВИАТУРА (cards_keyboard — столбик из 3 кнопок):")
         for text, callback in cards_keyboard(day):
-            print(f"+----------------------------------------")
+            print("+----------------------------------------")
             print(f"| {text}   -> callback_data = {callback!r}")
-        print(f"+----------------------------------------")
+        print("+----------------------------------------")
         print()
 
 
