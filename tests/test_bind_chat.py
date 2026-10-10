@@ -1,12 +1,14 @@
-"""Ручная привязка чата: /bind закрывает дыру, которую не закрывает my_chat_member.
+"""Авто-привязка чата: ручной /bind снят, регистрирует само присутствие.
 
-Единственный автоматический путь регистрации — my_chat_member, и он срабатывает
-только на СМЕНУ состава: бота, добавленного в канал, пока бот стоял (Telegram
-хранит апдейты сутки), система не видит никогда. Дни при этом уходят в пустоту,
-а claim дня уже стоит, так что восстановитель их не досылает. /bind — ручной
-путь для хранения и привязки чатов/каналов без лишней верификации поверх
-Telegram: канал, группа и обычный админский доступ уже проверяются самим
-Telegram, а дополнительная логика бота только записывает факт привязки.
+Указ владельца: /bind — лишний костыль (команду нужно знать, написать в
+нужном чате, а в ЛС она лишь отвечает «привязывай в нужном чате»). Чат
+попадает в рассылку теперь только автоматическими путями:
+
+- my_chat_member — смена состава (бота добавили, выгнали, повысили);
+- auto_bind_chat — первая же команда или сообщение в чате: закрывает дыру
+  пропущенного события добавления (Telegram хранит апдейты сутки), из-за
+  которой день уходил в пустоту, а claim дня уже стоял;
+- личка — через /start (dm_subscribed), привязки чата там не требуется.
 """
 
 from __future__ import annotations
@@ -16,27 +18,18 @@ from unittest.mock import AsyncMock
 
 from sqlalchemy import delete
 
-from app.config import settings
 from app.db import SessionLocal
-from app.handlers.admin import cmd_bind
+from app.handlers import auto_bind_chat
+from app.handlers.admin import track_chat
 from app.handlers.common import router
 from app.models import Chat
 
-KEEPER_ID = 4242
 CHAT_ID = -100_777_666
 
 
-def _message(
-    text: str = "/bind",
-    *,
-    chat_type: str = "supergroup",
-    chat_id: int = CHAT_ID,
-    user_id: int | None = KEEPER_ID,
-) -> SimpleNamespace:
+def _message(*, chat_type: str = "supergroup", chat_id: int = CHAT_ID) -> SimpleNamespace:
     return SimpleNamespace(
         chat=SimpleNamespace(type=chat_type, id=chat_id, title="Канал проверки", username=None),
-        from_user=None if user_id is None else SimpleNamespace(id=user_id),
-        text=text,
         answer=AsyncMock(),
     )
 
@@ -52,56 +45,11 @@ async def _forget(chat_id: int = CHAT_ID) -> None:
         await db.commit()
 
 
-async def test_bind_allows_outsider(monkeypatch) -> None:
-    """Дополнительная проверка хранителя для /bind снята: Telegram сам определяет доступ."""
-    monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
+async def test_traffic_binds_group_chat() -> None:
+    """Любое сообщение из группы регистрирует её для рассылки."""
     await _forget()
     try:
-        msg = _message(user_id=1)
-        await cmd_bind(msg)
-        assert "привязан" in msg.answer.call_args.args[0].lower()
-        assert msg.answer.await_count == 1
-        assert await _row() is not None
-    finally:
-        await _forget()
-
-
-async def test_bind_allows_anonymous_author(monkeypatch) -> None:
-    """Анонимный автор не блокирует привязку — бот не трогает логику Telegram."""
-    monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
-    await _forget()
-    try:
-        msg = _message(user_id=None)
-        await cmd_bind(msg)
-        assert "привязан" in msg.answer.call_args.args[0].lower()
-        assert await _row() is not None
-    finally:
-        await _forget()
-
-
-async def test_bind_in_private_says_where_to_run(monkeypatch) -> None:
-    """В личке привязывать нечего: хранитель должен получить подсказку,
-    а не пустую команду без объяснения."""
-    monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
-    private_id = KEEPER_ID
-    msg = _message(chat_type="private", chat_id=private_id)
-    try:
-        await cmd_bind(msg)
-        reply = msg.answer.call_args.args[0]
-        assert "/bind" in reply
-        assert "в группе или канале" in reply
-        assert await _row(private_id) is None
-    finally:
-        await _forget(private_id)
-
-
-async def test_bind_registers_group_chat(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
-    await _forget()
-    try:
-        msg = _message(chat_type="supergroup")
-        await cmd_bind(msg)
-        assert "привязан" in msg.answer.call_args.args[0].lower()
+        await auto_bind_chat(_message(chat_type="supergroup"))
         row = await _row()
         assert row is not None
         assert row.active is True
@@ -111,13 +59,11 @@ async def test_bind_registers_group_chat(monkeypatch) -> None:
         await _forget()
 
 
-async def test_bind_registers_channel(monkeypatch) -> None:
+async def test_traffic_binds_channel() -> None:
     """Канал — основной пострадавший: именно он не получал новостей дня."""
-    monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
     await _forget()
     try:
-        msg = _message(chat_type="channel")
-        await cmd_bind(msg)
+        await auto_bind_chat(_message(chat_type="channel"))
         row = await _row()
         assert row is not None and row.active is True
         assert row.type == "channel"
@@ -125,17 +71,38 @@ async def test_bind_registers_channel(monkeypatch) -> None:
         await _forget()
 
 
-async def test_bind_reactivates_deactivated_chat(monkeypatch) -> None:
-    """Чат уже известен, но помечен неактивным (бота выгнали / права отобрали)
-    — /bind обязан вернуть его в рассылку, а не оставить старую пометку."""
-    monkeypatch.setattr(settings, "admin_ids", str(KEEPER_ID))
+async def test_traffic_is_silent() -> None:
+    """Авто-привязка не отвечает в чат: мусорная строка не будит стаю."""
+    await _forget()
+    try:
+        msg = _message()
+        await auto_bind_chat(msg)
+        assert msg.answer.await_count == 0
+    finally:
+        await _forget()
+
+
+async def test_private_chat_does_not_bind() -> None:
+    """Личку рассылка получает через /start, а не через привязку чата."""
+    private_id = 4242
+    msg = _message(chat_type="private", chat_id=private_id)
+    try:
+        await auto_bind_chat(msg)
+        assert await _row(private_id) is None
+        assert msg.answer.await_count == 0
+    finally:
+        await _forget(private_id)
+
+
+async def test_traffic_reactivates_deactivated_chat() -> None:
+    """Чат помечен неактивным (бота выгнали / права отобрали) — первое же
+    сообщение возвращает его в рассылку, а не оставляет старую пометку."""
     await _forget()
     async with SessionLocal() as db:
         db.add(Chat(id=CHAT_ID, type="channel", active=False, title="старое имя"))
         await db.commit()
     try:
-        msg = _message(chat_type="channel")
-        await cmd_bind(msg)
+        await auto_bind_chat(_message(chat_type="channel"))
         row = await _row()
         assert row is not None and row.active is True
         assert row.title == "Канал проверки"
@@ -143,14 +110,35 @@ async def test_bind_reactivates_deactivated_chat(monkeypatch) -> None:
         await _forget()
 
 
-def test_bind_is_registered_for_messages_and_channel_posts() -> None:
-    """Два observer'а: группа отвечает на message, канал — на channel_post.
+async def test_my_chat_member_still_registers() -> None:
+    """Автоматический путь не тронут: смена состава по-прежнему пишет строку."""
+    await _forget()
+    event = SimpleNamespace(
+        chat=SimpleNamespace(type="group", id=CHAT_ID, title="Канал проверки", username=None),
+        new_chat_member=SimpleNamespace(status="administrator"),
+    )
+    try:
+        await track_chat(event)
+        row = await _row()
+        assert row is not None and row.active is True
+    finally:
+        await _forget()
 
-    В канал Telegram приходит channel_post, а не message: без второй
-    регистрации команда в канале молчала бы, и привязать его было бы
-    нечем — ровно та дыра, которую закрывает /bind.
+
+def test_bind_command_removed_and_autobind_registered() -> None:
+    """Ручной /bind снят; авто-привязка висит между игровыми хендлерами и fallback.
+
+    До fallback — с фильтром «не ЛС»: хендлер ловит только неразобранный
+    текст в группе/канале и не может перехватить ЛС (иначе молча съел бы
+    сообщения хранителя, ловит же fallback). После игровых команд — чтобы
+    не претендовать на их сообщения.
     """
+    from app import handlers
+
+    assert "cmd_bind" not in handlers.__all__
+    assert "auto_bind_chat" in handlers.__all__
     messages = [handler.callback.__name__ for handler in router.message.handlers]
     channels = [handler.callback.__name__ for handler in router.channel_post.handlers]
-    assert "cmd_bind" in messages
-    assert "cmd_bind" in channels
+    assert "cmd_bind" not in messages and "cmd_bind" not in channels
+    assert "auto_bind_chat" in messages and "auto_bind_chat" in channels
+    assert messages.index("auto_bind_chat") < messages.index("on_private_fallback")

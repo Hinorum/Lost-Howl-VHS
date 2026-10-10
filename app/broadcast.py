@@ -810,7 +810,8 @@ async def announce_new_day(
         inc("announce_no_audience_total")
         logger.warning(
             "Анонс дня %s ушёл в пустоту: нет ни активных чатов, ни игроков с "
-            "личной рассылкой — новость не увидит никто (/bind в нужном чате)",
+            "личной рассылкой — новость не увидит никто (бота не добавили ни "
+            "в один чат, игроки не подписаны через /start)",
             round_row.day_index,
         )
         await set_announce_empty_marker(round_row.day_index)

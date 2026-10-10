@@ -419,7 +419,7 @@ async def test_empty_announce_audience_raises_alarm(_clean) -> None:
         problems = await ops.check_anomalies(_clean)
         assert any("анонс дня 42 не дошёл ни до кого" in p for p in problems), problems
         assert _clean.sent, "тревога должна уйти админу"
-        assert any("/bind" in text for text in _clean.sent), _clean.sent
+        assert any("/start" in text and "Добавь бота" in text for text in _clean.sent), _clean.sent
     finally:
         async with SessionLocal() as db:
             await db.execute(

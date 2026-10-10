@@ -33,7 +33,7 @@ app/
 │   ├── wallet.py        # Привязка TON-кошелька, балансы, история ставок
 │   ├── payout.py        # Очередь выплат (UI: «запросить выплату», «история»)
 │   ├── panel.py         # /panel и /cassette: пульт игрока, редактор плёнки
-│   ├── admin.py         # Админ-команды: /bind, /advance, /finalize, /adjust, /dispute, ...
+│   ├── admin.py         # Админ-команды: /advance, /finalize, /adjust, /dispute, ...
 │   ├── ops_diag.py      # /ops: очередь выплат, джобы, доставка рассылок
 │   └── fallback.py      # Любой неподходящий апдейт → fallback handler
 │

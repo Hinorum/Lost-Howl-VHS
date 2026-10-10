@@ -10,6 +10,9 @@ on_private_fallback импортируется ПОСЛЕДНИМ — он ло�
 """
 from __future__ import annotations
 
+from aiogram import F
+from aiogram.enums import ChatType
+
 __all__ = [
     "_ACTIVE_STATUSES",
     "_ADJ_CONFIRM_WINDOW",
@@ -64,11 +67,11 @@ __all__ = [
     "_wallet_view_safe",
     "_wallet_view_text",
     "_win_calc_text",
+    "auto_bind_chat",
     "build_dispatcher",
     "cmd_adjust",
     "cmd_advance",
     "cmd_backup",
-    "cmd_bind",
     "cmd_change",
     "cmd_dispute",
     "cmd_disputes",
@@ -129,10 +132,10 @@ from .admin import (
     _adjust_menu_text,
     _apply_adjustment,
     _resolve_player_arg,
+    auto_bind_chat,
     cmd_adjust,
     cmd_advance,
     cmd_backup,
-    cmd_bind,
     cmd_dispute,
     cmd_disputes,
     cmd_pause,
@@ -244,6 +247,16 @@ from .wallet import (
     on_stake_view,
     on_wallet_view,
 )
+
+# Авто-привязка чатов: ловит только то, с чем не справились игровые
+# хендлеры (неизвестные команды и обычный текст в группе/канале), и молча
+# регистрирует чат для рассылки. Ручной /bind снят указом владельца:
+# присутствие бота в чате доказывается любым трафиком, а не командой.
+# Фильтр «не ЛС» обязателен: без него авто-привязка перехватила бы ЛС
+# раньше fallback и молча съела бы любое сообщение хранителя.
+router.message.register(auto_bind_chat, F.chat.type != ChatType.PRIVATE)
+# В канал приходит channel_post, а не message; ЛС там не бывают — без фильтра.
+router.channel_post.register(auto_bind_chat)
 
 # Вызов после всех @router.message доменов. Сам import fallback isort
 # ставит раньше player/wallet — без декоратора там ничего не регистрируется.

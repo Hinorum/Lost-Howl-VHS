@@ -239,7 +239,7 @@ async def test_ops_text_warns_when_audience_is_empty(monkeypatch) -> None:
     text = await ops_diag._ops_diag_text()
 
     assert "Аудитория рассылки: пусто" in text
-    assert "/bind" in text and "/start" in text
+    assert "/start" in text and "первое сообщение" in text
 
 
 async def test_ops_text_shows_audience_counts(monkeypatch) -> None:

@@ -56,10 +56,11 @@ _ACTIVE_STATUSES = {"member", "administrator", "creator"}
 async def _sync_chat_row(session, chat, active: bool) -> bool:
     """Строка чата в таблице рассылки. True — чата раньше не было.
 
-    Общий путь для my_chat_member (автоматически, при смене состава) и /bind
-    (вручную): два входа в одну и ту же таблицу не должны жить двумя копиями
-    upsert'а — расходятся незаметно, а следствие у обоих одно: рассылка идёт
-    или не идёт в этот чат.
+    Общий путь для my_chat_member (смена состава) и авто-привязки по
+    трафику (auto_bind_chat): два входа в одну и ту же таблицу не должны
+    жить двумя копиями upsert'а — расходятся незаметно, а следствие у
+    обоих одно: рассылка идёт или не идёт в этот чат. Ручной /bind снят
+    указом владельца — регистрация чата стала полностью автоматической.
     """
     row = await session.get(Chat, chat.id)
     if row is None:
@@ -93,35 +94,34 @@ async def track_chat(event: ChatMemberUpdated) -> None:
     logger.info("Чат %s (%s): статус бота %s, active=%s", chat.id, chat.type, status, active)
 
 
-_BIND_TEXT_PRIVATE = (
-    "Привязывай прямо в нужном чате: напиши /bind в группе или канале — "
-    "туда и уйдут новости дня."
-)
-_BIND_TEXT_OK = "✅ Чат привязан к рассылке: новости дня будут приходить сюда."
+async def auto_bind_chat(message: Message) -> None:
+    """Чат, откуда пришло любое сообщение, привязывается молча.
 
+    Указ владельца снял ручной /bind: команда, которую нужно знать и
+    написать в нужном чате, — лишний костыль поверх Telegram. Регистрация
+    чата теперь целиком автоматическая: my_chat_member (смена состава)
+    плюс этот хендлер — он закрывает дыру пропущенного события добавления
+    (Telegram хранит апдейты сутки): бот в чате есть, а строки рассылки
+    нет, — первая же команда или сообщение регистрируют чат сами.
 
-@router.message(Command("bind"))
-@router.channel_post(Command("bind"))
-async def cmd_bind(message: Message) -> None:
-    """Ручная привязка чата к рассылке.
-
-    Telegram уже проверяет права доступа к чату/каналу; дополнительная
-    верификация на уровне бота здесь не нужна, иначе обычная привязка канала
-    начинает зависеть от кастомной логики вместо встроенной модели Telegram.
+    Вешается последним в роутере (см. handlers/__init__): ловит только то,
+    с чем не справились игровые хендлеры, и никогда не отвечает.
     """
     chat = message.chat
     if chat.type == ChatType.PRIVATE:
-        await message.answer(_BIND_TEXT_PRIVATE)
         return
     async with SessionLocal() as session:
+        row = await session.get(Chat, chat.id)
+        title = chat.title or chat.username
+        if row is not None and row.active and (title is None or row.title == title):
+            return  # строка уже актуальна — писать в базу нечего
         created = await _sync_chat_row(session, chat, active=True)
-    logger.info(
-        "Чат %s (%s) привязан вручную: %s",
-        chat.id,
-        chat.type,
-        "новый" if created else "строка обновлена",
-    )
-    await message.answer(_BIND_TEXT_OK)
+    if created:
+        logger.info(
+            "Чат %s (%s) привязан автоматически (первое сообщение)",
+            chat.id,
+            chat.type,
+        )
 
 
 @router.message(Command("advance"), F.chat.type == ChatType.PRIVATE)
