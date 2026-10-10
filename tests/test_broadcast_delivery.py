@@ -248,6 +248,41 @@ async def test_retry_after_then_success_keeps_chat(monkeypatch) -> None:
         await _wipe(Chat, Round)
 
 
+async def test_announce_delivers_round_fetched_without_cards() -> None:
+    """Анонс дня обязан доставлять раунд, поднятый голым session.get.
+
+    Регресс прода («итоги приходят, новый день нет»): финализатор и
+    восстановитель брали день через session.get без selectinload, ленивая
+    загрузка карт падала MissingGreenlet, падение ловилось молча в
+    _deliver_chat («0 из N» без единого виноватого), claim оставался — и
+    день не уходил никогда, тогда как итоги (там selectinload) доезжали.
+    """
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.orm.attributes import NO_VALUE
+
+    # Чистый слэб: _wipe(Round) не трогает карты (FK не каскадит в SQLite),
+    # и вставка раунда в пустую таблицу повторила бы id=1 на осиротевших
+    # картах — UNIQUE round_id+position.
+    await _wipe(Chat, Round, Card)
+    chat = 777_106
+    async with SessionLocal() as db:
+        db.add(Chat(id=chat, type="group", active=True))
+        await db.commit()
+    round_row = _round(9310)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+    async with SessionLocal() as db:  # отдельная сессия — как у финализатора
+        bare = await db.get(Round, round_row.id)
+        # Дыра воспроизводима: коллекция карт не подгружена.
+        assert sa_inspect(bare).attrs.cards.loaded_value is NO_VALUE
+    try:
+        delivered = await bc.announce_new_day(_flaky_bot({}), bare, finished=None)
+        assert delivered == [chat]
+    finally:
+        await _wipe(Chat, Round, Card)
+
+
 # ── личные дубликаты ────────────────────────────────────────────────────────
 
 

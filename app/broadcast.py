@@ -12,8 +12,10 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import NO_VALUE
 
 from app.config import settings
 from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
@@ -765,6 +767,28 @@ async def _deliver_chat(
         return None
 
 
+async def _ensure_cards(round_row: Round) -> Round:
+    """Раунд с загруженными картами — ровно то, что делают пути итогов.
+
+    Пакет дня строит кнопки из round_row.cards. У вызывающих, берущих день
+    через голый session.get (финализатор нового дня, восстановитель),
+    коллекция не подгружена, и ленивая загрузка в async контексте падает
+    MissingGreenlet. Падение ловится молча в _deliver_chat — «0 из N» без
+    единого виноватого получателя, claim (announced_at) остаётся — и день
+    не уходит НИКОГДА, хотя итоги (там selectinload) приходили исправно.
+    Подгружаем при входе, один раз, чтобы любой вызывающий был безопасен.
+    """
+    if round_row.id is None:
+        return round_row  # ещё не в БД (тестовые заготовки) — карты в памяти
+    if sa_inspect(round_row).attrs.cards.loaded_value is not NO_VALUE:
+        return round_row
+    from app.rounds import get_round
+
+    async with SessionLocal() as session:
+        loaded = await get_round(session, round_row.id)
+    return loaded if loaded is not None else round_row
+
+
 async def announce_new_day(
     bot: Bot | None,
     round_row: Round,
@@ -796,6 +820,7 @@ async def announce_new_day(
 
         inc("announce_no_bot_total")
         return []
+    round_row = await _ensure_cards(round_row)
     chat_ids = await active_chat_ids()
     # Аудитория важнее самой отправки: claim дня уже стоит, и при пустой
     # аудитории анонс проходит «успешно», никому не доставив ни строчки.

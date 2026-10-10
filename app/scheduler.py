@@ -226,7 +226,7 @@ async def _retry_new_day_job() -> None:
     try:
         from app.models import Round
         from app.ops import is_game_paused
-        from app.rounds import catchup_cutoff
+        from app.rounds import catchup_cutoff, get_round
 
         async with SessionLocal() as session:
             if await is_game_paused(session):
@@ -250,7 +250,9 @@ async def _retry_new_day_job() -> None:
                 )
             ).all()
             for (round_id,) in pending:
-                day = await session.get(Round, round_id)
+                # С картами (selectinload): пустая коллекция из session.get
+                # роняла бы пакет дня на MissingGreenlet — см. _ensure_cards.
+                day = await get_round(session, round_id)
                 if day is None:
                     continue
                 try:
@@ -353,7 +355,7 @@ async def _finalize_new_day_job(
     from app.models import Round
 
     try:
-        from app.rounds import create_next_round_detailed, write_epilogue
+        from app.rounds import create_next_round_detailed, get_round, write_epilogue
 
         # 1. Эпилог подтверждает выбор и закрепляется в БД (идемпотентно).
         # cards грузим сразу: write_epilogue ходит по ним синхронно, ленивая
@@ -392,7 +394,9 @@ async def _finalize_new_day_job(
             # принял бы этот день за неанонсированный (announced_at IS NULL)
             # и объявил бы его второй раз.
             async with SessionLocal() as session:
-                fresh = await session.get(Round, nxt.id)
+                # get_round, а не session.get: карты должны быть подгружены
+                # ДО вещания (см. _ensure_cards — иначе MissingGreenlet).
+                fresh = await get_round(session, nxt.id)
                 if fresh is None or fresh.status != RoundStatus.OPEN:
                     logger.warning("День %s для анонса не найден или закрыт", nxt.id)
                 else:
