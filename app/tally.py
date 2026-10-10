@@ -21,7 +21,6 @@ from app.models import (
     WeeklyPot,
 )
 from app.rounds import pick_winner
-from app.rounds.time import _ROMAN
 from app.stakes import current_network
 from app.ton_utils import from_nano
 from app.weeks import iso_week_key
@@ -211,8 +210,10 @@ def format_results(
         stake_nano = stakes.get(position, 0)
         stake_str = f" ({from_nano(stake_nano):.2f} Gram)" if stake_nano > 0 else ""
 
+        # Без римских номеров (указ владельца): в строке уже есть имя пути
+        # и счёт — номер только дублировал позицию кнопки.
         lines.append(
-            f"{_ROMAN[position]}: {names[position]}: {counts.get(position, 0)}{stake_str}{mark}"
+            f"{names[position]}: {counts.get(position, 0)}{stake_str}{mark}"
         )
     # Коэффициент: если есть ставки на победивший путь
     if multiplier is not None and multiplier > 0:

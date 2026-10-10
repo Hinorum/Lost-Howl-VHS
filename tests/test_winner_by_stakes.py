@@ -350,11 +350,13 @@ async def test_results_post_stake_decided_text(session: AsyncSession) -> None:
     assert "Тропа B" in text
     assert "Кадр дня уцелел по счёту Gram" in text
     assert "на волоске" not in text
-    # Строки сцен пронумерованы римскими — та же нумерация, что и в итогах
-    # дня (scene_label: «I. «название»»), позиция кнопки = позиция карты.
-    assert "I: Тропа A: 5" in text
-    assert "II: Тропа B: 1" in text
-    assert "III: Тропа C: 0" in text
+    # Строки путей БЕЗ римских номеров (указ владельца): имя пути + счёт,
+    # позиция строки = позиция кнопки. Римские остались в scene_label
+    # личных итогов — в общем посте их больше нет.
+    assert "Тропа A: 5" in text
+    assert "Тропа B: 1" in text
+    assert "Тропа C: 0" in text
+    assert "I: " not in text
     assert "← 🏆 След" in text
 
 
@@ -425,8 +427,9 @@ async def test_winner_by_stakes_off_ignores_stakes_for_text_phrase(
     assert VOTE_RULE_PHRASES[WinRule.MAJORITY] == "уцелеет кадр, собравший больше всех голосов (день Большинства)"
 
 
-def test_results_post_scene_numbers_without_stakes() -> None:
-    # Голосовой день (без ставок): номера сцен всё равно проставлены.
+def test_results_post_paths_without_stakes() -> None:
+    # Голосовой день (без ставок): строки путей без римской нумерации
+    # (указ владельца), счёт по путям на месте.
     rnd = Round(
         day_index=6,
         win_rule=WinRule.MAJORITY,
@@ -439,6 +442,7 @@ def test_results_post_scene_numbers_without_stakes() -> None:
             Card(position=pos, title=title, consequence="к")
         )
     text = format_results(rnd)
-    assert "I: Тропа A: 1" in text
-    assert "II: Тропа B: 4" in text
-    assert "III: Тропа C: 2" in text
+    assert "Тропа A: 1" in text
+    assert "Тропа B: 4" in text
+    assert "Тропа C: 2" in text
+    assert "I: " not in text
