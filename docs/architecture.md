@@ -16,7 +16,7 @@ docstring'ах и в `README.md`.
 app/
 ├── main.py              # Точка входа: aiohttp + aiogram dispatcher + scheduler + self-ping
 ├── config.py            # Pydantic-settings: все ключи .env + validate_config() на старте
-├── models.py            # SQLAlchemy 2.x: 13 таблиц (Player, Round, Card, Stake, Payout, ...)
+├── models.py            # SQLAlchemy 2.x: 24 таблицы (Player, Round, Card, Stake, Payout, ...)
 ├── db.py                # Async-движок, init_db(), _migrate(), легаси-конвергенция
 ├── scheduler.py         # APScheduler: cron + interval джобы
 ├── http_utils.py        # Общий httpx.AsyncClient + http_post_with_retry
@@ -32,8 +32,9 @@ app/
 │   ├── topup.py         # Пополнение кошелька через бот
 │   ├── wallet.py        # Привязка TON-кошелька, балансы, история ставок
 │   ├── payout.py        # Очередь выплат (UI: «запросить выплату», «история»)
-│   ├── panel.py         # Пульт игрока (навигация по чату)
-│   ├── admin.py         # Админ-команды: /advance, /refund, /heal, /cassette, ...
+│   ├── panel.py         # /panel и /cassette: пульт игрока, редактор плёнки
+│   ├── admin.py         # Админ-команды: /bind, /advance, /finalize, /adjust, /dispute, ...
+│   ├── ops_diag.py      # /ops: очередь выплат, джобы, доставка рассылок
 │   └── fallback.py      # Любой неподходящий апдейт → fallback handler
 │
 ├── rounds/              # Движок игрового дня
@@ -51,7 +52,7 @@ app/
 │   ├── schema.py        # Контракт кассеты: Pydantic + валидаторы
 │   ├── bay.py           # Проигрыватель: install_bay() патчит rendering._plan_and_render
 │   ├── editor.py        # Dry-run редактирование кассеты (preview)
-│   └── cassettes/       # Библиотека кассет (4 шт. на сегодня)
+│   └── cassettes/       # Библиотека кассет (активная + две на ноябрь 2026)
 │
 ├── ton_pay/             # Диспетчер выплат (пакет: листы + оркестрация в __init__)
 ├── ton_watch/           # Watcher входящих: мемпул → Stake/WatcherState
@@ -59,7 +60,7 @@ app/
 │   │                    #   ledger, refunds, notify, revote
 ├── ton_codec.py         # Чистые кодеки: api_headers, extract_comment, norm_tx_hash
 ├── ton_utils.py         # TON-арифметика: nano/gram конверсии, форматы адресов
-├── treasury_mirror.py   # Цепочечно-подтверждённое зеркало казны + ежедневная сверка
+├── treasury_mirror.py   # Цепочечно-подтверждённое зеркало казны (sync_treasury_mirror)
 │
 ├── stakes.py            # Короткие операции со стейками (insert/refund)
 ├── payments.py          # Локальная таблица исходящих (pending/sending/sent/failed)
@@ -102,18 +103,21 @@ app/
                                            │                                 │
           ┌────────────────────────────────┤                                 │
           │  scheduler.py (APScheduler)    │                                 │
-          │   - open_daily_job   @ 11:00 UTC                                 │
-          │   - close_daily_job  @ 11:00 UTC                                 │
-          │   - payout_loop      @ 60s                                       │
-          │   - watch_loop       @ 30s                                       │
-          │   - heal_stale_rounds @ 5min                                     │
-          │   - check_anomalies  @ 1d                                        │
-          │   - self_ping         @ 600s                                     │
+          │   - way-tick        @ 15s (жизненный цикл дня: open →            │
+          │                       tally → close в 11:00 UTC)                 │
+          │   - ops-sweep       @ 2m (тревоги, очереди, джобы)               │
+          │   - story-sync      @ 1m (зеркало кассет из БД в каталог)        │
+          │   - db-backup       @ 04:17 MSK                                  │
+          │   - ws-cleanup      @ вс 03:30 MSK                               │
+          │   - vote-reminder   @ 10:00 UTC (за час до закрытия)             │
+          │   - при TON_ENABLED: ton-watch, ton-settle @ 2m,                 │
+          │                       treasury-mirror                            │
+          │   (self-ping живёт отдельно в main.py)                           │
           ▼                                │                                 │
    ┌─────────────┐                         │                                 │
    │ rounds/     │                         │                                 │
    │ lifecycle.py│──► Round (status=OPEN/TALLYING/CLOSED) ──────────────►    │
-   │ voting.py   │──► Card, Stake, Vote, Winner ───────────────────────►    │
+   │ voting.py   │──► Card, Stake, Vote, StoryBeat ────────────────────►    │
    │ tally.py    │                         │                                 │
    └─────────────┘                         │                                 │
           │ winner_card_id                 │                                 │
@@ -128,26 +132,26 @@ app/
           ▼                                │                                 │
    ┌─────────────┐                         │                                 │
    │ handlers/   │                         │                                 │
-   │ payout.py   │──► Payout (status=pending/sending/sent/failed) ─────►    │
+   │ payout.py   │──► Payout (pending/sending/sent/failed/dismissed) ──►    │
    │ broadcast.py│                         │                                 │
    └─────────────┘                         │                                 │
           │                                ▼                                 │
           │                       ┌─────────────────┐                        │
           │                       │ ton_pay/        │                        │
-          │                       │  send_via_liteserver() ─► liteserver ► TON
-          │                       │  send_via_toncenter() ─► https API   ─► TON
+          │                       │  send_ton_transfer ─► HTTP-канал ─► TON
           │                       └─────────────────┘                        │
           │                                │                                 │
           │                       ┌─────────────────┐                        │
-          │                       │ ton_watch/      │◄── liteserver ◄────────│
+          │                       │ ton_watch/      │◄── TonAPI/Toncenter ◄──│
           │                       │  watcher_state  │                        │
-          │                       │  → Stake(WATCHED)                        │
+          │                       │  → Stake(pending → confirmed)            │
           │                       └─────────────────┘                        │
           │                                │                                 │
           │                                ▼                                 │
           │                       ┌─────────────────┐                        │
           │                       │ treasury_mirror │                        │
-          │                       │  daily_check()  │   pg_dump + archive    │
+          │                       │ sync_treasury_  │   pg_dump + archive    │
+          │                       │ mirror()        │                        │
           │                       └─────────────────┘                        │
           ▼                                                                ▼
       Сообщения в чат                                            Состояние раундов
@@ -170,8 +174,9 @@ property-тестом (`tests/test_invariants.py`).
    блока masterchain TON, записанный **до** открытия ставок. Подогнать задним числом нельзя.
 6. **Состояние раунда монотонно**: `OPEN → TALLYING → CLOSED`. Переходы — атомарные
    UPDATE с `WHERE status = prev`. Двум процессам нельзя закрыть один день.
-7. **Watched ↔ Sent**: каждый стейк либо WATCHED, либо имеет pending-payout, но не оба;
-   каждый `payout.status='sent'` имеет `tx_hash` из зеркала, а не из памяти.
+7. **Стейк ↔ Выплата**: каждый стейк либо подтверждён watcher'ом и учтён в
+   расчёте дня, либо возвращён (`refunded`), но не то и другое; каждый
+   `payout.status='sent'` имеет `tx_hash` из зеркала, а не из памяти.
 
 ### Доставка итогов игроку (at-least-once)
 
@@ -243,7 +248,7 @@ property-тестом (`tests/test_invariants.py`).
 | `treasury_mirror.py` | Цепочка, комиссии, эталонный баланс | Кто получает выплаты |
 
 **Правило добавления нового:** если фича меняет экономику — идёт в `rounds/` или
-`payments.py`/`payouts.py`, Telegram-обёртка — в `handlers/`. Сюжет — только в
+`payments.py` (исходящие) / `handlers/payout.py` (выплаты), Telegram-обёртка — в `handlers/`. Сюжет — только в
 `story/cassettes/`. Никогда не импортировать `story/` из `rounds/` напрямую:
 единственный стык — `app/rounds/rendering.py::_plan_and_render` (см. `bay.install_bay`).
 
@@ -260,7 +265,7 @@ property-тестом (`tests/test_invariants.py`).
   ├─ TONCENTER_API_KEY     — опц., повышает лимит
   ├─ TREASURY_MNEMONIC     — sync:false, ТОЛЬКО на Render
   ├─ OWNER_WALLET_ADDRESS  — адрес казначея (для подписи сообщений в зеркале)
-  └─ ~40 прочих ключей    — RENDER_EXTERNAL_URL, WEBHOOK_SECRET, HEALTH_TOKEN, ...
+  └─ ~70 прочих ключей    — RENDER_EXTERNAL_URL, WEBHOOK_SECRET, HEALTH_TOKEN, ...
 ```
 
 Запуск:
@@ -284,13 +289,13 @@ property-тестом (`tests/test_invariants.py`).
 | E2E | `scripts/e2e_testnet.py` | Реальный testnet TON: пополнение, ставка, выплата |
 | Property | `tests/test_invariants.py` | Экономика: банки консервативны, нет отрицательных балансов |
 
-CI enforced: `--cov-fail-under=85` (при последнем замере 87 %).
+CI enforced: `--cov-fail-under=88` (при последнем замере 92 %).
 
 ---
 
 ## 7. Что НЕ здесь
 
-- **Нет web-интерфейса.** Только Telegram-бот и HTTP `/health` для мониторинга.
+- **Нет web-интерфейса.** Только Telegram-бот и HTTP-пробы `/health`, `/alive`, `/ready`, `/metrics` для мониторинга.
 - **Нет фронта для админа.** Все админ-операции — команды в Telegram.
 - **Нет внешних платных API.** Только бесплатные публичные индексаторы TON
   (TonAPI v2, Toncenter v3) с опциональным API-ключом.
@@ -305,7 +310,7 @@ CI enforced: `--cov-fail-under=85` (при последнем замере 87 %)
 2. Новый Telegram-команды → `app/handlers/...` + регистрация роутера в `app/main.py`.
 3. Новая механика дня → `app/rounds/` (state-machine) + UI в `handlers/panel.py`.
 4. Новая кассета → JSON в `app/story/cassettes/` по контракту `docs/lost_howl_prompts.md`,
-   валидация через `python -m scripts.cassette_tool.py lint path.json`.
+   валидация через `python -m scripts.cassette_tool lint path.json`.
 5. Любое изменение в пакетах `ton_pay/` или `ton_watch/` — обязательно
    `scripts/e2e_testnet.py` на testnet перед мержем.
 

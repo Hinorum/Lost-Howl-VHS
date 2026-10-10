@@ -289,7 +289,7 @@ python -m scripts.cassette_tool lint <файл.json> # кассета перед
 ### Покрытие тестами
 
 CI enforced `--cov-fail-under=88` по всему пакету `app/` (джоба `test`). Факт
-на последнем замере — **92 %**: 1489 passed, 10 skipped, полный прогон ≈3 минуты
+на последнем замере — **92 %**: 1485 passed, 10 skipped, полный прогон ≈3 минуты
 (`python -m pytest -q --cov=app --cov-report=term`). Покрытие — это floor, не цель:
 качественные тесты (инварианты экономики, property-тесты, конкурентные сценарии)
 важнее числа; конкретные сценарии описаны в `docs/architecture.md`, раздел
