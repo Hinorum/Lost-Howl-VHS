@@ -333,7 +333,11 @@ async def test_backup_alarm_names_the_offsite_chain(monkeypatch) -> None:
         assert "Render" in joined, joined
         assert "GitHub Actions" in joined, joined
         assert "db-backup" in joined, joined
-        assert "BACKUP_PASSPHRASE" in joined, joined
+        # Проверка на «BACKUP_PASSPHRASE» снята: секрет задан (05.10) и все
+        # прогоны workflow зелёные — упоминать его в тревоге значит посылать
+        # владельца настраивать уже настроенное. Держится разведение контуров:
+        # локальные копии деплой не переживает, живая копия — офсайтовая.
+        assert "не переживают деплой" in joined, joined
         # Дата в тревоге настоящая, а не «?»: раньше в _human_ts (форматер
         # unix-времени) передавали datetime, int() падал и тревога скрывала,
         # когда бэкап был.
