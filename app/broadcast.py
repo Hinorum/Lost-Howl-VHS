@@ -42,8 +42,8 @@ def cards_keyboard(round_id: int, cards) -> InlineKeyboardMarkup:
     текста (≈ 64) больше не узкое место, а защитный кап от очень длинных
     card.title. Подпись — название сцены из кассеты (короткое действие),
     длиннее капа — обрезается по словам. Последствия в кнопку не попадают —
-    их текст дня не показывает; канон живёт в consequence и всплывает
-    в итогах.
+    их текст дня не показывает; канон дня хранится в StoryBeat и в пост
+    игрокам не идёт.
     """
     titles = {card.position: (card.title or "").strip() for card in cards}
     rows: list[list[InlineKeyboardButton]] = []
