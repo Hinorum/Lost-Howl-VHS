@@ -351,7 +351,7 @@ async def test_plan_day_echo_absent_without_yesterday_winner(
 
 
 async def test_day_diary_reads_cassette(session, tmp_path, monkeypatch) -> None:
-    """Запись дневника дня читается из активной кассеты для поста итогов."""
+    """Запись дневника дня читается из активной кассеты для рассылки в 17:00 UTC."""
     from types import SimpleNamespace
 
     monkeypatch.setattr(bay, "datetime", _FakeDatetime)  # сегодня: 2026-05-11
@@ -367,12 +367,12 @@ async def test_day_diary_reads_cassette(session, tmp_path, monkeypatch) -> None:
     await set_next_cassette(session, "may-diary.json")
     assert install_bay(tmp_path) is True
     try:
-        finished = SimpleNamespace(
+        round_row = SimpleNamespace(
             day_index=11,
             opens_at=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
         )
         assert (
-            await bay.day_diary(session, finished)
+            await bay.day_diary(session, round_row)
             == "Щенок записал: мама почти выздоровела."
         )
         # Нет даты открытия — дневника нет (пусто, без ошибок).
@@ -381,13 +381,13 @@ async def test_day_diary_reads_cassette(session, tmp_path, monkeypatch) -> None:
         uninstall_bay()
 
 
-async def test_shipped_cassettes_diary_reaches_results(session) -> None:
-    """Запись дневника из ПОСТАВЛЕННОЙ кассеты доходит до поста итогов.
+async def test_shipped_cassettes_diary_resolves_by_day(session) -> None:
+    """Дневники из ПОСТАВЛЕННЫХ кассет находятся по месяцу и дню.
 
     Синтетическая кассета выше проверяет механику, но не проверяет главное:
     что реальные файлы библиотеки вообще содержат дневники и что они находятся
     по месяцу и дню. Ошибка тут выглядит безобидно — JSON валиден, линтер молчит,
-    а игрок просто не видит 📖 в итогах.
+    а игрок просто не видит 📖-поста дневника в 17:00.
     """
     from types import SimpleNamespace
 
@@ -397,12 +397,12 @@ async def test_shipped_cassettes_diary_reaches_results(session) -> None:
         # Октябрь 2026 — месяц, который играется прямо сейчас.
         found: dict[int, str] = {}
         for day_no in range(1, 32):
-            finished = SimpleNamespace(
+            round_row = SimpleNamespace(
                 day_index=day_no,
                 opens_at=datetime(2026, 10, day_no, 12, 0, tzinfo=UTC),
             )
             async with SessionLocal() as db:
-                found[day_no] = await bay.day_diary(db, finished)
+                found[day_no] = await bay.day_diary(db, round_row)
     finally:
         uninstall_bay()
 

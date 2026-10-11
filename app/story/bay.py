@@ -204,7 +204,7 @@ async def _prev_echo(session, today: date, day: DayModel) -> str:
     return ""
 
 
-async def day_diary(session, finished) -> str:
+async def day_diary(session, round_row) -> str:
     """Запись дневника (`diary` кассеты) для отдельного поста дневника (17:00 UTC).
 
     Дневник — ПОВ-контраст, не канон: запись читается из активной кассеты
@@ -212,8 +212,8 @@ async def day_diary(session, finished) -> str:
     локальна. Сбой/нет кассеты/нет поля — пусто: рассылка просто не уходит.
     """
     try:
-        opens = getattr(finished, "opens_at", None)
-        item_day = getattr(finished, "day_index", None)
+        opens = getattr(round_row, "opens_at", None)
+        item_day = getattr(round_row, "day_index", None)
         if opens is None or not item_day:
             return ""
         day = opens.date() if getattr(opens, "tzinfo", None) else opens.replace(tzinfo=UTC).date()
