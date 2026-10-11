@@ -762,6 +762,46 @@ async def problems_snapshot() -> tuple[list[str], float | None, list[dict]]:
     return problems, age, details
 
 
+async def _drop_exhausted_days(session, kinds: list[str]) -> list[str]:
+    """Отсекает из тревоги метки дней, вышедших за окно догона.
+
+    Восстановители досылают только недавние дни (catchup_cutoff): закрытый
+    день старше окна не дослать никогда, и его «0 доставлено» остаётся
+    записью в watcher_state, а не тревогой. Без этой границы каждый заваленный
+    деплоем день орал бы вечно: метка живёт вечно и никто её не перезаписывает.
+    Суффикс вида «day:34» / «results:35» — day_index; виды без числового
+    суффикса (dm:..., whisper) к дням не относятся и не фильтруются. Раунд не
+    найден — метка остаётся: неизвестно, старая ли она.
+    """
+    from app.rounds import catchup_cutoff
+
+    indexes: set[int] = set()
+    for kind in kinds:
+        _, _, suffix = kind.rpartition(":")
+        if suffix.isdigit():
+            indexes.add(int(suffix))
+    if not indexes:
+        return kinds
+    found = (
+        await session.execute(
+            select(Round.day_index, Round.opens_at).where(Round.day_index.in_(indexes))
+        )
+    ).all()
+    cutoff = catchup_cutoff()
+    ages: dict[int, datetime] = {}
+    for day_index, opens_at in found:
+        if opens_at.tzinfo is None:
+            opens_at = opens_at.replace(tzinfo=UTC)
+        ages[day_index] = opens_at
+    kept: list[str] = []
+    for kind in kinds:
+        _, _, suffix = kind.rpartition(":")
+        if suffix.isdigit() and int(suffix) in ages and ages[int(suffix)] < cutoff:
+            continue
+        kept.append(kind)
+    return kept
+
+
 async def check_anomalies(bot: Bot | None) -> list[str]:
     """Фоновые проверки раз в минутный цикл обслуживания; возвращает список проблем."""
     # Проблемы собираются во время проверок, а не в конце: тревога должна уйти
@@ -989,6 +1029,10 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                     lost.append(row.key.removeprefix("delivery:"))
             except ValueError:
                 logger.debug("Метка доставки %s не разобрана: %r", row.key, row.value)
+        if lost:
+            # День старше окна догона из тревоги уходит: дослать его нельзя,
+            # а метка живёт вечно — см. _drop_exhausted_days.
+            lost = await _drop_exhausted_days(session, lost)
         if lost:
             shown = sorted(lost)[:4]
             note = "ни одно сообщение не доставлено: " + ", ".join(shown)

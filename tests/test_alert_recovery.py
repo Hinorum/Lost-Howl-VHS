@@ -30,9 +30,10 @@ from app.db import SessionLocal
 from app.models import Chat, Round, RoundStatus, WatcherState, WinRule
 
 
-async def _closed_round(day_index: int) -> None:
+async def _closed_round(day_index: int, opens_hours_ago: int = 30) -> None:
     """Закрытый день, чьи итоги уже помечены отправленными (results_at)."""
     now = datetime.now(UTC)
+    opens_at = now - timedelta(hours=opens_hours_ago)
     async with SessionLocal() as db:
         await db.execute(delete(Round).where(Round.day_index == day_index))
         await db.commit()
@@ -43,10 +44,10 @@ async def _closed_round(day_index: int) -> None:
                 win_rule=WinRule.MAJORITY,
                 chapter_title=f"День {day_index}",
                 chapter_text="Сцена.",
-                opens_at=now - timedelta(hours=30),
-                voting_ends_at=now - timedelta(hours=20),
-                tally_ends_at=now - timedelta(hours=19),
-                results_at=now - timedelta(hours=19),
+                opens_at=opens_at,
+                voting_ends_at=opens_at + timedelta(hours=10),
+                tally_ends_at=opens_at + timedelta(hours=11),
+                results_at=opens_at + timedelta(hours=11),
             )
         )
         await db.commit()
@@ -326,6 +327,37 @@ async def test_partial_delivery_is_not_an_alarm(_clean) -> None:
                 )
             )
             await db.commit()
+
+
+async def test_stale_day_marker_stops_being_an_alarm(_clean) -> None:
+    """«0 доставлено» у дня старше окна догона — не тревога, а история.
+
+    Метка delivery:day:N живёт в watcher_state вечно и никто её не
+    перезаписывает: закрытый день дослать нельзя (восстановители ловят только
+    недавние дни), и без границы по окну догона каждый заваленный деплоем
+    день орал бы тревогой вечно. Свежий день — по-прежнему тревога: его ещё
+    можно догнать.
+    """
+    await _closed_round(8801, opens_hours_ago=120)  # старше окна догона (72 ч)
+    await _closed_round(8802)  # свежий
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:8801", value="0/4"))
+        db.add(WatcherState(key="delivery:day:8802", value="0/4"))
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert not any("day:8801" in p for p in problems), problems
+        assert any("day:8802" in p for p in problems), problems
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_(["delivery:day:8801", "delivery:day:8802"])
+                )
+            )
+            await db.commit()
+        await _drop_round(8801)
+        await _drop_round(8802)
 
 
 async def test_unparsable_delivery_marker_is_ignored(_clean) -> None:
