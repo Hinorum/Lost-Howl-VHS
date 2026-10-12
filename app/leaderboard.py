@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 
 from aiogram import Bot
@@ -65,6 +66,10 @@ from app.ton_utils import to_nano
 from app.weeks import iso_week_key, parse_prize_pcts, previous_week_key, week_bounds
 
 logger = logging.getLogger(__name__)
+
+# Форматы period в окне Claim: неделя «2026-W35», месяц «2026-08».
+_WEEK_PERIOD_RE = re.compile(r"^\d{4}-W\d{1,2}$")
+_MONTH_PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 # Приложение живёт в одном процессе, но закрытие дня (tick) и плановый
 # сброс копилок могут вызывать settle-функции параллельно из разных задач
@@ -221,7 +226,7 @@ async def _rank_window(
         select(
             Vote.player_id,
             correct_expr,
-            func.count(),
+            func.count(func.distinct(Round.id)),  # дни = уникальные раунды
         )
         .join(Round, Round.id == Vote.round_id)
         .where(
@@ -332,15 +337,27 @@ async def _open_claim_window(
 async def _load_claim_window(
     session, kind: str
 ) -> dict | None:
-    """Читает окно Claim из watcher_state. None = окна нет."""
+    """Читает окно Claim из watcher_state. None = окна нет.
+
+    period валидируется по формату ключа («YYYY-Www» / «YYYY-MM»): битые
+    данные окна (ручная правка, старая миграция) не должны дойти до
+    _human_claim_period или week_bounds и уронить хендлер.
+    """
     key = WEEK_CLAIM_WINDOW_KEY if kind == "week" else MONTH_CLAIM_WINDOW_KEY
     row = await session.get(WatcherState, key)
     if row is None or not row.value:
         return None
     try:
-        return json.loads(row.value)
+        data = json.loads(row.value)
     except (json.JSONDecodeError, TypeError):
         return None
+    if not isinstance(data, dict):
+        return None
+    period = data.get("period")
+    pattern = _WEEK_PERIOD_RE if kind == "week" else _MONTH_PERIOD_RE
+    if not isinstance(period, str) or not pattern.match(period):
+        return None
+    return data
 
 
 async def _clear_claim_window(session, kind: str) -> None:

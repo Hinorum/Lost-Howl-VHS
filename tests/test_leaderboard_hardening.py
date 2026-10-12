@@ -588,6 +588,42 @@ async def test_claim_window_overwrites_and_garbage_is_none(session: AsyncSession
     assert await _load_claim_window(session, "week") is None  # 342-343
 
 
+async def test_claim_window_invalid_period_is_treated_as_absent(
+    session: AsyncSession,
+) -> None:
+    """Битый period в окне = окна нет: JSON валиден, но ключ не тот.
+
+    Ручная правка watcher_state (или старая миграция) могла оставить
+    period вида «пн-вс» или «2026-13»: _human_claim_period и week_bounds
+    на этом падают. Окно с невалидным period отбрасывается целиком —
+    ничья переоткроется со свежими данными при следующем settle.
+    """
+    now = datetime.now(UTC).isoformat()
+    for key, bad_period in (
+        (WEEK_CLAIM_WINDOW_KEY, "понедельник"),
+        (WEEK_CLAIM_WINDOW_KEY, "2026-13"),  # месяц в недельном окне
+        (MONTH_CLAIM_WINDOW_KEY, "2026-W41"),  # неделя в месячном окне
+        (MONTH_CLAIM_WINDOW_KEY, "2026-13"),
+    ):
+        kind = "week" if key == WEEK_CLAIM_WINDOW_KEY else "month"
+        row = await session.get(WatcherState, key)
+        if row is None:
+            session.add(
+                WatcherState(
+                    key=key,
+                    value=json.dumps(
+                        {"period": bad_period, "players": [1], "opened_at": now}
+                    ),
+                )
+            )
+        else:
+            row.value = json.dumps(
+                {"period": bad_period, "players": [1], "opened_at": now}
+            )
+        await session.commit()
+        assert await _load_claim_window(session, kind) is None, bad_period
+
+
 async def test_resolve_claim_window_disabled_clears_window(
     session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

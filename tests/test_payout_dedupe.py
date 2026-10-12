@@ -553,6 +553,64 @@ async def test_no_wallet_prize_self_heals_when_player_binds(monkeypatch) -> None
             await session.commit()
 
 
+async def test_monthly_player_payout_hydrates_from_player_not_owner(monkeypatch) -> None:
+    """kind=leaderboard С player_id — приз игрока, не доля казны.
+
+    Месячный топ платит kind="leaderboard" с player_id; раньше гидрация
+    по _TREASURY_KINDS подставляла адрес хранителя и приз игрока уходил
+    на OWNER_WALLET_ADDRESS. OWNER-гидрация — только для строк без игрока.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    owner = "0:" + os.urandom(32).hex()
+    monkeypatch.setattr(settings, "owner_wallet_address", owner)
+    player_id = 931_001
+    player_wallet = "0:" + os.urandom(32).hex()
+    await ensure_round(7)
+    async with SessionLocal() as session:
+        from app.models import Player
+
+        session.add(
+            Player(id=player_id, username="top", wallet_address="", wallet_verified=False)
+        )
+        await session.commit()
+        payout = Payout(
+            round_id=None,
+            player_id=player_id,
+            kind="leaderboard",
+            amount_nanotons=500_000_000,
+            dest_address="",  # кошелёк привяжут позже
+            status="pending",
+        )
+        session.add(payout)
+        await session.flush()
+        payout_id = payout.id
+        await session.commit()
+
+    transfer = AsyncMock(return_value="bcast:92")
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", AsyncMock(return_value=set()))
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    try:
+        # Игрок привязал и подтвердил кошелёк — приз уходит ЕМУ, а не хранителю.
+        async with SessionLocal() as session:
+            player = await session.get(Player, player_id)
+            player.wallet_address = player_wallet
+            player.wallet_verified = True
+            await session.commit()
+        await ton_pay.dispatch_pending_payouts(bot=None)
+        assert transfer.await_count == 1
+        assert transfer.await_args.args[0] == player_wallet  # не owner
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert row.status == "sent" and row.dest_address == player_wallet
+    finally:
+        async with SessionLocal() as session:
+            await session.delete(await session.get(Payout, payout_id))
+            player = await session.get(Player, player_id)
+            if player is not None:
+                await session.delete(player)
+            await session.commit()
+
+
 async def test_empty_treasury_dest_revives_from_owner_env(monkeypatch) -> None:
     """Рейк без адреса (OWNER_WALLET_ADDRESS задан позже) уходит сам, без retry."""
     monkeypatch.setattr(settings, "ton_enabled", True)

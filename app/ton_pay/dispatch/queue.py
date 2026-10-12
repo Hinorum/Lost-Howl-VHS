@@ -98,7 +98,10 @@ async def _hydrate_player_dests(session, network: str) -> int:
             verified_map[pid] = verified
     revived = 0
     for payout in rows:
-        if payout.kind in _TREASURY_KINDS:
+        # Доля казны — ТОЛЬКО строки без игрока: kind="leaderboard" с
+        # player_id — это приз игрока из месячного топа, его кошелёк
+        # подставляется ниже по карте игроков, а не адресом хранителя.
+        if payout.player_id is None and payout.kind in _TREASURY_KINDS:
             if settings.owner_wallet_address:
                 payout.dest_address = normalize_address(settings.owner_wallet_address)
                 payout.last_error = None
