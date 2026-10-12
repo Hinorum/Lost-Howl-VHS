@@ -392,22 +392,48 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
 
     Кнопка видна только tied-игрокам, пока окно Claim открыто (приз не
     распределён из-за ничьей). Дублирующий check здесь — защита от hand-craft
-    callback: период берётся из окна, а не из текущей даты. Кошелёк обязателен,
+    callback: период берётся из окна, а не из текущей даты. После дедлайна
+    claim_window_hours заявки закрыты — поздняя претензия не переставляет
+    молчаливого соперника. Кошелёк обязателен,
     иначе приз физически некуда отправить. Идемпотентно:
     unique(player_id, kind, period) — повторный тап не заводит вторую запись.
     """
     if callback.from_user is None:
         await callback.answer()
         return
-    from app.leaderboard import _claim_window_players
+    from app.leaderboard import _load_claim_window
 
     async with SessionLocal() as session:
-        tied_players, period = await _claim_window_players(session, kind)
+        window = await _load_claim_window(session, kind)
+        tied_players = list(window.get("players") or []) if window else []
+        period = (window.get("period") or "") if window else ""
         player = await upsert_player(session, callback.from_user)
         if not period or not tied_players or player.id not in tied_players:
             await callback.answer(
                 "Сейчас нет открытых заявок: приз этого периода уже распределён "
                 "или ничьей среди лидеров нет.",
+                show_alert=True,
+            )
+            return
+        # Дедлайн, как его считает settle: после opened_at + claim_window_hours
+        # заявки закрыты — поздняя претензия не должна перестоять молчаливого
+        # соперника. Битый opened_at окно чинит по-своему (settle перезапускает
+        # таймер), поэтому здесь просто не считаем дедлайн прошедшим.
+        try:
+            opened_at = datetime.fromisoformat(window.get("opened_at", ""))
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=UTC)
+        except (ValueError, TypeError):
+            opened_at = None
+        now = datetime.now(UTC)
+        if (
+            opened_at is not None
+            and settings.claim_window_hours > 0
+            and (now - opened_at).total_seconds() >= settings.claim_window_hours * 3600
+        ):
+            await callback.answer(
+                f"Заявки закрыты: дедлайн {settings.claim_window_hours}ч прошёл — "
+                "приз решится по заявкам, поданным вовремя.",
                 show_alert=True,
             )
             return

@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock
 
 from sqlalchemy import func, select
 
+from app.config import settings
 from app.core.registry import (
     MONTH_CLAIM_WINDOW_KEY,
     WEEK_CLAIM_WINDOW_KEY,
@@ -222,6 +223,74 @@ async def test_claim_rejected_for_non_tied_player() -> None:
             )
         assert count == 0
     finally:
+        await _clean_player(pid)
+        await _clear_claim_windows()
+
+
+async def test_claim_rejected_after_deadline() -> None:
+    """Дедлайн прошёл — поздняя претензия не принимается: приз уже решён по срокам."""
+    pid = 990_006
+    await _mk_player(pid, wallet="0:" + os.urandom(32).hex())
+    opened_at = (datetime.now(UTC) - timedelta(hours=settings.claim_window_hours + 1)).isoformat()
+    await _seed_claim_window("week", "2026-W35", [pid], opened_at=opened_at)
+    try:
+        cb = _callback(pid)
+        await on_claim_week(cb)
+        async with SessionLocal() as db:
+            count = await db.scalar(
+                select(func.count())
+                .select_from(LeaderboardClaim)
+                .where(LeaderboardClaim.player_id == pid)
+            )
+        assert count == 0
+        alert = cb.answer.await_args.kwargs.get("show_alert")
+        assert alert is True
+        assert "дедлайн" in cb.answer.await_args.args[0]
+    finally:
+        await _clean_player(pid)
+        await _clear_claim_windows()
+
+
+async def test_claim_accepted_before_deadline_and_zero_hours_disables_gate() -> None:
+    """Окно моложе дедлайна — заявка проходит; claim_window_hours=0 снимает гейт."""
+    pid = 990_007
+    await _mk_player(pid, wallet="0:" + os.urandom(32).hex())
+    fresh_at = (datetime.now(UTC) - timedelta(hours=settings.claim_window_hours - 1)).isoformat()
+    await _seed_claim_window("week", "2026-W35", [pid], opened_at=fresh_at)
+    try:
+        cb = _callback(pid)
+        await on_claim_week(cb)
+        async with SessionLocal() as db:
+            count = await db.scalar(
+                select(func.count())
+                .select_from(LeaderboardClaim)
+                .where(LeaderboardClaim.player_id == pid)
+            )
+        assert count == 1
+        assert "принята" in cb.answer.await_args.args[0]
+    finally:
+        await _clean_player(pid)
+        await _clear_claim_windows()
+
+    # Дедлайн выключен (0) — протухшее окно всё равно принимает заявки.
+    await _mk_player(pid, wallet="0:" + os.urandom(32).hex())
+    ancient_at = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    await _seed_claim_window("week", "2026-W36", [pid], opened_at=ancient_at)
+    prev_hours = settings.claim_window_hours
+    settings.claim_window_hours = 0
+    try:
+        cb = _callback(pid)
+        await on_claim_week(cb)
+        async with SessionLocal() as db:
+            rows = (
+                (await db.execute(select(LeaderboardClaim).where(LeaderboardClaim.player_id == pid)))
+                .scalars()
+                .all()
+            )
+        assert len(rows) == 1
+        assert rows[0].period == "2026-W36"
+    finally:
+        settings.claim_window_hours = prev_hours
         await _clean_player(pid)
         await _clear_claim_windows()
 
