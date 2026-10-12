@@ -31,7 +31,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-# Лимиты из движка (см. docs/story_world_manifest.md, раздел «Формат полей»).
+# Лимиты из движка (см. docs/lost_howl_prompts.md, «Честные поля»).
 # Схема не выпускает текст, который рендер поста не сможет показать целиком:
 # лимит равен обрезке в app/broadcast.py — глава до 1500 → мы жёстче 700,
 # dilemma 400 == показу 400, заголовки 80 == показу 80 (ничего не режется
