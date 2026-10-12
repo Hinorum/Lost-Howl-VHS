@@ -72,8 +72,73 @@ def test_no_mnemonic_configured_changes_nothing(monkeypatch) -> None:
     """Дефолт (пусто) — краска выключена и не трогает обычные сообщения."""
     monkeypatch.setattr(settings, "treasury_mnemonic", "")
     monkeypatch.setattr(settings, "treasury_testnet_mnemonic", "")
+    monkeypatch.setattr(settings, "bot_token", "")
+    monkeypatch.setattr(settings, "health_token", "")
+    monkeypatch.setattr(settings, "webhook_secret", "")
+    monkeypatch.setattr(settings, "ton_api_key", "")
+    monkeypatch.setattr(settings, "toncenter_api_key", "")
+    monkeypatch.setattr(settings, "referral_secret", "")
 
     assert log_scrub.redact("обычное сообщение 42") == "обычное сообщение 42"
+
+
+def test_bot_token_is_redacted(monkeypatch) -> None:
+    """Токен бота в URL Telegram API — утечка в чистом виде; красим точным
+    вхождением настроенного значения."""
+    token = "1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+    monkeypatch.setattr(settings, "bot_token", token)
+
+    text = log_scrub.redact(f"https://api.telegram.org/bot{token}/getMe")
+
+    assert token not in text
+    assert log_scrub.REDACTED_SECRET in text
+    assert "getMe" in text
+
+
+def test_health_token_is_redacted(monkeypatch) -> None:
+    token = "health-s3cret-token-abc123"
+    monkeypatch.setattr(settings, "health_token", token)
+
+    text = log_scrub.redact(f"заголовок Authorization: Bearer {token}")
+
+    assert token not in text
+    assert log_scrub.REDACTED_SECRET in text
+
+
+def test_webhook_secret_is_redacted(monkeypatch) -> None:
+    token = "whsec-abcdef123456"
+    monkeypatch.setattr(settings, "webhook_secret", token)
+
+    text = log_scrub.redact(f"secret_token={token}")
+
+    assert token not in text
+    assert log_scrub.REDACTED_SECRET in text
+
+
+def test_ton_api_key_is_redacted(monkeypatch) -> None:
+    token = "tonapi-key-xyz78901234"
+    monkeypatch.setattr(settings, "ton_api_key", token)
+
+    text = log_scrub.redact(f"X-API-Key: {token}")
+
+    assert token not in text
+    assert log_scrub.REDACTED_SECRET in text
+
+
+def test_short_secret_is_not_redacted(monkeypatch) -> None:
+    """Короче 8 символов — пустяк: красить «true» сломал бы лог без пользы."""
+    monkeypatch.setattr(settings, "bot_token", "true")
+    monkeypatch.setattr(settings, "health_token", "1234")
+
+    assert log_scrub.redact("значение true и 1234") == "значение true и 1234"
+
+
+def test_empty_secrets_do_not_match_everything(monkeypatch) -> None:
+    """Пустая строка не должна красить всё подряд (re.escape("") == "")."""
+    monkeypatch.setattr(settings, "bot_token", "")
+    monkeypatch.setattr(settings, "health_token", "")
+
+    assert log_scrub.redact("обычное сообщение") == "обычное сообщение"
 
 
 def test_scrub_clears_args_so_formatter_cannot_rebuild(monkeypatch) -> None:
