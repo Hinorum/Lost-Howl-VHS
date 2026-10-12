@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from app.config import settings
 from app.models import Payout, Player
@@ -27,34 +27,49 @@ async def _reset_retriable(session, network: str) -> None:
     claimed_at IS NULL (строки, упавшие до появления колонки) считаем
     зависшими: живой клейм всегда пишет claimed_at сейчас. Сверка в naive
     UTC: Postgres вернёт aware, SQLite — naive (см. confirm_broadcast_payouts).
+
+    Предикаты — В САМОМ UPDATE, а не в Python. Два раздельных UPDATE'а
+    вместо одного «выбрать по id, перевести в pending»:
+    - на двух репликах UPDATE без предикатов делал массовую перезапись
+      статусов: первая реплика могла сбросить строку в pending, пока
+      вторая уже держала её в sending — без WHERE status='sending'
+      вторая реплика не отличила бы «уже сброшено» от «моё», и дубль
+      сбрасывался по кругу. С предикатом в UPDATE строка, ушедшая в
+      pending, не подходит под WHERE — повторный запуск no-op;
+    - предикат attempts<max — тоже в UPDATE: лимит попыток проверяется
+      гонке двух UPDATE'ов атомарно (один пишет, второй уже не видит).
+    Это страховка на пару с FOR UPDATE SKIP LOCKED в claim_retry_loop:
+    двойная отправка закрывается целиком (lock на claim + атомарный
+    reset).
     """
-    rows = (
-        await session.execute(
-            select(Payout.id, Payout.status, Payout.claimed_at).where(
-                Payout.status.in_(["failed", "sending"]),
-                Payout.attempts < settings.payout_max_attempts,
-                Payout.dest_address != "",
-                Payout.network == network,
-            )
-        )
-    ).all()
-    if not rows:
-        return
     cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(
         seconds=settings.payout_send_timeout_seconds + 30
     )
-    reset_ids = [payout_id for payout_id, status, _claimed in rows if status == "failed"]
-    for payout_id, status, claimed_at in rows:
-        if status != "sending":
-            continue
-        if claimed_at is None:
-            reset_ids.append(payout_id)
-        elif claimed_at.replace(tzinfo=None) <= cutoff:
-            reset_ids.append(payout_id)
-    if reset_ids:
-        await session.execute(
-            update(Payout).where(Payout.id.in_(reset_ids)).values(status="pending")
+    base_predicates = (
+        Payout.network == network,
+        Payout.attempts < settings.payout_max_attempts,
+        Payout.dest_address != "",
+    )
+    # failed оживает сразу — никакого среза по времени: «мёртвая» строка.
+    await session.execute(
+        update(Payout)
+        .where(Payout.status == "failed", *base_predicates)
+        .values(status="pending")
+    )
+    # sending — только заведомо мёртвая (либо сирота до claimed_at,
+    # либо клейм старше окна вещания + 30 с).
+    await session.execute(
+        update(Payout)
+        .where(
+            Payout.status == "sending",
+            *base_predicates,
+            or_(
+                Payout.claimed_at.is_(None),
+                Payout.claimed_at <= cutoff,
+            ),
         )
+        .values(status="pending")
+    )
 
 async def _hydrate_player_dests(session, network: str) -> int:
     """Оживляет выплаты без получателя, когда кошелёк уже привязан.
