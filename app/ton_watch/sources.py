@@ -63,6 +63,11 @@ class Page:
     next_cursor — курсор следующей страницы САМОГО провайдера: у TonAPI это lt
     самой старой строки, у Toncenter v3 — смещение offset. Провайдеры
     пагинируют по-разному, поэтому курсор вычисляет источник, а не общий цикл.
+    parse_fail_count — сколько item'ов на странице уронил парсер с исключением.
+    Source-free счётчик: парсеры источника и так молчат об этих item'ах
+    (warn без traceback, без хеша), поэтому число должно подняться до
+    watcher_state иначе деньги уходят «тихо». Глушится в счётчик прохода,
+    дальше — в parse_fail_count PassResult и в watcher_state из watch_once.
     """
 
     transfers: list[Transfer]
@@ -70,6 +75,7 @@ class Page:
     raw_count: int = 0
     requested: int = 0
     next_cursor: str | None = None
+    parse_fail_count: int = 0
 
 
 class PassResult(NamedTuple):
@@ -82,12 +88,54 @@ class PassResult(NamedTuple):
     раньше курсора (тогда reliable=True, но окно прочитано не целиком).
     floor_utime — utime самой старой увиденной транзакции: ею помечается дыра,
     чтобы её можно было назвать, а не потерять молча.
+    parse_fail_count — суммарное число item'ов, отброшенных парсером с
+    исключением за весь проход. Не влияет на complete/reliable — это сигнал
+    оператору, а не условие успешности цикла.
     """
 
     transfers: list[Transfer]
     reliable: bool
     complete: bool
     floor_utime: int | None
+    parse_fail_count: int = 0
+
+
+class _ParseFailure(Exception):
+    """Парсер item'а упал с исключением.
+
+    Тип ловится в page-loop'е источника: сам парсер уже отписался в лог
+    logger.exception с traceback и хешем, остаётся посчитать и поднять наверх,
+    в PassResult.parse_fail_count. До заведения типа парсер глушил ошибку и
+    возвращал None — возврат «как нормальный skip», и счётчик неотличим от
+    штатного фильтра (jetton/value<=0/старая utime).
+    """
+
+    __slots__ = ("tx_hash_short", "utime")
+
+    def __init__(self, tx_hash_short: str, utime: int) -> None:
+        super().__init__(f"parse failed: hash={tx_hash_short} utime={utime}")
+        self.tx_hash_short = tx_hash_short
+        self.utime = utime
+
+
+def _safe_short_hash(item: dict) -> str:
+    """Короткий идентификатор item'а для лога/исключения.
+
+    Парсер уже упал: глубокое чтение полей может уронить и эту строку.
+    Защищаемся try-уровнем на стороне парсера, чтобы трейсбек был по СУТИ
+    ошибки, а не по попытке достать хеш.
+    """
+    try:
+        return str(item.get("hash") or "")[:16] or "?"
+    except Exception:
+        return "?"
+
+
+def _safe_utime(item: dict) -> int:
+    try:
+        return int(item.get("utime", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 async def fetch_recent_transfers_page(
     since_utime: int, before_lt: str | None = None
@@ -136,14 +184,32 @@ async def fetch_recent_transfers_page(
         logger.warning("TonAPI недоступен: %s", exc)
         return Page([], _PAGE_DEGRADED, 0, 0)
     transfers: list[Transfer] = []
+    parse_fail_count = 0
     for item in items:
-        transfer = _parse_tx_item(item, since_utime)
+        try:
+            transfer = _parse_tx_item(item, since_utime)
+        except _ParseFailure:
+            # Парсер уже отписался в лог с traceback + хешем. Здесь — только
+            # счётчик: одна потерянная запись не валит страницу (как было бы
+            # при пробросе наверх), но и не растворяется в фильтрах (как было
+            # бы при глушении внутри парсера). Sample с хешем/utime уезжает
+            # в PassResult через _deep_collect — последний случай цикла нужен
+            # в watcher_state как «на что смотреть» в /blockchain.
+            parse_fail_count += 1
+            continue
         if transfer is not None:
             transfers.append(transfer)
     # Курсор следующей страницы — lt самой старой строки: /v2/blockchain/...
     # offset не понимает и режет выборку только before_lt.
     next_cursor = str(items[-1].get("lt") or "") if items else None
-    return Page(transfers, _PAGE_OK, len(items), _PAGE_LIMIT, next_cursor or None)
+    return Page(
+        transfers,
+        _PAGE_OK,
+        len(items),
+        _PAGE_LIMIT,
+        next_cursor or None,
+        parse_fail_count,
+    )
 
 
 async def _resolve_tonapi_empty_history(since_utime: int) -> tuple[list[Transfer], bool]:
@@ -217,6 +283,14 @@ def _parse_tx_item(item: dict, since_utime: int) -> Transfer | None:
     газа, источник — jetton-кошелёк игрока. Такой перевод нельзя ни
     зачесть, ни автоматически вернуть, поэтому он пропускается целиком,
     без пыльного refund-payout: токены ждут ручного возврата с казначея.
+
+    Исключение парсинга — НЕ «нормальный None», как было раньше. Раньше
+    ошибка парсера возвращала None, и счётчик прохода неотличим от штатных
+    jetton/старых/пустых фильтров: одна битая запись провайдера выглядела
+    как чистая страница, цикл коммитил курсор за неё — деньги уходили молча.
+    Теперь парсер логирует traceback с хешем/utime и бросает _ParseFailure;
+    page-loop ловит, копит в Page.parse_fail_count и НЕ коммитит item
+    как «обработанный фильтром».
     """
     try:
         in_msg = item.get("in_msg") or {}
@@ -247,9 +321,17 @@ def _parse_tx_item(item: dict, since_utime: int) -> Transfer | None:
             utime=utime,
             provider_ref=str(item.get("lt") or ""),
         )
-    except Exception as exc:
-        logger.warning("Странная транзакция пропущена: %s", exc)
-        return None
+    except Exception:
+        # logger.exception фиксирует traceback; repr хеша/utime могут сами
+        # упасть при битом item'е — защищаемся _safe_* хелперами.
+        tx_hash_short = _safe_short_hash(item)
+        utime_val = _safe_utime(item)
+        logger.exception(
+            "Битый item TonAPI пропущен: hash=%s utime=%s — item исключён из обработки",
+            tx_hash_short,
+            utime_val,
+        )
+        raise _ParseFailure(tx_hash_short, utime_val) from None
 
 def _parse_toncenter_item(item: dict, since_utime: int) -> Transfer | None:
     """Транзакция Toncenter v3 -> Transfer либо None (старая/пустая).
@@ -258,6 +340,10 @@ def _parse_toncenter_item(item: dict, since_utime: int) -> Transfer | None:
     (они садятся на jetton-кошелёк отправителя), поэтому отдельного фильтра,
     как у TonAPI, здесь не нужно. Комментарий приходит декодированным в
     message_content.decoded с типом «comment».
+
+    Исключение парсинга — то же поведение, что и в _parse_tx_item: лог с
+    traceback и поднятие _ParseFailure, иначе счётчик потерянных item'ов
+    провайдера неотличим от штатного фильтра. См. _parse_tx_item.docstring.
     """
     try:
         in_msg = item.get("in_msg") or {}
@@ -282,9 +368,15 @@ def _parse_toncenter_item(item: dict, since_utime: int) -> Transfer | None:
             utime=utime,
             provider_ref=str(item.get("lt") or ""),
         )
-    except Exception as exc:
-        logger.warning("Странная транзакция Toncenter пропущена: %s", exc)
-        return None
+    except Exception:
+        tx_hash_short = _safe_short_hash(item)
+        utime_val = _safe_utime(item)
+        logger.exception(
+            "Битый item Toncenter пропущен: hash=%s utime=%s — item исключён из обработки",
+            tx_hash_short,
+            utime_val,
+        )
+        raise _ParseFailure(tx_hash_short, utime_val) from None
 
 _TONCENTER_MAX_LIMIT = 256
 
@@ -328,8 +420,16 @@ async def _toncenter_page(since_utime: int, offset: str | None = None) -> Page:
         logger.warning("Toncenter v3 недоступен: %s", exc)
         return Page([], _PAGE_DEGRADED, 0, 0)
     transfers: list[Transfer] = []
+    parse_fail_count = 0
     for item in items:
-        transfer = _parse_toncenter_item(item, since_utime)
+        try:
+            transfer = _parse_toncenter_item(item, since_utime)
+        except _ParseFailure:
+            # См. _parse_tx_item — парсер уже отписался в лог. Сборка счётчика
+            # общая по обоим источникам; PassResult.parse_fail_count сольёт их
+            # в один показатель цикла.
+            parse_fail_count += 1
+            continue
         if transfer is not None:
             transfers.append(transfer)
     return Page(
@@ -338,6 +438,7 @@ async def _toncenter_page(since_utime: int, offset: str | None = None) -> Page:
         len(items),
         requested,
         next_cursor=str(shift + len(items)),
+        parse_fail_count=parse_fail_count,
     )
 
 _PAGE_OK = "ok"
@@ -392,10 +493,15 @@ async def _deep_collect(
     empty_pages = 0
     floor_utime: int | None = None
     prev_window: tuple[str, str] | None = None
+    parse_fail_count = 0  # сумма parse_fail_count по страницам прохода
     for _page in range(max_pages or _MAX_PAGES):
         page = await fetch_page(since, before)
+        # Счётчик parse-исключений накапливаем ДО проверок состояния страницы:
+        # даже «деградированная» страница может содержать частично разобранные
+        # item'ы (parse_fail_count > 0), и оператор должен видеть это в PassResult.
+        parse_fail_count += page.parse_fail_count
         if page.state != _PAGE_OK:
-            return PassResult(page.transfers, False, False, floor_utime)
+            return PassResult(page.transfers, False, False, floor_utime, parse_fail_count)
         transfers_page = page.transfers
         fresh = [t for t in transfers_page if t.tx_hash and t.tx_hash not in seen]
         for item in fresh:
@@ -411,7 +517,7 @@ async def _deep_collect(
         # голову цепочки — непрочитанный хвост исчезал навсегда, тихо и без
         # тревоги. Просили у провайдера page.requested, отдал он page.raw_count.
         if page.raw_count == 0 or page.raw_count < page.requested:
-            return PassResult(transfers, True, True, floor_utime)  # история кончилась — глубже пусто
+            return PassResult(transfers, True, True, floor_utime, parse_fail_count)  # история кончилась — глубже пусто
         if not transfers_page:
             # Провайдер отдал полную страницу, но фильтры съели её целиком.
             # Курсор вглубь вывести не из чего, а объявлять проход полным
@@ -423,8 +529,8 @@ async def _deep_collect(
                 page.raw_count,
             )
             if floor_utime is not None:
-                return PassResult(transfers, True, False, floor_utime)
-            return PassResult(transfers, False, False, None)
+                return PassResult(transfers, True, False, floor_utime, parse_fail_count)
+            return PassResult(transfers, False, False, None, parse_fail_count)
         # Провайдер, который не двигает курсор (параметр пагинации молча
         # игнорируется), приносит ту же самую страницу снова и снова. Раньше
         # это выглядело как «две страницы подряд без новых переводов» —
@@ -439,25 +545,25 @@ async def _deep_collect(
                 window[0][:12],
                 window[1][:12],
             )
-            return PassResult(transfers, False, False, floor_utime)
+            return PassResult(transfers, False, False, floor_utime, parse_fail_count)
         prev_window = window
         oldest = transfers_page[-1]
         if oldest.utime <= since:
-            return PassResult(transfers, True, True, floor_utime)  # страница дотянулась до курсора
+            return PassResult(transfers, True, True, floor_utime, parse_fail_count)  # страница дотянулась до курсора
         if not fresh:
             empty_pages += 1
             if empty_pages >= _EMPTY_STOP:
-                return PassResult(transfers, True, True, floor_utime)  # подряд страницы без новых переводов
+                return PassResult(transfers, True, True, floor_utime, parse_fail_count)  # подряд страницы без новых переводов
         else:
             empty_pages = 0
         if page.next_cursor is None:
             # Источник не умеет вести нас вглубь — продолжать бессмысленно.
-            return PassResult(transfers, True, False, floor_utime)
+            return PassResult(transfers, True, False, floor_utime, parse_fail_count)
         before = page.next_cursor
         await asyncio.sleep(0.12)  # бережём лимиты API на глубоком проходе
     # Бюджет страниц исчерпан, курсор не достигнут: окно ниже floor_utime не
     # прочитано. Это дыра, а не полный проход — вызывающий обязан её учесть.
-    return PassResult(transfers, True, False, floor_utime)
+    return PassResult(transfers, True, False, floor_utime, parse_fail_count)
 
 def _merge_unique(batches: list[list[Transfer]]) -> list[Transfer]:
     """Слияние результатов источников без дублей, по возрастанию utime."""
@@ -472,7 +578,7 @@ def _merge_unique(batches: list[list[Transfer]]) -> list[Transfer]:
 
 async def _collect_transfers(
     since: int, max_pages: int | None = None
-) -> tuple[list[Transfer], bool, str, int | None]:
+) -> tuple[list[Transfer], bool, str, int | None, int]:
     """Все переводы после курсора: основной источник + фолбэк Toncenter.
 
     Основной проход TonAPI'ем; если он не удался (сеть легла или индекс отдаёт
@@ -486,6 +592,11 @@ async def _collect_transfers(
     встаёт ровно на него (граница покрытия), и следующий проход стартует оттуда
     же, уходя вглубь — поэтому бэклог догоняется, а не теряется. Пока дыра
     жива, тревогу по ней держит ops.py.
+
+    Пятое значение — суммарное число parse-исключений парсера (TonAPI +
+    Toncenter) за цикл. Не влияет на complete/reliable — это сигнал
+    оператору, а не признак успешности цикла. watch_once отдаёт его
+    _bump_parse_fail в watcher_state, иначе тихий сброс item'ов в фильтрах.
     """
     # Страницы достаём из пакета в момент вызова, а не из своих глобалов:
     # тесты подменяют app.ton_watch._tonapi_page / ._toncenter_page (сценарий
@@ -494,20 +605,20 @@ async def _collect_transfers(
 
     primary = await _deep_collect(_tonapi_page, since, max_pages)
     if primary.complete:
-        return primary.transfers, True, "tonapi", None
+        return primary.transfers, True, "tonapi", None, primary.parse_fail_count
     if not primary.reliable:
         _warn_degraded_primary()
     fallback = await _deep_collect(_toncenter_page, since, max_pages)
     merged = _merge_unique([primary.transfers, fallback.transfers])
     if fallback.complete:
-        return merged, True, "toncenter", None
+        return merged, True, "toncenter", None, primary.parse_fail_count + fallback.parse_fail_count
     if not primary.reliable and not fallback.reliable:
         logger.error(
             "ОБА индексатора (%s) недоступны: переводы не читаются! "
             "Проверь TonAPI/Toncenter или перезапусти сервис.",
             "testnet" if settings.is_testnet else "mainnet",
         )
-        return merged, False, "none", None
+        return merged, False, "none", None, primary.parse_fail_count + fallback.parse_fail_count
     # Хотя бы один проход надёжен — цикл успешен, но окно прочитано не целиком.
     # Дно дыры — самая глубокая граница, до которой дошёл живой проход: выше
     # неё покрытие полное, курсор встанет на неё, и бэклог догонится глубже.
@@ -523,4 +634,4 @@ async def _collect_transfers(
         gap_at,
         since,
     )
-    return merged, True, ("tonapi" if primary.reliable else "toncenter"), gap_at
+    return merged, True, ("tonapi" if primary.reliable else "toncenter"), gap_at, primary.parse_fail_count + fallback.parse_fail_count

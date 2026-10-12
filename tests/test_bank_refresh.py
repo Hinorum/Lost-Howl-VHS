@@ -352,7 +352,7 @@ async def test_watch_once_refreshes_banks_after_aged_confirms(monkeypatch) -> No
         await session.commit()
 
     monkeypatch.setattr(
-        ton_watch, "_collect_transfers", AsyncMock(return_value=([], True, "none", None))
+        ton_watch, "_collect_transfers", AsyncMock(return_value=([], True, "none", None, 0))
     )
     bot = SimpleNamespace(
         edit_message_text=AsyncMock(),

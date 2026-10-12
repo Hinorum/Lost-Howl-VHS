@@ -30,6 +30,7 @@ from app.core.registry import (
     ALERT_DELIVERY_MISSING_KEY,
     ALERT_ENTROPY_KEY,
     ALERT_MIRROR_KEY,
+    ALERT_PARSE_FAIL_KEY,
     ALERT_QUEUE_KEY,
     ALERT_REFUND_KEY,
     ALERT_SCAN_GAP_KEY,
@@ -46,6 +47,8 @@ from app.core.registry import (
     OPS_ALERT_TRACK_KEY,
     OPS_PROBLEMS_AT_KEY,
     OPS_PROBLEMS_KEY,
+    PARSE_FAIL_COUNT_KEY,
+    PARSE_FAIL_LAST_KEY,
     PAUSE_KEY,
     PAUSE_REASON_KEY,
     PAYOUT_HALT_KEY,
@@ -882,6 +885,44 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                     f"{_human_ts(gap['floor'])}). Курсор стоит на границе покрытия, бюджет "
                     "страниц поднят; если так дольше 15 минут — подними WATCH_MAX_PAGES "
                     "или разбери окно через /incoming и /adjust.",
+                )
+        # 1c. Парсер провайдера роняет item'ы. Счётчик лежит в watcher_state
+        #     вместе с parse_fail_last (хеш, utime, время) — /blockchain видит
+        #     детали. Сбрасывается успешным циклом без потерь; пока ненулевой —
+        #     стоит алерт, чтобы «битый item» не уходил молча через фильтры.
+        #     Раньше ошибка парсера возвращала None и сливалась с jetton/
+        #     старыми/пустыми item'ами: один разломанный перевод казался
+        #     чистой страницей, курсор уезжал за него — деньги терялись.
+        if settings.ton_enabled:
+            parse_fail_raw = await _get_state(session, PARSE_FAIL_COUNT_KEY)
+            parse_fail_count = (
+                int(parse_fail_raw) if parse_fail_raw and parse_fail_raw.isdigit() else 0
+            )
+            last_raw = await _get_state(session, PARSE_FAIL_LAST_KEY)
+            last_note = ""
+            if last_raw:
+                try:
+                    import json as _json
+
+                    payload = _json.loads(last_raw)
+                    if isinstance(payload, dict):
+                        last_note = (
+                            f" (последний: hash={payload.get('tx_hash')!s}, "
+                            f"utime={_human_ts(payload.get('utime'))})"
+                        )
+                except (ValueError, TypeError) as exc:
+                    # Поле могло пострадать от старой версии бота или миграции;
+                    # счётчик важнее sample'а, тревогу глушить нельзя.
+                    logger.debug("parse_fail_last не разобран: %s", exc)
+            if parse_fail_count > 0:
+                await _raise(
+                    session,
+                    bot,
+                    ALERT_PARSE_FAIL_KEY,
+                    f"парсер отбросил {parse_fail_count} item'ов",
+                    f"⚠️ Парсер TonAPI/Toncenter отбросил {parse_fail_count} item'ов с исключением "
+                    f"за цикл{last_note}. Это значит: один или несколько переводов НЕ стали "
+                    "ставками — проверь лог и /blockchain до сброса счётчика.",
                 )
         # 2. Очередь выплат старше получаса — казначей застрял или сеть лежит.
         oldest = (

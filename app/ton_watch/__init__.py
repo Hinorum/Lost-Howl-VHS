@@ -100,6 +100,7 @@ from app.ton_watch.sources import (  # noqa: F401
     _PAGE_DEGRADED,
     _PAGE_LIMIT,
     _PAGE_OK,
+    _ParseFailure,
     _TONCENTER_MAX_LIMIT,
     Page,
     PassResult,
@@ -122,6 +123,7 @@ from app.ton_watch.state import (  # noqa: F401
     _CURSOR_OVERLAP_SECONDS,
     _MAX_SCAN_BOOST,
     _STUCK_MAX_FAILS,
+    _bump_parse_fail,
     _bump_scan_boost,
     _load_stuck,
     _read_cursor,
@@ -129,6 +131,7 @@ from app.ton_watch.state import (  # noqa: F401
     _read_scan_boost,
     _read_scan_gap,
     _read_stuck,
+    _reset_parse_fail,
     _reset_scan_state,
     _write_beat,
     _write_cursor,
@@ -616,9 +619,21 @@ async def watch_once(bot: Bot | None = None) -> None:
         raw_cursor = await _read_cursor_raw(session)
         stuck = await _read_stuck(session)
         scan_boost = await _read_scan_boost(session)
-    transfers, api_ok, source, gap_at = await _collect_transfers(
+    transfers, api_ok, source, gap_at, parse_fail_count = await _collect_transfers(
         since, _MAX_PAGES * scan_boost
     )
+    # Item'ы, отброшенные парсером с исключением (см. P0 #4 в README лога):
+    # раньше parser глушил ошибку как «нормальный None» и считать их было
+    # негде. Теперь счётчик за цикл уезжает в watcher_state как
+    # parse_fail_count и поднимает alarm до чистого цикла.
+    if parse_fail_count > 0:
+        async with SessionLocal() as session:
+            await _bump_parse_fail(session, parse_fail_count)
+        logger.warning(
+            "За цикл отброшено %d item'ов парсером TonAPI/Toncenter — "
+            "счётчик записан в watcher_state[parse_fail_count]",
+            parse_fail_count,
+        )
     processed_through = since
     # Сбойные транзакции попадают в stuck-список (watcher_state): они не должны
     # остаться за окном перекрытия навсегда (см. генерацию курсора ниже).

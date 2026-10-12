@@ -301,7 +301,7 @@ async def test_degraded_cycle_freezes_cursor(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     base = int(datetime.now(UTC).timestamp()) - 3_600
-    fetch = AsyncMock(return_value=([], False, "none", None))
+    fetch = AsyncMock(return_value=([], False, "none", None, 0))
     monkeypatch.setattr(ton_watch, "_collect_transfers", fetch)
     try:
         async with SessionLocal() as db:
@@ -339,7 +339,7 @@ async def test_scan_gap_moves_cursor_to_coverage_front_and_alerts(
     base = int(datetime.now(UTC).timestamp()) - 3_600
     fresh = ton_watch.Transfer("fresh-1", "0:" + os.urandom(32).hex(), to_nano(0.2), "", base + 10)
     # Прочитали до base+10, но окно от старого курсора до base+5 не вычитали.
-    collect = AsyncMock(return_value=([fresh], True, "tonapi", base + 5))
+    collect = AsyncMock(return_value=([fresh], True, "tonapi", base + 5, 0))
     monkeypatch.setattr(ton_watch, "_collect_transfers", collect)
     monkeypatch.setattr(ton_watch, "process_transfer", AsyncMock(return_value="refund_queued"))
     try:
@@ -401,9 +401,9 @@ async def test_scan_gap_backlog_drains_over_cycles(monkeypatch: pytest.MonkeyPat
     collect = AsyncMock(
         side_effect=[
             # Цикл 1: прочитали до base+20, курсор должен встать на base+20.
-            ([], True, "tonapi", base + 20),
+            ([], True, "tonapi", base + 20, 0),
             # Цикл 2: следующий проход идёт уже от границы покрытия и читает глубже.
-            ([deeper], True, "tonapi", base + 1),
+            ([deeper], True, "tonapi", base + 1, 0),
         ]
     )
     monkeypatch.setattr(ton_watch, "_collect_transfers", collect)
@@ -474,7 +474,7 @@ async def test_full_pass_clears_scan_gap_and_resets_budget(
         monkeypatch.setattr(
             ton_watch,
             "_collect_transfers",
-            AsyncMock(return_value=([], True, "tonapi", None)),
+            AsyncMock(return_value=([], True, "tonapi", None, 0)),
         )
         await ton_watch.watch_once()
 

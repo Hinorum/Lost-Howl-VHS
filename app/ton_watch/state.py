@@ -13,6 +13,8 @@ from app.config import settings
 from app.core.registry import (
     BEAT_KEY,
     CURSOR_KEY,
+    PARSE_FAIL_COUNT_KEY,
+    PARSE_FAIL_LAST_KEY,
     SCAN_BOOST_KEY,
     SCAN_GAP_KEY,
     SOURCE_KEY,
@@ -192,3 +194,64 @@ async def _write_stuck(session, stuck: dict) -> None:
     else:
         row.value = json.dumps(stuck)
     await session.commit()
+
+
+async def _bump_parse_fail(session, count: int, sample: tuple[str, int] | None = None) -> None:
+    """Увеличить счётчик parse-исключений (parser упал на конкретном item'е).
+
+    Раньше ошибка парсера глушилась в источнике и терялась тихо; теперь
+    каждый битый item — известная величина в watcher_state, а последняя
+    запись с деталями (tx_hash, utime, iso-time) откладывается отдельно — для
+    /blockchain и ручного разбора, без подъёма логов.
+
+    Без sample (например, битый item пришёл без хеша) — обновляется только
+    счётчик. Sample даёт только последний случай: счётчик за цикл важнее
+    конкретного хеша, а хранить N хешей в одной строке = дрейф парсера.
+    """
+    if count <= 0:
+        return
+    stamp = datetime.now(UTC).isoformat()
+    row_count = await session.get(WatcherState, PARSE_FAIL_COUNT_KEY)
+    prev = int(row_count.value) if row_count and row_count.value.isdigit() else 0
+    new_total = prev + count
+    if row_count is None:
+        session.add(WatcherState(key=PARSE_FAIL_COUNT_KEY, value=str(new_total)))
+    else:
+        row_count.value = str(new_total)
+    if sample is not None:
+        tx_hash_short, utime = sample
+        payload = json.dumps(
+            {
+                "tx_hash": tx_hash_short,
+                "utime": int(utime),
+                "at": stamp,
+                "delta": int(count),
+            },
+            ensure_ascii=False,
+        )
+        row_last = await session.get(WatcherState, PARSE_FAIL_LAST_KEY)
+        if row_last is None:
+            session.add(WatcherState(key=PARSE_FAIL_LAST_KEY, value=payload))
+        else:
+            row_last.value = payload
+    await session.commit()
+
+
+async def _reset_parse_fail(session) -> int:
+    """Сбросить счётчик parse-исключений. Возвращает предыдущее значение.
+
+    Зовётся из check_anomalies: пока счётчик жив — стоит алерт; обнулился —
+    аномалия ушла, починка зафиксирована. Возврат нужен для читаемого
+    сообщения в логе («было N, чисто»), без него оператор увидит только
+    обнуление и не поймёт масштаб прошедшей проблемы.
+    """
+    row_count = await session.get(WatcherState, PARSE_FAIL_COUNT_KEY)
+    if row_count is None:
+        return 0
+    prev = int(row_count.value) if row_count.value.isdigit() else 0
+    await session.delete(row_count)
+    row_last = await session.get(WatcherState, PARSE_FAIL_LAST_KEY)
+    if row_last is not None:
+        await session.delete(row_last)
+    await session.commit()
+    return prev

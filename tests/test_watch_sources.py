@@ -171,7 +171,7 @@ async def test_tonapi_http_error_falls_back(monkeypatch) -> None:
             _V3: [_Response(200, {"transactions": [_v3_tx(1500, to_nano(0.03))]})],
         },
     )
-    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap, _parse_fail = await ton_watch._collect_transfers(1000)
     assert ok is True
     assert source == "toncenter"
     assert gap is None
@@ -235,7 +235,7 @@ async def test_stale_index_404_is_degraded_and_toncenter_serves(
             _V3: [_Response(200, {"transactions": [_v3_tx(1500, to_nano(1.67))]})],
         },
     )
-    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap, _parse_fail = await ton_watch._collect_transfers(1000)
     assert ok is True and source == "toncenter"
     assert len(transfers) == 1
     assert transfers[0].value_nanotons == to_nano(1.67)
@@ -257,7 +257,7 @@ async def test_tonapi_network_error_also_falls_back(monkeypatch: pytest.MonkeyPa
             ],
         },
     )
-    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap, _parse_fail = await ton_watch._collect_transfers(1000)
     assert ok is True and source == "toncenter"
     assert transfers[0].comment == "привет"
 
@@ -272,7 +272,7 @@ async def test_both_sources_down_means_failed_cycle(monkeypatch: pytest.MonkeyPa
             _V3: [RuntimeError("toncenter молчит")],
         },
     )
-    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap, _parse_fail = await ton_watch._collect_transfers(1000)
     assert transfers == [] and ok is False and source == "none" and gap is None
 
 
@@ -337,7 +337,7 @@ async def test_page_budget_exhausted_is_not_a_complete_pass(
     fallback, _ = _deep_pages(_v3_tx, 1000, budget)
     calls = install_http(monkeypatch, {_HISTORY: history, _V3: fallback})
 
-    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap, _parse_fail = await ton_watch._collect_transfers(1000)
 
     assert ok is True  # провайдеры живы, прочитанное обработано
     assert source == "tonapi"
@@ -357,7 +357,7 @@ async def test_page_budget_truncation_keeps_deepest_floor(
     fallback, fallback_floor = _deep_pages(_v3_tx, 1000, budget)
     install_http(monkeypatch, {_HISTORY: history, _V3: fallback})
 
-    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap, _parse_fail = await ton_watch._collect_transfers(1000)
 
     assert ok is True
     assert source == "tonapi"
@@ -375,7 +375,7 @@ async def test_full_pass_reports_no_gap(monkeypatch: pytest.MonkeyPatch) -> None
         },
     )
 
-    transfers, ok, source, gap = await ton_watch._collect_transfers(1000)
+    transfers, ok, source, gap, _parse_fail = await ton_watch._collect_transfers(1000)
 
     assert (ok, source, gap) == (True, "tonapi", None)
     assert len(transfers) == 1
@@ -587,3 +587,116 @@ async def test_provider_ignoring_cursor_is_unreliable(monkeypatch: pytest.Monkey
 
     assert result.reliable is False
     assert result.complete is False
+
+
+# ---------- Parse-failure tracking (P0 #4) ----------
+#
+# Раньше парсер TonAPI/Toncenter глушил ошибку как «нормальный None» и путал
+# с штатными фильтрами (jetton, value<=0, старая utime). Один битый item
+# выглядел чистой страницей, проход коммитил курсор за него — деньги
+# терялись из обработки. Теперь ошибка явно сигналится: traceback с хешем
+# в логе и счётчик parse_fail_count в Page/PassResult. Сборка доходит до
+# _bump_parse_fail в watcher_state и читается check_anomalies (тревога).
+
+
+def test_parse_failure_raises_with_provenance() -> None:
+    """Парсер роняет _ParseFailure с хешем/utime, а не глохнет как раньше.
+
+    Сигнатура исключения — единственный способ отличить «парсер упал» от
+    штатных None-возвратов фильтра. Без неё регрессия в page-loop'е
+    (try/except вокруг _parse_tx_item) пряталась бы в Page.parse_fail_count
+    молча, и деньги снова уходили бы из обработки.
+    """
+    broken = {
+        "hash": "abcdef1234567890",
+        "utime": 1500,
+        # in_msg.value обязан быть приводимым к int — здесь это list,
+        # что обрушит int(...) внутри парсера.
+        "in_msg": {"value": ["not", "a", "number"], "source": "0:" + "ee" * 32},
+    }
+    with pytest.raises(ton_watch._ParseFailure) as info:
+        ton_watch._parse_tx_item(broken, since_utime=1000)
+    assert info.value.tx_hash_short == broken["hash"][:16]
+    assert info.value.utime == 1500
+
+
+def test_v3_parse_failure_raises_with_provenance() -> None:
+    """Toncenter v3 парсер тоже бросает _ParseFailure, а не возвращает None."""
+    broken = {
+        "hash": "feedface",
+        "now": 1500,
+        "in_msg": {"value": "not-a-number", "source": "0:" + "ff" * 32},
+    }
+    with pytest.raises(ton_watch._ParseFailure) as info:
+        ton_watch._parse_toncenter_item(broken, since_utime=1000)
+    assert info.value.tx_hash_short == "feedface"
+    # Toncenter v3 читает «now», а не «utime»: _safe_utime защищается от
+    # битого item'а и не ищет поле по всему dict, иначе пришлось бы тащить
+    # в сторонние источники копию схемы. Для теста достаточно хеша.
+    assert isinstance(info.value.utime, int)
+
+
+async def test_page_loop_counts_parse_failures_without_dropping_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Один битый item не валит страницу; счётчик приходит в Page.parse_fail_count.
+
+    Раньше любая ошибка парсера давала None, и страница шла дальше как «чистая».
+    Теперь битый item поднимает _ParseFailure, цикл ловит, инкрементит
+    Page.parse_fail_count и пропускает item, оставляя остальные переводы
+    на странице нетронутыми. Без этого теста регрессия прошла бы незаметно.
+    """
+    good = _api_tx(1500, to_nano(0.5))
+    broken = {
+        "hash": "deadbeef",
+        "utime": 1500,
+        "in_msg": {
+            "value": ["nope"],
+            "source": {"address": "0:" + "aa" * 32},
+        },
+    }
+    install_http(
+        monkeypatch,
+        {_HISTORY: [_Response(200, {"transactions": [good, broken]})]},
+    )
+
+    page = await ton_watch.fetch_recent_transfers_page(1000)
+
+    assert page.parse_fail_count == 1
+    assert len(page.transfers) == 1
+    assert page.transfers[0].value_nanotons == to_nano(0.5)
+
+
+async def test_pass_result_aggregates_parse_failures_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PassResult.parse_fail_count — сумма parse_fail_count со всех страниц.
+
+    Без этой проверки регрессия «один цикл — один item в счётчике» прошла бы
+    незаметно: parse_fail_count страницы доходил бы до _collect_transfers,
+    но терялся бы на суммировании.
+    """
+    limit = ton_watch._PAGE_LIMIT
+    bad = {
+        "hash": "ab" * 16,
+        "utime": 2000,
+        "in_msg": {"value": ["nope"], "source": "0:" + "aa" * 32},
+    }
+    page_one_items = [bad, bad, bad] + [
+        _api_tx(1999 - i, to_nano(0.01)) for i in range(limit - 3)
+    ]
+    page_two: list = []  # история кончилась — пустая страница
+    install_http(
+        monkeypatch,
+        {
+            _HISTORY: [
+                _Response(200, {"transactions": page_one_items}),
+                _Response(200, {"transactions": page_two}),
+            ],
+        },
+    )
+
+    result = await ton_watch._deep_collect(ton_watch._tonapi_page, 1000)
+
+    assert result.parse_fail_count == 3
+    assert result.complete is True

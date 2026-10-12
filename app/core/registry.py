@@ -34,6 +34,10 @@ ALERT_MIRROR_KEY = "alert_mirror_ts"
 ALERT_REFUND_KEY = "alert_refund_ts"
 ALERT_STAKE_KEY = "alert_stake_ts"
 ALERT_STUCK_KEY = "alert_stuck_ts"
+# Тревога «парсер провайдера роняет item'ы»: пока счётчик PARSE_FAIL_COUNT_KEY
+# ненулевой, за цикл поднимается один алерт, и аномалия стоит в /ops, пока
+# счётчик не обнулит чистый parse-цикл. Связан с watcher_state:parse_fail_count.
+ALERT_PARSE_FAIL_KEY = "alert_parse_fail_ts"
 ALERT_ENTROPY_KEY = "alert_entropy_ts"
 ALERT_BACKUP_KEY = "alert_backup_ts"
 # Тревога «рассылка не дошла». До появления меток delivery:* успешный проход
@@ -129,6 +133,15 @@ SCAN_GAP_KEY = "ton_watch_scan_gap"
 # Во сколько раз поднят бюджет страниц поверх watch_max_pages (1 = базовый).
 # Сбрасывается в 1 полным проходом.
 SCAN_BOOST_KEY = "ton_watch_scan_boost"
+# Счётчик item'ов провайдера, отброшенных парсером с исключением
+# (_parse_tx_item/_parse_toncenter_item упали). Раньше отбрасывались молча —
+# тихий сброс средств из обработки; теперь ошибка видна в логе с traceback,
+# а счётчик растёт за цикл и тревожит, пока parse-цикл не разберёт причину.
+PARSE_FAIL_COUNT_KEY = "ton_watch_parse_fail_count"
+# Последнее parse-исключение (JSON: hash[:16], utime, iso-время, класс ошибки).
+# Деталь для /blockchain и оператора, отдельный от счётчика — позволяет понять
+# «что именно сломалось» без подъёма логов.
+PARSE_FAIL_LAST_KEY = "ton_watch_parse_fail_last"
 
 # --- Зеркало казны (app/treasury_mirror.py) ---
 
