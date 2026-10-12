@@ -1063,6 +1063,114 @@ async def test_settle_week_tie_reopens_stale_window(monkeypatch: pytest.MonkeyPa
             await session.commit()
 
 
+async def test_settle_week_rollover_keeps_claims_of_absorbed_weeks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Поглощение недель: заявки Claim поглощённой недели не теряются.
+
+    settle недели A откладывается (даунтайм, открытое окно), в понедельник
+    недели B считается горш A+B: заявки, сделанные под периодом A, обязаны
+    участвовать в сортировке — иначе ничья решается player_id, а окно
+    переоткрывается под B с новым таймером (баг roll-over).
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 1)
+    prev_key = previous_week_key()
+    prev_start, _ = week_bounds(prev_key)
+    absorbed_key = iso_week_key(prev_start - timedelta(days=1))
+    base_t = datetime.now(UTC)
+    pids = [985_000, 985_001]
+    rounds: list[Round] = []
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                Player(
+                    id=pids[0], username="roll1",
+                    wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True,
+                ),
+                Player(
+                    id=pids[1], username="roll2",
+                    wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True,
+                ),
+            ]
+        )
+        absorbed_start, _ = week_bounds(absorbed_key)
+        for offset in range(2):
+            round_row = await _seed_closed_round(
+                session, 849_000 + offset, absorbed_start + timedelta(days=offset, hours=11)
+            )
+            rounds.append(round_row)
+            for pid in pids:
+                session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+            if offset == 0:
+                for pid in pids:
+                    _set_stake(session, round_row, pid)
+        session.add(WeeklyPot(week=absorbed_key, nanotons=to_nano(6)))
+        session.add(WeeklyPot(week=prev_key, nanotons=to_nano(4)))
+        # Оба tied уже заявились под периодом A (окно открылось до даунтайма);
+        # раньше заявившийся — pid_one.
+        session.add(
+            LeaderboardClaim(
+                player_id=pids[0], kind="week", period=absorbed_key,
+                claimed_at=base_t + timedelta(hours=1),
+            )
+        )
+        session.add(
+            LeaderboardClaim(
+                player_id=pids[1], kind="week", period=absorbed_key,
+                claimed_at=base_t + timedelta(hours=2),
+            )
+        )
+        # Окно пережило понедельник: период A, дедлайн прошёл.
+        session.add(
+            WatcherState(
+                key=WEEK_CLAIM_WINDOW_KEY,
+                value=json.dumps({
+                    "period": absorbed_key,
+                    "players": list(pids),
+                    "opened_at": (base_t - timedelta(hours=200)).isoformat(),
+                }),
+            )
+        )
+        await session.commit()
+        try:
+            await _set_week_ready(session, prev_key)
+            # Заявки периода A видны: все tied заявились — платим сразу,
+            # не переоткрывая окно под период B.
+            assert await settle_week_if_due(bot=None) is True
+            by_pid = {
+                p.player_id: p.amount_nanotons
+                for p in (await session.execute(select(Payout).where(Payout.kind == "weekly"))).scalars()
+            }
+            total = to_nano(10)
+            assert by_pid == {
+                pids[0]: total * 50 // 100,  # заявил раньше (час 1)
+                pids[1]: total * 30 // 100,
+            }
+            # Окно закрыто, а не переоткрыто под период B.
+            assert await session.get(WatcherState, WEEK_CLAIM_WINDOW_KEY) is None
+            marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
+            assert marker is not None and marker.value == prev_key
+        finally:
+            await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
+            await session.execute(LeaderboardClaim.__table__.delete())
+            await session.execute(
+                WatcherState.__table__.delete().where(WatcherState.key.in_(
+                    [WEEKLY_MARKER_KEY, WEEK_CLAIM_WINDOW_KEY]
+                ))
+            )
+            await session.execute(WeeklyPot.__table__.delete())
+            for round_row in rounds:
+                await session.execute(Vote.__table__.delete().where(Vote.round_id == round_row.id))
+                await session.execute(Stake.__table__.delete().where(Stake.round_id == round_row.id))
+                await session.delete(round_row)
+            for pid in pids:
+                player = await session.get(Player, pid)
+                if player is not None:
+                    await session.delete(player)
+            await session.commit()
+
+
 # --- Слепые ветки недельной выплаты: якорь, копилки, церемония ----------------
 
 

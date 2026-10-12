@@ -967,8 +967,18 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         staked = await _players_with_stake(session, period_start, period_end, by="opens_at")
         # Места недели — три сильнейших ИГРОКА по (верные пути, вклад Gram,
         # Claim, player_id), а не ступени счёта: внутри места приз не делится.
+        # Претензии за ВЕСЬ поглощаемый период недель — как claim_months в
+        # месяце: если settle недели A откладывался (открытое окно Claim,
+        # даунтайм), в понедельник недели B горш A+B считается заново и
+        # заявки недели A обязаны участвовать в сортировке — иначе roll-over
+        # теряет их и переоткрывает окно уже под периодом B с новым таймером.
+        claim_weeks: list[str] = []
+        cursor = period_start
+        while cursor < period_end:
+            claim_weeks.append(iso_week_key(cursor))
+            cursor += timedelta(weeks=1)
         claims = (
-            await _claim_times(session, "week", [prev_key])
+            await _claim_times(session, "week", claim_weeks)
             if settings.leaderboard_claim_enabled
             else {}
         )
