@@ -386,7 +386,7 @@ app/
   main.py        — точка входа (polling / webhook)
 migrations/      — Alembic-история схемы
 scripts/         — утилиты: e2e на тестнете, check_db, cassette_tool, dependency_hashes
-docs/            — архитектура и инварианты, дизайн кассет и мира, чек-лист mainnet
+docs/            — архитектура и инварианты, сюжетный промпт, чек-лист mainnet
 .github/         — CI (pytest + cov-gate, alembic drift, test-postgres) и бэкап БД
 tests/           — pytest
 ```
