@@ -38,6 +38,14 @@ _mnemonic_cache: list[re.Pattern[str]] = []
 _secret_cache_key: tuple[str, ...] | None = None
 _secret_cache: list[re.Pattern[str]] = []
 _factory_installed = False
+# Счётчик сломанных getMessage() и реентрантный флаг: глушить тот же except,
+# что пытаемся залогировать — иначе logger.exception внутри except пойдёт по
+# той же фабрике записей, и логгер краски зациклится в тишине. Источник
+# правды для тестов и /health: если растёт — в логе «скрытый bug остаётся».
+_scrub_failures = 0
+_in_failure_report = False
+
+logger = logging.getLogger(__name__)
 
 
 def _compile(value: str) -> re.Pattern[str] | None:
@@ -105,13 +113,57 @@ def scrub(record: logging.LogRecord) -> None:
     try:
         message = record.getMessage()
     except Exception:
-        # Сломанные args не должны валить логирование (и краску): остаётся
-        # как есть, форматтер сам разберётся, краска ниже его не догонит.
+        # Сломанные args не должны валить логирование (и саму краску):
+        # запись остаётся как есть, форматтер всё равно пройдёт redact()
+        # поверх exc_text — утечки нет. Но без `logger.exception` дев
+        # никогда не узнает, что чей-то логгер передал битые args: раньше
+        # ветка была полностью тихой (`return`), и искать причину приходилось
+        # вручную. Теперь:
+        #  - счётчик растёт в /health;
+        #  - logger.exception идёт через ту же фабрику, но мы передаём
+        #    строку, а не record — getMessage() тут не падает;
+        #    реентрантный флаг держит как страховку от петли.
+        _report_scrub_failure(record)
         return
     clean = redact(message)
     if clean != message:
         record.msg = clean
         record.args = ()
+
+
+def _report_scrub_failure(record: logging.LogRecord) -> None:
+    """Залогировать факт сломанной краски без зацикливания фабрики.
+
+    Сценарий: сторонний логгер зовёт logger.exception с битыми args; getMessage()
+    падает. Мы попадаем сюда из except в scrub(). logger.exception здесь
+    штатный: в format string передаётся «починка» + repr record.msg, не args, —
+    значит getMessage() уже не упадёт. Реентрантный флаг на случай,
+    если сам этот лог однажды получит битые args от отладчика или будущей
+    правки: петля в тишину уже была однажды, на этом не экономим.
+    """
+    global _scrub_failures, _in_failure_report
+    _scrub_failures += 1
+    if _in_failure_report:
+        return
+    _in_failure_report = True
+    try:
+        logger.exception(
+            "log_scrub: getMessage() упал на битых args — запись оставлена как есть, "
+            "форматтер-обёртка повторит redact(). Скрытый bug в источнике лога."
+        )
+    finally:
+        _in_failure_report = False
+
+
+def scrub_failures() -> int:
+    """Число сломанных record.getMessage() с момента старта процесса.
+
+    Для /health и тестов: если растёт — где-то логгер с битыми args, и
+    formatter-обёртка один раз вытянула, но без видимой записи дев
+    причину не увидит. Возвращаем int, а не bool: ноль — здоровье, монотонный
+    рост — повод для разбора.
+    """
+    return _scrub_failures
 
 
 class _RedactingFormatter(logging.Formatter):

@@ -212,3 +212,76 @@ def test_production_entrypoint_installs_scrub() -> None:
     from app import main  # noqa: F401  (импорт и есть проверяемое действие)
 
     assert log_scrub._factory_installed
+
+
+# ---------- Тихая ветка (P0 #5) ----------
+#
+# Раньше except в scrub() проглатывал битый getMessage() и возвращал None:
+# сломанный логгер внешней библиотеки оставался незаметным, и единственной
+# страховкой от утечки была форматтер-обёртка из коммита log_scrub-fix.
+# Теперь — счётчик scrub_failures() растёт на каждое падение, и флаг
+# _in_failure_report не пускает logger.exception в петлю.
+
+
+def test_scrub_counts_broken_get_message(monkeypatch) -> None:
+    """Битый record.getMessage() инкрементит счётчик и НЕ падает в фабрике.
+
+    Сценарий «логгер с битыми args» — реальный риск: %d с не-int и т.п.
+    Раньше ветка возвращала None тихо, и неудача проходила мимо dev'а, и
+    чек-листа «утечки нет». Теперь оставляет след.
+    """
+    log_scrub.install()
+    before = log_scrub.scrub_failures()
+
+    record = logging.LogRecord(
+        name="x",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=0,
+        msg="broken",
+        args=("not-an-int-but-fmt-%%d-expects-int",),
+        exc_info=None,
+    )
+    log_scrub.scrub(record)  # НЕ должно бросить
+
+    assert log_scrub.scrub_failures() == before + 1
+
+
+def test_scrub_does_not_recurse_when_logging_failure(monkeypatch) -> None:
+    """logger.exception внутри _report_scrub_failure не должен вызвать петлю.
+
+    Сам логгер краски однажды может получить битые args (если внутренний
+    формат изменят). Реентрантный флаг _in_failure_report обрывает цепочку
+    в той же ветке: иначе мы получили бы StackOverflow или зависание
+    под фабрикой записей.
+    """
+    log_scrub.install()
+    base_factory = logging.getLogRecordFactory()
+
+    def counting_factory(*args, **kwargs):
+        record = base_factory(*args, **kwargs)
+        # Сообщение как %d с не-int args — getMessage() упадёт. Под реентрантным
+        # флагом _report_scrub_failure должна вернуться без второго
+        # logger.exception'а, иначе петля.
+        record.msg = "%d"
+        record.args = ("not-an-int",)
+        log_scrub.scrub(record)
+        return record
+
+    monkeypatch.setattr(logging, "setLogRecordFactory", lambda f: None)
+    monkeypatch.setattr(logging, "getLogRecordFactory", lambda: counting_factory)
+
+    # Прямой вызов — упадёт на getMessage() и закроется в _report_scrub_failure.
+    record = logging.LogRecord(
+        name="x",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=0,
+        msg="%d",
+        args=("not-an-int",),
+        exc_info=None,
+    )
+    log_scrub.scrub(record)
+    log_scrub.scrub(record)
+    # Два вызова — два инкремента, реентрантный флаг НЕ глушит счётчик.
+    assert log_scrub.scrub_failures() >= 2
