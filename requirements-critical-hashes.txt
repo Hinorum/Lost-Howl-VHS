@@ -158,7 +158,7 @@ apscheduler==3.11.3
 #   apscheduler-3.11.3-py3-none-any.whl sha256:bbeb2ec02d23d3c06a6c07ed7f0f3939ada6680eb121fae809a69bb42c537a30
 #   apscheduler-3.11.3.tar.gz sha256:cd2fcc9330039a81a5893472ad49facf23a6d5604cbe1d918c835c6de7834d5a
 
-asyncpg==0.31.0
+asyncpg==0.32.0
 #   asyncpg-0.31.0-cp310-cp310-macosx_10_9_x86_64.whl sha256:831712dd3cf117eec68575a9b50da711893fd63ebe277fc155ecae1c6c9f0f61
 #   asyncpg-0.31.0-cp310-cp310-macosx_11_0_arm64.whl sha256:0b17c89312c2f4ccea222a3a6571f7df65d4ba2c0e803339bfc7bed46a96d3be
 #   asyncpg-0.31.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl sha256:3faa62f997db0c9add34504a68ac2c342cfee4d57a0c3062fcf0d86c7f9cb1e8
@@ -393,7 +393,7 @@ pyyaml==6.0.3
 #   pyyaml-6.0.3-cp39-cp39-win_amd64.whl sha256:2e71d11abed7344e42a8849600193d15b6def118602c4c176f748e4583246007
 #   pyyaml-6.0.3.tar.gz sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
 
-sqlalchemy==2.1.2
+sqlalchemy==2.1.4
 #   sqlalchemy-2.1.2-cp311-cp311-macosx_11_0_arm64.whl sha256:d70a33db5c6cf4c1b06565648432717b93a34ed98c7c42ef498caa70d349b8ad
 #   sqlalchemy-2.1.2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl sha256:43f383f5ca982892af074f4aca6f8bf3e99461073f963fdf99da693df681f02b
 #   sqlalchemy-2.1.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl sha256:5d0cd7e76304b46192c834ccf668d73fff3f9c9cc1b2530de36066bd15921db6
