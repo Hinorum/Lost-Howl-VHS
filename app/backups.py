@@ -207,9 +207,16 @@ async def _mark_backup_ok() -> None:
     from app.models import WatcherState
 
     async with SessionLocal() as session:
-        session.add(
-            WatcherState(key=BACKUP_LAST_OK_KEY, value=datetime.now(UTC).isoformat())
-        )
+        # Upsert, а не голой add: ключ — PK, второй успешный бэкап ронял бы
+        # IntegrityError, маркер замирал, а тревога «бэкапов нет» висела бы
+        # вечно (файл при этом лежал на диске).
+        row = await session.get(WatcherState, BACKUP_LAST_OK_KEY)
+        if row is None:
+            session.add(
+                WatcherState(key=BACKUP_LAST_OK_KEY, value=datetime.now(UTC).isoformat())
+            )
+        else:
+            row.value = datetime.now(UTC).isoformat()
         await session.commit()
 
 

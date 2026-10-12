@@ -216,6 +216,48 @@ async def test_successful_backup_marks_last_ok(monkeypatch, tmp_path: Path) -> N
             await session.commit()
 
 
+async def test_second_backup_does_not_crash_on_mark(monkeypatch, tmp_path: Path) -> None:
+    """Второй успешный бэкап не падает на отметке (upsert, PK-коллизия).
+
+    Инцидент: _mark_backup_ok делал голой session.add при PK key — на втором
+    бэкапе IntegrityError, маркер замирал, тревога «бэкапов нет» висела вечно,
+    хотя файл на диске лежал. Тесты не ловили: они стирали ключ между прогонами.
+    """
+    import sqlite3
+
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    source = tmp_path / "live.db"
+    with sqlite3.connect(str(source)) as conn:
+        conn.execute("create table t(x)")
+        conn.execute("insert into t values (1)")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'x.db').as_posix()}")
+    monkeypatch.setattr(backups, "sqlite_file_path", lambda: source)
+
+    try:
+        await backups.backup_now()
+        # Второй прогон: раньше ронял IntegrityError на session.add.
+        await backups.backup_now()
+
+        async with SessionLocal() as session:
+            value = (
+                await session.execute(
+                    select(WatcherState.value).where(WatcherState.key == BACKUP_LAST_OK_KEY)
+                )
+            ).scalar_one_or_none()
+        assert value is not None
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+            )
+            await session.commit()
+
+
 async def test_failed_backup_leaves_no_success_mark(monkeypatch, tmp_path: Path) -> None:
     """Провал бэкапа не должен выглядеть как успешный."""
     from app.core.registry import BACKUP_LAST_OK_KEY
