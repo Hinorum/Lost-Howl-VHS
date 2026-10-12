@@ -710,6 +710,34 @@ async def _cleanup_month_scene(
     await session.commit()
 
 
+async def test_month_without_pots_advances_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Горшка нет (месяц без ставок): метка двигается, False — без warning-спама.
+
+    До фикса ветки не было: окно ранжирования пустое, метка стояла, и
+    «Копилка 0 нанотонов ждёт» печаталось каждые 120с, маскируя реальные
+    «ждём»-состояния (в неделе эта ветка была всегда).
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    prev_key = previous_month_key()
+    async with SessionLocal() as session:
+        await session.execute(LeaderboardPot.__table__.delete())
+        session.add(WatcherState(key=MONTH_READY_KEY, value=prev_key))
+        await session.commit()
+        try:
+            assert await settle_month_if_due(bot=None) is False
+            marker = await session.get(WatcherState, MARKER_KEY)
+            assert marker is not None and marker.value == prev_key
+            # Идемпотентность: повторный тик уже ничего не делает.
+            assert await settle_month_if_due(bot=None) is False
+        finally:
+            await session.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_([MARKER_KEY, MONTH_READY_KEY])
+                )
+            )
+            await session.commit()
+
+
 async def test_month_settle_waits_for_unfinished_day(monkeypatch: pytest.MonkeyPatch) -> None:
     """Незакрытый день месяца: метка не двигается (650-651)."""
     monkeypatch.setattr(settings, "ton_enabled", True)

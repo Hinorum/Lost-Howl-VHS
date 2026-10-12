@@ -626,14 +626,20 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                 select(LeaderboardPot).where(LeaderboardPot.month <= prev_key).order_by(LeaderboardPot.month.asc())
             )
         ).scalars().all()
+        if not pots:
+            # Горшка нет (месяц без ставок — банк в копилку не капал):
+            # двигаем метку, как в неделе, иначе warning каждые 120с маскирует
+            # реальные «ждём»-состояния. Поздний catch-up-вклад такого месяца
+            # не пропадёт: он ляжет в pots следующего цикла (month <= prev_key).
+            marker.value = prev_key
+            await session.commit()
+            return False
         total = sum(pot.nanotons for pot in pots)
         # Период лидерборда: от начала самого старого НЕвыплаченного месяца
         # (после простоя копилка копится за несколько месяцев сразу) до начала
         # текущего — ровно то, за что платим.
-        period_start = month_start
-        if pots:
-            year, mon = map(int, pots[0].month.split("-"))
-            period_start = datetime(year, mon, 1, tzinfo=UTC)
+        year, mon = map(int, pots[0].month.split("-"))
+        period_start = datetime(year, mon, 1, tzinfo=UTC)
 
         # Последние дни месяца ещё не финализированы (долгий тик, сбой) —
         # их вклад в копилку может быть недолит. Как в неделе: платим только
