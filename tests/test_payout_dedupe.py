@@ -400,6 +400,64 @@ async def test_admin_retry_keeps_history_check_on_redispatch(monkeypatch) -> Non
             await session.commit()
 
 
+async def test_weekly_dead_letter_retry_completes(monkeypatch) -> None:
+    """Сквозной путь kind=weekly: dead-letter → ручной retry → реальная отправка.
+
+    В отличие от prize-выплат, у weekly round_id=None — memo строится как
+    way:None:weekly#<id>. Крах после пяти попыток оставляет строку failed;
+    dispatch сам её не трогает, ручной retry возвращает в очередь, и деньги
+    доходят ровно один раз.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "payout_max_attempts", 5)
+    await ensure_player(43)
+    async with SessionLocal() as session:
+        payout = Payout(
+            round_id=None,  # копилка недели не привязана к дню
+            player_id=43,
+            kind="weekly",
+            amount_nanotons=500_000_000,
+            dest_address="0:" + os.urandom(32).hex(),
+            status="failed",
+            attempts=5,
+            alerted=True,
+        )
+        session.add(payout)
+        await session.flush()
+        payout_id = payout.id
+        await session.commit()
+
+    async def empty_markers() -> set[str]:
+        return set()
+
+    transfer = AsyncMock(return_value="bcast:901")
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    try:
+        # Мёртвая строка сама в очередь не возвращается: долг ждёт хранителя.
+        assert await ton_pay.dispatch_pending_payouts(bot=None) == 0
+        assert transfer.await_count == 0
+        async with SessionLocal() as session:
+            assert await ton_pay.resolve_dead_payout(session, payout_id, "retry") == "pending"
+            row = await session.get(Payout, payout_id)
+            assert row.attempts == 5  # счётчик сохранён — анти-дубль активен
+
+        sent = await ton_pay.dispatch_pending_payouts(bot=None)
+        assert sent == 1
+        assert transfer.await_count == 1
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert row.status == "sent"
+        assert row.tx_hash == "bcast:901"
+        assert row.attempts == 0  # успех обнуляет счётчик
+    finally:
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+            if row is not None:
+                await session.delete(row)
+            await session.commit()
+
+
 async def test_failed_transfer_records_reason(monkeypatch) -> None:
     """Причина неудачи пишется в last_error и переживает исчерпание ретраев."""
     monkeypatch.setattr(settings, "ton_enabled", True)

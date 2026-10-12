@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -1169,6 +1170,135 @@ async def test_settle_week_rollover_keeps_claims_of_absorbed_weeks(
                 if player is not None:
                     await session.delete(player)
             await session.commit()
+
+
+async def test_concurrent_week_settle_pays_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Два параллельных settle недели — один комплект Payout, один True.
+
+    На SQLite ряд-лок FOR UPDATE no-op: сериализацию держит только
+    asyncio.Lock (межпроцессная защита — ряд-лок на Postgres). Инвариант
+    «не задвоено» обязателен при любом бэкенде.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 1)
+    week_key = previous_week_key()
+    prev_start, _ = week_bounds(week_key)
+    pid = 987_001
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        session.add(
+            Player(
+                id=pid, username="solo",
+                wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True,
+            )
+        )
+        round_row = await _seed_closed_round(
+            session, 896_000, prev_start + timedelta(days=2, hours=11)
+        )
+        session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+        _set_stake(session, round_row, pid)
+        session.add(WeeklyPot(week=week_key, nanotons=to_nano(10)))
+        await _set_week_ready(session, week_key)
+        await session.commit()
+        try:
+            results = await asyncio.gather(
+                settle_week_if_due(bot=None), settle_week_if_due(bot=None)
+            )
+            assert sorted(results) == [False, True]  # ровно один платит
+            payouts = (
+                (await session.execute(select(Payout).where(Payout.kind == "weekly")))
+                .scalars()
+                .all()
+            )
+            assert [(p.player_id, p.amount_nanotons) for p in payouts] == [
+                (pid, to_nano(10) * 50 // 100)
+            ]
+            marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
+            assert marker is not None and marker.value == week_key
+        finally:
+            await _cleanup_week_scene(session, [round_row], [pid])
+
+
+async def test_week_settle_crash_before_commit_keeps_pot_and_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Сбой в середине settle до коммита: копилка и метка нетронуты.
+
+    Payout создаётся в сессии ДО общего commit — падение между add и commit
+    обязано откатиться целиком (никаких «повисших» строк и сдвинутой метки
+    без выплаты). Инжект: конструктор Payout бросает на втором игроке.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "weekly_min_days", 1)
+    week_key = previous_week_key()
+    prev_start, _ = week_bounds(week_key)
+    pids = [988_000, 988_001]
+    rounds: list[Round] = []
+    async with SessionLocal() as session:
+        await _wipe_week_keys(session)
+        session.add_all(
+            [
+                Player(
+                    id=pids[0], username="crash1",
+                    wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True,
+                ),
+                Player(
+                    id=pids[1], username="crash2",
+                    wallet_address="0:" + os.urandom(32).hex(), wallet_verified=True,
+                ),
+            ]
+        )
+        for offset in range(2):
+            round_row = await _seed_closed_round(
+                session, 897_000 + offset, prev_start + timedelta(days=offset, hours=11)
+            )
+            rounds.append(round_row)
+            if offset == 0:
+                for pid in pids:
+                    session.add(Vote(round_id=round_row.id, player_id=pid, card_position=0))
+                    _set_stake(session, round_row, pid)
+            else:
+                # Второй раунд голосует только лидер: без ничьей, чтобы
+                # settle дошёл до создания Payout и инжект успел сработать.
+                session.add(Vote(round_id=round_row.id, player_id=pids[0], card_position=0))
+                _set_stake(session, round_row, pids[0])
+        session.add(WeeklyPot(week=week_key, nanotons=to_nano(10)))
+        await _set_week_ready(session, week_key)
+        await session.commit()
+
+        from app import leaderboard as lb
+
+        real_payout = lb.Payout
+        calls = {"n": 0}
+
+        def boom_once(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("инжект: сбой до коммита")
+            return real_payout(*args, **kwargs)
+
+        monkeypatch.setattr(lb, "Payout", boom_once)
+        try:
+            with pytest.raises(RuntimeError, match="инжект"):
+                await settle_week_if_due(bot=None)
+            # Роллбек: ни одной строки выплаты, копилка цела, метка не сдвинута.
+            paid = (
+                (await session.execute(select(Payout).where(Payout.kind == "weekly")))
+                .scalars()
+                .all()
+            )
+            assert paid == []
+            pot = (
+                await session.execute(select(WeeklyPot).where(WeeklyPot.week == week_key))
+            ).scalar_one()
+            assert pot.nanotons == to_nano(10)
+            marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
+            assert marker is None or marker.value == ""
+        finally:
+            monkeypatch.setattr(lb, "Payout", real_payout)
+            await _cleanup_week_scene(session, rounds, pids)
 
 
 # --- Слепые ветки недельной выплаты: якорь, копилки, церемония ----------------
