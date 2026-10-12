@@ -269,6 +269,112 @@ async def test_boot_game_retry_captures_lock_after_release(monkeypatch) -> None:
         main_module._lock_retry_task = None
 
 
+async def test_boot_task_done_alerts_on_exception(caplog) -> None:
+    """Смерть bootstrap не должна оставаться незамеченной (webhook-режим).
+
+    Инцидент: boot_game уходит в фон, исключение никто не читал до shutdown,
+    /health отвечал 200, а игра стояла без тиков. Done-callback обязан
+    поднять critical в лог.
+    """
+    import logging
+
+    async def _bomb():
+        raise RuntimeError("БД недоступна при старте")
+
+    task = asyncio.create_task(_bomb())
+    with contextlib.suppress(RuntimeError):
+        await task
+
+    with caplog.at_level(logging.CRITICAL, logger="way"):
+        main_module._boot_task_done(task)
+
+    assert any(
+        "Bootstrap игры упал" in r.message and "БД недоступна" in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+
+
+async def test_boot_task_done_ignores_cancelled() -> None:
+    """Отменённый boot_task (штатный shutdown) — не авария."""
+    async def _noop():
+        return None
+
+    task = asyncio.create_task(_noop())
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    # Не должен бросить.
+    main_module._boot_task_done(task)
+
+
+async def test_boot_game_survives_acquire_scheduler_lock_error(monkeypatch) -> None:
+    """Сбой при захвате лока (БД моргнула) не роняет boot_game молча.
+
+    Раньше acquire_scheduler_lock() стоял вне try: исключение пролетало
+    мимо done-callback (его не было) и оставляло процесс без retry-таски.
+    """
+    monkeypatch.setattr(main_module, "set_bot", Mock())
+    monkeypatch.setattr(main_module, "start_scheduler", Mock())
+
+    async def _broken_lock():
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(main_module, "acquire_scheduler_lock", _broken_lock)
+
+    main_module._lock_retry_task = None
+    try:
+        # Не должно бросить — уходит в фоновый retry.
+        await main_module.boot_game(SimpleNamespace())
+        # Retry-таска создана, даже лок не удалось взять.
+        assert main_module._lock_retry_task is not None
+        main_module._lock_retry_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await main_module._lock_retry_task
+    finally:
+        main_module._lock_retry_task = None
+
+
+async def test_retry_loop_releases_lock_and_retries_after_boot_failure(monkeypatch) -> None:
+    """Падение _boot_after_lock после захвата лока: отдать лок и повторить.
+
+    Раньше retry-цикл делал return после падения bootstrap — лок оставался
+    у процесса, тика нет, повторов нет («игра стоит» только в логе).
+    """
+    scheduler = importlib.import_module("app.scheduler")
+    scheduler_lock = importlib.import_module("app.scheduler_lock")
+    story_bay = importlib.import_module("app.story.bay")
+    monkeypatch.setattr(main_module, "set_bot", Mock())
+    monkeypatch.setattr(main_module, "_SCHEDULER_LOCK_RETRY_SECONDS", 0)
+    monkeypatch.setattr(scheduler_lock, "scheduler_lock_held", Mock(return_value=False))
+    monkeypatch.setattr(story_bay, "install_bay", Mock(return_value=True))
+
+    # bootstrap падает на start_scheduler один раз, затем чинится —
+    # retry-цикл должен отдать лок после падения и завершиться на успехе.
+    monkeypatch.setattr(main_module, "acquire_scheduler_lock", AsyncMock(return_value=True))
+    release = AsyncMock()
+    monkeypatch.setattr(main_module, "release_scheduler_lock", release)
+    monkeypatch.setattr(main_module, "tick", AsyncMock())
+    boom = Mock(side_effect=[RuntimeError("планировщик не поднялся"), None])
+    monkeypatch.setattr(main_module, "start_scheduler", boom)
+    monkeypatch.setattr(main_module, "apply_profile", AsyncMock())
+    monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
+
+    main_module._lock_retry_task = None
+    try:
+        # запускаем retry-цикл напрямую, без boot_game
+        task = asyncio.create_task(
+            main_module._retry_scheduler_lock_loop(SimpleNamespace()),
+            name="test-retry",
+        )
+        await asyncio.wait_for(task, timeout=2)
+        # лок отдан после падения bootstrap
+        assert release.await_count == 1
+        # bootstrap дошёл до успеха со второй попытки
+        assert boom.call_count == 2
+    finally:
+        main_module._lock_retry_task = None
+
+
 async def test_boot_game_takes_lock_before_first_tick(monkeypatch) -> None:
     """Порядок обязателен: лок берётся раньше любого тика."""
     order: list[str] = []

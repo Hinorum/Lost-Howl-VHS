@@ -208,7 +208,7 @@ async def test_ops_text_shows_tick_failures(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", False)
     async with SessionLocal() as db:
         db.add(WatcherState(key=ops.TICK_FAIL_KEY, value="4"))
-        db.add(WatcherState(key=ops.TICK_KEY, value=datetime.now(UTC).isoformat()))
+        # TICK_KEY уже стоит свежий от конфтеста — не дублируем.
         await db.commit()
 
     text = await ops_diag._ops_diag_text()

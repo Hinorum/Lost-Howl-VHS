@@ -61,6 +61,14 @@ async def test_failed_tick_leaves_heartbeat_stale(monkeypatch) -> None:
     """Упавший тик НЕ подтверждает собственную живость (прежний баг)."""
     from app import scheduler as sched
 
+    # Конфтест ставит свежий бит — убираем, чтобы проверить,
+    # что упавший тик его не создаёт.
+    async with SessionLocal() as db:
+        row = await db.get(WatcherState, ops.TICK_KEY)
+        if row is not None:
+            await db.delete(row)
+            await db.commit()
+
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
     monkeypatch.setattr(sched, "get_latest_round", AsyncMock(side_effect=RuntimeError("взрыв")))
 
@@ -80,7 +88,9 @@ async def test_stale_heartbeat_is_reported_as_alarm(monkeypatch) -> None:
     bot = SimpleNamespace(send_message=AsyncMock())
     old = datetime.now(UTC) - timedelta(minutes=30)
     async with SessionLocal() as db:
-        db.add(WatcherState(key=ops.TICK_KEY, value=old.isoformat()))
+        row = await db.get(WatcherState, ops.TICK_KEY)
+        assert row is not None  # конфтест ставит свежий бит
+        row.value = old.isoformat()
         await db.commit()
 
     problems = await ops.check_anomalies(bot=bot)
@@ -88,6 +98,30 @@ async def test_stale_heartbeat_is_reported_as_alarm(monkeypatch) -> None:
     assert any("планировщик не тикает" in p for p in problems)
     assert bot.send_message.await_count == 1
     assert "планировщик не тикает" in bot.send_message.await_args[0][1].lower()
+
+
+async def test_never_ticked_bootstrap_is_reported_as_alarm(monkeypatch) -> None:
+    """Bootstrap упал до первого тика — тревога, а не тишина.
+
+    Инцидент: tick_age is None (маркер ни разу не записан) молчал, в отличие
+    от watcher'а, у которого «ещё ни разу» проверяется. В webhook-режиме
+    boot_game уходит в фон: падение bootstrap оставляло /health отвечать 200,
+    а check_anomalies (джоба того же мёртвого планировщика) не запускался.
+    """
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    bot = SimpleNamespace(send_message=AsyncMock())
+    # Конфтест ставит свежий бит — убираем, чтобы смоделировать «тик не было».
+    async with SessionLocal() as db:
+        row = await db.get(WatcherState, ops.TICK_KEY)
+        if row is not None:
+            await db.delete(row)
+            await db.commit()
+
+    problems = await ops.check_anomalies(bot=bot)
+
+    assert any("ни разу не выполнялся" in p for p in problems), problems
+    assert bot.send_message.await_count == 1
+    assert "ни разу не выполнялся" in bot.send_message.await_args[0][1].lower()
 
 
 async def test_successful_tick_beats_heartbeat(monkeypatch) -> None:

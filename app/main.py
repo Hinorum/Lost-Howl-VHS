@@ -330,6 +330,22 @@ _SCHEDULER_LOCK_RETRY_SECONDS = 15
 _lock_retry_task: asyncio.Task | None = None
 
 
+def _boot_task_done(task: asyncio.Task) -> None:
+    """Done-callback для boot_game: смерть bootstrap не должна оставаться незамеченной.
+
+    В webhook-режиме boot_game уходит в фон: исключение до сих пор никем не
+    читалось до shutdown (CancelledError подавлялся, остальное тонуло в stderr).
+    /health при этом отвечал 200 — процесс жив, а игра стоит.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.critical(
+            "Bootstrap игры упал — планировщик не поднят, тиков нет: %r", exc, exc_info=exc
+        )
+
+
 async def _boot_after_lock(bot) -> None:
     """Шаги, которые выполняются только после успешного захвата лока планировщика.
 
@@ -422,12 +438,14 @@ async def _retry_scheduler_lock_loop(bot) -> None:
                 )
                 try:
                     await _boot_after_lock(bot)
+                    return
                 except Exception:
                     log.exception(
-                        "Фоновый bootstrap после получения лока упал — игра стоит",
-                        exc_info=True,
+                        "Фоновый bootstrap после получения лока упал — "
+                        "отдаём лок и повторяем попытку"
                     )
-                return
+                    with contextlib.suppress(Exception):
+                        await release_scheduler_lock()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -451,7 +469,12 @@ async def boot_game(bot) -> None:
     # Лок ПЕРЕД первым тиком, а не перед start_scheduler: стартовый tick тоже
     # пишет в игру (анонсы, финализация, выплаты), поэтому второй инстанс не
     # должен отработать даже один раз.
-    if not await acquire_scheduler_lock():
+    try:
+        acquired = await acquire_scheduler_lock()
+    except Exception:
+        log.exception("Сбой при захвате лока планировщика — уходим в фоновый retry")
+        acquired = False
+    if not acquired:
         log.critical(
             "База уже занята другим процессом — этот экземпляр уходит в фон: "
             "/health работает, игру он не трогает. Если так не задумано, на "
@@ -493,7 +516,8 @@ async def run_webhook(bot, dispatcher) -> None:
             secret_token=secret,
             drop_pending_updates=False,
         )
-    boot_task = asyncio.create_task(boot_game(bot))
+    boot_task = asyncio.create_task(boot_game(bot), name="boot-game")
+    boot_task.add_done_callback(_boot_task_done)
     stop = asyncio.Event()
     ping_task = asyncio.create_task(_self_ping_loop(stop))
     _install_stop_handlers(stop)

@@ -814,8 +814,20 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
     _problem_entry.clear()
     async with SessionLocal() as session:
         # 0. Планировщик молчит — дни не закрываются, выплаты не уходят.
+        # tick_age is None — маркер тика ни разу не записан: bootstrap упал до
+        # первого тика (или это свежая БД). Раньше такая дыра молчала, в отличие
+        # от watcher'а, у которого «ещё ни разу» проверяется.
         tick_age = _age_seconds(await _get_state(session, TICK_KEY))
-        if tick_age is not None and tick_age > _TICK_STALE_AFTER.total_seconds():
+        if tick_age is None:
+            note = "планировщик ни разу не выполнялся"
+            await _raise(
+                session,
+                bot,
+                ALERT_TICK_KEY,
+                note,
+                f"⚠️ {note.capitalize()}. Дни не переключаются, смотрите логи сервиса.",
+            )
+        elif tick_age > _TICK_STALE_AFTER.total_seconds():
             note = f"планировщик не тикает {int(tick_age // 60)} мин"
             await _raise(
                 session,
