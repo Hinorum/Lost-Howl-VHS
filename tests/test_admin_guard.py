@@ -35,7 +35,13 @@ from app.handlers.admin import (
 )
 from app.handlers.common import router as app_router
 from app.handlers.ops_diag import cmd_ops
-from app.handlers.panel import cmd_cassette, cmd_panel, on_cassette_action, on_panel_action
+from app.handlers.panel import (
+    cmd_cassette,
+    cmd_panel,
+    on_cassette_action,
+    on_cassette_document,
+    on_panel_action,
+)
 from app.handlers.payout import (
     cmd_blockchain,
     cmd_fundout,
@@ -232,6 +238,81 @@ async def test_group_filters_present_on_every_admin_command() -> None:
         if not any(isinstance(f, MagicFilter) for f in filters):
             unguarded.append(handler.__name__)
     assert not unguarded, f"админ-команды без фильтра по типу чата: {unguarded}"
+
+
+async def test_cassette_document_rejects_outsider(monkeypatch) -> None:
+    """Документ от не-админа молча отбрасывается (гейт в теле хендлера)."""
+    monkeypatch.setattr(panel_mod.settings, "admin_ids", "4242")
+    msg = SimpleNamespace(
+        chat=SimpleNamespace(type="private"),
+        from_user=SimpleNamespace(id=OUTSIDER_ID),
+        document=SimpleNamespace(file_size=1024, file_name="x.json"),
+        reply=AsyncMock(),
+    )
+    await on_cassette_document(msg)
+    assert msg.reply.await_count == 0
+
+
+def test_every_admin_gated_handler_has_chat_type_filter() -> None:
+    """Мета-тест guard-полноты: любой хендлер с admin-гейтом в теле обязан
+    иметь фильтр по типу чата в роутере.
+
+    Ловит регрессию «добавили хендлер с проверкой admin_id_set, но забыли
+    F.chat.type == PRIVATE» — как было с on_cassette_document: хендлер ловил
+    документы в группах, проверка админа стояла только внутри.
+
+    Проверяем не просто наличие MagicFilter (F.document — тоже MagicFilter),
+    а именно фильтр по chat.type: resolve на группе обязан вернуть False.
+
+    Не-гейты (упоминают admin_id_set, но доступны игрокам) перечислены
+    явно: cmd_change снимает кулдаун для хранителя, но команда /change —
+    игрокская.
+    """
+    import inspect
+
+    from aiogram.types import Chat as AiogramChat
+    from aiogram.types import Message as AiogramMessage
+
+    # Хендлеры, упоминающие admin_id_set, но НЕ гейтящие по нему.
+    ALLOWLIST = {"cmd_change"}
+    group_msg = AiogramMessage(
+        message_id=1,
+        date=datetime.now(UTC),
+        chat=AiogramChat(id=-1001234567890, type="supergroup"),
+        from_user=None,
+    )
+    unguarded: list[str] = []
+    seen: set[str] = set()
+    for observer_name, observer in app_router.observers.items():
+        # Callback-хендлеры не проверяем: колбэк приходит только из инлайн-
+        # клавиатуры, которую бот сам отправил в личку. Фильтр chat.type
+        # нужен message-хендлерам — их пересылают/дёргают из групп.
+        if observer_name != "message":
+            continue
+        for entry in observer.handlers:
+            name = getattr(entry.callback, "__name__", None)
+            if name is None or name in seen or name in ALLOWLIST:
+                continue
+            seen.add(name)
+            try:
+                src = inspect.getsource(entry.callback)
+            except (OSError, TypeError):
+                continue
+            if "admin_id_set" not in src and "admin_ids" not in src:
+                continue
+            # Нужен фильтр, который отсекает группу: chat.type == private
+            # (или иной chat-type фильтр, отвергающий supergroup).
+            filters = _registered_filters(entry.callback)
+            blocks_group = any(
+                isinstance(f, MagicFilter) and f.resolve(group_msg) is False
+                for f in filters
+            )
+            if not blocks_group:
+                unguarded.append(name)
+    assert not unguarded, (
+        "хендлеры с admin-гейтом без фильтра, отсекающего группу: "
+        f"{unguarded}"
+    )
 
 
 def test_magic_filter_presence_is_detectable() -> None:

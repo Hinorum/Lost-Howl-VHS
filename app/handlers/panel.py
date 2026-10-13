@@ -1129,7 +1129,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
         await callback.answer(f"Не получилось: {exc}", show_alert=True)
 
 
-@router.message(F.document)
+@router.message(F.document, F.chat.type == ChatType.PRIVATE)
 async def on_cassette_document(message: Message) -> None:
     """Приём документа: правка месяца/дня, проверка без записи, новая кассета."""
     if message.from_user is None or message.from_user.id not in settings.admin_id_set:
