@@ -180,9 +180,11 @@ class Settings(BaseSettings):
     # Значение обязано совпадать с PAYOUT_FEE_GRAM в render.yaml: прод видит
     # рычаг только оттуда, а расхождение означало бы, что один и тот же газ
     # считается в коде и на деплое по-разному. Равенство проверяет
-    # tests/test_money_config_parity.py. Само число берётся замером на testnet
-    # (5–10 переводов A→B, среднее × 1.15, вверх) — см. MAINNET_READINESS.md.
-    payout_fee_gram: float = 0.002
+    # tests/test_money_config_parity.py. Замерено на mainnet 2026-10-13:
+    # 7 исходящих переводов (total_fees + fwd_fee), среднее 0.00055,
+    # среднее × 1.15 = 0.000633, округлено вверх до 0.0007 — см.
+    # MAINNET_READINESS.md.
+    payout_fee_gram: float = 0.0007
     # Перевод меньше этой суммы (Gram) не создаётся вовсе: комиссия съела бы
     # большую его часть. Пыльные доли капают в копилку недели — видно в итогах.
     min_payout_gram: float = 0.02
