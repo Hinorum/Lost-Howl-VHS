@@ -73,10 +73,53 @@ def detect_wallet_version(
     return None, candidates
 
 
+def _assert_public_https_url(url: str) -> None:
+    """SSRF-гейт: https + публичный хост, без loopback/private/link-local.
+
+    URL приходит из LITESERVER_CONFIG_URL (env деплоера), но редиректы
+    включены — легитимный хост может увести на 169.254.169.254 (метаданные
+    облака) или 127.0.0.1. Проверяем схему и IP-литералы; DNS-имена не
+    резолвим (гейт на старте, а не на каждый тик — дорого и ненадёжно).
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError(
+            f"LITESERVER_CONFIG_URL обязан быть https:// (получено: {parsed.scheme or 'без схемы'})"
+        )
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"LITESERVER_CONFIG_URL без хоста: {url}")
+    lowered = host.lower()
+    blocked_hosts = {
+        "localhost",
+        "metadata.google.internal",
+        "instance-data",
+    }
+    if lowered in blocked_hosts:
+        raise ValueError(f"SSRF-гейт: хост {host} заблокирован")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return  # DNS-имя — не IP-литерал, пропускаем
+    if (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
+        raise ValueError(f"SSRF-гейт: адрес {host} не является публичным")
+
+
 async def fetch_remote_json(url: str) -> dict:
     """Скачивает JSON (конфиг лайтсерверов) с редиректами."""
     from app.http_utils import get_http_client
 
+    _assert_public_https_url(url)
     client = get_http_client()
     response = await client.get(url)
     response.raise_for_status()
