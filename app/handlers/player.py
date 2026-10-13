@@ -45,7 +45,6 @@ def _commands_help() -> list[str]:
         "/start — вставить кассету: как играть и памятка",
         "/today — кадр дня: варианты и выбор",
         "/score — карточка Стаи: титул, серия и голоса за неделю и месяц",
-        "/rank — карточка Стаи (то же, что /score)",
     ]
     if settings.revote_enabled and settings.ton_enabled:
         # В бесплатной версии /change безусловно отказывает (topup) — не рекламируем.
@@ -74,17 +73,8 @@ def _commands_help() -> list[str]:
     return lines
 
 
-@router.message(Command("invite", "referral"))
-async def cmd_invite(message: Message) -> None:
-    """Личная ссылка приглашения, счётчик приведённых и копилка наград.
-
-    Команда /referral — тот же хендлер: обе вели на одну страницу, объединены.
-    """
-    if message.chat.type != ChatType.PRIVATE:
-        return
-    caller = message.from_user
-    if caller is None:
-        return
+async def _invite_text(user, bot) -> str | None:
+    """Текст «плёнки наград»: ссылка, счётчик, копилка. None — приглашения выключены."""
     from app.referrals import (
         invited_count,
         referral_link,
@@ -92,13 +82,12 @@ async def cmd_invite(message: Message) -> None:
         resolve_bot_username,
     )
 
-    username = await resolve_bot_username(getattr(message, "bot", None))
-    link = referral_link(caller.id, username)
+    username = await resolve_bot_username(bot)
+    link = referral_link(user.id, username)
     if not link:
-        await message.answer("🧭 Приглашения в стаю пока не открыты — приходи чуть позже.")
-        return
-    count = await invited_count(caller.id)
-    balance = await referral_pot_balance(caller.id)
+        return None
+    count = await invited_count(user.id)
+    balance = await referral_pot_balance(user.id)
     threshold_nano = to_nano(settings.referral_min_payout_gram)
     if balance <= 0:
         status = "Пока копилка пуста: награда капает с подтверждённых ставок приведённых."
@@ -111,16 +100,33 @@ async def cmd_invite(message: Message) -> None:
         need = from_nano(threshold_nano - balance)
         status = f"🌸 До выплаты не хватает {need:g} Gram — копилка докапает с новых ставок."
     earned = from_nano(balance)
-    await message.answer(
+    return (
         f"🐾 <b>Твоя плёнка наград</b>\n\n"
         f"Ссылка в стаю:\n{link}\n\n"
         "Кто придёт по ней — тот войдёт следом за тобой.\n"
         f"Приведено: {count}\n"
         f"В копилке: {earned:g} Gram "
         f"(автовыплата от {settings.referral_min_payout_gram:g} Gram)\n\n"
-        f"{status}",
-        parse_mode=ParseMode.HTML,
+        f"{status}"
     )
+
+
+@router.message(Command("invite", "referral"))
+async def cmd_invite(message: Message) -> None:
+    """Личная ссылка приглашения, счётчик приведённых и копилка наград.
+
+    Команда /referral — тот же хендлер: обе вели на одну страницу, объединены.
+    """
+    if message.chat.type != ChatType.PRIVATE:
+        return
+    caller = message.from_user
+    if caller is None:
+        return
+    text = await _invite_text(caller, getattr(message, "bot", None))
+    if text is None:
+        await message.answer("🧭 Приглашения в стаю пока не открыты — приходи чуть позже.")
+        return
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(CommandStart())
@@ -221,6 +227,9 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="🏆 Копилки", callback_data="menu:top"),
             InlineKeyboardButton(text="🐾 Фонд", callback_data="menu:fund"),
+        ],
+        [
+            InlineKeyboardButton(text="🐾 Позвать в стаю", callback_data="menu:invite"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -386,7 +395,7 @@ async def cmd_today(message: Message) -> None:
 async def _score_text(user) -> str:
     """Единый экран Стаи: выбор дня, титул, серия, голоса и личный блок.
 
-    Одна карточка для /score и /rank: выбор дня, прогресс и голоса за
+    Одна карточка для /score (и /rank): выбор дня, прогресс и голоса за
     неделю и месяц, затем личные данные (кошелёк, ставка дня, приведённые в стаю).
     В группе сюда не показываем — только приватный поп-ап _score_short.
     """
@@ -493,8 +502,12 @@ def _score_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-@router.message(Command("score"))
+@router.message(Command("score", "rank"))
 async def cmd_score(message: Message) -> None:
+    """Карточка Стаи: титул, серия и голоса.
+
+    Команда /rank — тот же хендлер: обе вели на одну карточку, объединены.
+    """
     if message.chat.type != ChatType.PRIVATE:
         # В группе личные цифры не показываем: только кнопка с приватным окном.
         await message.answer(
@@ -524,30 +537,6 @@ async def on_score_view(callback: CallbackQuery) -> None:
     await callback.answer(await _score_short(callback.from_user), show_alert=True)
 
 
-@router.message(Command("rank"))
-async def cmd_rank(message: Message) -> None:
-    """Показывает тот же единый экран, что и /score: титул, серия и голоса."""
-    if message.chat.type == ChatType.PRIVATE:
-        await message.answer(
-            await _score_text(message.from_user),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_score_keyboard(),
-        )
-    else:
-        await message.answer(
-            "Рейтинг — только в личке.",
-            reply_markup=_personal_keyboard("rank:view", "Мой рейтинг"),
-        )
-
-
-@router.callback_query(F.data == "rank:view")
-async def on_rank_view(callback: CallbackQuery) -> None:
-    if callback.message is None:
-        await callback.answer()
-        return
-    await callback.answer(await _score_short(callback.from_user), show_alert=True)
-
-
 @router.callback_query(F.data == "noop")
 async def on_noop(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -562,6 +551,7 @@ async def on_menu(callback: CallbackQuery) -> None:
         "wallet": _menu_wallet,
         "top": _menu_top,
         "fund": _menu_fund,
+        "invite": _menu_invite,
     }.get(action)
     if handler is None:
         await callback.answer()
@@ -636,6 +626,25 @@ async def _menu_fund(callback: CallbackQuery) -> None:
     from app.handlers.wallet import _fund_text
 
     await callback.message.answer(await _fund_text(), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+async def _menu_invite(callback: CallbackQuery) -> None:
+    """🐾 Позвать в стаю — карточка приглашения (та же, что /invite)."""
+    if callback.message is None or callback.from_user is None:
+        await callback.answer()
+        return
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer(
+            "Приглашения — личное: открой профиль бота и нажми Start — там кнопка в пульте.",
+            show_alert=True,
+        )
+        return
+    text = await _invite_text(callback.from_user, getattr(callback, "bot", None))
+    if text is None:
+        await callback.answer("🧭 Приглашения в стаю пока не открыты.", show_alert=True)
+        return
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
     await callback.answer()
 
 

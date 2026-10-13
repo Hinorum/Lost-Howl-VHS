@@ -276,3 +276,40 @@ async def test_start_with_garbage_args_does_not_break(monkeypatch) -> None:
             )
         ).scalars().all()
         assert rows == []
+
+
+async def test_menu_invite_button_shows_card_in_private() -> None:
+    """Кнопка «Позвать в стаю» в пульте отдаёт ту же карточку, что /invite."""
+    uid = next_uid()
+    await _existing_player(uid)
+    callback = SimpleNamespace(
+        data="menu:invite",
+        from_user=make_user(uid),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(type="private"),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await player_mod._menu_invite(callback)
+    text = callback.message.answer.call_args.args[0]
+    assert "https://t.me/the_ways_bot?start=ref" in text
+    assert "Приведено: 0" in text
+    callback.answer.assert_awaited_once()
+
+
+async def test_menu_invite_button_directs_groups_to_private() -> None:
+    """В группе кнопка не выдаёт личное — только направляет в личку."""
+    uid = next_uid()
+    callback = SimpleNamespace(
+        data="menu:invite",
+        from_user=make_user(uid),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(type="supergroup"),
+            answer=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+    await player_mod._menu_invite(callback)
+    callback.message.answer.assert_not_awaited()
+    assert callback.answer.await_args.kwargs.get("show_alert") is True

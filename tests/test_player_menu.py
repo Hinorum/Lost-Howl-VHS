@@ -20,6 +20,7 @@ def test_menu_keyboard_covers_daily_actions() -> None:
     assert kb["stake:view"] == "💸 Ставка"
     assert kb["menu:top"] == "🏆 Копилки"
     assert kb["menu:fund"] == "🐾 Фонд"
+    assert kb["menu:invite"] == "🐾 Позвать в стаю"
     # Кнопки-дублёры /start сняты владельцем: «Итоги в личку» (Telegram
     # сам умеет отключать уведомления) и «Помощь» (дублировала /start).
     assert "menu:help" not in kb
