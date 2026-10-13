@@ -136,7 +136,9 @@ async def _refunds_panel_text() -> str:
         lines.append("Нет кандидатов для ручного возврата. Долгов нет.")
         return "\n".join(lines)
     for stake, player, round_row in rows:
-        who = (
+        # username/first_name — пользовательские: без escape ломают HTML
+        # (панель шлётся с parse_mode=HTML) и открывают путь к инъекции.
+        who = html_escape(
             (player.username or player.first_name or f"игрок {player.id}")
             if player
             else f"игрок {stake.player_id}"

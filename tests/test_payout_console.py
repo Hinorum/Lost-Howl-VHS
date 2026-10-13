@@ -983,6 +983,40 @@ async def test_refunds_panel_lists_candidates(monkeypatch) -> None:
     assert "80029" not in text
 
 
+async def test_refunds_panel_escapes_html_in_username(monkeypatch) -> None:
+    """username/first_name экранируются: панель шлётся с parse_mode=HTML.
+
+    Игрок с first_name вида «<b>жирный</b>» ломал бы разметку и открывал
+    путь к инъекции произвольного HTML в сообщение хранителя.
+    """
+    await _wipe(Payout, Stake, Round, Player, PackFund)
+    async with SessionLocal() as db:
+        db.add(Player(id=54, first_name="<b>инъекция</b>&amp;стек"))
+        day = _round(80_040, RoundStatus.TALLYING)
+        db.add(day)
+        await db.commit()
+        day_id = day.id
+    async with SessionLocal() as db:
+        db.add(
+            Stake(
+                round_id=day_id,
+                player_id=54,
+                amount_nanotons=to_nano(1),
+                tx_hash="r-html",
+                network=current_network(),
+                status="pending",
+            )
+        )
+        await db.commit()
+
+    text = await _refunds_panel_text()
+    # Сырой HTML-тег не должен пройти: имя экранировано.
+    assert "<b>инъекция</b>" not in text
+    assert "&lt;b&gt;инъекция&lt;/b&gt;" in text
+    # &amp; — двойное экранирование: сначала &, потом &amp;.
+    assert "&amp;amp;стек" in text
+
+
 async def test_treasury_guard_uses_admin_id_set(monkeypatch) -> None:
     """Несколько хранителей — список в настройках, а не один id."""
     monkeypatch.setattr(settings, "admin_ids", "1, 4242 ,777")
