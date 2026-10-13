@@ -54,7 +54,7 @@ from .admin import (
     _adjust_menu_text,
     cmd_advance,
 )
-from .common import _set_paused_and_broadcast, router
+from .common import _set_paused_and_broadcast, require_admin, router
 from .payout import (
     _payouts_text,
     _refunds_panel_text,
@@ -352,21 +352,17 @@ async def _panel_keyboard() -> InlineKeyboardMarkup:
 
 
 @router.message(Command("panel"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Пульт только для хранителя игры.")
 async def cmd_panel(message: Message) -> None:
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Пульт только для хранителя игры.")
-        return
     async with SessionLocal() as session:
         text = await _admin_panel_text(session)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=await _panel_keyboard())
 
 
 @router.callback_query(F.data.startswith("panel:"))
+@require_admin("Пульт только для хранителя.")
 async def on_panel_action(callback: CallbackQuery) -> None:
     """Единая точка кнопок пульта: гейт хранителя + маршрутизация действий."""
-    if callback.from_user.id not in settings.admin_id_set:
-        await callback.answer("Пульт только для хранителя.", show_alert=True)
-        return
     action = callback.data.split(":", 1)[1]
     try:
         if action in {"view", "refresh"}:
@@ -888,21 +884,17 @@ def _chunk_message(text: str) -> list[str]:
 
 
 @router.message(Command("cassette"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Пульт только для хранителя игры.")
 async def cmd_cassette(message: Message) -> None:
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Пульт только для хранителя игры.")
-        return
     async with SessionLocal() as session:
         text = await _cassette_menu_text(session)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard())
 
 
 @router.callback_query(F.data.startswith("cassette:"))
+@require_admin("Пульт только для хранителя.")
 async def on_cassette_action(callback: CallbackQuery) -> None:
     """Назначение «следующей», вход в «Редактор плёнки», скачивание и правки."""
-    if callback.from_user.id not in settings.admin_id_set:
-        await callback.answer("Пульт только для хранителя.", show_alert=True)
-        return
     parts = callback.data.split(":")
     op = parts[1] if len(parts) > 1 else ""
     file_name = parts[2] if len(parts) > 2 else ""

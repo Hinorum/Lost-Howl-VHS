@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -228,7 +229,10 @@ def test_engine_pool_timeout_is_sized_for_parallel_tasks() -> None:
     Тик, диспетчер, watch, бэкап и вебхук держат соединения одновременно;
     при исчерпании пула checkout ждал молча 30 с и умирал по TimeoutError
     без контекста. 60 с > 30 с дефолта — внятная ошибка в логах.
+    SQLite (StaticPool) не принимает pool_timeout — проверяем только Postgres.
     """
+    if db._IS_SQLITE:
+        pytest.skip("SQLite: pool_timeout не передаётся (StaticPool)")
     pool = db.engine.pool
     assert getattr(pool, "_timeout", None) is not None, "pool_timeout обязан быть задан"
     assert pool._timeout >= 60, "pool_timeout должен быть ≥ 60 с"

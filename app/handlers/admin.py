@@ -44,7 +44,7 @@ from app.ton_pay import pending_payout_count
 from app.ton_utils import from_nano, to_nano
 from app.voting import upsert_player
 
-from .common import _set_paused_and_broadcast, router
+from .common import _set_paused_and_broadcast, require_admin, router
 
 logger = logging.getLogger(__name__)
 
@@ -124,10 +124,8 @@ async def auto_bind_chat(message: Message) -> None:
 
 
 @router.message(Command("advance"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_advance(message: Message) -> None:
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     # Стоп-кран не спорит с хранителем: явный /advance снимает паузу сам
     # (инцидент: отказ «сначала /resume» выглядел как поломка кнопок).
     changed, _delivered = await _set_paused_and_broadcast(message.bot, False)
@@ -209,13 +207,11 @@ async def cmd_advance(message: Message) -> None:
 
 
 @router.message(Command("resetgame"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_resetgame(message: Message) -> None:
     """Сброс игры — только для хранителя. Два режима:
     /resetgame confirm — всё с нуля, включая канон истории;
     /resetgame confirm keepstory — счёты чисты, но мир помнит прошлое."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     # Явный confirm снимает паузу сам: сброс под стоп-краном — осознанное
     # действие хранителя, а не ошибка, которую надо блокировать.
     changed, _delivered = await _set_paused_and_broadcast(message.bot, False)
@@ -284,6 +280,7 @@ async def cmd_resetgame(message: Message) -> None:
 
 
 @router.message(Command("backup"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_backup(message: Message) -> None:
     """Ручной снимок БД из Телеграма: репетиция восстановления, страховка.
 
@@ -291,9 +288,6 @@ async def cmd_backup(message: Message) -> None:
     GitHub Actions) — команда даёт снимок по требованию: перед ручными
     операциями и для репетиции восстановления на тестовом стенде.
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     await message.answer("⏳ Снимаю снимок базы…")
     try:
         from app.backups import backup_now
@@ -343,6 +337,7 @@ async def _resolve_player_arg(session, raw: str) -> int | None:
 
 
 @router.message(Command("dispute"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Только для хранителя игры.")
 async def cmd_dispute(message: Message) -> None:
     """Жалоба на итог дня. Хранителю доступны open/resolve/reject/compensate."""
     from app import disputes as dispute_mod
@@ -420,11 +415,9 @@ async def cmd_dispute(message: Message) -> None:
 
 
 @router.message(Command("disputes"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Только для хранителя игры.")
 async def cmd_disputes(message: Message) -> None:
     """Список открытых споров. Только для хранителя."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Только для хранителя игры.")
-        return
     from app import disputes as dispute_mod
 
     async with SessionLocal() as session:
@@ -571,15 +564,13 @@ async def _apply_adjustment(bot, direction: str, amount_nanotons: int | None, no
 
 
 @router.message(Command("adjust"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_adjust(message: Message) -> None:
     """Сверка казны: меню разбора расхождения баланса с ожиданиями БД.
 
     Кнопки закрывают расхождение целиком; точная сумма — аргументами:
     /adjust 1.3569 out «вывод на биржу».
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     parts = (message.text or "").split()
     if len(parts) >= 3 and parts[2].lower() in {"out", "in", "loss"}:
         try:
@@ -605,6 +596,7 @@ async def cmd_adjust(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("adj:"))
+@require_admin("Сверка только для хранителя.")
 async def on_adjust_action(callback: CallbackQuery) -> None:
     """Кнопки сверки казны: первый тап предупреждает, второй — делает.
 
@@ -612,9 +604,6 @@ async def on_adjust_action(callback: CallbackQuery) -> None:
     а не в памяти процесса: два инстанса бота видят один и тот же ожидающий
     тап, и второй тап подтверждает даже на другой реплике.
     """
-    if callback.from_user.id not in settings.admin_id_set:
-        await callback.answer("Сверка только для хранителя.", show_alert=True)
-        return
     action = callback.data.split(":", 1)[1]
     if action not in {"out", "in", "loss"}:
         await callback.answer("Неизвестное действие.", show_alert=True)
@@ -659,11 +648,9 @@ async def on_adjust_action(callback: CallbackQuery) -> None:
 
 
 @router.message(Command("finalize"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_finalize(message: Message) -> None:
     """Ручная финализация ставок застрявших дней: /finalize или /finalize 40"""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     from app.stakes import finalize_day_payouts
     from app.ton_pay import dispatch_pending_payouts
 
@@ -768,12 +755,10 @@ async def cmd_finalize(message: Message) -> None:
 
 
 @router.message(Command("refinalize"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_refinalize(message: Message) -> None:
     """Принудительная перефинализация: сбрасывает finalized, помечает старые
     невыполненные выплаты dismissed, пересоздаёт всё заново. /refinalize 1"""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
 
     from app.stakes import finalize_day_payouts
     from app.ton_pay import dispatch_lock, dispatch_pending_payouts
@@ -870,11 +855,9 @@ async def cmd_refinalize(message: Message) -> None:
 
 
 @router.message(Command("pause"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_pause(message: Message) -> None:
     """Стоп-кран: дни замирают, входящие переводы автоматически возвращаются."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     words = (message.text or "").split(maxsplit=1)
     reason = words[1].strip()[:200] if len(words) > 1 else "идут технические работы"
     changed, delivered = await _set_paused_and_broadcast(message.bot, True, reason)
@@ -892,11 +875,9 @@ async def cmd_pause(message: Message) -> None:
 
 
 @router.message(Command("resume"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
 async def cmd_resume(message: Message) -> None:
     """Снимает стоп-кран: следующий тик откроет новый день сам."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     changed, delivered = await _set_paused_and_broadcast(message.bot, False)
     if not changed:
         await message.answer("Игра и так идёт.")

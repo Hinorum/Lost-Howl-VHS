@@ -20,6 +20,8 @@ def _sqlite_connect_args() -> dict:
     return {"timeout": 30}
 
 
+_IS_SQLITE = settings.async_database_url.startswith("sqlite")
+
 engine = create_async_engine(
     settings.async_database_url,
     echo=False,
@@ -29,9 +31,8 @@ engine = create_async_engine(
     # исчерпывались на пике закрытия дня, и следующий checkout ждал молча.
     # pool_timeout 60 с > 30 с дефолта: вместо тихого ожидания — внятный
     # TimeoutError, который видно в логах и тревогах.
-    pool_size=10,
-    max_overflow=20,
-    pool_timeout=60,
+    # SQLite (StaticPool) не принимает pool-параметры — только для Postgres.
+    **({} if _IS_SQLITE else {"pool_size": 10, "max_overflow": 20, "pool_timeout": 60}),
     # Пулеры (Supabase/pgbouncer) закрывают простаивающие серверные соединения
     # по server_lifetime (~15 мин у Supabase; поверх этого копятся «Idle session
     # timeout»). Пересоздаём нашу сторону явно и раньше — 900 с < 15 мин — чтобы
@@ -40,7 +41,7 @@ engine = create_async_engine(
     pool_recycle=900,
     connect_args=(
         _sqlite_connect_args()
-        if settings.async_database_url.startswith("sqlite")
+        if _IS_SQLITE
         else postgres_connect_args(settings.database_url)
     ),
 )

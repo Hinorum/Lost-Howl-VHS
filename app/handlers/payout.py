@@ -21,7 +21,7 @@ from app.models import Income, Payout, Player, Round, Stake
 from app.style import money_mark, ok_mark, warn_mark
 from app.ton_utils import friendly_address, from_nano, normalize_address
 
-from .common import router
+from .common import require_admin, router
 
 logger = logging.getLogger(__name__)
 
@@ -155,15 +155,14 @@ async def _refunds_panel_text() -> str:
 
 
 @router.message(Command("payouts"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_payouts(message: Message) -> None:
     """Очередь выплат для хранителя: что не ушло и почему."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     await message.answer(await _payouts_text())
 
 
 @router.message(Command("halt-payouts"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_halt_payouts(message: Message) -> None:
     """Kill switch: остановить отправку исходящих выплат. /halt-payouts [причина].
 
@@ -178,9 +177,6 @@ async def cmd_halt_payouts(message: Message) -> None:
     команду. Подтверждения уже ушедших переводов при этом не останавливаются
     — иначе судьба in-flight выплат осталась бы неизвестной навсегда.
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     from app.ops import set_payouts_halted
 
     words = (message.text or "").split(maxsplit=1)
@@ -202,11 +198,9 @@ async def cmd_halt_payouts(message: Message) -> None:
 
 
 @router.message(Command("resume-payouts"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_resume_payouts(message: Message) -> None:
     """Снять kill switch /halt-payouts и разпустить очередь обратно."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     from app.ops import set_payouts_halted
 
     async with SessionLocal() as session:
@@ -424,6 +418,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
 
 
 @router.message(Command("payout"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_payout(message: Message) -> None:
     """Ручной разбор одной выплаты: /payout <id> spam confirm|retry.
 
@@ -435,9 +430,6 @@ async def cmd_payout(message: Message) -> None:
     см. _payout_test): та же защита «только хранитель», но деньги движутся
     только по явному confirm.
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     raw = (message.text or "").split()
     if len(raw) > 1 and raw[1].lower() == "test":
         await _payout_test(message, raw[2:])
@@ -480,11 +472,9 @@ async def cmd_payout(message: Message) -> None:
 
 
 @router.message(Command("return"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_return(message: Message) -> None:
     """Ручной возврат «не засчитанной» ставки хранителем: /return <id>."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer(
@@ -508,12 +498,10 @@ async def cmd_return(message: Message) -> None:
 
 
 @router.message(Command("treasury"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_treasury(message: Message) -> None:
     """Здоровье казначея одним сообщением: адрес, мнемоника, баланс,
     сверка пары мнемоника/адрес, очередь выплат. Только для хранителя."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     from app.ton_pay import treasury_diagnostics
 
     try:
@@ -524,6 +512,7 @@ async def cmd_treasury(message: Message) -> None:
 
 
 @router.message(Command("fundout"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_fundout(message: Message) -> None:
     """Записать ручную раздачу Фонда Стаи в журнал (аудит, не двигает деньги).
 
@@ -531,9 +520,6 @@ async def cmd_fundout(message: Message) -> None:
     здесь фиксируется <сумма> и <зачем>, а баланс фонда уменьшается, чтобы
     прозрачный журнал и цифра фонда оставались честными. Только для хранителя.
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     args = message.text.split()
     if len(args) < 3:
         await message.answer("Формат: /fundout <Gram> <причина. Что купили/разыграли>")
@@ -612,15 +598,13 @@ async def _revenue_text() -> str:
 
 
 @router.message(Command("incoming"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_incoming(message: Message) -> None:
     """Журнал входящих переводов казначея: откуда, сколько, чем стало.
 
     Только для хранителя. Источник — Income-леджер, куда watcher пишет
     каждый поступивший перевод (идемпотентно по хешу транзакции).
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
 
     async with SessionLocal() as session:
         rows = (
@@ -656,11 +640,9 @@ async def cmd_incoming(message: Message) -> None:
 
 
 @router.message(Command("stakes"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_stakes(message: Message) -> None:
     """Все ставки текущего и вчерашнего дня: статус каждой."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     async with SessionLocal() as session:
         latest = (
             await session.execute(
@@ -695,23 +677,19 @@ async def cmd_stakes(message: Message) -> None:
 
 
 @router.message(Command("revenue"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_revenue(message: Message) -> None:
     """Касса игры для хранителя: ledger доходов из Income.
 
     Звёзды сверяются с балансом бота во Fragment, Gram — с историей казны.
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     await message.answer(await _revenue_text())
 
 
 @router.message(Command("blockchain"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_blockchain(message: Message) -> None:
     """Аудит блокчейн-контура: watcher, очередь выплат, казна, сверка истории."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     from app.ton_pay import blockchain_diagnostics
 
     try:
@@ -722,6 +700,7 @@ async def cmd_blockchain(message: Message) -> None:
 
 
 @router.message(Command("mirror"), F.chat.type == ChatType.PRIVATE)
+@require_admin()
 async def cmd_mirror(message: Message) -> None:
     """Пересборка зеркала казны: /mirror reset confirm.
 
@@ -729,9 +708,6 @@ async def cmd_mirror(message: Message) -> None:
     от головы к генезису и перепроверит тождество «Σ = баланс». Лекарство от
     глубокого рассинхрона (сбои индексаторов, реорги вглубь истории).
     """
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Команда только для хранителя игры.")
-        return
     if message.text.split()[1:] != ["reset", "confirm"]:
         await message.answer(
             "Пересборка зеркала казны: /mirror reset confirm\n"

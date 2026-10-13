@@ -19,11 +19,10 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from app.config import settings
 from app.ops import problems_snapshot, snapshot
 from app.style import ok_mark, warn_mark
 
-from .common import router
+from .common import require_admin, router
 
 # Снимок старше этого — сигнатура о том, что молчит сама проверка, а не игрок.
 _STALE_SWEEP_AFTER = 600.0
@@ -156,11 +155,9 @@ def _round_line(data: dict) -> str:
 
 
 @router.message(Command("ops"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Пульт — только для хранителя.")
 async def cmd_ops(message: Message) -> None:
     """Пульт: что сломано прямо сейчас, одним сообщением."""
-    if message.from_user is None or message.from_user.id not in settings.admin_id_set:
-        await message.answer("Пульт — только для хранителя.")
-        return
     try:
         await message.answer(await _ops_diag_text())
     except Exception as exc:

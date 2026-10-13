@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import wraps
+from typing import Any
 
 from aiogram import Router
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import RoundStatus, WalletDialog
 from app.rounds import ensure_current_round, get_active_round
@@ -16,6 +20,34 @@ from app.rounds import ensure_current_round, get_active_round
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+def require_admin(denial: str = "Команда только для хранителя игры.") -> Callable:
+    """Гейт хранителя для Message- и CallbackQuery-хендлеров.
+
+    Не-админ получает отказ (message.answer / callback.answer с alert)
+    и хендлер не вызывается. Заменяет дублирующиеся проверки
+    `message.from_user is None or message.from_user.id not in settings.admin_id_set`.
+    """
+
+    def decorator(handler: Callable) -> Callable:
+        @wraps(handler)
+        async def wrapper(event: Message | CallbackQuery, *args: Any, **kwargs: Any) -> Any:
+            user = getattr(event, "from_user", None)
+            if user is None or user.id not in settings.admin_id_set:
+                # CallbackQuery имеет data и answer(show_alert=True);
+                # Message — только answer(text). isinstance не подходит,
+                # тесты передают SimpleNamespace.
+                if getattr(event, "data", None) is not None:
+                    await event.answer(denial, show_alert=True)
+                else:
+                    await event.answer(denial)
+                return None
+            return await handler(event, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 # Диалог привязки кошелька живёт 15 минут: начал — сразу пришли адрес.
 # Дольше открытую «сессию» считаем забытой, чтобы случайное сообщение
