@@ -220,3 +220,15 @@ async def test_orphan_column_drop_is_flag_gated(tmp_path, monkeypatch) -> None:
             assert not await conn.run_sync(_column_exists), "flag on обязан удалить колонку"
     finally:
         await async_engine.dispose()
+
+
+def test_engine_pool_timeout_is_sized_for_parallel_tasks() -> None:
+    """pool_timeout ≥ 60 с: дефолтные 30 с не покрывают пик закрытия дня.
+
+    Тик, диспетчер, watch, бэкап и вебхук держат соединения одновременно;
+    при исчерпании пула checkout ждал молча 30 с и умирал по TimeoutError
+    без контекста. 60 с > 30 с дефолта — внятная ошибка в логах.
+    """
+    pool = db.engine.pool
+    assert getattr(pool, "_timeout", None) is not None, "pool_timeout обязан быть задан"
+    assert pool._timeout >= 60, "pool_timeout должен быть ≥ 60 с"

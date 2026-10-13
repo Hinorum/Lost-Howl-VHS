@@ -38,9 +38,9 @@ async def _reset_retriable(session, network: str) -> None:
       pending, не подходит под WHERE — повторный запуск no-op;
     - предикат attempts<max — тоже в UPDATE: лимит попыток проверяется
       гонке двух UPDATE'ов атомарно (один пишет, второй уже не видит).
-    Это страховка на пару с FOR UPDATE SKIP LOCKED в claim_retry_loop:
-    двойная отправка закрывается целиком (lock на claim + атомарный
-    reset).
+    Это страховка на пару с условным UPDATE-клеймом в dispatch_pending_payouts
+    (WHERE status='pending' перед переводом в sending): двойная отправка
+    закрывается целиком (атомарный клейм + атомарный reset).
     """
     cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(
         seconds=settings.payout_send_timeout_seconds + 30

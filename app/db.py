@@ -24,6 +24,14 @@ engine = create_async_engine(
     settings.async_database_url,
     echo=False,
     pool_pre_ping=True,
+    # Пул 10+20 вместо дефолтных 5+10: параллельные задачи (тик, диспетчер,
+    # watch, бэкап, вебхук) держат соединения одновременно; 15 слотов
+    # исчерпывались на пике закрытия дня, и следующий checkout ждал молча.
+    # pool_timeout 60 с > 30 с дефолта: вместо тихого ожидания — внятный
+    # TimeoutError, который видно в логах и тревогах.
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=60,
     # Пулеры (Supabase/pgbouncer) закрывают простаивающие серверные соединения
     # по server_lifetime (~15 мин у Supabase; поверх этого копятся «Idle session
     # timeout»). Пересоздаём нашу сторону явно и раньше — 900 с < 15 мин — чтобы
