@@ -22,6 +22,7 @@ from app.ton_codec import api_headers
 
 from . import state
 from . import wallet as _wallet_pkg
+from .cell import _comment_cell  # noqa: F401 — re-export для совместимости
 
 logger = logging.getLogger(__name__)
 
@@ -158,13 +159,6 @@ async def _http_broadcast_external(wallet, seqno: int, internal_msg) -> None:
     if response.status_code != 200 or not data.get("ok"):
         reason = str((data.get("error") if isinstance(data, dict) else None) or response.text)
         raise RuntimeError(f"Toncenter не принял сообщение ({response.status_code}): {reason[:160]}")
-
-
-def _comment_cell(text: str):
-    """Memo-ячейка для исходящего сообщения: 32-битный нулевой op + utf8 текст."""
-    from pytoniq_core import begin_cell
-
-    return begin_cell().store_uint(0, 32).store_string(text[:120]).end_cell()
 
 
 async def _send_ton_transfer_http(dest_address: str, amount_nanotons: int, comment: str) -> str:

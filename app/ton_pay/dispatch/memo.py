@@ -5,18 +5,9 @@ from __future__ import annotations
 
 import logging
 
+from ..cell import _comment_cell  # noqa: F401 — re-export для send.py
+
 logger = logging.getLogger(__name__)
-
-def _comment_cell(text: str):
-    """Memo-ячейка для исходящего сообщения: 32-битный нулевой op + utf8 текст.
-
-    Текст усекается до 120 символов: ячейка v3 стандарта TON-комментария.
-    Дубликат http_channel._comment_cell — оставлен локально, чтобы диспетчер
-    не тянул импорт из соседнего модуля ради одного хелпера.
-    """
-    from pytoniq_core import begin_cell
-
-    return begin_cell().store_uint(0, 32).store_string(text[:120]).end_cell()
 
 def _payout_comment_candidates(payout) -> list[str]:
     """Все комментарии, которыми эта выплата МОГЛА уйти в цепочку.
