@@ -1,0 +1,15 @@
+# Контракты импортной архитектуры. Запуск: lint-imports
+# Цель — ловить циклы и нарушения слоёв ДО рантайма, а не в traceback'е.
+
+[importlinter]
+root_package = app
+include_external_packages = False
+
+# Контракт 1: пакет app не должен содержать циклов.
+# layers с одной слоем = «любой модуль app может импортировать любой другой,
+# но без циклов»: сам разбор графа ловит цикл и валит контракт.
+[importlinter:contract:1]
+name = Нет циклических импортов в app
+type = layers
+layers =
+    app

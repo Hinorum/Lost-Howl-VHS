@@ -37,6 +37,10 @@ jobs:
         run: python -m scripts.dependency_hashes
       - name: Lint (runtime errors only)
         run: python -m ruff check .
+      # Контракты импортной архитектуры: циклы и нарушения слоёв ловятся
+      # здесь, а не в traceback'е на проде. Конфиг: .importlinter.
+      - name: Import contracts
+        run: lint-imports
       # Кассета — JSON, который читается только в рантайме: сломанная схема
       # всплыла бы в первый же день месяца, при открытии дня, а не на пуше.
       # lint валит только ошибки схемы; накопленные замечания (ротация,
