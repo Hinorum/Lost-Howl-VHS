@@ -140,3 +140,43 @@ async def test_refinalize_refuses_when_any_payout_moved(monkeypatch, payout_stat
         await session.execute(delete(Payout).where(Payout.round_id == round_id))
         await session.execute(delete(Round).where(Round.id == round_id))
         await session.commit()
+
+
+async def test_refinalize_does_not_dismiss_refund(monkeypatch) -> None:
+    """Refund-выплата переживает /refinalize: ставка уже refunded, повторная
+    финализация её claim'ом (WHERE status IN pending/rejected) не берёт —
+    новый refund не создаётся. Гашение старого = деньги игрока в никуда."""
+    monkeypatch.setattr(settings, "admin_ids", "4242")
+    async with SessionLocal() as session:
+        round_id = await _seed_closed_round(session, 423, payout_status="pending")
+        # Вторая строка — refund: в реальности её создал либо первый прогон
+        # finalize_day_payouts, либо ручной /return (create_manual_refund).
+        session.add(
+            Payout(
+                round_id=round_id,
+                player_id=7,
+                kind="refund",
+                amount_nanotons=500_000_000,
+                dest_address="0:" + "22" * 32,
+                status="pending",
+            )
+        )
+        await session.commit()
+
+    msg = make_message(4242, 423)
+    await cmd_refinalize(msg)
+
+    async with SessionLocal() as session:
+        row = await session.get(Round, round_id)
+        payout_q = await session.execute(select(Payout).where(Payout.round_id == round_id))
+        by_kind = {p.kind: p.status for p in payout_q.scalars().all()}
+    # Приз гасится (пересоздастся), refund — нет.
+    assert by_kind["prize"] == "dismissed"
+    assert by_kind["refund"] == "pending", (
+        "refund обязан пережить /refinalize — иначе возврат игроку теряется"
+    )
+    assert row.payouts_finalized is True
+    async with SessionLocal() as session:
+        await session.execute(delete(Payout).where(Payout.round_id == round_id))
+        await session.execute(delete(Round).where(Round.id == round_id))
+        await session.commit()

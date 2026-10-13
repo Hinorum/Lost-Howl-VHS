@@ -825,10 +825,16 @@ async def cmd_refinalize(message: Message) -> None:
                     "Разберись с ушедшим через /treasury или /adjust."
                 )
                 return
+            # Гасим только то, что финализация пересоздаст заново: призы,
+            # rake, pot, referral. Refund НЕ гасим — ставка уже refunded,
+            # условный claim (WHERE status IN pending/rejected) не пройдёт,
+            # и возврат потерялся бы навсегда. Manual-refund (/return) —
+            # та же история: payout создан вне финализации, пересоздания нет.
             stale_q = await session.execute(
                 select(Payout).where(
                     Payout.round_id == row.id,
                     Payout.status.notin_(["sent", "sending"]),
+                    Payout.kind != "refund",
                 )
             )
             stale = list(stale_q.scalars().all())
