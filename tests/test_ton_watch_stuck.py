@@ -116,7 +116,7 @@ async def test_heal_auto_refunds_after_repeated_failures(
     monkeypatch.setattr(settings, "refund_min_gram", 0.05)
 
     # process_transfer теперь всегда падает — как баг версии, который не починили.
-    async def _boom(*_args, **_kwargs):  # noqa: ANN002, ANN003
+    async def _boom(*_args, **_kwargs):
         raise RuntimeError("вечный баг версии")
 
     monkeypatch.setattr(tw, "process_transfer", _boom)

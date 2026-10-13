@@ -22,7 +22,7 @@ from app.ton_codec import api_headers
 
 from . import state
 from . import wallet as _wallet_pkg
-from .cell import _comment_cell  # noqa: F401 — re-export для совместимости
+from .cell import _comment_cell
 
 logger = logging.getLogger(__name__)
 

@@ -197,7 +197,7 @@ async def _has_alembic_history() -> bool:
                 return rows is not None
 
             return bool(await conn.run_sync(_probe))
-    except Exception as exc:  # noqa: BLE001 — не смогли понять, значит считаем managed
+    except Exception as exc:
         logger.warning("Не удалось прочитать alembic_version: %s", exc)
         return True
 
