@@ -11,6 +11,6 @@ def _message_handler_names() -> list[str]:
 def test_private_fallback_is_last_message_handler() -> None:
     names = _message_handler_names()
     assert names[-1] == on_private_fallback.__name__
-    for command in ("cmd_help", "cmd_start", "cmd_today", "cmd_menu", "cmd_wallet"):
+    for command in ("cmd_start", "cmd_today", "cmd_wallet", "cmd_invite"):
         assert command in names
         assert names.index(command) < names.index(on_private_fallback.__name__)

@@ -12,7 +12,7 @@ def _by_data(markup):
 
 
 def test_menu_keyboard_covers_daily_actions() -> None:
-    kb = _by_data(_menu_keyboard("🔔 Итоги в личку: ВКЛ"))
+    kb = _by_data(_menu_keyboard())
     assert kb["menu:today"] == "▶️ Сегодня"
     assert kb["score:view"] == "⭐ Карточка Стаи"
     assert "rank:view" not in kb
@@ -20,15 +20,16 @@ def test_menu_keyboard_covers_daily_actions() -> None:
     assert kb["stake:view"] == "💸 Ставка"
     assert kb["menu:top"] == "🏆 Копилки"
     assert kb["menu:fund"] == "🐾 Фонд"
-    assert kb["menu:help"] == "❓ Помощь"
-    label = kb["dm:toggle"]
-    assert label.startswith("🔔") or label.startswith("🔕")
+    # Кнопки-дублёры /start сняты владельцем: «Итоги в личку» (Telegram
+    # сам умеет отключать уведомления) и «Помощь» (дублировала /start).
+    assert "menu:help" not in kb
+    assert "dm:toggle" not in kb
 
 
-def test_menu_keyboard_toggle_label_flows_through() -> None:
-    kb = _by_data(_menu_keyboard("🔕 Итоги в личку: ВЫКЛ"))
-    assert kb["dm:toggle"] == "🔕 Итоги в личку: ВЫКЛ"
-
-
-def test_commands_help_mentions_remote_control() -> None:
-    assert any("/menu" in line for line in _commands_help())
+def test_commands_help_mentions_start_and_invite() -> None:
+    lines = _commands_help()
+    assert any("/start" in line for line in lines)
+    assert any("/invite" in line for line in lines)
+    assert not any("/help" in line for line in lines)
+    assert not any("/menu" in line for line in lines)
+    assert not any("/referral" in line for line in lines)

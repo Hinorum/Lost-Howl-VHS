@@ -8,7 +8,6 @@ from datetime import UTC, datetime, timedelta
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -22,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from app.broadcast import POSITIONS, cards_keyboard, scene_label, status_text
 from app.config import settings
 from app.db import SessionLocal
-from app.models import LeaderboardClaim, Player, RoundStatus
+from app.models import LeaderboardClaim, RoundStatus
 from app.rounds import get_active_round, get_latest_round
 from app.style import (
     day_mark,
@@ -40,11 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 def _commands_help() -> list[str]:
-    """Справочный блок команд — общий для /start и /help."""
+    """Справочный блок команд — общий для /start."""
     lines = [
         "<b>Команды Стаи</b>",
         "/start — вставить кассету: как играть и памятка",
-        f"/menu — пульт {settings.world_name}: всё по кнопкам",
         "/today — кадр дня: варианты и выбор",
         "/score — карточка Стаи: титул, серия и голоса за неделю и месяц",
         "/rank — карточка Стаи (то же, что /score)",
@@ -70,79 +68,18 @@ def _commands_help() -> list[str]:
         lines.append(
             f"\n💰 Фонд дня: {_pct_text(pool_pct)}% — поставившим на верную сцену; остальное — "
             "Фонд Стаи, копилки недели и месяца (/top), хранителю и пригласившим "
-            f"({_pct_text(settings.referral_pct)}%, см. /referral). Подробности: /stake."
+            f"({_pct_text(settings.referral_pct)}%, см. /invite). Подробности: /stake."
         )
-    lines += [
-        "/invite — позвать в стаю по личной ссылке",
-        "/referral — твоя награда за приведённых",
-        "/help — эта памятка",
-    ]
+    lines.append("/invite — позвать в стаю: ссылка и награда за приведённых")
     return lines
 
 
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    """Памятка команд с пультом вместо слепого меню."""
-    lines = [f"{day_mark(str(message.from_user.id))} <b>{settings.world_name}</b>", ""]
-    lines.extend(_commands_help())
-    label = (
-        await _dm_toggle_label(message.from_user.id)
-        if message.from_user is not None
-        else "🔔 Итоги в личку: ВКЛ"
-    )
-    await message.answer(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_menu_keyboard(label),
-    )
-
-
-@router.message(Command("menu"))
-async def cmd_menu(message: Message) -> None:
-    """Пульт LOST HOWL: все действия дня по кнопкам."""
-    uid = str(message.from_user.id) if message.from_user else "0"
-    label = (
-        await _dm_toggle_label(message.from_user.id)
-        if message.from_user is not None
-        else "🔔 Итоги в личку: ВКЛ"
-    )
-    await message.answer(
-        f"{day_mark(uid)} <b>Пульт {settings.world_name}</b>\n\n"
-        "Всё по кнопкам: кадр дня, твой счёт, кошелёк — одним нажатием. "
-        "Вариант дня выбираешь кнопкой под кадром.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_menu_keyboard(label),
-    )
-
-
-@router.message(Command("invite"))
+@router.message(Command("invite", "referral"))
 async def cmd_invite(message: Message) -> None:
-    """Личная ссылка приглашения ?start=ref_<id>_<токен> и счётчик приведённых."""
-    if message.chat.type != ChatType.PRIVATE:
-        return
-    caller = message.from_user
-    if caller is None:
-        return
-    from app.referrals import invited_count, referral_link, resolve_bot_username
+    """Личная ссылка приглашения, счётчик приведённых и копилка наград.
 
-    username = await resolve_bot_username(getattr(message, "bot", None))
-    link = referral_link(caller.id, username)
-    if not link:
-        await message.answer("🧭 Приглашения в стаю пока не открыты — приходи чуть позже.")
-        return
-    count = await invited_count(caller.id)
-    await message.answer(
-        f"🐾 Твоя личная ссылка в стаю:\n{link}\n\n"
-        "Кто придёт по ней — тот войдёт следом за тобой. "
-        f"Приведено всего: {count}.\n"
-        "📼 За каждую подтверждённую ставку приведённого награда пишется "
-        f"на твою плёнку — баланс: /referral."
-    )
-
-
-@router.message(Command("referral"))
-async def cmd_referral(message: Message) -> None:
-    """Реферальная награда игрока: ссылка, приведённые и накопленный баланс."""
+    Команда /referral — тот же хендлер: обе вели на одну страницу, объединены.
+    """
     if message.chat.type != ChatType.PRIVATE:
         return
     caller = message.from_user
@@ -175,8 +112,9 @@ async def cmd_referral(message: Message) -> None:
         status = f"🌸 До выплаты не хватает {need:g} Gram — копилка докапает с новых ставок."
     earned = from_nano(balance)
     await message.answer(
-        f"🎞 <b>Твоя плёнка наград</b>\n\n"
+        f"🐾 <b>Твоя плёнка наград</b>\n\n"
         f"Ссылка в стаю:\n{link}\n\n"
+        "Кто придёт по ней — тот войдёт следом за тобой.\n"
         f"Приведено: {count}\n"
         f"В копилке: {earned:g} Gram "
         f"(автовыплата от {settings.referral_min_payout_gram:g} Gram)\n\n"
@@ -265,7 +203,7 @@ async def _record_start_referral(session, message: Message) -> None:
         logging.getLogger(__name__).exception("Реферальный переход не записан")
 
 
-def _menu_keyboard(toggle_label: str) -> InlineKeyboardMarkup:
+def _menu_keyboard() -> InlineKeyboardMarkup:
     """Пульт LOST HOWL: кнопки-действия вместо вызова команд слепым меню.
 
     Сами действия — уже существующие колбэки, где их хватает (карточка
@@ -284,24 +222,8 @@ def _menu_keyboard(toggle_label: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏆 Копилки", callback_data="menu:top"),
             InlineKeyboardButton(text="🐾 Фонд", callback_data="menu:fund"),
         ],
-        [
-            InlineKeyboardButton(text=toggle_label, callback_data="dm:toggle"),
-            InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help"),
-        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def _dm_toggle_label(uid: int) -> str:
-    """Подпись кнопки личных рассылок по состоянию игрока."""
-    async with SessionLocal() as session:
-        player = await session.get(Player, uid)
-    subscribed = bool(getattr(player, "dm_subscribed", True))
-    return (
-        "🔔 Итоги в личку: ВКЛ"
-        if subscribed
-        else "🔕 Итоги в личку: ВЫКЛ"
-    )
 
 
 async def _start_keyboard(session, player) -> InlineKeyboardMarkup:
@@ -311,13 +233,7 @@ async def _start_keyboard(session, player) -> InlineKeyboardMarkup:
     места закрытого периода, пока окно заявок открыто (приз ещё не роздан).
     Остальным кнопка не видна: заявлять нечего.
     """
-    subscribed = bool(getattr(player, "dm_subscribed", True))
-    label = (
-        "🔔 Итоги в личку: ВКЛ"
-        if subscribed
-        else "🔕 Итоги в личку: ВЫКЛ"
-    )
-    markup = _menu_keyboard(label)
+    markup = _menu_keyboard()
     buttons: list[InlineKeyboardButton] = []
     if settings.leaderboard_claim_enabled:
         from app.leaderboard import _claim_window_players
@@ -332,32 +248,6 @@ async def _start_keyboard(session, player) -> InlineKeyboardMarkup:
         if buttons:
             markup.inline_keyboard.append(buttons)
     return markup
-
-
-@router.callback_query(F.data == "dm:toggle")
-async def on_dm_toggle(callback: CallbackQuery) -> None:
-    """Тумблер личной рассылки: единственный параметр — флаг dm_subscribed."""
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    async with SessionLocal() as session:
-        player = await upsert_player(session, callback.from_user)
-        subscribed = not bool(getattr(player, "dm_subscribed", True))
-        player.dm_subscribed = subscribed
-        await session.commit()
-        keyboard = await _start_keyboard(session, player)
-    if callback.message is not None:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=keyboard)
-        except TelegramBadRequest as exc:
-            # Клавиатуру могло не сменить (тот же набор) или сообщение устарело.
-            # Пользователь уже получил финальный ответ, повторять правку некуда.
-            logger.debug("Клавиатура подписок не обновилась: %s", exc)
-    await callback.answer(
-        "Итоги и анонсы снова приходят в личку." if subscribed
-        else "Личные рассылки отключены — играем только в группе.",
-        show_alert=True,
-    )
 
 
 @router.callback_query(F.data == "claim:week")
@@ -672,7 +562,6 @@ async def on_menu(callback: CallbackQuery) -> None:
         "wallet": _menu_wallet,
         "top": _menu_top,
         "fund": _menu_fund,
-        "help": _menu_help,
     }.get(action)
     if handler is None:
         await callback.answer()
@@ -747,22 +636,6 @@ async def _menu_fund(callback: CallbackQuery) -> None:
     from app.handlers.wallet import _fund_text
 
     await callback.message.answer(await _fund_text(), parse_mode=ParseMode.HTML)
-    await callback.answer()
-
-
-async def _menu_help(callback: CallbackQuery) -> None:
-    """❓ Помощь — памятка с пультом."""
-    if callback.message is None or callback.from_user is None:
-        await callback.answer()
-        return
-    lines = [f"{day_mark(str(callback.from_user.id))} <b>{settings.world_name}</b>", ""]
-    lines.extend(_commands_help())
-    label = await _dm_toggle_label(callback.from_user.id)
-    await callback.message.answer(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_menu_keyboard(label),
-    )
     await callback.answer()
 
 

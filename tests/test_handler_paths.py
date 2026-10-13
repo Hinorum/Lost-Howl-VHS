@@ -366,7 +366,7 @@ async def _wipe_rounds() -> None:
         await db.commit()
 
 
-async def test_menu_top_fund_help_render() -> None:
+async def test_menu_top_fund_render() -> None:
     await _wipe_rounds()
     callback = _menu_callback("menu:top")
     await on_menu(callback)
@@ -380,11 +380,12 @@ async def test_menu_top_fund_help_render() -> None:
     assert "Фонд Стаи" in fund_text
     assert kwargs.get("parse_mode") == "HTML"
 
+    # «Помощь» снята владельцем (дублировала /start): старый callback
+    # из старых сообщений гасится как неизвестный — ack без ответа.
     callback = _menu_callback("menu:help")
     await on_menu(callback)
-    (help_text,), kwargs = callback.message.answer.await_args
-    assert settings.world_name in help_text
-    assert kwargs.get("reply_markup") is not None
+    callback.answer.assert_awaited_once()
+    callback.message.answer.assert_not_awaited()
 
 
 async def test_menu_unknown_action_is_acknowledged() -> None:

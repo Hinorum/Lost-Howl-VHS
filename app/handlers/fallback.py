@@ -20,7 +20,7 @@ _FALLBACK_REGISTERED = False
 
 
 def register_private_fallback() -> None:
-    """Catch-all ЛС — строго после команд: иначе /help глотается молча.
+    """Catch-all ЛС — строго после команд: иначе /start глотается молча.
 
     Декоратор @router.message в этом модуле нельзя: isort поднимает
     `from .fallback` раньше player/wallet, и первый подходящий хендлер

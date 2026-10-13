@@ -1,5 +1,9 @@
 """Личная рассылка (DM): итоги, новый день с обложкой и вечерний пост дублируются
-в личку подписанным игрокам; отписка в /start уважается, флаг player_dm глушит всё."""
+в личку подписанным игрокам; флаг player_dm глушит всё.
+
+Кнопки-тумблера «Итоги в личку» больше нет (снята владельцем: у Telegram
+есть собственные уведомления бота). Флаг dm_subscribed остаётся в модели:
+по умолчанию True, отписка — только авто-отпиской заблокировавших бота."""
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -17,7 +21,6 @@ from app.broadcast import (
 )
 from app.config import settings
 from app.db import SessionLocal
-from app.handlers import on_dm_toggle
 from app.models import Card, Player, Round, RoundStatus, WinRule
 
 
@@ -154,30 +157,6 @@ async def test_evening_whisper_goes_to_players(tmp_path, monkeypatch) -> None:
     finally:
         for pid in (subscribed, muted):
             await _cleanup_player(pid)
-
-
-async def test_dm_toggle_flips_subscription() -> None:
-    """Кнопка в /start: отписанный снова получает рассылку и наоборот."""
-    pid = 88_151
-    await _add_player(pid, subscribed=False)
-    try:
-        callback = SimpleNamespace(
-            from_user=SimpleNamespace(id=pid, username=None, first_name="P"),
-            message=SimpleNamespace(edit_reply_markup=AsyncMock()),
-            answer=AsyncMock(),
-        )
-        await on_dm_toggle(callback)
-        callback.answer.assert_awaited()
-        alert = callback.answer.await_args.kwargs.get("show_alert")
-        assert alert is True
-        async with SessionLocal() as db:
-            player = await db.get(Player, pid)
-        assert player is not None and player.dm_subscribed is True
-
-        text = callback.answer.await_args.args[0]
-        assert "снова приходят" in text
-    finally:
-        await _cleanup_player(pid)
 
 
 async def test_active_player_ids_respects_flag() -> None:

@@ -57,8 +57,9 @@ BOT_DESCRIPTION = _bot_description()
 def _build_commands() -> tuple[list[BotCommand], list[BotCommand]]:
     """Меню отражает включённые механики: без ставок — без кошелька и /top.
 
-    Порядок логичный: онбординг, ежедневная игра, счёт, экономика, стая,
-    справка. В группе день живёт через /today; полная памятка — в /help.
+    Порядок логичный: онбординг, ежедневная игра, счёт, экономика, стая.
+    В группе день живёт через /today; полная памятка — в /start (и в списке
+    команд лички).
     """
     private = [
         BotCommand(command="start", description="Как играть: PLAY кассеты"),
@@ -76,13 +77,11 @@ def _build_commands() -> tuple[list[BotCommand], list[BotCommand]]:
             BotCommand(command="top", description="Копилки и лидеры"),
             BotCommand(command="fund", description="Фонд Стаи: баланс и журнал"),
         ]
-    private += [
-        BotCommand(command="invite", description="Позвать в стаю"),
-        BotCommand(command="help", description="Памятка команд"),
-    ]
+    private.append(
+        BotCommand(command="invite", description="Позвать в стаю: ссылка и награда")
+    )
     group = [
         BotCommand(command="today", description="Карты дня"),
-        BotCommand(command="help", description="Памятка команд"),
     ]
     return private, group
 

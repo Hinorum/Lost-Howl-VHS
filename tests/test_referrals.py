@@ -2,8 +2,8 @@
 
 Каждый игрок получает персональную ссылку ?start=ref_<id>_<токен>. Токен —
 HMAC от id на секрете: вписать чужой id нельзя. Первый валидный переход
-фиксируется один раз; наград пока нет — есть только факт приведения.
-"""
+фиксируется один раз; наград копятся в копилке (баланс показывает /invite,
+объединённый с бывшим /referral)."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -209,7 +209,7 @@ async def test_record_referral_disabled_without_secret(monkeypatch) -> None:
         assert await record_referral(session, a, b) is False
 
 
-async def test_invite_shows_link_and_invited_count(monkeypatch) -> None:
+async def test_invite_shows_link_count_and_pot(monkeypatch) -> None:
     referrer = next_uid()
     await _existing_player(referrer)
     for _ in range(2):
@@ -222,7 +222,9 @@ async def test_invite_shows_link_and_invited_count(monkeypatch) -> None:
     text = message.answer.call_args.args[0]
     assert "https://t.me/the_ways_bot?start=ref" in text
     assert str(referrer) in text
-    assert "Приведено всего: 2" in text
+    assert "Приведено: 2" in text
+    # Объединение с /referral: копилка наград показывается здесь же.
+    assert "В копилке:" in text
     assert await invited_count(referrer) == 2
 
 

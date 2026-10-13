@@ -26,7 +26,7 @@ app/
 │   └── registry.py      # Каталог плагинов (банки, копилки, переводы)
 │
 ├── handlers/            # Telegram-слой (aiogram Router-ы)
-│   ├── bootstrap.py     # /start, /help, deep-link, регистрация
+│   ├── bootstrap.py     # /start, deep-link, регистрация
 │   ├── common.py        # Базовые фильтры, локализация, форматтеры
 │   ├── player.py        # Голосование: callback «Путь I/II/III» → votes
 │   ├── topup.py         # Пополнение кошелька через бот
