@@ -37,6 +37,10 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
       • memo, которого НЕТ в истории дольше payout_confirm_timeout_seconds →
         строка возвращается в pending (перевод в цепочку не ушёл, анти-дубль
         при повторной отправке не сработает — мемо там нет);
+      • memo, которого НЕТ в истории, но sent_at старше
+        payout_reconcile_history_seconds → строка уходит в failed: за окном
+        сверки нельзя ни подтвердить, ни опровергнуть, а повторная отправка
+        рискует задублировать перевод;
       • карта истории пуста (оба провайдера молчат) → НЕ трогаем строки:
         «не знаю» не имеет права ни подтверждать, ни возвращать в очередь.
     """
@@ -78,10 +82,19 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                 return 0
             confirmed = 0
             requeued = 0
+            window_lost = 0
             # Сравнение в naive UTC: Postgres (timezone=True) вернёт aware,
             # SQLite — naive; снос tzinfo с обеих сторон даёт один масштаб.
             cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(
                 seconds=settings.payout_confirm_timeout_seconds
+            )
+            # Граница «не видно в окне сверки»: если sent_at старше неё,
+            # отсутствие memo в tx_map значит «не знаю, что в цепочке», а не
+            # «перевод не ушёл». Такие строки в очередь НЕ возвращаем:
+            # повтор отправил бы тот же memo второй раз (memo уникальный
+            # по payout_id), а деньги уже могли уйти в цепочке раньше.
+            window_cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+                seconds=settings.payout_reconcile_history_seconds
             )
             for payout in rows:
                 real_hash = next(
@@ -100,6 +113,19 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                 if sent_at is not None and sent_at > cutoff:
                     # Свежая вещация: блокчейн мог ещё не успеть — даём время.
                     continue
+                if sent_at is not None and sent_at <= window_cutoff:
+                    # За окном сверки: невозможно ни подтвердить, ни опровергнуть.
+                    # Возвращать в pending = риск дубля (memo может жить в цепочке
+                    # за пределами нашего покрытия). В failed с понятной причиной:
+                    # ручной разбор через /payouts → retry при подтверждённой доле.
+                    payout.status = "failed"
+                    payout.last_error = (
+                        f"memo «{_payout_comment_candidates(payout)[0][:40]}…» за окном сверки "
+                        f"{settings.payout_reconcile_history_seconds} с — нельзя подтвердить "
+                        "или опровергнуть, ручной разбор"
+                    )
+                    window_lost += 1
+                    continue
                 # memo нет в истории, окно верификации истекло — перевод не ушёл.
                 payout.status = "pending"
                 payout.attempts += 1
@@ -109,11 +135,16 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                 )
                 requeued += 1
             await session.commit()
-    if requeued:
-        logger.warning("Сверка: %d выплат подтверждены, %d возвращены в очередь для ретрая", confirmed, requeued)
+    if requeued or window_lost:
+        logger.warning(
+            "Сверка: %d подтверждены, %d возвращены в очередь, %d ушли за окно сверки (ручной разбор)",
+            confirmed,
+            requeued,
+            window_lost,
+        )
     elif confirmed:
         logger.info("Сверка: %d выплат подтверждены реальными хешами", confirmed)
-    return confirmed + requeued
+    return confirmed + requeued + window_lost
 
 async def _wait_for_broadcast_memo(candidates: set[str], seconds: float) -> bool:
     """Ждёт, пока memo перевода появится в истории исходящих казначея.

@@ -90,6 +90,7 @@ async def test_confirm_requeues_lost_transfer(monkeypatch) -> None:
         await _cleanup(payout_id)
 
 
+
 async def test_confirm_leaves_fresh_broadcast_alone(monkeypatch) -> None:
     """Свежая вещация (окно верификации не истекло) не трогается: блокчейн
     мог просто не успеть проиндексировать перевод."""
@@ -222,5 +223,86 @@ async def test_confirm_skips_rows_with_real_hash(monkeypatch) -> None:
         async with SessionLocal() as session:
             row = await session.get(Payout, payout_id)
         assert row.status == "sent" and row.tx_hash == "3" * 64
+    finally:
+        await _cleanup(payout_id)
+
+
+async def test_confirm_marks_window_elapsed_as_failed(monkeypatch) -> None:
+    """sent_at старше окна сверки и memo не в истории — НЕ pending, а failed.
+
+    Сценарий: бот лежал дольше окна сверки (по умолчанию 7 суток). При
+    подъёме memo старой строки нет в tx_map (за окном), и предыдущая логика
+    возвращала её в pending — диспетчер вещал тот же memo повторно, а в
+    цепочке деньги уже были. Теперь строка идёт в failed с понятной
+    причиной: ручной разбор через /payouts → retry только после сверки
+    админом, что перевод НЕ ушёл.
+    """
+    payout_id = await _seed_sent_payout()
+    # sent_at — за окном сверки: window_cutoff = now - reconcile_history_seconds.
+    async with SessionLocal() as session:
+        row = await session.get(Payout, payout_id)
+        row.sent_at = datetime.now(UTC) - timedelta(
+            seconds=settings.payout_reconcile_history_seconds + 3600
+        )
+        await session.commit()
+
+    async def fake_tx_map(**kwargs) -> dict[str, str]:
+        # Возвращаем НЕпустую карту: пустой словарь рано выйдет через
+        # `if not tx_map: return 0` ещё до тела цикла. Возвращаем memo
+        # чужой выплаты — наш таргет не совпадёт, и пойдём в ветку
+        # «за окном сверки».
+        return {"way:64:prize#999": "0" * 64}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+
+    try:
+        changed = await ton_pay.confirm_broadcast_payouts(bot=None)
+        assert changed == 1
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        # Не pending — иначе диспетчер отправит тот же memo повторно.
+        assert row.status == "failed", (
+            "за окном сверки строка должна идти в failed, не в pending"
+        )
+        assert "за окном сверки" in (row.last_error or "")
+        # attempts не растёт — повторной отправки не будет.
+        assert row.attempts == 0
+    finally:
+        await _cleanup(payout_id)
+
+
+async def test_confirm_still_requeues_within_window(monkeypatch) -> None:
+    """Регресс: сразу после payout_confirm_timeout (но В окне сверки) — re-queue.
+
+    Страховка от перетягивания ветки «за окном сверки»: случаи в окне
+    (sent_at моложе reconcile_history_seconds) должны идти в pending, как
+    раньше. Иначе мы заморозили бы все выплаты сразу после длительной
+    паузы, а это поломало бы автоматический ретрай.
+    """
+    payout_id = await _seed_sent_payout()
+    # sent_at — между confirm_timeout и reconcile_history.
+    async with SessionLocal() as session:
+        row = await session.get(Payout, payout_id)
+        row.sent_at = datetime.now(UTC) - timedelta(
+            seconds=settings.payout_confirm_timeout_seconds + 600
+        )
+        await session.commit()
+
+    async def fake_tx_map(**kwargs) -> dict[str, str]:
+        # Непустой, чтобы не словить `if not tx_map: return 0` выше тела
+        # цикла — там cancel проходит до ветки с проверкой окна.
+        return {"way:64:prize#other": "1" * 64}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+
+    try:
+        changed = await ton_pay.confirm_broadcast_payouts(bot=None)
+        assert changed == 1
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        # В окне сверки: re-queue как раньше.
+        assert row.status == "pending"
+        assert row.attempts >= 1
+        assert "не найдено в блокчейне" in (row.last_error or "")
     finally:
         await _cleanup(payout_id)
