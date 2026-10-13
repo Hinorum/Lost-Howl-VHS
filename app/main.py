@@ -422,13 +422,15 @@ async def _retry_scheduler_lock_loop(bot) -> None:
     цикла логируется, но не убивает задачу: один сбой БД не должен оставлять
     бот без игрового движка.
     """
-    from app.scheduler_lock import scheduler_lock_held
+    from app.scheduler_lock import verify_scheduler_lock
 
     while True:
-        if scheduler_lock_held():
+        if await verify_scheduler_lock():
             # Лок каким-то образом уже у процесса (гонка с основным boot_game
             # невозможна: create_task срабатывает только после неудачного acquire,
             # где _lock_conn остаётся None; защищаемся на всякий случай).
+            # verify_scheduler_lock пингует соединение: мёртвый лок сбрасывает
+            # ссылку и возвращает False — цикл перезахватит его.
             log.info("Фоновый retry лока: лок уже у процесса — выходим")
             return
         try:

@@ -174,3 +174,49 @@ async def test_real_postgres_lock_is_exclusive(pg_url: str) -> None:
             ).scalar() is True
     finally:
         await engine.dispose()
+
+
+async def test_verify_scheduler_lock_resets_on_dead_connection(monkeypatch) -> None:
+    """verify_scheduler_lock сбрасывает ссылку при мёртвом соединении.
+
+    scheduler_lock_held() проверяет только _lock_conn is not None: если
+    соединение умерло (сеть, pgbouncer, рестарт PG), лок уже свободен, но
+    процесс считает, что держит его — второй инстанс берёт лок, и оба тикают.
+    verify пингует соединение; при сбое ссылка сбрасывается.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    class _DeadConn:
+        async def execute(self, *_a, **_kw):
+            raise OperationalError("select 1", None, Exception("connection closed"))
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(slock, "_lock_conn", _DeadConn())
+    assert await slock.verify_scheduler_lock() is False
+    assert slock._lock_conn is None, "мёртвое соединение обязано сбросить ссылку"
+
+
+async def test_verify_scheduler_lock_keeps_live_connection(monkeypatch) -> None:
+    """Живое соединение: verify возвращает True и не трогает ссылку."""
+
+    class _LiveConn:
+        async def execute(self, *_a, **_kw):
+            class _R:
+                def scalar(self):
+                    return 1
+
+            return _R()
+
+    live = _LiveConn()
+    monkeypatch.setattr(slock, "_lock_conn", live)
+    assert await slock.verify_scheduler_lock() is True
+    assert slock._lock_conn is live
+
+
+async def test_verify_scheduler_lock_without_conn_on_sqlite(monkeypatch) -> None:
+    """SQLite: лок не поддерживается, verify без соединения — True."""
+    monkeypatch.setattr(slock, "_lock_conn", None)
+    monkeypatch.setattr("app.db.engine", type("e", (), {"dialect": type("d", (), {"name": "sqlite"})()})())
+    assert await slock.verify_scheduler_lock() is True

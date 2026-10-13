@@ -192,7 +192,7 @@ async def test_boot_game_yields_to_holder_of_scheduler_lock(monkeypatch) -> None
     monkeypatch.setattr(
         main_module, "acquire_scheduler_lock", AsyncMock(return_value=False)
     )
-    monkeypatch.setattr(scheduler_lock, "scheduler_lock_held", Mock(return_value=False))
+    monkeypatch.setattr(scheduler_lock, "verify_scheduler_lock", AsyncMock(return_value=False))
     # Делаем retry-цикл «мгновенным», чтобы он не висел в asyncio.sleep
     # и не предупреждал «Task was destroyed but it is pending!» после теста.
     monkeypatch.setattr(main_module, "_SCHEDULER_LOCK_RETRY_SECONDS", 0)
@@ -234,7 +234,7 @@ async def test_boot_game_retry_captures_lock_after_release(monkeypatch) -> None:
     monkeypatch.setattr(main_module, "tick", AsyncMock())
     monkeypatch.setattr(main_module, "apply_profile", AsyncMock())
     monkeypatch.setattr(scheduler, "boot_maintenance", AsyncMock())
-    monkeypatch.setattr(scheduler_lock, "scheduler_lock_held", Mock(return_value=False))
+    monkeypatch.setattr(scheduler_lock, "verify_scheduler_lock", AsyncMock(return_value=False))
     monkeypatch.setattr(main_module, "_SCHEDULER_LOCK_RETRY_SECONDS", 0)
     # install_bay() подменяет _plan_and_render в rendering и lifecycle глобально и
     # снимается только через uninstall_bay(). Этот тест доходит до реального
@@ -345,7 +345,7 @@ async def test_retry_loop_releases_lock_and_retries_after_boot_failure(monkeypat
     story_bay = importlib.import_module("app.story.bay")
     monkeypatch.setattr(main_module, "set_bot", Mock())
     monkeypatch.setattr(main_module, "_SCHEDULER_LOCK_RETRY_SECONDS", 0)
-    monkeypatch.setattr(scheduler_lock, "scheduler_lock_held", Mock(return_value=False))
+    monkeypatch.setattr(scheduler_lock, "verify_scheduler_lock", AsyncMock(return_value=False))
     monkeypatch.setattr(story_bay, "install_bay", Mock(return_value=True))
 
     # bootstrap падает на start_scheduler один раз, затем чинится —

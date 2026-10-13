@@ -25,6 +25,7 @@ SQLite (локальная разработка и весь тестовый п�
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from sqlalchemy import text
@@ -92,3 +93,32 @@ def scheduler_lock_held() -> bool:
     from app.db import engine
 
     return engine.dialect.name != "postgresql"
+
+
+async def verify_scheduler_lock() -> bool:
+    """Перепроверить, что лок всё ещё у процесса.
+
+    scheduler_lock_held() проверяет только факт наличия _lock_conn: если
+    соединение умерло (сбой сети, pgbouncer, рестарт PG), лок уже свободен,
+    но процесс считает, что держит его — второй инстанс берёт лок, и оба
+    тикают. Здесь соединение пингуется лёгким запросом; при сбое ссылка
+    сбрасывается, чтобы retry-цикл мог перезахватить лок.
+    """
+    global _lock_conn
+    if _lock_conn is None:
+        from app.db import engine
+
+        return engine.dialect.name != "postgresql"
+    try:
+        await _lock_conn.execute(text("select 1"))
+    except Exception:
+        logger.warning(
+            "Лок планировщика: соединение мертво — сбрасываю ссылку, "
+            "retry-цикл перезахватит лок",
+            exc_info=True,
+        )
+        with contextlib.suppress(Exception):
+            await _lock_conn.close()
+        _lock_conn = None
+        return False
+    return True
