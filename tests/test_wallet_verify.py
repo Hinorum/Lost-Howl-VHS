@@ -121,6 +121,9 @@ async def test_bind_under_money_requires_verification(ton_on) -> None:
     message = make_message(uid, f"/wallet {address}")
     await cmd_wallet(message)
     text = message.answer.call_args.args[0]
+    assert message.answer.call_args.kwargs.get("parse_mode") is not None, (
+        "привязка без parse_mode покажет сырые <code> теги"
+    )
     async with SessionLocal() as session:
         player = await session.get(Player, uid)
         assert player.wallet_address == normalize_address(address)

@@ -329,7 +329,7 @@ async def _bind_wallet(message: Message, address: str) -> bool:
             "игра идёт голосами."
         )
     if message.chat.type == ChatType.PRIVATE:
-        await message.answer(confirmation)
+        await message.answer(confirmation, parse_mode=ParseMode.HTML)
     else:
         # Без деталей: сам адрес уже засветился в сообщении группы.
         await message.answer(f"{ok_mark('group')} Кошелёк привязан (детали — в личке у бота).")
