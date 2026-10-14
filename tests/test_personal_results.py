@@ -47,19 +47,19 @@ def _payout(kind: str, amount: int) -> SimpleNamespace:
 
 
 def test_scene_label_includes_title(monkeypatch) -> None:
-    assert scene_label(_CARDS, 1) == "II. «Маяк»"
+    assert scene_label(_CARDS, 1) == "«Маяк»"
     assert scene_label({0: "Казарма"}, 2) == "III"
 
 
 def test_scene_label_escapes_html(monkeypatch) -> None:
-    assert scene_label({0: "Крыша <настоящая>"}, 0) == "I. «Крыша &lt;настоящая&gt;»"
+    assert scene_label({0: "Крыша <настоящая>"}, 0) == "«Крыша &lt;настоящая&gt;»"
 
 
 def test_build_win_prize(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", True)
     text = _build_player_result_text(_round(1, winner=1), _CARDS, 1, _stake(), [_payout("prize", 4_750_000_000)])
     assert "Ты угадал сцену дня!" in text
-    assert "II. «Маяк»" in text
+    assert "«Маяк»" in text
     assert "0.5 Gram в выигрыш: +4.75 Gram" in text
 
 
@@ -67,7 +67,7 @@ def test_build_loss_refund(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", True)
     text = _build_player_result_text(_round(2, winner=1), _CARDS, 0, _stake(), [_payout("refund", 495_000_000)])
     assert "Твоя сцена не победила" in text
-    assert "I. «Казарма»" in text
+    assert "«Казарма»" in text
     assert "0.5 Gram возвращается: 0.495 Gram" in text
 
 
@@ -187,7 +187,7 @@ async def test_player_result_texts_honors_db(monkeypatch) -> None:
     texts = dict(await _player_result_texts(round_row))
     assert pid_win in texts and pid_muted not in texts
     body = texts[pid_win]
-    assert "II. «Маяк»" in body
+    assert "«Маяк»" in body
     assert "Ты угадал сцену дня!" in body
     assert "+4.75 Gram" in body
 
@@ -202,7 +202,7 @@ async def test_announce_player_results_delivers(monkeypatch) -> None:
     sent_pid = bot.send_message.await_args.args[0]
     text = bot.send_message.await_args.args[1]
     assert sent_pid == pid
-    assert "II. «Маяк»" in text
+    assert "«Маяк»" in text
 
 
 async def test_announce_player_results_respects_player_dm_flag(monkeypatch) -> None:

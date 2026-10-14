@@ -1038,12 +1038,11 @@ async def announce_day_diary(bot: Bot | None, round_row: Round) -> int:
 
 
 def scene_label(cards: dict[int, str], position: int) -> str:
-    """Короткая подпись сцены: «I. «Вскрыть крышу»» — и в алерты, и в личные итоги."""
+    """Подпись сцены: «Вскрыть крышу» — и в алерты, и в личные итоги."""
     title = cards.get(position, "")
-    label = POSITIONS[position] if position < len(POSITIONS) else str(position + 1)
     if title:
-        return f"{label}. «{html.escape(title)}»"
-    return label
+        return f"«{html.escape(title)}»"
+    return POSITIONS[position] if position < len(POSITIONS) else str(position + 1)
 
 
 def _build_player_result_text(
