@@ -10,15 +10,43 @@ from app.models import Player, RevoteGrant, Round, RoundStatus, Vote
 
 
 async def upsert_player(session: AsyncSession, user) -> Player:
+    """Поднять игрока по Telegram-пользователю: создать или освежить профиль.
+
+    Аккаунт-бот НИКОГДА не подписывается на личную рассылку. Telegram
+    запрещает боту писать боту (USER_BOT_TO_BOT_DISABLED), поэтому такая
+    подписка заведомо недоставима: бот в группе может отправить команду,
+    и его from_user (is_bot=True) создавал игрока с dm_subscribed по
+    умолчанию — каждая рассылка спотыкалась об этом аккаунт, оставляя
+    «0 из N» и почасовую тревогу (инцидент dm:vote-reminder).
+
+    Существующему игроку-боту подписка снимается при следующем обращении;
+    сама запись не удаляется — голосы и история должны остаться целыми.
+    is_bot читаем через getattr: тестовые заглушки (SimpleNamespace)
+    поля не имеют и по умолчанию не боты.
+    """
+    is_bot = bool(getattr(user, "is_bot", False))
     player = await session.get(Player, user.id)
     if player is None:
-        player = Player(id=user.id, username=user.username, first_name=user.first_name)
+        player = Player(
+            id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            dm_subscribed=not is_bot,
+        )
         session.add(player)
         await session.commit()
         return player
+    changed = False
     if player.username != user.username or player.first_name != user.first_name:
         player.username = user.username
         player.first_name = user.first_name
+        changed = True
+    if is_bot and player.dm_subscribed:
+        # Самолечение: игрок-бот, подписанный до этого фикса, отпишется
+        # при первом же обращении.
+        player.dm_subscribed = False
+        changed = True
+    if changed:
         await session.commit()
     return player
 
