@@ -68,8 +68,11 @@ async def _revote_status(user) -> tuple[str, int | None]:
         vote = await get_vote(session, round_row.id, player.id)
         if vote is None:
             return f"{hint_mark('revote-free')} Ты ещё не сделал выбор дня — первая запись бесплатная.", None
+        # Название сцены из кассеты (card.title по позиции), не римская цифра.
+        titles = {card.position: (card.title or "").strip() for card in round_row.cards}
+        label = titles.get(vote.card_position) or POSITIONS[vote.card_position]
         return (
-            f"{path_mark('care', str(player.id))} Сегодня твой выбор: {POSITIONS[vote.card_position]}. "
+            f"{path_mark('care', str(player.id))} Сегодня твой выбор: {label}. "
             "Оплати перемотку кадра и нажми другой вариант. Грант действует до конца дня.",
             round_row.id,
         )
@@ -115,10 +118,9 @@ async def cmd_change(message: Message) -> None:
                 "Выбери способ оплаты перемотки:\n\n"
                 "⭐ <b>Stars</b> — надёжно и мгновенно (кнопка оплаты в Telegram).\n"
                 "💎 <b>Gram</b> — перевод казначею: от "
-                f"{settings.revote_ton:g} до {_revote_gram_ceiling():g} Gram (строго меньше минимума ставки "
-                f"{settings.stake_min_ton:g} Gram). Мемо не обязателен: сумма из вилки "
-                "зачтётся сама как оплата перемотки кадра. Если приложишь комментарий — "
-                "бот найдёт `rv:день` в любой части текста, даже с подписью кошелька.",
+                f"{settings.revote_ton:g} до {_revote_gram_ceiling():g} Gram "
+                f"(строго меньше минимума ставки {settings.stake_min_ton:g} Gram). "
+                "Мемо не обязателен — сумма в нужном диапазоне зачтётся автоматически.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_revote_keyboard(round_id),
             )
