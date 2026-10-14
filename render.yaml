@@ -53,8 +53,9 @@ services:
       - key: WEBHOOK_SECRET
         sync: false
       - key: HEALTH_TOKEN
-        # Доступ к операционному снимку: /health и /metrics принимают
-        # Authorization: Bearer <token> либо ?token=. Значение задаётся
+        # Доступ к операционному снимку: /health и /metrics принимают только
+        # Authorization: Bearer <token> (query-формы ?token= нет: токен в строке
+        # запроса утекал бы в access-логи прокси и Referer). Значение задаётся
         # только в env Render и в репозитории не лежит: healthCheckPath
         # смотрит на /alive, где секрета нет вовсе.
         sync: false
