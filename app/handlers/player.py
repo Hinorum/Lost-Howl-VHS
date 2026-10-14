@@ -668,6 +668,15 @@ async def on_vote(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Некорректный выбор.", show_alert=True)
         return
+    if position not in (0, 1, 2):
+        # POSITIONS[position] ниже бросил бы IndexError (а отрицательный индекс
+        # молча взял бы чужую сцену) и оставил кнопку со спиннером. cast_vote и
+        # change_vote такую позицию всё равно отвергают — отвечаем тем же.
+        await callback.answer(
+            f"{warn_mark('invalid')} Такого варианта нет в кадре дня.",
+            show_alert=True,
+        )
+        return
     label = POSITIONS[position]
     async with SessionLocal() as session:
         # Кулдаун на нажатие. Голосование — основное действие игры, поэтому окно

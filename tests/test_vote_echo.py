@@ -273,3 +273,32 @@ async def test_vote_dm_no_shortcut_without_linked_wallet(monkeypatch) -> None:
         assert "Ставку на выбор" not in call.args[1]
     finally:
         await _wipe(rid, pid)
+
+
+async def test_vote_rejects_out_of_range_position() -> None:
+    """Битый callback_data — вежливый отказ, а не IndexError и висящий спиннер.
+
+    Раньше POSITIONS[position] стоял выше любой валидации: подделанный
+    callback_data (vote:<rid>:3) ронял хендлер до ответа игроку. Отрицательный
+    индекс хуже — молча брал бы чужую сцену. cast_vote такие позиции всё равно
+    отвергает, поэтому до БД дело не доходит.
+    """
+    rid, pid = await _seed_round(8106)
+    try:
+        for bad in ("3", "-1", "99"):
+            callback = _callback(
+                pid=pid, chat_type="private", bot=Mock(send_message=AsyncMock())
+            )
+            callback.data = f"vote:{rid}:{bad}"
+            await on_vote(callback)
+            callback.answer.assert_awaited_once()
+            assert "нет в кадре дня" in callback.answer.await_args.args[0]
+        async with SessionLocal() as db:
+            vote = (
+                await db.execute(
+                    select(Vote).where(Vote.round_id == rid, Vote.player_id == pid)
+                )
+            ).scalar_one_or_none()
+        assert vote is None, "голос записан по несуществующей позиции"
+    finally:
+        await _wipe(rid, pid)
