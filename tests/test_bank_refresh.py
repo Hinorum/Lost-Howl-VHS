@@ -280,6 +280,25 @@ async def test_refresh_deletes_dead_chat_on_bad_request(monkeypatch) -> None:
     await _delete_round(round_id)
 
 
+async def test_refresh_keeps_row_on_transient_bad_request(monkeypatch) -> None:
+    """Временная ошибка Telegram (не «message is not modified», не «chat not
+    found») НЕ удаляет строку StatusPost — иначе пост навсегда выпадает из
+    обновлений банка (реальный баг: любой TelegramBadRequest кроме «not
+    modified» безвозвратно удалял точку доставки)."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    round_id = await _persist_round(9799)
+    await _stake(round_id, 100_000_000)
+    await _status_row(round_id, -100_9799, 9004, pot=0)
+
+    bot = SimpleNamespace(
+        edit_message_text=AsyncMock(side_effect=TelegramBadRequest(None, "flood control: too many requests"))
+    )
+    await bc.refresh_day_bank(bot)
+    rows = await _rows_for(round_id)
+    assert len(rows) == 1, "временная ошибка не должна удалять точку доставки"
+    await _delete_round(round_id)
+
+
 async def test_refresh_skips_when_bot_none(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ton_enabled", True)
     round_id = await _persist_round(9812)

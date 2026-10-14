@@ -702,15 +702,27 @@ async def refresh_day_bank(bot: Bot | None = None) -> None:
                         row.chat_id,
                         exc2,
                     )
-                    await session.delete(row)
             except TelegramBadRequest as exc:
                 lowered = str(exc).lower()
-                if "not modified" not in lowered:
-                    # Пост/чат исчезли (удалено, бот выгнан) — точка доставки мертва.
+                if "not modified" in lowered:
+                    # Текст совпал (пост уже с этим банком) — фиксируем счёт.
+                    row.last_pot_nanotons = nano
+                elif (
+                    "message to edit not found" in lowered
+                    or "message is too old" in lowered
+                    or "chat not found" in lowered
+                ):
+                    # Сообщение удалено, старше 48 ч или чат не существует —
+                    # точка доставки мертва, повторные попытки бессмысленны.
                     await session.delete(row)
-                    continue
-                # Текст совпал (пост уже с этим банком) — фиксируем счёт, правка не нужна.
-                row.last_pot_nanotons = nano
+                else:
+                    # Временная ошибка Telegram (флуд-контроль, лаг API):
+                    # строку НЕ удаляем, попробуем в следующем цикле.
+                    logger.warning(
+                        "Правка банка дня: временная ошибка (chat=%s): %s",
+                        row.chat_id,
+                        exc,
+                    )
             except TelegramForbiddenError:
                 # Бот выгнан из чата: точка доставки мертва, дедуп не спасёт.
                 await session.delete(row)
