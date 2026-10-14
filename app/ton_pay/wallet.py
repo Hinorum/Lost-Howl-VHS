@@ -30,6 +30,10 @@ WALLET_VERSIONS = ("v4r2", "v5r1")
 # Дефолтный wallet_id контракта v4r2 (константа pytoniq; в data-ячейке v4).
 _V4R2_WALLET_ID = 698983191
 
+# Сколько редиректов при загрузке конфига лайтсерверов готовы пройти вручную,
+# проверяя каждый хоп SSRF-гейтом (см. fetch_remote_json).
+_MAX_CONFIG_REDIRECTS = 5
+
 
 def wallet_address(version: str, public_key: bytes, network_global_id: int, wc: int = 0) -> str:
     """Адрес кошелька данной версии для ключа — чистая локальная математика.
@@ -76,10 +80,12 @@ def detect_wallet_version(
 def _assert_public_https_url(url: str) -> None:
     """SSRF-гейт: https + публичный хост, без loopback/private/link-local.
 
-    URL приходит из LITESERVER_CONFIG_URL (env деплоера), но редиректы
-    включены — легитимный хост может увести на 169.254.169.254 (метаданные
-    облака) или 127.0.0.1. Проверяем схему и IP-литералы; DNS-имена не
-    резолвим (гейт на старте, а не на каждый тик — дорого и ненадёжно).
+    URL приходит из LITESERVER_CONFIG_URL (env деплоера). Проверяем схему и
+    IP-литералы; DNS-имена не резолвим (гейт на старте, а не на каждый тик —
+    дорого и ненадёжно). Редиректы автоматически НЕ следуются: каждый
+    следующий хоп обязан быть https и публичным (см. fetch_remote_json), иначе
+    легитимный хост увёл бы запрос на 169.254.169.254 (метаданные облака) или
+    127.0.0.1 в обход проверки исходного URL.
     """
     import ipaddress
     from urllib.parse import urlparse
@@ -116,14 +122,36 @@ def _assert_public_https_url(url: str) -> None:
 
 
 async def fetch_remote_json(url: str) -> dict:
-    """Скачивает JSON (конфиг лайтсерверов) с редиректами."""
+    """Скачивает JSON (конфиг лайтсерверов), проверяя каждый хоп редиректа.
+
+    Общий httpx-клиент ходит с follow_redirects=True, поэтому одной проверки
+    исходного URL недостаточно: легитимный хост мог ответить 302 на
+    169.254.169.254 или 127.0.0.1, и запрос ушёл бы туда мимо гейта. Здесь
+    редиректы не следуются автоматически — каждый Location резолвится
+    относительно текущего адреса и проверяется _assert_public_https_url до
+    следующего запроса. Потолок редиректов — _MAX_CONFIG_REDIRECTS.
+    """
+    from urllib.parse import urljoin
+
     from app.http_utils import get_http_client
 
-    _assert_public_https_url(url)
     client = get_http_client()
-    response = await client.get(url)
-    response.raise_for_status()
-    return response.json()
+    current = url
+    for hop in range(_MAX_CONFIG_REDIRECTS + 1):
+        _assert_public_https_url(current)
+        response = await client.get(current, follow_redirects=False)
+        if not response.is_redirect:
+            response.raise_for_status()
+            return response.json()
+        location = response.headers.get("location")
+        if not location:
+            raise ValueError(f"Редирект без Location при загрузке {current}")
+        if hop == _MAX_CONFIG_REDIRECTS:
+            break
+        current = urljoin(str(response.url), location)
+    raise ValueError(
+        f"Слишком много редиректов при загрузке конфига лайтсерверов: {url}"
+    )
 
 
 async def get_wallet():
