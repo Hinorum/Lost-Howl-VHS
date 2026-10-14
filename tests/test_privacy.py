@@ -110,3 +110,36 @@ async def test_button_press_by_another_user_shows_his_own_data() -> None:
     args, kwargs = presser_callback.answer.call_args
     assert kwargs.get("show_alert") is True
     assert "Голосов" in args[0]
+
+
+async def test_score_escapes_card_title_html(monkeypatch) -> None:
+    """Название сцены из кассеты уходит parse_mode=HTML: сырой `<` ломает карточку.
+
+    Текст кассеты — не наш (её правят в /panel): `<script>` в card.title должен
+    приехать экранированным, а собственная разметка карточки — остаться живой.
+    """
+    import app.handlers.player as player_mod
+    from app.models import RoundStatus
+
+    fake_round = SimpleNamespace(
+        id=700_900,
+        status=RoundStatus.OPEN,
+        cards=[SimpleNamespace(position=0, title="Крыша <script>alert(1)</script>")],
+    )
+
+    async def fake_active(_session):
+        return fake_round
+
+    async def fake_vote(_session, _round_id, _player_id):
+        return SimpleNamespace(card_position=0)
+
+    monkeypatch.setattr(player_mod, "get_active_round", fake_active)
+    monkeypatch.setattr(player_mod, "get_vote", fake_vote)
+
+    message = make_message("private", 700_009)
+    await cmd_score(message)
+    text = message.answer.call_args.args[0]
+    assert "<script>" not in text
+    assert "&lt;script&gt;" in text
+    # Экранируем только название сцены: наша разметка карточки цела.
+    assert "<b>" in text

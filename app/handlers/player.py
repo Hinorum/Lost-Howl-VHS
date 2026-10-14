@@ -3,6 +3,7 @@
 # со слоем сюжета — ядро: голосование, ставки и выплаты.
 from __future__ import annotations
 
+import html
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -413,10 +414,16 @@ async def _score_text(user) -> str:
     invited = await invited_count(user.id)
 
     def _scene_label() -> str:
+        # Название сцены — не наш текст: приходит из кассеты. Карточка Стаи
+        # уходит parse_mode=HTML, поэтому сырой `<`/`&` из правки в /panel
+        # Telegram отвергнет целиком. Экранируем здесь, у самой HTML-витрины
+        # (scene_label экранирует так же, но эта локальная подпись добавляет
+        # римскую позицию и раньше шла в обход общего хелпера).
         name = next((c.title for c in round_row.cards if c.position == vote.card_position), None)
         if name is None:
             return f"{POSITIONS[vote.card_position]}."
-        return f"{POSITIONS[vote.card_position]}. «{name}»"
+        escaped = html.escape(name, quote=False)
+        return f"{POSITIONS[vote.card_position]}. «{escaped}»"
 
     if vote is None:
         choice = f"{hint_mark(str(user.id))} Сегодня ты ещё не сделал выбор дня."
