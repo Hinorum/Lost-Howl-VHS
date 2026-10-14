@@ -256,6 +256,16 @@ async def _dm_send_all(
                 await deactivate_player(player_id)
                 reasons["игрок заблокировал бота или аккаунт недоступен"] += 1
                 return False
+            except TelegramBadRequest as exc:
+                if "USER_BOT_TO_BOT_DISABLED" in str(exc):
+                    # Аккаунт-бот: Telegram запрещает боту писать боту в ЛС.
+                    # Деактивируем — доставка невозможна в принципе.
+                    await deactivate_player(player_id)
+                    reasons["аккаунт-бот (нельзя писать боту)"] += 1
+                    return False
+                logger.warning("Игроку %s сообщение не доставлено: %s", player_id, exc)
+                reasons[failure_reason(exc)] += 1
+                return False
             except Exception as exc:
                 logger.warning("Игроку %s сообщение не доставлено: %s", player_id, exc)
                 reasons[failure_reason(exc)] += 1

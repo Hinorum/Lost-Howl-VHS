@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from sqlalchemy import delete, select
 
 from app import broadcast as bc
@@ -343,6 +343,34 @@ async def test_dm_send_all_survives_plain_error(monkeypatch) -> None:
             raise ValueError("telegram timeout")
 
         assert await bc._dm_send_all(SimpleNamespace(), deliver, "личный пакет") == 0
+    finally:
+        await _wipe(Player)
+
+
+async def test_dm_send_all_deactivates_bot_account(monkeypatch) -> None:
+    """USER_BOT_TO_BOT_DISABLED: аккаунт-бот деактивируется, доставка невозможна."""
+    monkeypatch.setattr(settings, "player_dm", True)
+    await _wipe(Player)
+    bot_id, human_id = 777_302, 777_303
+    async with SessionLocal() as db:
+        db.add_all(
+            [
+                Player(id=bot_id, username="somebot", dm_subscribed=True),
+                Player(id=human_id, dm_subscribed=True),
+            ]
+        )
+        await db.commit()
+    try:
+
+        async def deliver(pid: int) -> None:
+            if pid == bot_id:
+                raise TelegramBadRequest(None, "Bad Request: USER_BOT_TO_BOT_DISABLED")
+
+        delivered = await bc._dm_send_all(SimpleNamespace(), deliver, "личный пакет")
+        assert delivered == 1
+        async with SessionLocal() as db:
+            player = await db.get(Player, bot_id)
+            assert player.dm_subscribed is False
     finally:
         await _wipe(Player)
 
