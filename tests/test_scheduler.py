@@ -1578,3 +1578,59 @@ async def test_vote_reminder_count_is_truthful(monkeypatch, caplog) -> None:
             await db.commit()
         await _clear_rounds()
 
+
+async def test_vote_reminder_clears_stale_marker_when_audience_empty(monkeypatch) -> None:
+    """Все проголосовали — отправлять некому, и застрявшая метка прошлого
+    прохода снимается, а не орал бы тревогой каждый час.
+
+    Раньше джоба при пустой аудитории обрывалась ранним return до
+    _dm_send_all — и delivery:dm:vote-reminder = «0 из N» от вчерашнего
+    сбоя оставался в watcher_state навсегда (инцидент 14.10.2026). Джоба
+    обязана дойти до _dm_send_all(only=пусто), который метку снимает.
+    """
+    from app import scheduler as sched
+    from app.models import Player, Vote
+
+    await _clear_rounds()
+    rid = await _make_round(9806, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", False)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[541]))
+    reminder_now = datetime(2026, 6, 6, 10, 0, tzinfo=UTC)
+    monkeypatch.setattr(sched, "_now", lambda: reminder_now)
+    claim_key = "job:vote-reminder:2026-06-06"
+    async with SessionLocal() as db:
+        # Claim на дату должен быть свеж: тест мог пережить перезапуск прогона.
+        await db.execute(delete(WatcherState).where(WatcherState.key == claim_key))
+        db.add(Player(id=541, username="voted_all", first_name="V", dm_subscribed=True))
+        await db.commit()
+        # В БД могли утечь подписчики чужих тестов — голосуем за всех, кто
+        # подписан: аудитория напоминания обязана быть детерминированно пустой.
+        subscribed = (
+            await db.execute(select(Player.id).where(Player.dm_subscribed.is_(True)))
+        ).scalars().all()
+        for pid in subscribed:
+            db.add(Vote(round_id=rid, player_id=pid, card_position=0))
+        # Вчерашняя метка с нулём — ровно то, что осталось от инцидента.
+        db.add(WatcherState(key="delivery:dm:vote-reminder", value="0/1"))
+        await db.commit()
+    try:
+        await sched._vote_reminder_job()
+        # Отправлять некому: ни одного вызова отправки и ни одной метки.
+        sends.assert_not_awaited()
+        async with SessionLocal() as db:
+            assert await db.get(WatcherState, "delivery:dm:vote-reminder") is None
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_([claim_key, "delivery:dm:vote-reminder"])
+                )
+            )
+            await db.execute(delete(Player).where(Player.id == 541))
+            await db.commit()
+        await _clear_rounds()
+

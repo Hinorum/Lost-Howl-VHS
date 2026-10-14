@@ -767,9 +767,13 @@ async def _vote_reminder_job() -> None:
                 _select(Player).where(Player.dm_subscribed == True)
             )
             unbotted = [p for p in all_players.scalars().all() if p.id not in voted_ids]
-
-            if not unbotted:
-                return
+            # Пустая аудитория (все уже проголосовали или подписчиков нет) —
+            # это НЕ ранний return. Раньше джоба здесь обрывалась, и
+            # _dm_send_all(only=set()), который снимает застрявшую метку
+            # delivery:dm:vote-reminder прошлого прохода, не вызывался:
+            # «0 из N», оставшийся со вчерашнего сбоя, орал бы тревогой
+            # каждый час вечно (инцидент 14.10). Нечего отправлять — это
+            # не сбой; считает ноль и честно пишет об этом в лог ниже.
             unbotted_ids = {p.id for p in unbotted}
 
             stake_mode = (

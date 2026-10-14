@@ -228,11 +228,21 @@ async def _dm_send_all(
     «доставлено»). С `only` знаменатель совпадает с реальной аудиторией.
     """
     if bot is None or not settings.player_dm:
+        # Проход НЕ состоялся (без бота или с выключенной личкой): метку
+        # не трогаем — её судит возраст (см. check 3.9 в ops).
         return 0
     player_ids = await active_player_ids()
     if only is not None:
         player_ids = [pid for pid in player_ids if pid in only]
     if not player_ids:
+        # Проход состоялся, но отправлять некому (все проголосовали,
+        # подписчиков нет). Метка прошлого прохода — «0 из N» от вчерашнего
+        # сбоя — описывает уже пройденный проход и не может быть дослана
+        # ни при каких условиях: перезаписать её нечем (record_delivery
+        # выходит при нулевой аудитории), а окна догона у видов без
+        # числового суффикса нет. Без снятия она орала бы тревогой
+        # каждый час вечно — ровно так застрял delivery:dm:vote-reminder.
+        await clear_delivery_marker(f"dm:{label}")
         return 0
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
     reasons: Counter[str] = Counter()
@@ -412,6 +422,11 @@ async def record_delivery(
 
     Метка НИКОГДА не должна ронять рассылку: это телеметрия, а не условие
     доставки. Ошибка записи уходит в warning и теряется.
+
+    КАЖДАЯ запись освежает updated_at метки: возраст строки — это возраст
+    последнего прохода вида. На этом стоит возрастная фильтрация недневных
+    видов в check 3.9 (ops): старше окна — рассылка вида больше не проходит
+    и досылать уже нечего.
     """
     if attempted <= 0:
         return
@@ -420,6 +435,7 @@ async def record_delivery(
             row = await session.get(WatcherState, f"{DELIVERY_KEY_PREFIX}{kind}")
             row = row or WatcherState(key=f"{DELIVERY_KEY_PREFIX}{kind}", value="")
             row.value = f"{delivered}/{attempted}"
+            row.updated_at = datetime.now(UTC)
             session.add(row)
             reason_row = await session.get(
                 WatcherState, f"{DELIVERY_REASON_KEY_PREFIX}{kind}"
@@ -436,6 +452,33 @@ async def record_delivery(
             await session.commit()
     except Exception as exc:
         logger.warning("Метку доставки %s не записали: %s", kind, exc)
+
+
+async def clear_delivery_marker(kind: str) -> None:
+    """Снять метку доставки вида рассылки: проход состоялся, отправлять некому.
+
+    `delivery:<kind>` и `delivery_reason:<kind>` описывают последний
+    ПОСЫЛАЮЩИЙ проход. Если новый проход не нашёл ни одного получателя,
+    старый ноль задним числом уже не чинится — он не «досланный» и не
+    «текущий», он просто отстал от реальности и орал бы тревогой вечно.
+    Причина гаснет вместе с меткой: она живёт ровно вместе с нулём.
+
+    Как и запись, это телеметрия: сбой снятия уходит в warning и ничего
+    не роняет. Если снять не удалось, метку доживёт до возрастного
+    фильтра в check 3.9 (ops).
+    """
+    try:
+        async with SessionLocal() as session:
+            for key in (
+                f"{DELIVERY_KEY_PREFIX}{kind}",
+                f"{DELIVERY_REASON_KEY_PREFIX}{kind}",
+            ):
+                row = await session.get(WatcherState, key)
+                if row is not None:
+                    await session.delete(row)
+            await session.commit()
+    except Exception as exc:
+        logger.warning("Метку доставки %s не сняли: %s", kind, exc)
 
 
 async def announce_audience() -> dict[str, int]:

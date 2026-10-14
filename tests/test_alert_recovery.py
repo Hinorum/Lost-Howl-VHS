@@ -283,6 +283,42 @@ async def test_record_delivery_writes_marker() -> None:
             await db.commit()
 
 
+async def test_record_delivery_refreshes_marker_timestamp() -> None:
+    """Каждая запись освежает updated_at метки: возраст строки — это возраст
+    последнего прохода вида.
+
+    На этом стоит36-часовой фильтр недневных видов в check 3.9: без
+    освежения ежедневно падающая рассылка выглядела бы забытой уже через
+    сутки и замолкала, хотя её только что переписывали.
+    """
+    from app.broadcast import record_delivery
+    from app.rounds import utc_aware
+
+    stale = datetime.now(UTC) - timedelta(hours=48)
+    async with SessionLocal() as db:
+        await db.execute(delete(WatcherState).where(WatcherState.key == "delivery:day:7"))
+        await db.commit()
+    try:
+        await record_delivery("day:7", 0, 3)
+        # Состариваем метку «вручную», как если бы её не переписывали двое суток.
+        async with SessionLocal() as db:
+            row = await db.get(WatcherState, "delivery:day:7")
+            assert row is not None
+            row.updated_at = stale
+            await db.commit()
+        await record_delivery("day:7", 3, 3)
+        async with SessionLocal() as db:
+            row = await db.get(WatcherState, "delivery:day:7")
+        assert row is not None
+        assert utc_aware(row.updated_at) > stale
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key == "delivery:day:7")
+            )
+            await db.commit()
+
+
 async def test_zero_delivery_raises_alarm(_clean) -> None:
     """Рассылка, не дошедшая ни до кого, — тревога.
 
@@ -325,6 +361,98 @@ async def test_partial_delivery_is_not_an_alarm(_clean) -> None:
                 delete(WatcherState).where(
                     WatcherState.key.in_(["delivery:day:10", "delivery:day:11"])
                 )
+            )
+            await db.commit()
+
+
+async def test_fresh_non_day_delivery_marker_raises_alarm(_clean) -> None:
+    """Недневная метка с нулём — тревога с причиной, как у дней.
+
+    dm:… и whisper не привязаны к day_index, но «не дошло» они обязаны
+    показывать так же честно: и факт в problems, и причина последнего
+    прохода в том же сообщении админу.
+    """
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:dm:vote-reminder", value="0/1"))
+        db.add(
+            WatcherState(
+                key="delivery_reason:dm:vote-reminder",
+                value="TelegramBadRequest: USER_BOT_TO_BOT_DISABLED (×1)",
+            )
+        )
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert any("dm:vote-reminder" in p for p in problems), problems
+        assert any("Причины последнего прохода" in t for t in _clean.sent), _clean.sent
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_(
+                        ["delivery:dm:vote-reminder", "delivery_reason:dm:vote-reminder"]
+                    )
+                )
+            )
+            await db.commit()
+
+
+async def test_stale_non_day_delivery_marker_stops_alerting(_clean) -> None:
+    """Метка недневного вида старше окна — уже не тревога, а запись.
+
+    Переписывает её только сама рассылка, а та проходит лишь при живой
+    аудитории: все проголосовали, личка выключена, вид снят. Без
+    возрастного фильтра «0 из 1», оставшийся со вчерашнего сбоя, орал бы
+    каждый час вечно — ровно так застрял dm:vote-reminder (инцидент
+    14.10.2026). Сама строка при этом не удаляется: из тревоги её убирает
+    возраст.
+    """
+    async with SessionLocal() as db:
+        db.add(
+            WatcherState(
+                key="delivery:dm:vote-reminder",
+                value="0/1",
+                updated_at=datetime.now(UTC) - timedelta(hours=40),
+            )
+        )
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert not any("ни одно сообщение не доставлено" in p for p in problems), problems
+        assert await _state("delivery:dm:vote-reminder") == "0/1"
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key == "delivery:dm:vote-reminder"
+                )
+            )
+            await db.commit()
+
+
+async def test_day_delivery_marker_is_not_dropped_by_age(_clean) -> None:
+    """У дня свой срок жизни — catchup-окно по самому раунду, а не 36 часов.
+
+    Суффикс day_index не судится возрастом строки: дни уходят из тревоги
+    только через _drop_exhausted_days, и старая метка дня (в т.ч. когда
+    раунд уже не найден и возраст неизвестен) обязана остаться тревогой.
+    """
+    async with SessionLocal() as db:
+        db.add(
+            WatcherState(
+                key="delivery:day:9998",
+                value="0/4",
+                updated_at=datetime.now(UTC) - timedelta(hours=40),
+            )
+        )
+        await db.commit()
+    try:
+        problems = await ops.check_anomalies(_clean)
+        assert any("day:9998" in p for p in problems), problems
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(WatcherState.key == "delivery:day:9998")
             )
             await db.commit()
 

@@ -375,6 +375,105 @@ async def test_dm_send_all_deactivates_bot_account(monkeypatch) -> None:
         await _wipe(Player)
 
 
+async def test_upsert_player_never_subscribes_a_bot() -> None:
+    """Аккаунт-бот не подписывается на личную рассылку — ни при создании,
+    ни задним числом.
+
+    Telegram запрещает боту писать боту (USER_BOT_TO_BOT_DISABLED), поэтому
+    такая подписка заведомо недоставима: бот в группе мог отправить команду,
+    его from_user создавал игрока с dm_subscribed по умолчанию, и каждая
+    рассылка спотыкалась об этот аккаунт, оставляя «0 из N» и почасовую
+    тревогу (инцидент dm:vote-reminder). Запись-игрок при этом не удаляется —
+    голосы и история должны остаться целыми.
+    """
+    from app.voting import upsert_player
+
+    await _wipe(Player)
+    async with SessionLocal() as db:
+        try:
+            bot_user = SimpleNamespace(
+                id=777_901, username="somebot", first_name="Bot", is_bot=True
+            )
+            human_user = SimpleNamespace(
+                id=777_902, username="human", first_name="H", is_bot=False
+            )
+            fresh_bot = await upsert_player(db, bot_user)
+            assert fresh_bot.dm_subscribed is False
+            fresh_human = await upsert_player(db, human_user)
+            assert fresh_human.dm_subscribed is True
+
+            # Самолечение: игрок-бот, подписанный ДО фикса, отпишется
+            # при первом же обращении.
+            legacy = Player(
+                id=777_903, username="oldbot", first_name="Old", dm_subscribed=True
+            )
+            db.add(legacy)
+            await db.commit()
+            healed = await upsert_player(
+                db,
+                SimpleNamespace(
+                    id=777_903, username="oldbot", first_name="Old", is_bot=True
+                ),
+            )
+            assert healed.dm_subscribed is False
+        finally:
+            await _wipe(Player)
+
+
+async def test_dm_send_all_empty_audience_clears_stale_marker(monkeypatch) -> None:
+    """Пустая аудитория снимает застрявшую метку прошлого прохода.
+
+    «0 из N» от вчерашнего сбоя описывает уже пройденный проход: сегодня
+    отправлять некому, дослать нечего, перезаписать метку нечем — без снятия
+    она орала бы тревогой каждый час вечно (инцидент dm:vote-reminder).
+    Метка при bot is None (проход НЕ состоялся) при этом не трогается —
+    её судит возраст в check 3.9 (ops).
+    """
+    monkeypatch.setattr(settings, "player_dm", True)
+    await _wipe(Player)
+    # Подписчик есть, но в аудитории прохода никого (only= пуст) — ровно
+    # сценарий «все уже проголосовали».
+    async with SessionLocal() as db:
+        db.add(Player(id=777_911, dm_subscribed=True))
+        db.add_all(
+            [
+                WatcherState(key="delivery:dm:напоминание", value="0/2"),
+                WatcherState(
+                    key="delivery_reason:dm:напоминание", value="network: сеть легла"
+                ),
+            ]
+        )
+        await db.commit()
+    try:
+        deliver = AsyncMock()
+        # Бота нет — проход не состоялся, метка остаётся на месте.
+        assert await bc._dm_send_all(None, deliver, "напоминание", only=set()) == 0
+        async with SessionLocal() as db:
+            assert await db.get(WatcherState, "delivery:dm:напоминание") is not None
+        # Аудитория пуста — метка и её причина сняты, отправки нет.
+        assert await bc._dm_send_all(SimpleNamespace(), deliver, "напоминание", only=set()) == 0
+        async with SessionLocal() as db:
+            assert await db.get(WatcherState, "delivery:dm:напоминание") is None
+            assert (
+                await db.get(WatcherState, "delivery_reason:dm:напоминание") is None
+            )
+        deliver.assert_not_awaited()
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_(
+                        [
+                            "delivery:dm:напоминание",
+                            "delivery_reason:dm:напоминание",
+                        ]
+                    )
+                )
+            )
+            await db.commit()
+        await _wipe(Player)
+
+
 async def test_dm_send_all_only_narrows_audience_and_count(monkeypatch) -> None:
     """`only` сужает аудиторию: и вызовы, и знаменатель счётчика.
 

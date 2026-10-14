@@ -73,6 +73,14 @@ _problem_entry: dict[str, dict] = {}
 _DIGITS_RE = re.compile(r"\d+")
 
 _ALERT_COOLDOWN = timedelta(hours=1)
+# Недневные метки delivery:* (dm:..., whisper) судятся по возрасту строки:
+# переписывает их только сама рассылка, а та может больше не прийти —
+# аудитория опустела, вида больше нет, личная рассылка выключена. Окно
+# 36ч = сутки + запас: все регулярные недневные виды ходят ежедневно и
+# освежают updated_at (record_delivery), так что старше окна оказывается
+# только метка, которую больше никто не переписывает. Для дней (суффикс —
+# day_index) своё, более долгое окно: catchup в _drop_exhausted_days.
+_DELIVERY_STALE_AFTER = timedelta(hours=36)
 _WATCHER_STALE_AFTER = timedelta(minutes=30)
 _QUEUE_OLD_AFTER = timedelta(minutes=30)
 # Возврат ставки (refund) считается «застрявшим», когда ждёт отправки дольше
@@ -1069,23 +1077,40 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
     #      с нулём): факт «не дошло» по логам не разобрать, а причина
     #      (kicked против сети на Render) решает, куда идти.
     if bot is not None:
+        from app.rounds import utc_aware
+
         rows = (
             await session.execute(
                 select(WatcherState).where(WatcherState.key.like("delivery:%"))
             )
         ).scalars().all()
-        lost: list[str] = []
+        lost: dict[str, datetime] = {}
         for row in rows:
             head, _, tail = (row.value or "").partition("/")
             try:
                 if int(tail) > 0 and int(head) == 0:
-                    lost.append(row.key.removeprefix("delivery:"))
+                    lost[row.key.removeprefix("delivery:")] = utc_aware(row.updated_at)
             except ValueError:
                 logger.debug("Метка доставки %s не разобрана: %r", row.key, row.value)
         if lost:
             # День старше окна догона из тревоги уходит: дослать его нельзя,
             # а метка живёт вечно — см. _drop_exhausted_days.
-            lost = await _drop_exhausted_days(session, lost)
+            lost = {
+                kind: lost[kind]
+                for kind in await _drop_exhausted_days(session, list(lost))
+            }
+            # Недневный вид (суффикс после «:» — не day_index) старше окна:
+            # тревогу несёт уже одна память строки. Переписывает такую метку
+            # только сама рассылка, а та проходит лишь при живой аудитории
+            # (все проголосовали, личка выключена, вид снят) — так застрял
+            # dm:vote-reminder = 0/1 и орал каждый час. Дни судит catchup
+            # в _drop_exhausted_days: у них своё, более долгое окно жизни.
+            stale_before = _now() - _DELIVERY_STALE_AFTER
+            lost = {
+                kind: stamp
+                for kind, stamp in lost.items()
+                if kind.rpartition(":")[2].isdigit() or stamp >= stale_before
+            }
         if lost:
             shown = sorted(lost)[:4]
             note = "ни одно сообщение не доставлено: " + ", ".join(shown)
