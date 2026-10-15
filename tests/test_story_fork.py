@@ -70,7 +70,7 @@ def _fork_payload() -> dict:
 
 def test_valid_fork_passes() -> None:
     result = validate_payload(_fork_payload())
-    assert result.ok, result.errors
+    assert result.cassette is not None, result.errors
     cassette = result.cassette
     assert cassette is not None
     assert cassette.attribution
@@ -81,7 +81,7 @@ def test_valid_fork_passes() -> None:
 def test_fork_without_wire_ok() -> None:
     payload = _fork_payload()
     payload.pop("switch")
-    assert validate_payload(payload).ok
+    assert validate_payload(payload).cassette is not None
 
 
 @pytest.mark.parametrize(
@@ -115,7 +115,7 @@ def test_bad_forks_rejected(mutate, needle) -> None:
     payload = _fork_payload()
     mutate(payload)
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
     assert any(needle in error for error in result.errors), result.errors
 
 
@@ -126,7 +126,7 @@ def test_too_many_forks_rejected() -> None:
             {"to": f"r{n}", "at_day": at, "winner": 0, "days": [_day(i) for i in range(at, 31)]}
         )
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
     assert any("перемоток" in error for error in result.errors)
 
 
@@ -134,7 +134,7 @@ def test_fork_days_must_start_contiguous() -> None:
     payload = _fork_payload()
     payload["switch"][0]["days"] = [_day(i) for i in range(9, 31)]
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
 
 
 def test_road_stays_main_until_trigger() -> None:

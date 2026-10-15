@@ -316,7 +316,6 @@ def test_lint_clean_cassette_has_no_warnings() -> None:
     from app.story.schema import validate_payload
 
     parsed = validate_payload(_clean_cassette_payload())
-    assert parsed.ok
     assert parsed.cassette is not None
     assert cassette_tool.lint_warnings(parsed.cassette) == []
 

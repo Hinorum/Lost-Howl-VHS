@@ -65,7 +65,6 @@ def _write_cassette(
         "cassette_id": cassette_id,
         "month": month,
         "title": f"Кассета {cassette_id}",
-        "logline": "проверка проигрывателя.",
         "days": [_day(i) for i in range(1, n_days + 1)],
     }
     (directory / file_name).write_text(
@@ -193,7 +192,6 @@ async def test_dilemma_reaches_round_column(session, tmp_path, monkeypatch) -> N
         "cassette_id": "may-dilemma",
         "month": "2026-05",
         "title": "Кассета с дилеммой",
-        "logline": "день с блоком выбора.",
         "days": days,
     }
     (tmp_path / "may-dilemma.json").write_text(

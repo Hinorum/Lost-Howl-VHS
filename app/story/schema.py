@@ -26,7 +26,7 @@ import calendar
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -234,7 +234,6 @@ class Cassette(BaseModel):
     cassette_id: str = Field(min_length=1)
     month: str
     title: str = Field(min_length=1)
-    logline: str | None = None
     attribution: str | None = Field(default=None, max_length=FIELD_LIMITS["attribution"])
     switch: list[SwitchModel] = Field(default_factory=list)
     days: list[DayModel]
@@ -292,17 +291,6 @@ class Cassette(BaseModel):
                     "без пропусков и дублей"
                 )
         return self
-
-    def active_day(self, today: date) -> DayModel | None:
-        """День главной дороги для даты, или None, если кассета молчит.
-
-        Кассета активна, только когда месяц (YYYY-MM) кассеты == месяцу даты:
-        день = день календарного месяца. За пределами своих N дней (в том
-        числе на стыке месяцев) кассета молчит — движок играет шаблон.
-        """
-        if today.strftime("%Y-%m") != self.month:
-            return None
-        return self.day_for(today.day, "main")
 
     def road(self, today_day: int, winners: dict[int, int]) -> str:
         """Активная дорога на календарный день месяца.
@@ -491,10 +479,6 @@ class ValidationResult:
     cassette: Cassette | None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        return self.cassette is not None
 
 
 def _taboo_hits(cassette: Cassette) -> list[str]:

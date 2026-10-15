@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import json
-from datetime import date
 from pathlib import Path
 
 from app.story.schema import (
@@ -56,7 +55,6 @@ def _payload(month: str, n_days: int, **overrides) -> dict:
         "cassette_id": "test-kasseta",
         "month": month,
         "title": "Тестовая кассета",
-        "logline": "проверка контракта.",
         "days": [_day(i) for i in range(1, n_days + 1)],
     }
     payload.update(overrides)
@@ -72,14 +70,14 @@ def test_month_lengths_28_to_31() -> None:
         ("2026-01", 31),
     ):
         result = validate_payload(_payload(month, n))
-        assert result.ok, result.errors
+        assert result.cassette is not None, result.errors
         assert result.cassette is not None
         assert len(result.cassette.days) == n
 
 
 def test_wrong_days_count_for_month_rejected() -> None:
     result = validate_payload(_payload("2027-02", 30))
-    assert not result.ok
+    assert result.cassette is None
     assert any("2027-02" in error for error in result.errors)
 
 
@@ -87,26 +85,26 @@ def test_duplicate_day_index_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][4]["day_index"] = 1
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
 
 
 def test_missing_day_rejected() -> None:
     result = validate_payload(_payload("2026-01", 29))  # в январе 31 день
-    assert not result.ok
+    assert result.cassette is None
 
 
 def test_bad_cards_positions_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][1]["position"] = 0
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
     assert any("позиции 0, 1, 2" in error for error in result.errors)
 
 
 def test_bad_month_format_rejected() -> None:
-    assert not validate_payload(_payload("2026-13", 30)).ok
-    assert not validate_payload(_payload("okt-2026", 30)).ok
-    assert not validate_payload(_payload("", 30)).ok
+    assert validate_payload(_payload("2026-13", 30)).cassette is None
+    assert validate_payload(_payload("okt-2026", 30)).cassette is None
+    assert validate_payload(_payload("", 30)).cassette is None
 
 
 def test_field_length_limits_rejected() -> None:
@@ -114,22 +112,22 @@ def test_field_length_limits_rejected() -> None:
     result = validate_payload(
         _payload("2026-04", 30, days=[_day(1, chapter_title=too_long)])
     )
-    assert not result.ok
+    assert result.cassette is None
 
     too_long_chapter = "а" * (FIELD_LIMITS["chapter_text"] + 1)
     result = validate_payload(
         _payload("2026-04", 30, days=[_day(1, chapter_text=too_long_chapter)])
     )
-    assert not result.ok
+    assert result.cassette is None
 
     too_long_card = "а" * (FIELD_LIMITS["card_title"] + 1)
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["title"] = too_long_card
-    assert not validate_payload(payload).ok
+    assert validate_payload(payload).cassette is None
 
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["consequence"] = "с" * (FIELD_LIMITS["card_consequence"] + 1)
-    assert not validate_payload(payload).ok
+    assert validate_payload(payload).cassette is None
 
 
 def test_dilemma_required_and_limited() -> None:
@@ -137,34 +135,34 @@ def test_dilemma_required_and_limited() -> None:
     длиннее лимита: пост обязан показывать его целиком."""
     payload = _payload("2026-04", 30)
     del payload["days"][0]["dilemma"]
-    assert not validate_payload(payload).ok
+    assert validate_payload(payload).cassette is None
 
     payload = _payload("2026-04", 30)
     payload["days"][0]["dilemma"] = "Куда пойдёт стая: к воде или за топливом?"
-    assert validate_payload(payload).ok
+    assert validate_payload(payload).cassette is not None
 
     payload["days"][0]["dilemma"] = "д" * (FIELD_LIMITS["dilemma"] + 1)
-    assert not validate_payload(payload).ok
+    assert validate_payload(payload).cassette is None
 
 
 def test_empty_card_fields_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][0]["cards"][0]["title"] = ""
-    assert not validate_payload(payload).ok
+    assert validate_payload(payload).cassette is None
 
 
 def test_taboo_word_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][0]["chapter_text"] = "Наши граммы дают хороший доход стае."
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
     assert any("стоп-слова" in error for error in result.errors)
 
 
 def test_missing_attribution_is_soft_warning() -> None:
     """Отсутствие клейма (attribution) — warning, а не ошибка (см. промпт §5)."""
     result = validate_payload(_payload("2026-04", 30))
-    assert result.ok
+    assert result.cassette is not None
     assert result.cassette is not None
     assert not (result.cassette.attribution or "").strip()
     assert any("attribution" in warning for warning in result.warnings)
@@ -182,7 +180,7 @@ def test_style_chapter_long_warns() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][0]["chapter_text"] = "а" * 605
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert any("мягкий порог" in warning for warning in result.warnings)
 
 
@@ -191,14 +189,14 @@ def test_style_chapter_single_sentence_warns() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][0]["chapter_text"] = "Стая молчит у котла."
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert any("одним предложением" in warning for warning in result.warnings)
 
 
 def test_style_clean_payload_no_style_warnings() -> None:
     """Свежий день без перегибов не тянет стилевых замечаний."""
     result = validate_payload(_payload("2026-04", 30))
-    assert result.ok
+    assert result.cassette is not None
     assert not any(
         word in warning
         for word in ("мягкий порог", "одним предложением")
@@ -206,21 +204,24 @@ def test_style_clean_payload_no_style_warnings() -> None:
     )
 
 
-def test_active_day_matches_calendar_day() -> None:
+def test_day_for_matches_calendar_day() -> None:
     result = validate_payload(_payload("2026-10", 31))
     assert result.cassette is not None
-    day = result.cassette.active_day(date(2026, 10, 15))
+    day = result.cassette.day_for(15, "main")
     assert day is not None and day.day_index == 15
-    # Последний день месяца играется (октябрь — 31 день, на 31-е числа есть день).
-    assert result.cassette.active_day(date(2026, 10, 31)).day_index == 31
-    # Другой месяц — кассета не играется (стоп на стыке).
-    assert result.cassette.active_day(date(2026, 9, 15)) is None
+    # Последний день месяца играется (октябрь — 31 день, на 31-е число есть день).
+    assert result.cassette.day_for(31, "main").day_index == 31
+    # За пределами дней кассеты кассета молчит (отсев по месяцу живёт
+    # в bay.active_cassette — см. test_story_bay).
+    assert result.cassette.day_for(32, "main") is None
+    assert result.cassette.day_for(0, "main") is None
 
 
-def test_active_day_keeps_full_scene_text() -> None:
+def test_day_for_keeps_full_scene_text() -> None:
     """Глава кассеты — текст сцены (не крючок): сохраняется как есть, целиком."""
     result = validate_payload(_payload("2026-10", 31))
-    day = result.cassette.active_day(date(2026, 10, 1))
+    assert result.cassette is not None
+    day = result.cassette.day_for(1, "main")
     assert day is not None
     assert day.chapter_text == _day(1)["chapter_text"]
 
@@ -234,17 +235,17 @@ def test_validate_file_reads_and_validates(tmp_path) -> None:
         json.dumps(_payload("2026-04", 30), ensure_ascii=False), encoding="utf-8"
     )
     result: ValidationResult = validate_file(good)
-    assert result.ok
+    assert result.cassette is not None
 
     broken = good_dir / "broken.json"
     broken.write_text("{не json", encoding="utf-8")
     result = validate_file(broken)
-    assert not result.ok
+    assert result.cassette is None
     assert any("не JSON" in error for error in result.errors)
 
     missing = good_dir / "nope.json"
     result = validate_file(missing)
-    assert not result.ok
+    assert result.cassette is None
     assert any("не прочитать" in error for error in result.errors)
 
 
@@ -252,7 +253,7 @@ def test_bom_is_tolerated(tmp_path) -> None:
     raw = json.dumps(_payload("2026-04", 30), ensure_ascii=False).encode("utf-8")
     path = tmp_path / "bom.json"
     path.write_bytes(b"\xef\xbb\xbf" + raw)
-    assert validate_file(path).ok
+    assert validate_file(path).cassette is not None
 
 
 def test_prev_echo_and_diary_accepted() -> None:
@@ -263,7 +264,7 @@ def test_prev_echo_and_diary_accepted() -> None:
     }
     payload["days"][1]["diary"] = "Щенок записал: мама почти выздоровела."
     result = validate_payload(payload)
-    assert result.ok, result.errors
+    assert result.cassette is not None, result.errors
     assert result.cassette is not None
     assert result.cassette.days[1].diary
     assert result.cassette.days[1].prev == {0: "Вчера стая пошла на свет.", 2: "Вчера стая ждала утра."}
@@ -273,7 +274,7 @@ def test_prev_bad_keys_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][1]["prev"] = {0: "текст", 5: "текст"}
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
     assert any("ключи prev" in error for error in result.errors)
 
 
@@ -281,21 +282,21 @@ def test_prev_empty_value_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][1]["prev"] = {0: "   "}
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
 
 
 def test_prev_value_too_long_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][1]["prev"] = {0: "а" * (FIELD_LIMITS["prev_value"] + 1)}
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
 
 
 def test_diary_too_long_rejected() -> None:
     payload = _payload("2026-04", 30)
     payload["days"][0]["diary"] = "д" * (FIELD_LIMITS["diary"] + 1)
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
 
 
 def _fork_payload() -> dict:
@@ -316,7 +317,7 @@ def test_fork_duplicate_at_day_winner_rejected() -> None:
         {"to": "b2", "at_day": 28, "winner": 1, "days": [_day(i) for i in range(28, 31)]}
     )
     result = validate_payload(payload)
-    assert not result.ok
+    assert result.cassette is None
     assert any("at_day=28" in error and "winner=1" in error for error in result.errors)
 
 
@@ -329,14 +330,14 @@ def test_fork_dead_prev_key_on_entrance_warns() -> None:
         2: "Вчера стая ждала утра.",
     }
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert any("мёртвые" in warning for warning in result.warnings)
 
 
 def test_fork_only_own_prev_key_on_entrance_is_clean() -> None:
     payload = _fork_payload()
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert not any("мёртвые" in warning for warning in result.warnings)
 
 
@@ -383,7 +384,7 @@ def test_prev_echo_of_yesterday_is_clean() -> None:
     payload = _payload_with_echoes()
     payload["days"][1]["prev"] = {0: _ЭХО_ДНЯ1}  # день 2 помнит котельную (день 1)
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert not any("СВОЕГО" in warning and "день 2" in warning for warning in result.warnings)
 
 
@@ -392,7 +393,7 @@ def test_prev_echo_of_own_day_is_flagged() -> None:
     payload = _payload_with_echoes()
     payload["days"][1]["prev"] = {0: _ЭХО_ДНЯ2}  # день 2 «помнит» шиповник (свой день)
     result = validate_payload(payload)
-    assert result.ok, result.errors  # мягкое замечание, не отказ
+    assert result.cassette is not None, result.errors  # мягкое замечание, не отказ
     hits = [w for w in result.warnings if "СВОЕГО" in w and "день 2" in w]
     assert hits, result.warnings
     assert "ждёт дня на +1" in hits[0]
@@ -403,7 +404,7 @@ def test_own_day_echo_is_found_in_a_long_cassette() -> None:
     payload = _payload_with_echoes()
     payload["days"][1]["prev"] = {0: _ЭХО_ДНЯ2}
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     flagged = [w for w in result.warnings if "СВОЕГО" in w and "день 2" in w]
     assert flagged, result.warnings
     # и остальной месяц линтер не сочтит сдвигом
@@ -417,7 +418,7 @@ def test_repeated_prev_block_is_flagged() -> None:
     payload["days"][2]["prev"] = dict(block)
     payload["days"][8]["prev"] = dict(block)
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert any("блок prev дословно повторяет день 3" in w for w in result.warnings), (
         result.warnings
     )
@@ -429,7 +430,7 @@ def test_repeated_single_prev_key_is_flagged() -> None:
     payload["days"][2]["prev"] = {0: _ЭХО_ДНЯ1}
     payload["days"][8]["prev"] = {0: _ЭХО_ДНЯ1, 1: "Совсем другой текст для ключа один."}
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert any("prev[0] дословно повторяет день 3" in w for w in result.warnings), (
         result.warnings
     )
@@ -440,7 +441,7 @@ def test_prev_of_first_day_is_not_judged() -> None:
     payload = _payload_with_echoes()
     payload["days"][0]["prev"] = {0: _ЭХО_ДНЯ2}
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert not any("СВОЕГО" in w and "день 1" in w for w in result.warnings), result.warnings
 
 
@@ -458,7 +459,7 @@ def test_fork_first_day_echo_compared_against_main_road() -> None:
         card["consequence"] = fork_text
     payload["switch"][0]["days"][0]["prev"] = {1: "Главная дорога ушла в тупик."}
     result = validate_payload(payload)
-    assert result.ok
+    assert result.cassette is not None
     assert not any("СВОЕГО" in w and "день 28" in w for w in result.warnings), result.warnings
 
 
@@ -474,7 +475,7 @@ def test_fork_day_echoing_its_own_day_is_flagged() -> None:
         card["consequence"] = own_text
     fork_days[1]["prev"] = {0: "Ветка обогнула овраг по верху, и голос остался подо льдом."}
     result = validate_payload(payload)
-    assert result.ok, result.errors
+    assert result.cassette is not None, result.errors
     assert any("СВОЕГО" in w and "день 29" in w for w in result.warnings), result.warnings
 
 
@@ -485,4 +486,4 @@ def test_real_cassettes_have_no_hard_errors() -> None:
     assert files, "библиотека кассет пуста"
     for path in files:
         result = validate_file(path)
-        assert result.ok, f"{path.name}: {result.errors}"
+        assert result.cassette is not None, f"{path.name}: {result.errors}"
