@@ -265,8 +265,58 @@ async def test_confirm_marks_window_elapsed_as_failed(monkeypatch) -> None:
             "за окном сверки строка должна идти в failed, не в pending"
         )
         assert "за окном сверки" in (row.last_error or "")
-        # attempts не растёт — повторной отправки не будет.
-        assert row.attempts == 0
+        # Лимит попыток сожжён: failed с attempts < max гигиена _reset_retriable
+        # оживила бы в следующем цикле, и тот же memo ушёл бы в цепочку повторно.
+        assert row.attempts == settings.payout_max_attempts
+    finally:
+        await _cleanup(payout_id)
+
+
+async def test_window_elapsed_waits_for_manual_review(monkeypatch) -> None:
+    """Регресс: гигиена очереди не оживляет failed «за окном сверки».
+
+    _reset_retriable возвращает failed в pending, пока attempts < max. Ветка
+    «за окном сверки» раньше не трогала attempts — и строка оживала сама,
+    диспетчер вещал тот же memo повторно: двойной платёж за пределами окна
+    сверки, где анти-дубль по истории казначея уже не видит перевод.
+    Обратно в очередь строку поднимает только ручной разбор хранителя.
+    """
+    payout_id = await _seed_sent_payout()
+    async with SessionLocal() as session:
+        row = await session.get(Payout, payout_id)
+        row.sent_at = datetime.now(UTC) - timedelta(
+            seconds=settings.payout_reconcile_history_seconds + 3600
+        )
+        await session.commit()
+
+    async def fake_tx_map(**kwargs) -> dict[str, str]:
+        return {"way:64:prize#999": "0" * 64}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+
+    network = "testnet" if settings.is_testnet else "mainnet"
+    try:
+        await ton_pay.confirm_broadcast_payouts(bot=None)
+
+        # Цикл гигиены очереди: failed оживает только при attempts < max.
+        async with SessionLocal() as session:
+            await ton_pay._reset_retriable(session, network)
+            await session.commit()
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert row.status == "failed", (
+            "автооживление строки за окном сверки — прямой путь к двойному платежу"
+        )
+
+        # Ручной разбор хранителя — единственный вход обратно в очередь.
+        async with SessionLocal() as session:
+            new_status = await ton_pay.resolve_dead_payout(session, payout_id, "retry")
+        assert new_status == "pending"
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert row.status == "pending"
+        # Счётчик не сброшен: повтор пройдёт анти-дубль по истории казначея.
+        assert row.attempts == settings.payout_max_attempts
     finally:
         await _cleanup(payout_id)
 

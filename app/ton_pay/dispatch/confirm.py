@@ -38,9 +38,11 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
         строка возвращается в pending (перевод в цепочку не ушёл, анти-дубль
         при повторной отправке не сработает — мемо там нет);
       • memo, которого НЕТ в истории, но sent_at старше
-        payout_reconcile_history_seconds → строка уходит в failed: за окном
-        сверки нельзя ни подтвердить, ни опровергнуть, а повторная отправка
-        рискует задублировать перевод;
+        payout_reconcile_history_seconds → строка уходит в failed с сожжённым
+        лимитом попыток (attempts = payout_max_attempts): за окном сверки нельзя
+        ни подтвердить, ни опровергнуть, повторная отправка рискует задвоить
+        перевод, а failed с attempts < max гигиена очереди оживляет сама —
+        такая строка ждёт только ручного разбора через /payouts;
       • карта истории пуста (оба провайдера молчат) → НЕ трогаем строки:
         «не знаю» не имеет права ни подтверждать, ни возвращать в очередь.
     """
@@ -118,7 +120,14 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                     # Возвращать в pending = риск дубля (memo может жить в цепочке
                     # за пределами нашего покрытия). В failed с понятной причиной:
                     # ручной разбор через /payouts → retry при подтверждённой доле.
+                    # Сжигаем остаток попыток: failed с attempts < max — корм
+                    # гигиены _reset_retriable, а она оживила бы строку уже в
+                    # следующем цикле, и тот же memo ушёл бы в цепочку повторно.
+                    # attempts == max делает решение окончательным до ручного
+                    # вердикта: resolve_dead_payout счётчик не сбрасывает, и
+                    # ручной retry по-прежнему пройдёт анти-дубль по истории.
                     payout.status = "failed"
+                    payout.attempts = settings.payout_max_attempts
                     payout.last_error = (
                         f"memo «{_payout_comment_candidates(payout)[0][:40]}…» за окном сверки "
                         f"{settings.payout_reconcile_history_seconds} с — нельзя подтвердить "
