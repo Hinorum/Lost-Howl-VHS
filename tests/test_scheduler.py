@@ -1325,6 +1325,134 @@ async def test_vote_reminder_sends_dms_once_per_day(monkeypatch) -> None:
         await _clear_rounds()
 
 
+async def test_vote_reminder_catchup_sends_within_window(monkeypatch) -> None:
+    """Догон в окне [10:00, 10:20) UTC досылает потерянное напоминание один раз.
+
+    Деплой на границе 10:00 UTC теряет cron-запуск безвозвратно: jobstore в
+    RAM, догоняющего запуска у APScheduler нет. Повторный тик того же окна
+    упирается в занятую метку дня и не спамит.
+    """
+    from app import scheduler as sched
+    from app.models import Player
+
+    await _clear_rounds()
+    await _make_round(9811, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[511]))
+
+    async with SessionLocal() as db:
+        db.add(Player(id=511, username="a", first_name="A", dm_subscribed=True))
+        await db.commit()
+
+    monkeypatch.setattr(
+        sched, "_now", lambda: datetime(2026, 6, 1, 10, 5, tzinfo=UTC)
+    )
+
+    try:
+        await sched._vote_reminder_catchup_job()
+        assert sends.await_count == 1
+
+        # Второй тик того же окна — метка дня занята, дубля нет.
+        await sched._vote_reminder_catchup_job()
+        assert sends.await_count == 1
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(delete(Player).where(Player.id == 511))
+            await db.commit()
+        await _clear_rounds()
+
+
+async def test_vote_reminder_catchup_stays_silent_outside_window(monkeypatch) -> None:
+    """Вне окна джоба не шлёт и не сжигает метку дня.
+
+    Метка «сгорает» только вместе с реальной рассылкой: иначе тик в 09:59
+    занял бы её раньше штатного крона в 10:00 и напоминание не ушло бы
+    никому — тот же инцидент, только устроенный нами самими.
+    """
+    from app import scheduler as sched
+    from app.models import Player
+
+    await _clear_rounds()
+    await _make_round(9812, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[512]))
+
+    async with SessionLocal() as db:
+        db.add(Player(id=512, username="a", first_name="A", dm_subscribed=True))
+        await db.commit()
+
+    try:
+        for moment in (
+            datetime(2026, 6, 1, 9, 59, tzinfo=UTC),
+            datetime(2026, 6, 1, 10, 20, tzinfo=UTC),
+            datetime(2026, 6, 1, 10, 25, tzinfo=UTC),
+        ):
+            monkeypatch.setattr(sched, "_now", lambda m=moment: m)
+            await sched._vote_reminder_catchup_job()
+        assert sends.await_count == 0
+
+        async with SessionLocal() as db:
+            assert await db.get(WatcherState, "job:vote-reminder:2026-06-01") is None
+
+        # Метка не сожжена — в окне рассылка ещё уходит.
+        monkeypatch.setattr(
+            sched, "_now", lambda: datetime(2026, 6, 1, 10, 5, tzinfo=UTC)
+        )
+        await sched._vote_reminder_catchup_job()
+        assert sends.await_count == 1
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(delete(Player).where(Player.id == 512))
+            await db.commit()
+        await _clear_rounds()
+
+
+async def test_vote_reminder_catchup_yields_to_live_cron(monkeypatch) -> None:
+    """Штатный cron уже занял метку дня — догон молчит, несмотря на окно."""
+    from app import scheduler as sched
+    from app.models import Player
+
+    await _clear_rounds()
+    await _make_round(9813, RoundStatus.OPEN)
+
+    sends = AsyncMock()
+    monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "player_dm", True)
+    monkeypatch.setattr("app.broadcast.active_player_ids", AsyncMock(return_value=[513]))
+
+    async with SessionLocal() as db:
+        db.add(Player(id=513, username="a", first_name="A", dm_subscribed=True))
+        await db.commit()
+
+    try:
+        monkeypatch.setattr(
+            sched, "_now", lambda: datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+        )
+        await sched._vote_reminder_job()
+        assert sends.await_count == 1
+
+        # Тик догона в 10:05 уступает: claim_once вернёт False.
+        monkeypatch.setattr(
+            sched, "_now", lambda: datetime(2026, 6, 1, 10, 5, tzinfo=UTC)
+        )
+        await sched._vote_reminder_catchup_job()
+        assert sends.await_count == 1
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(delete(Player).where(Player.id == 513))
+            await db.commit()
+        await _clear_rounds()
+
+
 async def test_story_diary_job_sends_once_per_day(monkeypatch) -> None:
     """Дневник дня — отдельной рассылкой в 17:00 UTC (указ владельца).
 

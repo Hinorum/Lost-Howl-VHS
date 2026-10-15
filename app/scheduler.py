@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import time
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -684,7 +685,16 @@ def start_scheduler() -> None:
     # Напоминание о голосовании: 10:00 UTC (за час до закрытия в 11:00 UTC)
     _register_job(
         "vote-reminder", _vote_reminder_job, "cron",
-        hour=10, minute=0, timezone="UTC",
+        hour=_VOTE_REMINDER_AT.hour, minute=_VOTE_REMINDER_AT.minute,
+        timezone="UTC",
+    )
+    # Догон того же напоминания: крон без постоянного jobstore теряется при
+    # рестарте на границе 10:00 UTC (деплой-гонка инцидента 14.10.2026).
+    # Каждая минута окна — новая попытка; claim_once внутри самой рассылки
+    # держит «раз в сутки», поэтому живой cron и догон не задваиваются.
+    _register_job(
+        "vote-reminder-catchup", _vote_reminder_catchup_job, "interval",
+        seconds=60,
     )
     # Дневник дня — отдельной рассылкой (указ владельца: снят из итогов):
     # 17:00 UTC, посреди игрового дня.
@@ -835,6 +845,36 @@ async def _vote_reminder_job() -> None:
             )
     except Exception as exc:
         logger.warning("Ошибка напоминания о голосовании: %s", exc)
+
+
+# Напоминание уходит в 10:00 UTC (за час до закрытия в 11:00 UTC).
+_VOTE_REMINDER_AT = time(10, 0)
+# Окно догона пропущенного крона: [10:00, 10:20) UTC. Дальше текст
+# «закрывается через час» врал бы сильнее, чем был бы полезен (до закрытия
+# оставалось бы <40 мин), а пропущенный после окна крон — уже не деплой-гонка
+# на секунды, а простой, который виден по /health и логу Render.
+_VOTE_REMINDER_CATCHUP_UNTIL = time(10, 20)
+
+
+async def _vote_reminder_catchup_job() -> None:
+    """Догон пропущенного напоминания о голосовании (инцидент 14.10.2026).
+
+    Постоянного jobstore нет (см. докстринг `_register_job`): если деплой
+    перезапускает процесс ровно на границе 10:00 UTC, cron-запуск теряется
+    навсегда — игроки узнают о закрытии голосования только по итогам дня.
+    Так и случилось: пуш в 12:55 MSK переехал на границу крона, и рассылка
+    не ушла никому, а метки `delivery:*` даже не было (попыток не было вовсе).
+
+    Джоба идёт каждую минуту и в узком окне зовёт ту же рассылку.
+    Идемпотентность — на метке дня внутри `_vote_reminder_job`
+    (`claim_once("job:vote-reminder:<дата>")`): штатный cron успел — джоба
+    молчит; деплой его потерял — джоба досылает ровно один раз. Отдельный
+    спавн из тика не нужен: тик сам держит ту же метку дня.
+    """
+    moment = _now()
+    if not (_VOTE_REMINDER_AT <= moment.time() < _VOTE_REMINDER_CATCHUP_UNTIL):
+        return
+    await _vote_reminder_job()
 
 
 async def _story_diary_job() -> None:
