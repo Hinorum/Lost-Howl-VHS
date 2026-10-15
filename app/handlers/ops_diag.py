@@ -19,7 +19,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from app.ops import problems_snapshot, snapshot
+from app.ops import clear_delivery_alert, problems_snapshot, snapshot, zero_delivery_markers
 from app.style import ok_mark, warn_mark
 
 from .common import require_admin, router
@@ -162,3 +162,48 @@ async def cmd_ops(message: Message) -> None:
         await message.answer(await _ops_diag_text())
     except Exception as exc:
         await message.answer(f"Пульт не собрался: {type(exc).__name__}")
+
+
+@router.message(Command("alerts_clear"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Пульт — только для хранителя.")
+async def cmd_alerts_clear(message: Message) -> None:
+    """Ручное снятие застрявшей метки доставки: /alerts_clear [вид].
+
+    Вид — как в тревоге («ни одно сообщение не доставлено: dm:vote-reminder»);
+    префикс `delivery:` тоже принимается, его просто срезают. Без аргумента
+    показывает текущие нулевые метки: хранителю, не помнящему точный вид,
+    сначала нужно увидеть, что вообще застряло и с какой причиной.
+    """
+    words = (message.text or "").split()
+    kind = words[1] if len(words) > 1 else ""
+    for prefix in ("delivery_reason:", "delivery:"):
+        if kind.startswith(prefix):
+            kind = kind.removeprefix(prefix)
+
+    if not kind:
+        markers = await zero_delivery_markers()
+        if not markers:
+            await message.answer(
+                f"{ok_mark('ops')} Нулевых меток доставки нет — снимать нечего."
+            )
+            return
+        lines = [f"{warn_mark('ops')} Нулевые метки доставки ({len(markers)}):"]
+        for marker_kind, cause in markers:
+            lines.append(f"• {marker_kind}")
+            if cause:
+                lines.append(f"  причина: {cause}")
+        lines.append(
+            "\nСнятие: /alerts_clear «вид», например /alerts_clear dm:vote-reminder"
+        )
+        await message.answer("\n".join(lines))
+        return
+
+    removed = await clear_delivery_alert(kind)
+    if not removed:
+        await message.answer(f"{warn_mark('ops')} Метка {kind} не найдена — снимать нечего.")
+        return
+    await message.answer(
+        f"{ok_mark('ops')} Снято: {', '.join(removed)}.\n"
+        "Тревога погаснет на ближайшей проверке; кулдаун сброшен, только если "
+        "других нулевых меток не осталось."
+    )

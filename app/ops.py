@@ -501,6 +501,128 @@ async def _clear_alert_stamp(session, alert_key: str | None) -> None:
         await session.commit()
 
 
+_DELIVERY_PROBLEM_PREFIX = "ни одно сообщение не доставлено: "
+
+
+def _zero_delivery(value: str | None) -> bool:
+    """Метка `delivery:*` = «<доставлено>/<попыток>» означает нулевую доставку.
+
+    Тот же разбор, что у проверки 3.9: ноль только при живых попытках —
+    «0/0» (пустая аудитория) метки не несёт вовсе, а битая строка не повод
+    тревожить. Здесь и в проверке — одна формула, иначе «что такое ноль»
+    разъехалось бы между тревогой и ручным снятием.
+    """
+    head, _, tail = (value or "").partition("/")
+    try:
+        return int(tail) > 0 and int(head) == 0
+    except ValueError:
+        return False
+
+
+def _note_lists_kind(text: str, kind: str) -> bool:
+    """Текст тревоги 3.9 перечисляет именно этот вид рассылки.
+
+    Сравнение по токенам после «не доставлено:», а не по подстроке: иначе
+    снятие `day:1` чистило бы запись тревоги для `day:11` и гасило бы
+    чужую, живую беду.
+    """
+    if not text.startswith(_DELIVERY_PROBLEM_PREFIX):
+        return False
+    listed = text[len(_DELIVERY_PROBLEM_PREFIX):]
+    return kind in {token.strip() for token in listed.split(",")}
+
+
+async def zero_delivery_markers() -> list[tuple[str, str]]:
+    """Текущие нулевые метки доставки: (вид, причина последнего прохода).
+
+    Нужны админ-команде `/alerts_clear` без аргумента: хранителю, который
+    не помнит точный вид из тревоги, сначала показывают, что застряло и с
+    какой причиной, и только потом он снимает.
+    """
+    from app.broadcast import DELIVERY_KEY_PREFIX, DELIVERY_REASON_KEY_PREFIX
+
+    async with SessionLocal() as session:
+        marker_rows = (
+            await session.execute(
+                select(WatcherState).where(WatcherState.key.like(f"{DELIVERY_KEY_PREFIX}%"))
+            )
+        ).scalars().all()
+        zeros = {
+            row.key.removeprefix(DELIVERY_KEY_PREFIX): (row.value or "")
+            for row in marker_rows
+            if _zero_delivery(row.value)
+        }
+        if not zeros:
+            return []
+        reason_rows = (
+            await session.execute(
+                select(WatcherState).where(
+                    WatcherState.key.like(f"{DELIVERY_REASON_KEY_PREFIX}%")
+                )
+            )
+        ).scalars().all()
+    reasons = {
+        row.key.removeprefix(DELIVERY_REASON_KEY_PREFIX): (row.value or "")
+        for row in reason_rows
+    }
+    return [(kind, reasons.get(kind, "")) for kind in sorted(zeros)]
+
+
+async def clear_delivery_alert(kind: str) -> list[str]:
+    """Ручное снятие застрявшей метки доставки и её тревоги.
+
+    Инцидент 14.10.2026: `delivery:dm:vote-reminder` = «0/1» орал каждый
+    час, и лечили это SQL-правкой в прод-БД. Возрастной фильтр (36 ч)
+    снимает такое само, но ждать сутки — не выход: хранителю нужен ручной
+    рычаг без доступа к базе.
+
+    Снимает все три слоя, которыми держится тревога:
+    * `delivery:<вид>` и `delivery_reason:<вид>` — факт «0 из N» и причина
+      последнего прохода; без них проверка 3.9 проблему не видит;
+    * запись в карте тревог — иначе часовая сводка повторяла бы
+      «держится N ч» по проблеме, которой уже нет;
+    * кулдаун `ALERT_DELIVERY_KEY` — но только если других нулевых меток
+      не осталось: чужая живая тревога не должна из-за этой правки
+      промолчать в следующий час.
+
+    Возвращает список снятых ключей (пусто — снимать нечего).
+    """
+    from app.broadcast import DELIVERY_KEY_PREFIX, DELIVERY_REASON_KEY_PREFIX
+
+    limit = WatcherState.key.type.length
+    keys = (f"{DELIVERY_KEY_PREFIX}{kind}", f"{DELIVERY_REASON_KEY_PREFIX}{kind}")
+    for key in keys:
+        if len(key) > limit:
+            raise ValueError(f"ключ {key!r} длиннее колонки key ({limit})")
+
+    removed: list[str] = []
+    async with SessionLocal() as session:
+        for key in keys:
+            row = await session.get(WatcherState, key)
+            if row is not None:
+                await session.delete(row)
+                removed.append(key)
+        if removed:
+            await session.commit()
+
+        track = _load_track(await _get_state(session, OPS_ALERT_TRACK_KEY))
+        stale = [key for key, entry in track.items() if _note_lists_kind(_tracked_text(entry), kind)]
+        if stale:
+            for key in stale:
+                track.pop(key)
+            await _store_track(session, track)
+            removed.append(OPS_ALERT_TRACK_KEY)
+
+        others = (
+            await session.execute(
+                select(WatcherState).where(WatcherState.key.like(f"{DELIVERY_KEY_PREFIX}%"))
+            )
+        ).scalars().all()
+        if not any(_zero_delivery(row.value) for row in others):
+            await _clear_alert_stamp(session, ALERT_DELIVERY_KEY)
+    return removed
+
+
 async def _raise(session, bot, alert_key: str, problem: str, notice: str) -> None:
     """Единая точка тревоги: проблема в список + первое сообщение + учёт.
 

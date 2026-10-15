@@ -71,6 +71,7 @@ __all__ = [
     "build_dispatcher",
     "cmd_adjust",
     "cmd_advance",
+    "cmd_alerts_clear",
     "cmd_backup",
     "cmd_change",
     "cmd_dispute",
@@ -163,7 +164,7 @@ from .common import (
     router,
 )
 from .fallback import on_private_fallback, register_private_fallback
-from .ops_diag import _ops_diag_text, cmd_ops
+from .ops_diag import _ops_diag_text, cmd_alerts_clear, cmd_ops
 from .panel import (
     _admin_panel_text,
     _panel_keyboard,

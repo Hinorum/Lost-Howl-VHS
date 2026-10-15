@@ -34,7 +34,7 @@ from app.handlers.admin import (
     on_adjust_action,
 )
 from app.handlers.common import router as app_router
-from app.handlers.ops_diag import cmd_ops
+from app.handlers.ops_diag import cmd_alerts_clear, cmd_ops
 from app.handlers.panel import (
     cmd_cassette,
     cmd_panel,
@@ -87,6 +87,7 @@ COMMAND_GUARDS = [
     (cmd_blockchain, "/blockchain"),
     (cmd_mirror, "/mirror reset confirm"),  # гейт обязан стоять до разбора аргументов
     (cmd_ops, "/ops"),
+    (cmd_alerts_clear, "/alerts_clear delivery:dm:vote-reminder"),
 ]
 
 CALLBACK_GUARDS = [

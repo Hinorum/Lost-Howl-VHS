@@ -313,3 +313,84 @@ async def test_cmd_ops_answers_admin(monkeypatch) -> None:
     await ops_diag.cmd_ops(message)
 
     assert "Пульт" in message.answer.call_args.args[0]
+
+
+async def test_cmd_alerts_clear_without_arg_lists_stuck_markers(monkeypatch) -> None:
+    """Без аргумента — что застряло и с какой причиной.
+
+    Хранитель не обязан помнить точный вид из тревоги: сначала подсказка,
+    потом снятие.
+    """
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:dm:vote-reminder", value="0/1"))
+        db.add(
+            WatcherState(
+                key="delivery_reason:dm:vote-reminder",
+                value="бот-аккаунт (×1)",
+            )
+        )
+        await db.commit()
+
+    message = _message(42, "/alerts_clear")
+    await ops_diag.cmd_alerts_clear(message)
+
+    text = message.answer.call_args.args[0]
+    assert "dm:vote-reminder" in text
+    assert "бот-аккаунт (×1)" in text
+    assert "/alerts_clear" in text, "в подсказке должен быть пример снятия"
+
+
+async def test_cmd_alerts_clear_without_arg_says_nothing_when_clean(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    message = _message(42, "/alerts_clear")
+
+    await ops_diag.cmd_alerts_clear(message)
+
+    assert "снимать нечего" in message.answer.call_args.args[0]
+
+
+async def test_cmd_alerts_clear_removes_marker_and_reports(monkeypatch) -> None:
+    """Снятие убирает метку и называет, что именно снято."""
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:dm:vote-reminder", value="0/1"))
+        await db.commit()
+
+    message = _message(42, "/alerts_clear dm:vote-reminder")
+    await ops_diag.cmd_alerts_clear(message)
+
+    text = message.answer.call_args.args[0]
+    assert "Снято" in text
+    assert "delivery:dm:vote-reminder" in text
+    async with SessionLocal() as db:
+        assert await db.get(WatcherState, "delivery:dm:vote-reminder") is None
+
+
+async def test_cmd_alerts_clear_accepts_full_key(monkeypatch) -> None:
+    """Ключ, скопированный из тревоги целиком, — префикс срезается."""
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:dm:vote-reminder", value="0/1"))
+        await db.commit()
+
+    message = _message(42, "/alerts_clear delivery:dm:vote-reminder")
+    await ops_diag.cmd_alerts_clear(message)
+
+    async with SessionLocal() as db:
+        assert await db.get(WatcherState, "delivery:dm:vote-reminder") is None
+
+
+async def test_cmd_alerts_clear_unknown_kind_says_not_found(monkeypatch) -> None:
+    """Не тот вид — явный отказ, а не мнимое «снято»."""
+    monkeypatch.setattr(settings, "admin_ids", "42")
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:48", value="0/4"))
+        await db.commit()
+
+    message = _message(42, "/alerts_clear dm:vote-reminder")
+    await ops_diag.cmd_alerts_clear(message)
+
+    assert "не найдена" in message.answer.call_args.args[0]
+    async with SessionLocal() as db:
+        assert await db.get(WatcherState, "delivery:day:48") is not None

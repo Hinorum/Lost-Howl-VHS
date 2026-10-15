@@ -20,6 +20,7 @@ from sqlalchemy import delete
 
 from app import ops
 from app.core.registry import (
+    ALERT_DELIVERY_KEY,
     ALERT_QUEUE_KEY,
     ALERT_TICK_KEY,
     OPS_ALERT_DIGEST_KEY,
@@ -683,3 +684,100 @@ async def test_closed_round_without_results_is_not_alarmed(_clean) -> None:
         assert not any("нет отметки о доставке" in p for p in problems), problems
     finally:
         await _drop_round(23)
+
+
+# ---------- ручное снятие (/alerts_clear) ----------
+
+
+async def test_clear_delivery_alert_removes_marker_reason_and_track(_clean) -> None:
+    """Одна команда снимает все три слоя, которыми держится тревога.
+
+    Метку убрать мало: запись в карте тревог продолжала бы «держится N ч» по
+    проблеме, которой уже нет, и часовая сводка врала бы до конца дня.
+    """
+    from app.broadcast import record_delivery
+
+    note = "ни одно сообщение не доставлено: dm:vote-reminder"
+    await record_delivery("dm:vote-reminder", 0, 1, {"бот-аккаунт": 1})
+    await _sweep(None, [note])
+    assert await _state("delivery:dm:vote-reminder") == "0/1"
+    assert any(e["text"] == note for e in (await _track()).values())
+
+    removed = await ops.clear_delivery_alert("dm:vote-reminder")
+
+    assert await _state("delivery:dm:vote-reminder") is None
+    assert await _state("delivery_reason:dm:vote-reminder") is None
+    assert all(e["text"] != note for e in (await _track()).values())
+    assert "delivery:dm:vote-reminder" in removed
+    problems = await ops.check_anomalies(_clean)
+    assert not any("не доставлено" in p for p in problems), problems
+
+
+async def test_clear_delivery_alert_keeps_cooldown_while_other_zero_exists(_clean) -> None:
+    """Кулдаун сбрасывается, только когда других нулевых меток не осталось.
+
+    Тревога доставки одна на все виды: сбросив кулдаун при живом чужом нуле,
+    мы заставили бы следующий же проход повторить её — шум вместо помощи.
+    """
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:dm:vote-reminder", value="0/1"))
+        db.add(WatcherState(key="delivery:day:44", value="0/4"))
+        db.add(WatcherState(key=ALERT_DELIVERY_KEY, value=datetime.now(UTC).isoformat()))
+        await db.commit()
+
+    await ops.clear_delivery_alert("dm:vote-reminder")
+    assert await _state("delivery:day:44") == "0/4", "чужой живой ноль снимать нельзя"
+    assert await _state(ALERT_DELIVERY_KEY) is not None, "кулдаун обязан держаться"
+
+    await ops.clear_delivery_alert("day:44")
+    assert await _state(ALERT_DELIVERY_KEY) is None, "последний ноль — кулдаун сброшен"
+
+
+async def test_clear_delivery_alert_matches_kind_exactly(_clean) -> None:
+    """Снятие `day:1` не чуждается `day:11`: сравнение по токенам списка,
+    а не по подстроке — иначе ручное снятие гасило бы чужую, живую беду."""
+    note = "ни одно сообщение не доставлено: day:11"
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:1", value="0/4"))
+        db.add(WatcherState(key="delivery:day:11", value="0/4"))
+        await db.commit()
+    await _sweep(None, [note])
+
+    removed = await ops.clear_delivery_alert("day:1")
+
+    assert "delivery:day:1" in removed
+    assert await _state("delivery:day:1") is None
+    assert await _state("delivery:day:11") == "0/4", "day:11 сниматься не должен"
+    assert any(e["text"] == note for e in (await _track()).values()), (
+        "запись тревоги day:11 обязана пережить снятие day:1"
+    )
+
+
+async def test_clear_delivery_alert_unknown_kind_is_noop(_clean) -> None:
+    """Неизвестный вид — тишина, а не ложное «снято»: хранителю нужно знать,
+    что указан не тот ключ."""
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:day:45", value="0/4"))
+        await db.commit()
+
+    removed = await ops.clear_delivery_alert("dm:vote-reminder")
+
+    assert removed == []
+    assert await _state("delivery:day:45") == "0/4"
+
+
+async def test_zero_delivery_markers_lists_stuck_kinds(_clean) -> None:
+    """Подсказка `/alerts_clear` без аргумента: что застряло и с какой причиной."""
+    from app.broadcast import record_delivery
+
+    await record_delivery("day:46", 0, 4, {"доступ закрыт": 4})
+    async with SessionLocal() as db:
+        db.add(WatcherState(key="delivery:dm:vote-reminder", value="0/1"))
+        db.add(WatcherState(key="delivery:day:47", value="4/4"))
+        await db.commit()
+
+    markers = await ops.zero_delivery_markers()
+
+    assert [kind for kind, _ in markers] == ["day:46", "dm:vote-reminder"]
+    assert dict(markers)["day:46"] != "", "причина обязана дойти до подсказки"
+    assert dict(markers)["dm:vote-reminder"] == "", "без причины — пустая строка"
