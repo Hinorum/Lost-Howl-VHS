@@ -563,7 +563,21 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                         continue
                     created += add_payout(stake, "prize", share)
             if referral_cut > 0:
-                for referrer_id, share in split_pot(referral_cut, referred_entries):
+                # Один вызов _credit_referral на (день, пригласившего): метка
+                # pot:...:ref:<id> гасит повторный вызов, поэтому доли ВСЕХ его
+                # приведённых (несколько игроков, несколько ставок) обязаны быть
+                # просуммированы ДО зачисления. Раньше доля шла отдельным
+                # вызовом на каждую ставку — в копилку попадала только первая
+                # (крупнейшая по split_pot), остальные молча терялись, хотя
+                # referral_nanotons дня продолжал обещать полную сумму.
+                # Сумма долей сходится с referral_cut до нанотона: это те же
+                # поэлементные floor'ы, что и в его вычислении выше.
+                referral_shares: dict[int, int] = {}
+                for referrer_id, amount in referred_entries:
+                    referral_shares[referrer_id] = (
+                        referral_shares.get(referrer_id, 0) + amount * referral_bp // 10_000
+                    )
+                for referrer_id, share in referral_shares.items():
                     await _credit_referral(session, round_row.id, referrer_id, share)
             if house_cut > 0:
                 created += add_treasury_payout("rake", house_cut)

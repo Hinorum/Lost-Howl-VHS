@@ -100,6 +100,49 @@ async def test_referred_stake_feeds_pot_and_shrinks_prize_pool(session: AsyncSes
     assert abs(rows[referred] - rows[other]) <= 1  # равные ставки — равные доли
 
 
+async def test_same_referrer_gets_sum_of_all_referred_stakes(session: AsyncSession) -> None:
+    """Доли одного пригласившего за день суммируются, а не теряются.
+
+    _credit_referral клеймит пару (день, пригласивший) и на повторный вызов
+    молчит; раньше вызов шёл по одному на КАЖДУЮ ставку приведённых, и в
+    копилку попадала только первая доля, остальные молча пропадали. Здесь
+    R привёл A (2 Gram) и B (3 Gram), R2 — C (4 Gram): копилки обязаны сойтись
+    с referral_nanotons дня до нанотона.
+    """
+    r1, r2 = 9000, 9001
+    a, b, c = 9002, 9003, 9004
+    for pid in (r1, r2, a, b, c):
+        session.add(Player(id=pid, wallet_address=f"wallet-{pid}", wallet_verified=True))
+    session.add_all(
+        [
+            Referral(referrer_id=r1, referred_id=a),
+            Referral(referrer_id=r1, referred_id=b),
+            Referral(referrer_id=r2, referred_id=c),
+        ]
+    )
+    round_row = await make_closed_round(session, winner_card=0)
+    session.add_all(
+        [
+            Vote(round_id=round_row.id, player_id=a, card_position=0),
+            Vote(round_id=round_row.id, player_id=b, card_position=0),
+            Vote(round_id=round_row.id, player_id=c, card_position=0),
+            Stake(round_id=round_row.id, player_id=a, amount_nanotons=to_nano(2), tx_hash="a", status="confirmed"),
+            Stake(round_id=round_row.id, player_id=b, amount_nanotons=to_nano(3), tx_hash="b", status="confirmed"),
+            Stake(round_id=round_row.id, player_id=c, amount_nanotons=to_nano(4), tx_hash="c", status="confirmed"),
+        ]
+    )
+    await session.commit()
+
+    await stakes_mod.finalize_day_payouts(session, round_row)
+
+    share_a = to_nano(2) * 100 // 10_000
+    share_b = to_nano(3) * 100 // 10_000
+    share_c = to_nano(4) * 100 // 10_000
+    assert await _referral_pot_total(session) == {r1: share_a + share_b, r2: share_c}
+    # Σ копилок сходится с referral_cut дня: ни один нанотон не потерян.
+    assert round_row.referral_nanotons == share_a + share_b + share_c
+
+
 async def test_no_referrers_keeps_old_split(session: AsyncSession) -> None:
     """День без приведённых ставок не откладывает реферальной доли: пул 96% как раньше."""
     for pid in (2001, 2002):
