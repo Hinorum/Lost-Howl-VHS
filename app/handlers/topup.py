@@ -336,18 +336,16 @@ async def on_payton(callback: CallbackQuery) -> None:
                 return
     address = settings.active_treasury_address
     await callback.message.answer(
-        f"{money_mark(raw)} Переведи от {settings.revote_ton:g} до {_revote_gram_ceiling():g} Gram "
-        f"(строго меньше минимума ставки {settings.stake_min_ton:g} Gram) на адрес казначея:\n"
-        f"<code>{address}</code>\n\n"
-        f"Комментарий (memo) не обязателен — сумма из вилки зачтётся автоматически.\n"
-        f"Можно приложить (бот распознает `rv:день` в любой части текста):\n<code>{revote_memo(int(raw))}</code>\n\n"
-        "Эту сумму ставкой быть не может — потолок ниже минимума ставки. "
-        f"Ровно {settings.stake_min_ton:g} Gram не подойдёт: это уже минимальная ставка, а не оплата перемотки кадра "
-        "(бот примет её как ставку дня). Если кошелёк приложит мемо — оплата привяжется "
-        "мгновенно и любой суммой из вилки. Без мемо сумма из той же вилки зачтётся "
-        "автоматически. Грант на перемотку придёт в течение минуты.\n\n"
-        "💡 Надёжнее и без кошелька — Stars: кнопка оплаты прямо в Telegram.\n"
-        "Кошелёк должен быть привязан: /wallet. Неиспользованный до конца дня грант сгорает.",
+        f"{money_mark(raw)} Перемотка кадра — оплата Gram.\n"
+        f"Переведи <b>{settings.revote_ton:g}–{_revote_gram_ceiling():g} Gram</b> "
+        f"(строго меньше минимума ставки {settings.stake_min_ton:g} Gram) на казначея:\n"
+        f"<code>{address}</code>\n"
+        f"Memo не обязателен — сумма из вилки зачтётся автоматически. Можно приложить "
+        f"<code>{revote_memo(int(raw))}</code> в любой части комментария.\n\n"
+        "Грант придёт в течение минуты и живёт до конца дня. "
+        f"Ровно {settings.stake_min_ton:g} Gram — уже минимальная ставка, не оплата перемотки.\n"
+        "💡 Проще и без кошелька — Stars: кнопка в /change. "
+        "Для оплаты Gram кошелёк должен быть привязан: /wallet.",
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()

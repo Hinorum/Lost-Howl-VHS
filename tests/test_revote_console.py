@@ -547,7 +547,7 @@ async def test_payton_refuses_broken_round_id(stage) -> None:
 
 async def test_payton_shows_fork_and_memo(stage, monkeypatch) -> None:
     """Инструкция по Gram: вилка, потолок ниже ставки, memo и предупреждение,
-    что ровно минимальная ставка будет засчитана как ставка дня."""
+    что ровно минимальная ставка — это ставка дня, а не оплата перемотки."""
     monkeypatch.setattr(settings, "revote_ton", 0.4)
     monkeypatch.setattr(settings, "stake_min_ton", 0.5)
     callback = _callback(f"payton:{stage.round_id}", stage.uid)
@@ -556,5 +556,6 @@ async def test_payton_shows_fork_and_memo(stage, monkeypatch) -> None:
     assert TREASURY in text
     assert "0.4" in text and "0.49" in text
     assert f"rv:{stage.round_id}" in text
-    assert "не может" in text
+    assert "не оплата перемотки" in text
+    assert "`" not in text
     callback.answer.assert_awaited_with()
