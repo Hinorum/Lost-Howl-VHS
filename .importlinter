@@ -5,11 +5,62 @@
 root_package = app
 include_external_packages = False
 
-# Контракт 1: пакет app не должен содержать циклов.
-# layers с одной слоем = «любой модуль app может импортировать любой другой,
-# но без циклов»: сам разбор графа ловит цикл и валит контракт.
+# Контракт 1: пакет app без циклических импортов.
+#
+# Тип выбран осознанно: layers с одним слоем циклы НЕ ловит — внутри слоя
+# импорты разрешены, и цикл a↔b такой контракт «проходит» (проверено на
+# минимальном пакете 2026-10-16). Циклы ловит acyclic_siblings.
+#
+# ignore_imports — известные ленивые импорты (исторические развязки
+# статического графа: на уровне импорта модуля эти рёбра создают петли,
+# поэтому спрятаны внутрь функций). Список обязан быть точным: несовпавший
+# ignore валит контракт, поэтому развязка любой из этих пар обязана удалить
+# строку отсюда. Всё, что вне списка, контракт проверяет как есть.
 [importlinter:contract:1]
 name = Нет циклических импортов в app
-type = layers
-layers =
+type = acyclic_siblings
+ancestors =
     app
+ignore_imports =
+    app.leaderboard -> app.handlers
+    app.ops -> app.broadcast
+    app.ops -> app.rounds
+    app.ops -> app.ton_pay
+    app.ops -> app.ton_watch
+    app.rounds.lifecycle -> app.tally
+    app.rounds.lifecycle -> app.ton_pay
+    app.stakes -> app.handlers.wallet
+    app.stakes -> app.rounds.time
+    app.ton_pay.treasury -> app.ton_watch
+    app.treasury_mirror -> app.ton_pay
+
+# Контракт 2: денежный контур не знает про Telegram-слой и сюжет.
+# Хендлеры, анонсы, планировщик и кассеты могут звать деньги, деньги их — нет.
+# Проверяются только прямые импорты: косвенные цепочки через другие модули
+# существуют исторически (см. ignore_imports контракта 1), и новый ПРЯМОЙ
+# импорт денег в хендлеры/кассеты — уже нарушение.
+[importlinter:contract:2]
+name = Деньги (ton_pay) не импортируют handlers/broadcast/scheduler/story
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    app.ton_pay
+forbidden_modules =
+    app.handlers
+    app.broadcast
+    app.scheduler
+    app.story
+
+# Контракт 3: сюжетный слой — пассивные данные: ни Telegram, ни денег.
+# Только прямые импорты — как в контракте 2.
+[importlinter:contract:3]
+name = Сюжет (story) не импортирует handlers/ton_pay/broadcast/scheduler
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    app.story
+forbidden_modules =
+    app.handlers
+    app.ton_pay
+    app.broadcast
+    app.scheduler
