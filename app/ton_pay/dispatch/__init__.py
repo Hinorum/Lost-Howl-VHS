@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 
 from aiogram import Bot
@@ -52,6 +53,8 @@ from .queue import (
     _reset_retriable,
 )
 from .send import (  # noqa: F401
+    BatchRejected,
+    BatchUncertain,
     _send_raw_batch_with_seqno,
     _send_raw_with_seqno,
     send_ton_transfer,
@@ -94,6 +97,157 @@ async def _balance_via_liteserver() -> int | None:
             str(exc) or type(exc).__name__,
         )
         return None
+
+
+async def _wait_for_batch_memos(
+    batch_rows: list[tuple[Payout, tuple[str, ...]]], seconds: float
+) -> set[int]:
+    """Ждёт memo пачки в истории казначея: id строк, чьи memo уже видны.
+
+    Пачечный аналог _wait_for_broadcast_memo: там цель одна (предыдущий
+    перевод пачки), здесь — кандидаты всех строк сразу, с ранним стопом по
+    факту «нашли всё». Транзакция v5r1 атомарна, поэтому частично найденное —
+    рассинхрон индексации провайдера, а не «половина ушла»: строки с
+    найденным memo вызывающий фиксирует sent, остальным пишет причину.
+
+    Флаги полноты (_RECONCILE_*) — снапшот/восстановление, как в
+    _wait_for_broadcast_memo: целевой скан с ранним стопом неполон по
+    построению и не имеет права менять вердикты соседних строк очереди.
+    """
+    import app.ton_pay as _tp
+
+    saved_ok = _state._RECONCILE_HISTORY_OK
+    saved_window = _state._RECONCILE_WINDOW_COMPLETE
+    try:
+        targets = {
+            candidate for _payout, candidates in batch_rows for candidate in candidates
+        }
+        deadline = time.monotonic() + seconds
+        while True:
+            tx_map = await _tp.fetch_broadcast_tx_map(targets=targets)
+            found = {
+                payout.id
+                for payout, candidates in batch_rows
+                if any(candidate in tx_map for candidate in candidates)
+            }
+            if len(found) == len(batch_rows) or time.monotonic() >= deadline:
+                return found
+            await asyncio.sleep(_BROADCAST_CONFIRM_POLL)
+    finally:
+        _state._RECONCILE_HISTORY_OK = saved_ok
+        _state._RECONCILE_WINDOW_COMPLETE = saved_window
+
+
+async def _try_send_batch_v5(
+    payouts: list[Payout], markers: set[str]
+) -> tuple[int, set[int]]:
+    """Одна пачка за цикл: отправляемые строки — одним сообщением v5r1.
+
+    Возвращает (сколько строк помечено sent, id строк, которые поштучный
+    проход этого цикла обязан пропустить). Исходы:
+      • в пачку не берутся строки, уже найденные в маркерах (поштучный проход
+        пометит их sent без повтора), и повторы с недоступной/неполной
+        историей казначея (поштучный проход заморозит их с видимой причиной);
+      • BatchRejected (ошибка сборки/явный отказ лайтсерверов) — ничего не
+        помечаем и не держим: поштучный проход отправит строки как раньше.
+        Транзакция v5r1 атомарна (одно плохое действие отменяет всю пачку),
+        поэтому поштучный фолбэк — не опция, а требование корректности;
+      • всё прочее (таймаут вещания, сбой обоих каналов, неклассифицированные
+        ошибки) — «неясно»: вещание могло состояться, повтор в этом цикле
+        рискнул бы двойным платежом. Ждём memo пачки: найденное фиксируем
+        sent без повтора, остальное — pending с видимой причиной (попытку
+        не возвращаем: вещание могло уйти); следующий цикл начнёт с
+        анти-дубля.
+    """
+    history_trusted = _state._RECONCILE_HISTORY_OK and _state._RECONCILE_WINDOW_COMPLETE
+    batch_rows: list[tuple[Payout, tuple[str, ...]]] = []
+    for payout in payouts:
+        candidates = tuple(_payout_comment_candidates(payout))
+        if any(candidate in markers for candidate in candidates):
+            continue
+        if payout.attempts > 1 and not history_trusted:
+            continue
+        batch_rows.append((payout, candidates))
+    if not batch_rows:
+        return 0, set()
+
+    import app.ton_pay as _tp
+
+    payload = [
+        (payout.dest_address, payout.amount_nanotons, candidates[0])
+        for payout, candidates in batch_rows
+    ]
+    try:
+        marker = await asyncio.wait_for(
+            _tp.send_ton_transfers_batch(payload),
+            timeout=settings.payout_send_timeout_seconds,
+        )
+    except BatchRejected as exc:
+        logger.warning(
+            "Пачка из %d переводов не принята (%s) — отправляю поштучно",
+            len(batch_rows),
+            exc,
+        )
+        return 0, set()
+    except Exception as exc:
+        # «Неясно», а не «не ушло»: таймаут вещания (asyncio.wait_for), сбой
+        # обоих каналов после таймаута лайтсерверов (BatchUncertain) и прочие
+        # неклассифицированные сбои. Внешка могла уйти в сеть — повтор в этом
+        # цикле рискнул бы двойным платежом. Решаем по memo, как одиночный
+        # путь при таймауте.
+        if isinstance(exc, TimeoutError):
+            logger.warning(
+                "Пачка из %d переводов: таймаут вещания >%ss — решаю по memo",
+                len(batch_rows),
+                settings.payout_send_timeout_seconds,
+            )
+        else:
+            logger.warning(
+                "Пачка из %d переводов: вещание не подтвердилось (%s) — "
+                "считаю судьбу неясной, повтор в цикле не шлю",
+                len(batch_rows),
+                exc,
+            )
+        found = await _wait_for_batch_memos(
+            batch_rows, settings.payout_batch_confirm_seconds
+        )
+        confirmed = 0
+        for payout, _candidates in batch_rows:
+            if payout.id in found:
+                payout.tx_hash = None
+                payout.status = "sent"
+                payout.sent_at = datetime.now(UTC)
+                payout.attempts = 0
+                payout.last_error = None
+                confirmed += 1
+                continue
+            payout.last_error = (
+                "судьба пачки неясна (таймаут вещания или сбой канала) — "
+                "повтор отложен до сверки по memo"
+            )[:200]
+            if payout.attempts >= settings.payout_max_attempts:
+                payout.status = "failed"
+            else:
+                payout.status = "pending"
+        logger.warning(
+            "Пачка: вещание неясно — memo найдено у %d из %d, остальные ждут сверки",
+            confirmed,
+            len(batch_rows),
+        )
+        return confirmed, {payout.id for payout, _candidates in batch_rows}
+
+    if marker is None:
+        # TON выключен или нет мнемоники: причина строк пишется поштучным
+        # проходом ниже (он единственный путь с видимым last_error).
+        return 0, set()
+    for payout, _candidates in batch_rows:
+        payout.tx_hash = marker
+        payout.status = "sent"
+        payout.sent_at = datetime.now(UTC)
+        payout.attempts = 0
+        payout.last_error = None
+    logger.info("Пачка: %d переводов разошлись одним внешним сообщением", len(batch_rows))
+    return len(batch_rows), {payout.id for payout, _candidates in batch_rows}
 
 
 async def dispatch_pending_payouts(limit: int = 50, bot: Bot | None = None) -> int:
@@ -268,16 +422,22 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
         # и два подряд перевода (приз + рейк одного дня) получили бы ОДИН и тот
         # же seqno — в блок входил бы только один, второй тихо терялся.
         _state._batch_seqno = None
+        v5_batch_capable = False
         if payouts and settings.ton_enabled and settings.active_treasury_mnemonic:
             try:
                 import app.ton_pay as _tp
 
                 wallet_for_batch = await _tp._get_wallet()
                 _state._batch_seqno = await wallet_for_batch.get_seqno()
+                # Пачка одним внешним сообщением — механизм контракта v5r1
+                # (out_list). Проверяем класс кошелька, которым реально
+                # подписываем, а не строку версии из настроек.
+                v5_batch_capable = _tp.wallet_supports_batch(wallet_for_batch)
             except Exception:
                 # Сбой не критичен: выродимся в старый путь, где send_ton_transfer
                 # сам получает seqno (а её тред-безопасность отдельная история).
                 _state._batch_seqno = None
+                v5_batch_capable = False
                 logger.warning("Не удалось получить seqno для батч-отправки — отправлю по одному", exc_info=True)
         # Известен ли уже разосланный на этом цикле перевод? Если да — ждём его
         # memo в блоке перед подписью следующего (гонка двух быстрых переводов
@@ -288,8 +448,21 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
         # строки, которые остались в 'sending' за нами, НИКОГДА не вещаем в этом
         # цикле — иначе их seqno пришлось бы угадывать вслепую.
         deferred = False
+        # Пачечный проход (флаг PAYOUT_V5_BATCH + контракт v5r1): пробует
+        # увести все отправляемые строки цикла ОДНИМ внешним сообщением.
+        # Строки, уже найденные в маркерах, и замороженные повторы сюда не
+        # берутся — их разбирает поштучный проход ниже, как раньше.
         try:
+            batch_skip_ids: set[int] = set()
+            if settings.payout_v5_batch and v5_batch_capable and payouts:
+                batch_sent, batch_skip_ids = await _try_send_batch_v5(payouts, markers)
+                sent += batch_sent
             for payout in payouts:
+                if payout.id in batch_skip_ids:
+                    # Строка уже разобрана пачечным проходом: либо помечена
+                    # sent одним сообщением, либо удержана после неясного
+                    # вещания (повтор в этом цикле мог бы задвоить платёж).
+                    continue
                 # Свободный комментарий (возвраты при паузе) дополняется
                 # служебным суффиксом «way:<день>:<тип>#<id>», чтобы анти-дубль
                 # не спотыкался на одинаковом тексте разных возвратов.

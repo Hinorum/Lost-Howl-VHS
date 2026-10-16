@@ -169,6 +169,8 @@ async def _get_wallet():
 from .dispatch import (  # noqa: F401  # noqa: E402,F401
     _BROADCAST_CONFIRM_POLL,
     _TREASURY_KINDS,
+    BatchRejected,
+    BatchUncertain,
     _alert_admin,
     _alert_http_channel_switch,
     _comment_cell,

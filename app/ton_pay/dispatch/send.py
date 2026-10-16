@@ -115,6 +115,25 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
         return await _tp._send_ton_transfer_http(dest_address, amount_nanotons, comment)
 
 
+class BatchRejected(RuntimeError):
+    """Пачка ТОЧНО не ушла: вещания не было — поштучный фолбэк безопасен.
+
+    Единственный сигнал, по которому диспетчер имеет право повторять строки
+    поштучно в том же цикле: ошибка локальной сборки (адрес, число действий)
+    и явный отказ лайтсервера (результат != 1) — сеть внешний месседж не
+    получала.
+    """
+
+
+class BatchUncertain(RuntimeError):
+    """Судьба пачки неизвестна: вещание могло состояться — повтор опасен.
+
+    Лайтсерверный сбой (таймаут/нет пиров), после которого и HTTP-канал не
+    подтвердил приём: внешний месседж мог уже уйти в сеть. Диспетчер такие
+    строки в цикле не переотправляет, а решает по memo.
+    """
+
+
 def wallet_supports_batch(wallet) -> bool:
     """Умеет ли контракт нести пачку переводов в одном внешнем сообщении.
 
@@ -141,20 +160,26 @@ async def _send_raw_batch_with_seqno(
     """
     from pytoniq_core import Address
 
-    internals = [
-        wallet.create_wallet_internal_message(
-            destination=Address(dest_address),
-            value=amount_nanotons,
-            body=_comment_cell(comment),
+    try:
+        internals = [
+            wallet.create_wallet_internal_message(
+                destination=Address(dest_address),
+                value=amount_nanotons,
+                body=_comment_cell(comment),
+            )
+            for dest_address, amount_nanotons, comment in transfers
+        ]
+        transfer_msg = wallet.raw_create_transfer_msg(
+            private_key=wallet.private_key,
+            seqno=seqno,
+            wallet_id=wallet.wallet_id,
+            messages=internals,
         )
-        for dest_address, amount_nanotons, comment in transfers
-    ]
-    transfer_msg = wallet.raw_create_transfer_msg(
-        private_key=wallet.private_key,
-        seqno=seqno,
-        wallet_id=wallet.wallet_id,
-        messages=internals,
-    )
+    except Exception as exc:
+        # Сборка — чистая локальная математика, вещания ещё не было: «точно не
+        # ушло». Диспетчер по такому сигналу уйдёт на поштучный фолбэк, и
+        # плохая строка (например, нечитаемый адрес) провалится одна.
+        raise BatchRejected(f"пачка не собралась: {exc}") from exc
     return await wallet.send_external(body=transfer_msg)
 
 
@@ -162,10 +187,12 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
     """Пачка переводов ОДНИМ внешним сообщением v5r1. Метка вещания или None.
 
     None — только когда отправка невозможна в принципе (TON выключен или нет
-    мнемоники) — как у send_ton_transfer. Реальные ошибки ПРОПАГАЦИЯТСЯ:
-    вызывающий сам решает, уходить ли на поштучный фолбэк. Успех фиксируется
-    лайтсервером (результат 1); «принято» ≠ «выполнено» — контрактная
-    транзакция атомарна, а отмену действия дожмёт сверка
+    мнемоники) — как у send_ton_transfer. Отказы классифицируются:
+    BatchRejected (точно не ушло — поштучный фолбэк безопасен) и
+    BatchUncertain (судьба неизвестна — повтор в цикле мог бы задвоить
+    платёж); прочие исключения — реальные ошибки, как у одиночного пути.
+    Успех фиксируется лайтсервером (результат 1); «принято» ≠ «выполнено» —
+    контрактная транзакция атомарна, а отмену действия дожмёт сверка
     confirm_broadcast_payouts.
 
     Батч-счётчик _batch_seqno держится тем же инвариантом, что у одиночного
@@ -202,7 +229,7 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
                 raise
             if result != 1:
                 _state._batch_seqno = None
-                raise RuntimeError(f"Лайтсерверы не приняли пачку (результат {result})")
+                raise BatchRejected(f"Лайтсерверы не приняли пачку (результат {result})")
             _state._batch_seqno += 1
         else:
             # Вне цикла диспетчера (смоук /payout test): свежий seqno на всю
@@ -212,7 +239,7 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
                 wallet, await wallet.get_seqno(), transfers
             )
         if result != 1:
-            raise RuntimeError(f"Лайтсерверы не приняли пачку (результат {result})")
+            raise BatchRejected(f"Лайтсерверы не приняли пачку (результат {result})")
         if _state._http_channel_engaged_at is not None:
             # Лайтсерверы снова принимают вещание — флаг HTTP-канала снимается
             # (симметрично одиночному пути, иначе алерт «недоступны» врал бы
@@ -235,4 +262,13 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
             exc,
             len(transfers),
         )
-        return await _tp._send_ton_transfers_http(transfers)
+        try:
+            return await _tp._send_ton_transfers_http(transfers)
+        except Exception as http_exc:
+            # Оба канала не отдали «принято», но лайтсерверный сбой мог быть
+            # таймаутом: внешка могла уже уйти в сеть. Классифицируем как
+            # «неясно», а не «не ушло» — диспетчер такие строки в цикле не
+            # переотправляет, а ждёт memo.
+            raise BatchUncertain(
+                f"лайтсерверы не приняли ({exc}); HTTP-канал тоже не подтвердил ({http_exc})"
+            ) from http_exc

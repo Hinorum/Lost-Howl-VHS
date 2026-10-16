@@ -45,6 +45,10 @@ MONEY_LEVERS = (
     # потому, что этих строк здесь не было.
     ("WEEKLY_MIN_DAYS", "weekly_min_days"),
     ("LEADERBOARD_CORRECT_CAP", "leaderboard_correct_cap"),
+    # Флаг пачки v5r1 — не сумма, а выключатель денежного пути: расхождение
+    # «в render.yaml true, в коде false» — та же тихая дивергенция копий,
+    # ради которой этот тест и существует.
+    ("PAYOUT_V5_BATCH", "payout_v5_batch"),
 )
 
 
@@ -72,11 +76,18 @@ def _env_example_values() -> dict[str, str]:
 
 
 def _assert_matches_default(env_key: str, field: str, actual: str, where: str) -> None:
+    default = Settings.model_fields[field].default
+    if isinstance(default, bool):
+        assert str(actual).strip().lower() == str(default).strip().lower(), (
+            f"{env_key} {where} = {actual}, "
+            f"а в app/config.py = {default}"
+        )
+        return
     assert float(actual) == pytest.approx(
-        float(Settings.model_fields[field].default)
+        float(default)
     ), (
         f"{env_key} {where} = {actual}, "
-        f"а в app/config.py = {Settings.model_fields[field].default}"
+        f"а в app/config.py = {default}"
     )
 
 
