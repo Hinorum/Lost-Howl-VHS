@@ -130,6 +130,8 @@ async def test_bind_under_money_requires_verification(ton_on) -> None:
         assert player.wallet_verified is False
         assert player.wallet_verify_code
     assert "bv:" in text
+    assert "<b>" in text, "требование комментария должно быть выделено жирным"
+    assert "комментар" in text
 
 
 async def test_bind_free_version_is_instant_verified() -> None:
@@ -296,6 +298,44 @@ async def test_wrong_code_refunds_and_explains_in_dm(ton_on) -> None:
     assert len(bot.messages) == 1
     assert "возвращается" in bot.messages[0][1]
     assert "bv:ABC123" in bot.messages[0][1]
+
+
+async def test_blank_comment_refund_names_missing_comment(ton_on) -> None:
+    """Перевод с неподтверждённого кошелька без комментария: игроку прямо
+    называется причина (реальный кейс: проверочный перевод отправили, а код
+    в комментарий не вписали) — и показывается образец верного комментария."""
+    uid = next_uid()
+    await _reset_player(uid)
+    raw = _raw(0xCAFE17)
+    async with SessionLocal() as session:
+        session.add(
+            Player(
+                id=uid,
+                username="no-comment",
+                wallet_address=raw,
+                wallet_verified=False,
+                wallet_verify_code="ABC123",
+            )
+        )
+        await session.commit()
+
+    bot = _RecorderBot()
+    status = await process_transfer(
+        Transfer(
+            tx_hash=f"wv-nocomment-{uid}",
+            source=raw,
+            value_nanotons=to_nano(0.05),
+            comment="",
+            utime=int(datetime.now(UTC).timestamp()),
+        ),
+        bot=bot,
+    )
+    assert status == "refund_queued"
+    assert len(bot.messages) == 1
+    text = bot.messages[0][1]
+    assert "не было комментария" in text
+    assert "bv:ABC123" in text
+    assert "<b>" in text, "требование комментария должно быть выделено жирным"
 
 
 async def test_dust_size_verify_mismatch_still_refunds(ton_on) -> None:

@@ -267,16 +267,23 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                 ledger_player_id=player.id,
                 force=True,
             )
-            await _dm_stake(
-                bot,
-                player.id,
-                f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-                "кошелёк привязан, но ещё не подтверждён. Докажи владение — отправь "
-                "с него микро-перевод казначею с комментарием "
-                f"<code>bv:{player.wallet_verify_code}</code> (код виден в /wallet); "
-                "сумма вернётся целиком. Пока кошелёк не подтверждён, ставки и плата "
-                "за смену пути с него не принимаются.",
-            )
+            if (transfer.comment or "").strip():
+                # Комментарий был, но код в нём не распознался (обрезан,
+                # искажён или вовсе не код) — объясняем так же, как при чужом коде.
+                await _dm_verify_mismatch(bot, player, transfer)
+            else:
+                # Игрок просто забыл комментарий — частый кейс новичка. Текст
+                # прямо называет причину, а не ограничивается «не подтверждён».
+                await _dm_stake(
+                    bot,
+                    player.id,
+                    f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
+                    "в переводе не было комментария.\n\n"
+                    "Кошелёк привязан, но ещё не подтверждён. Отправь с него казначею "
+                    "микро-перевод и <b>обязательно укажи комментарий</b> "
+                    f"<b><code>bv:{player.wallet_verify_code}</code></b> — "
+                    "сумма вернётся целиком.",
+                )
             return result
         revote_round_id = parse_revote_memo(transfer.comment)
         if revote_round_id is not None:
@@ -458,9 +465,11 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
             await _dm_stake(
                 bot,
                 player.id,
-                f"↩️ Перевод {amount} Gram возвращается: этот кошелёк ещё не подтверждён. "
-                "Сначала докажи владение — отправь с него микро-перевод казначею с мемо "
-                "bv:… (код из ответа при привязке, дублируется в /wallet).",
+                f"↩️ Перевод {amount} Gram возвращается: кошелёк ещё не подтверждён — "
+                "ставки с него не принимаются.\n\n"
+                "Отправь с него микро-перевод казначею и <b>обязательно укажи "
+                f"комментарий</b> <b><code>bv:{player.wallet_verify_code}</code></b> "
+                "(код виден в /wallet), затем повтори ставку.",
             )
         elif result == "ok":
             age = datetime.now(UTC).timestamp() - transfer.utime

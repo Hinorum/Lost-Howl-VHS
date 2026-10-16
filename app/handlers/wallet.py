@@ -206,14 +206,13 @@ async def _wallet_view_text(user) -> str:
                 "Как поставить Gram на свой выбор: /stake"
             )
             if player.wallet_verified:
-                body += "\n\nКошелёк подтверждён. Начисленные призы обрабатываются очередью выплат."
+                body += "\n\nКошелёк подтверждён — призы обрабатывает очередь выплат."
             elif player.wallet_verify_code:
                 body += (
-                    "\n\n⚠️ Кошелёк ещё не подтверждён — с него не считаются ставки.\n"
-                    f"Подтверди владение: отправь с него перевод казначею (/stake) "
-                    f"от {settings.refund_min_gram:g} Gram с комментарием "
+                    "\n\n⚠️ Кошелёк не подтверждён — ставки с него не считаются.\n"
+                    f"Подтверди: микро-перевод казначею (/stake) <b>с комментарием</b> "
                     f"<code>bv:{player.wallet_verify_code}</code> — "
-                    "сумма проверочного перевода вернётся целиком."
+                    "сумма вернётся целиком."
                 )
         else:
             body = (
@@ -316,12 +315,12 @@ async def _bind_wallet(message: Message, address: str) -> bool:
     await _dialog_close(uid)
     if settings.ton_enabled:
         confirmation = (
-            f"{ok_mark(str(uid))} Кошелёк привязан — осталось подтвердить, что он твой.\n"
-            f"Отправь с него перевод казначею (адрес: /stake) с комментарием:\n"
-            f"<code>bv:{player.wallet_verify_code}</code>\n"
-            f"от {settings.refund_min_gram:g} Gram — сумма проверочного перевода "
-            "вернётся целиком. Играть со ставками можно только после подтверждения — "
-            "перевод до него вернётся обратно."
+            f"{ok_mark(str(uid))} Кошелёк привязан. Осталось доказать, что он твой:\n\n"
+            f"переведи с него казначею (/stake) <b>от {settings.refund_min_gram:g} Gram</b> "
+            "и <b>обязательно укажи в комментарии этот код</b>:\n"
+            f"<b><code>bv:{player.wallet_verify_code}</code></b>\n\n"
+            "Без комментария перевод вернётся, а кошелёк останется неподтверждённым — "
+            "ставки с него не принимаются."
         )
     else:
         confirmation = (

@@ -36,14 +36,17 @@ async def _dm_verify_mismatch(bot: Bot | None, player: Player | None, transfer: 
     if bot is None or player is None:
         return
     code = player.wallet_verify_code
-    code_hint = f" с кодом <code>bv:{code}</code>" if code else ""
+    action = (
+        "микро-перевод строго с привязанного адреса и <b>обязательно с комментарием</b> "
+        f"<b><code>bv:{code}</code></b>"
+        if code
+        else "микро-перевод строго с привязанного адреса (код подтверждения — в /wallet)"
+    )
     await _dm_stake(
         bot,
         player.id,
         f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-        "код подтверждения кошелька не сошёлся (код другой или переведено "
-        f"не с привязанного адреса). Повтори микро-перевод строго с привязанного "
-        f"адреса{code_hint} — префикс bv: писать не обязательно.",
+        f"код в комментарии не сошёлся.\n\nПовтори {action}.",
     )
 
 async def _kick_dispatch_after_verify(bot: Bot | None) -> None:
