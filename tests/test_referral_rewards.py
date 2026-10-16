@@ -382,6 +382,32 @@ async def test_gas_day_accrues_referral_despite_dust_pool(
     assert await _referral_pot_total(session) == {referrer: referral_cut}
 
 
+async def test_zero_threshold_creates_no_empty_payouts(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """referral_min_payout_gram=0 не плодит пустых выплат.
+
+    Порог 0 попадает в выборку `nanotons >= 0` вместе с обнулёнными копилками;
+    payout на 0 нанотонов диспатч не отправляет (берёт только amount > 0) —
+    без гварда строка висела бы в очереди вечно и плодилась каждую финализацию.
+    Непустая копилка при пороге 0 по-прежнему выплачивается целиком.
+    """
+    monkeypatch.setattr(settings, "referral_min_payout_gram", 0.0)
+    referrer_zero, referrer_dust, winner = 8300, 8301, 8302
+    for pid in (referrer_zero, referrer_dust, winner):
+        session.add(Player(id=pid, wallet_address=f"wallet-{pid}", wallet_verified=True))
+    session.add(ReferralPot(referrer_id=referrer_zero, nanotons=0))
+    session.add(ReferralPot(referrer_id=referrer_dust, nanotons=to_nano(0.1)))
+    await session.commit()
+
+    created = await stakes_mod._settle_referral_pots(session)
+
+    assert created == 1
+    payouts = (await session.execute(select(Payout).where(Payout.kind == "referral"))).scalars().all()
+    assert [(p.player_id, p.amount_nanotons) for p in payouts] == [(referrer_dust, to_nano(0.1))]
+    assert await _referral_pot_total(session) == {referrer_zero: 0, referrer_dust: 0}
+
+
 async def test_settle_referral_pots_concurrency_guard(session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
     """Между чтением копилки и атомарным UPDATE её обнулила другая реплика —
     повторная выплата не создаётся (ветка rowcount == 0)."""

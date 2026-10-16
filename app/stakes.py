@@ -353,6 +353,12 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
         # Забираем замер ДО UPDATE: SQLAlchemy синхронизирует объект identity-map
         # после execute (synchronize_session), и pot.nanotons стал бы 0.
         amount = pot.nanotons
+        if amount <= 0:
+            # Порог 0 включает в выборку (>= 0) и обнулённые строки копилок:
+            # без гварда каждая финализация плодила бы payout на 0 нанотонов,
+            # а диспатч такие строки не берёт (amount > 0) — вечный хвост в
+            # очереди и раздутый счётчик «ожидает».
+            continue
         claimed = await session.execute(
             update(ReferralPot)
             .where(ReferralPot.id == pot.id, ReferralPot.nanotons == amount)
