@@ -51,7 +51,13 @@ from .queue import (
     _hydrate_player_dests,
     _reset_retriable,
 )
-from .send import _send_raw_with_seqno, send_ton_transfer  # noqa: F401
+from .send import (  # noqa: F401
+    _send_raw_batch_with_seqno,
+    _send_raw_with_seqno,
+    send_ton_transfer,
+    send_ton_transfers_batch,
+    wallet_supports_batch,
+)
 
 
 async def _balance_via_liteserver() -> int | None:

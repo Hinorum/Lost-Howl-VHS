@@ -122,15 +122,19 @@ async def http_get_wallet_seqno(wallet, *, address: str | None = None) -> int:
 async def _http_broadcast_external(wallet, seqno: int, internal_msg) -> None:
     """Подписывает внешнее сообщение оффлайн и вещает через Toncenter sendBoc.
 
+    internal_msg — одно внутреннее сообщение ИЛИ список сообщений: пачка
+    v5r1 несёт все переводы в out_list одного внешнего месседжа тем же
+    контрактным механизмом, что и одиночный перевод.
     seqno == 0 (казна ещё не развёрнута) → сообщение несёт state_init и
     деплоит кошелёк той же транзакцией. Возвращает None; неуспех — исключение
     с текстом от провайдера.
     """
+    messages = internal_msg if isinstance(internal_msg, list) else [internal_msg]
     transfer_msg = wallet.raw_create_transfer_msg(
         private_key=wallet.private_key,
         seqno=seqno,
         wallet_id=wallet.wallet_id,
-        messages=[internal_msg],
+        messages=messages,
     )
     external = wallet.create_external_msg(
         src=None,
@@ -197,6 +201,50 @@ async def _send_ton_transfer_http(dest_address: str, amount_nanotons: int, comme
         "Перевод %d нанотонов к …%s разослан через HTTP (toncenter, seqno=%d)",
         amount_nanotons,
         dest_address[-6:],
+        state._batch_seqno - 1,
+    )
+    return marker
+
+
+async def _send_ton_transfers_http(transfers: list[tuple[str, int, str]]) -> str:
+    """Оффлайн-подпись + HTTPS-вещание ПАЧКИ переводов одним Boc.
+
+    transfers — [(адрес, нанотоны, комментарий)]. Инвариант _batch_seqno —
+    1:1 с поштучным путём (_send_ton_transfer_http): один seqno на всю пачку,
+    локально наращивается только при УСПЕХЕ вещания. Вне цикла диспетчера
+    (смоук /payout test) seqno читается у сети один раз на всю пачку.
+    """
+    wallet, _ = _wallet_pkg.build_offline_treasury_wallet()
+    from pytoniq_core import Address
+
+    if not settings.toncenter_api_key and not state._warned_no_toncenter_key:
+        state._warned_no_toncenter_key = True
+        logger.warning(
+            "TONCENTER_API_KEY пуст: HTTP-канал работает под анонимным лимитом "
+            "Toncenter — при частых выплатах возможны 429; задай ключ в .env"
+        )
+    if state._batch_seqno is None:
+        state._batch_seqno = await http_get_wallet_seqno(wallet)
+    internal_msgs = [
+        wallet.create_wallet_internal_message(
+            destination=Address(dest_address),
+            value=amount_nanotons,
+            body=_comment_cell(comment),
+        )
+        for dest_address, amount_nanotons, comment in transfers
+    ]
+    # Обращение через app.ton_pay, чтобы monkeypatch.setattr в тестах
+    # (`ton_pay._http_broadcast_external`) доходил до реального вызова.
+    import app.ton_pay as _tp
+
+    await _tp._http_broadcast_external(wallet, state._batch_seqno, internal_msgs)
+    state._batch_seqno += 1
+    if state._http_channel_engaged_at is None:
+        state._http_channel_engaged_at = datetime.now(UTC)
+    marker = f"bcast:{int(datetime.now(UTC).timestamp())}"
+    logger.info(
+        "Пачка из %d переводов разослана через HTTP (toncenter, seqno=%d)",
+        len(transfers),
         state._batch_seqno - 1,
     )
     return marker

@@ -113,3 +113,126 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
             exc,
         )
         return await _tp._send_ton_transfer_http(dest_address, amount_nanotons, comment)
+
+
+def wallet_supports_batch(wallet) -> bool:
+    """Умеет ли контракт нести пачку переводов в одном внешнем сообщении.
+
+    Пачка — механизм v5r1 (out_list действий внутри контрактной транзакции).
+    v4r2 упаковывает максимум 4 перевода, а очередь цикла может быть длиннее,
+    поэтому для него остаётся поштучный путь. Проверка по КЛАССУ кошелька, а
+    не по строке версии из настроек: источник истины — то, чем реально
+    подписываем.
+    """
+    from pytoniq.contract.wallets.wallet_v5 import WalletV5R1
+
+    return isinstance(wallet, WalletV5R1)
+
+
+async def _send_raw_batch_with_seqno(
+    wallet, seqno: int, transfers: list[tuple[str, int, str]]
+) -> int:
+    """Пачка переводов с ЗАДАННЫМ seqno — ОДНИМ внешним сообщением кошелька.
+
+    transfers — [(адрес, нанотоны, комментарий)]. v5r1 пакует все действия в
+    out_list одной транзакции: один seqno, один внешний месседж, атомарный
+    результат (одно плохое действие отменяет ВСЮ пачку — поэтому у
+    вызывающего обязан быть поштучный фолбэк). Порядок переводов сохраняется.
+    """
+    from pytoniq_core import Address
+
+    internals = [
+        wallet.create_wallet_internal_message(
+            destination=Address(dest_address),
+            value=amount_nanotons,
+            body=_comment_cell(comment),
+        )
+        for dest_address, amount_nanotons, comment in transfers
+    ]
+    transfer_msg = wallet.raw_create_transfer_msg(
+        private_key=wallet.private_key,
+        seqno=seqno,
+        wallet_id=wallet.wallet_id,
+        messages=internals,
+    )
+    return await wallet.send_external(body=transfer_msg)
+
+
+async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str | None:
+    """Пачка переводов ОДНИМ внешним сообщением v5r1. Метка вещания или None.
+
+    None — только когда отправка невозможна в принципе (TON выключен или нет
+    мнемоники) — как у send_ton_transfer. Реальные ошибки ПРОПАГАЦИЯТСЯ:
+    вызывающий сам решает, уходить ли на поштучный фолбэк. Успех фиксируется
+    лайтсервером (результат 1); «принято» ≠ «выполнено» — контрактная
+    транзакция атомарна, а отмену действия дожмёт сверка
+    confirm_broadcast_payouts.
+
+    Батч-счётчик _batch_seqno держится тем же инвариантом, что у одиночного
+    пути: один seqno на пачку, локальный инкремент только при УСПЕХЕ вещания.
+    Вызывается из цикла диспетчера (seqno уже взят на цикл) и из смоука
+    /payout test (вне цикла seqno читается у сети один раз на всю пачку).
+    """
+    if not transfers:
+        raise ValueError("пустая пачка переводов")
+    if not settings.ton_enabled or not settings.active_treasury_mnemonic:
+        logger.warning(
+            "TON выключен или нет мнемоники: пачка из %d переводов не отправлена",
+            len(transfers),
+        )
+        return None
+    try:
+        # Вызовы идут через app.ton_pay: тесты патчат ton_pay._get_wallet /
+        # ton_pay._send_ton_transfers_http / ton_pay._is_liteserver_down.
+        import app.ton_pay as _tp
+
+        wallet = await _tp._get_wallet()
+        if _state._batch_seqno is not None:
+            # Диспетчер держит seqno из одного get_seqno() на цикл: вся пачка
+            # подписывается одним номером, гонки следующих seqno внутри неё нет.
+            # Инкремент — только при УСПЕХЕ вещания; при сбое батч отменяется.
+            seqno = _state._batch_seqno
+            try:
+                result = await _send_raw_batch_with_seqno(wallet, seqno, transfers)
+            except (Exception, asyncio.CancelledError):
+                # Таймаут диспетчера (asyncio.wait_for) обрывает корутину через
+                # CancelledError — это НЕ Exception, и без явного перехвата
+                # _batch_seqno остался бы протухшим.
+                _state._batch_seqno = None
+                raise
+            if result != 1:
+                _state._batch_seqno = None
+                raise RuntimeError(f"Лайтсерверы не приняли пачку (результат {result})")
+            _state._batch_seqno += 1
+        else:
+            # Вне цикла диспетчера (смоук /payout test): свежий seqno на всю
+            # пачку; устаревший номер контракт отвергнет сам, потерять
+            # перевод нельзя.
+            result = await _send_raw_batch_with_seqno(
+                wallet, await wallet.get_seqno(), transfers
+            )
+        if result != 1:
+            raise RuntimeError(f"Лайтсерверы не приняли пачку (результат {result})")
+        if _state._http_channel_engaged_at is not None:
+            # Лайтсерверы снова принимают вещание — флаг HTTP-канала снимается
+            # (симметрично одиночному пути, иначе алерт «недоступны» врал бы
+            # после возврата канала).
+            _state._http_channel_engaged_at = None
+        marker = f"bcast:{int(datetime.now(UTC).timestamp())}"
+        logger.info("Пачка из %d переводов разослана (%s)", len(transfers), marker)
+        return marker
+    except asyncio.CancelledError:
+        # Таймаут диспетчера: он сам решит, что делать со строками. HTTP-канал
+        # сюда не цепляем — рваную корутину «добивать» нельзя.
+        raise
+    except Exception as exc:
+        import app.ton_pay as _tp
+
+        if not _tp._is_liteserver_down(exc):
+            raise
+        logger.warning(
+            "Лайтсерверы недоступны (%s) — пачка из %d переводов уходит в HTTP-канал (toncenter)",
+            exc,
+            len(transfers),
+        )
+        return await _tp._send_ton_transfers_http(transfers)
