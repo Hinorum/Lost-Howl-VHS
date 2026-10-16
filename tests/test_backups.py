@@ -519,3 +519,80 @@ def test_is_postgres_detects_every_postgres_scheme(monkeypatch, url: str) -> Non
 def test_is_postgres_rejects_sqlite(monkeypatch) -> None:
     monkeypatch.setattr(settings, "database_url", "sqlite+aiosqlite:///./data/x.db")
     assert backups.is_postgres() is False
+
+
+# ---------- Права на файлы копий ----------
+
+
+def test_restrict_owner_only_applies_posix_mode(tmp_path: Path) -> None:
+    """Копия закрывается до владельца: 600 на файле.
+
+    Дамп содержит адреса кошельков, memo и историю ставок всех игроков —
+    при маске 644 его читает любой пользователь системы, а не только
+    процесс бота и хранитель.
+    """
+    if os.name != "posix":
+        pytest.skip("POSIX-права не выставляются на Windows")
+    target = tmp_path / "backup-20240101-0000.db"
+    target.write_bytes(b"x")
+    backups._restrict_owner_only(target, 0o600)
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_restrict_owner_only_survives_filesystem_without_chmod(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """ФС без поддержки прав (FAT, часть сетевых шар) не роняет бэкап.
+
+    Сужение прав — гигиена поверх главного: копия к этому моменту уже
+    создана, и терять её из-за OSError от chmod нельзя. Провал должен быть
+    виден в логе, но не исключением.
+    """
+    def deny(self: Path, mode: int) -> None:
+        raise OSError("chmod не поддерживается")
+
+    monkeypatch.setattr(Path, "chmod", deny)
+    backups._restrict_owner_only(tmp_path / "x.db", 0o600)
+
+
+async def test_backup_now_restricts_permissions(monkeypatch, tmp_path: Path) -> None:
+    """Успешный бэкап закрывает и каталог копий (700), и файл дампа (600).
+
+    Проверяются вызовы chmod, а не биты файла: на Windows POSIX-права не
+    выставляются, а CI гоняет на Linux — так проверка живёт в обоих
+    окружениях.
+    """
+    import sqlite3
+
+    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    source = tmp_path / "live.db"
+    with sqlite3.connect(str(source)) as conn:
+        conn.execute("create table t(x)")
+        conn.execute("insert into t values (1)")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'x.db').as_posix()}")
+    monkeypatch.setattr(backups, "sqlite_file_path", lambda: source)
+
+    calls: list[tuple[Path, int]] = []
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: calls.append((self, mode)))
+
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+        )
+        await session.commit()
+    try:
+        dest = await backups.backup_now()
+        assert dest is not None
+        assert (Path("data") / "backups", 0o700) in calls
+        assert (dest, 0o600) in calls
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(WatcherState.key == BACKUP_LAST_OK_KEY)
+            )
+            await session.commit()

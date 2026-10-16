@@ -103,6 +103,23 @@ def _prune(directory: Path, keep: int) -> int:
     return removed
 
 
+def _restrict_owner_only(path: Path, mode: int) -> None:
+    """Права «только владелец» для дампа и каталога копий.
+
+    Дамп — самый чувствительный файл на диске: адреса кошельков, memo и
+    история ставок всех игроков. При дефолтной маске 644 (umask 022) его
+    читает любой пользователь системы, а не только процесс бота и хранитель.
+    На Windows chmod не различает права так, как POSIX, и вызов там
+    безвреден; на ФС без поддержки прав (FAT, часть сетевых шар) он может
+    упасть — провал сужения прав не должен ронять сам бэкап (копия уже
+    создана), поэтому OSError только логируется.
+    """
+    try:
+        path.chmod(mode)
+    except OSError:
+        logger.warning("Не удалось сузить права %s до %o", path, mode, exc_info=True)
+
+
 async def backup_now(keep: int = KEEP) -> Path | None:
     """Создаёт копию БД (SQLite или Postgres через pg_dump) и подрезает хвост."""
     directory = Path("data") / "backups"
@@ -138,6 +155,9 @@ async def backup_now(keep: int = KEEP) -> Path | None:
                 src_conn.close()
 
         await asyncio.to_thread(_sqlite_copy)
+    # Сужение прав после создания файла: каталог — 700, сам дамп — 600.
+    _restrict_owner_only(directory, 0o700)
+    _restrict_owner_only(dest, 0o600)
     pruned = await asyncio.to_thread(_prune, directory, keep)
     size_kb = dest.stat().st_size / 1024
     logger.info(
