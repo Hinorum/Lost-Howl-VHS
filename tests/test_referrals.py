@@ -3,8 +3,10 @@
 Каждый игрок получает персональную ссылку ?start=ref_<id>_<токен>. Токен —
 HMAC от id на секрете: вписать чужой id нельзя. Первый валидный переход
 фиксируется один раз; наград копятся в копилке (баланс показывает /invite,
-объединённый с бывшим /referral)."""
+объединённый с бывшим /referral). Приведённым может стать только игрок
+без ставок (pending/confirmed) — рефералка приводит новых."""
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,13 +17,14 @@ from app.config import settings
 from app.db import SessionLocal, init_db
 from app.handlers import cmd_invite, cmd_start
 from app.handlers import player as player_mod
-from app.models import Referral
+from app.models import Referral, Round, RoundStatus, Stake, WinRule
 from app.referrals import (
     invited_count,
     parse_referral_arg,
     record_referral,
     referral_link,
 )
+from app.ton_utils import to_nano
 from app.voting import upsert_player
 
 _uid = 750_000
@@ -207,6 +210,54 @@ async def test_record_referral_disabled_without_secret(monkeypatch) -> None:
     await _existing_player(a)
     async with SessionLocal() as session:
         assert await record_referral(session, a, b) is False
+
+
+async def test_record_referral_allows_only_new_players() -> None:
+    """Классическая рефералка: приводить можно только новых игроков.
+
+    pending/confirmed ставка значит «деньги уже в игре» — приведение
+    отклоняется (иначе действующий кит сам бы кликнул чужую ссылку и отдал
+    1% своего оборота). Отклонённая ставка (rejected) деньги вернула —
+    после неё игрок снова считается новым.
+    """
+    referrer, staked, waiting, refunded = next_uid(), next_uid(), next_uid(), next_uid()
+    for uid in (referrer, staked, waiting, refunded):
+        await _existing_player(uid)
+    now = datetime.now(UTC)
+    async with SessionLocal() as session:
+        round_row = Round(
+            day_index=970_001,
+            status=RoundStatus.CLOSED,
+            win_rule=WinRule.MAJORITY,
+            chapter_title="t",
+            chapter_text="x",
+            opens_at=now - timedelta(hours=25),
+            voting_ends_at=now - timedelta(hours=1),
+            tally_ends_at=now,
+            winner_card=0,
+            vote_counts_json="{}",
+        )
+        session.add(round_row)
+        await session.flush()
+        session.add_all(
+            [
+                Stake(round_id=round_row.id, player_id=staked, amount_nanotons=to_nano(1), tx_hash="ref-new-confirmed", status="confirmed"),
+                Stake(round_id=round_row.id, player_id=waiting, amount_nanotons=to_nano(1), tx_hash="ref-new-pending", status="pending"),
+                Stake(round_id=round_row.id, player_id=refunded, amount_nanotons=to_nano(1), tx_hash="ref-new-rejected", status="rejected"),
+            ]
+        )
+        await session.commit()
+
+    async with SessionLocal() as session:
+        assert await record_referral(session, referrer, staked) is False   # confirmed
+        assert await record_referral(session, referrer, waiting) is False  # pending
+        assert await record_referral(session, referrer, refunded) is True  # rejected — деньги вернули
+
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(select(Referral).where(Referral.referrer_id == referrer))
+        ).scalars().all()
+        assert [row.referred_id for row in rows] == [refunded]
 
 
 async def test_invite_shows_link_count_and_pot(monkeypatch) -> None:

@@ -4,6 +4,10 @@
 от id игрока на settings.referral_secret, поэтому вписать в ссылку чужой id
 нельзя без секрета. Первый валидный переход фиксируется в таблице Referral
 строго один раз на игрока; повторные /start с чужими ссылками игнорируются.
+Приведённым становится только НОВЫЙ игрок: у него ещё нет ни одной ставки
+в статусе pending/confirmed. Иначе действующий кит сам кликнул бы чужую
+ссылку и отдал 1% своего оборота — классическая рефералка приводит новых,
+а не переписывает историю уже ставящих.
 Самоподписка заблокирована (referrer_id == referred_id) — позвать самого себя
 по своей же ссылке невозможно, как и цепочку-цикл (A привёл B, B пытается
 привести A обратно): record_referral идёт вверх по цепочке приглашений и
@@ -32,7 +36,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Player, Referral, ReferralPot
+from app.models import Player, Referral, ReferralPot, Stake
 
 _BOT_USERNAME_CACHE: str | None = None
 
@@ -77,8 +81,8 @@ def parse_referral_arg(arg: str | None) -> int | None:
 
 async def record_referral(session, referrer_id: int, referred_id: int) -> bool:
     """Фиксирует приведение, если оно первое и честное. False — самоссылка,
-    цикл в цепочке приглашений, каркас выключен, приглашающего нет в базе
-    или переход уже записан."""
+    цикл в цепочке приглашений, каркас выключен, приглашающего нет в базе,
+    переход уже записан или приведённый уже ставил (рефералка — для новых)."""
     if referrer_id <= 0 or referred_id <= 0 or referrer_id == referred_id:
         return False
     if settings.referral_secret == "":
@@ -109,6 +113,16 @@ async def record_referral(session, referrer_id: int, referred_id: int) -> bool:
         select(Referral.referred_id).where(Referral.referred_id == referred_id)
     )
     if already is not None:
+        return False
+    # Действующего ставившего перепригласить нельзя: pending (деньги в пути)
+    # и confirmed (деньги в игре) значат, что игрок не новый. Отклонённые и
+    # возвращённые ставки не считаются — деньги игроку вернули.
+    staked = await session.scalar(
+        select(Stake.id)
+        .where(Stake.player_id == referred_id, Stake.status.in_(("pending", "confirmed")))
+        .limit(1)
+    )
+    if staked is not None:
         return False
     session.add(Referral(referrer_id=referrer_id, referred_id=referred_id))
     try:
