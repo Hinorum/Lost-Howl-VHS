@@ -386,7 +386,8 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
     if not confirm:
         await message.answer(
             f"{report}\n\nНичего не отправлено — это только предполёт. "
-            f"Увести деньги: <code>{html_escape(_TEST_USAGE)} confirm</code>",
+            "Увести деньги: <code>/payout test &lt;сумма Gram&gt; confirm</code>"
+            " (опции <code>http</code> и <code>batch2|batch3</code> — по нужде).",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -408,6 +409,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
         parse_mode=ParseMode.HTML,
     )
     engaged_before = _tp.state._http_channel_engaged_at
+    engaged_after = None
     try:
         # Лок диспетчера обязателен: цикл очереди держит один seqno на пачку,
         # параллельный перевод с тем же seqno молча потерялся бы.
@@ -422,6 +424,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
                 marker = await _tp._send_ton_transfer_http(dest, nano, memos[0])
             else:
                 marker = await _tp.send_ton_transfer(dest, nano, memos[0])
+        engaged_after = _tp.state._http_channel_engaged_at
     except Exception as exc:
         await message.answer(
             f"{warn_mark('nopay')} Отправка не удалась: {html_escape(str(exc))}",
@@ -442,6 +445,19 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
+    # Фактический канал отправки: успех по фолбэку не должен читаться как
+    # «лайтсерверная нога доказана», иначе смоук молча проверяет HTTP.
+    # Флаг канала ставится при HTTP-вещании и снимается при успехе на
+    # лайтсерверах; если он уже стоял до репетиции и не сменился — честно
+    # говорим «не определить», а не угадываем.
+    if force_http:
+        channel = "HTTP (принудительно)"
+    elif engaged_before is None and engaged_after is not None:
+        channel = "HTTP (фолбэк — лайтсерверы не отдали отправку)"
+    elif engaged_after is None:
+        channel = "лайтсерверы"
+    else:
+        channel = "не определить (флаг HTTP-канала стоял ещё до репетиции)"
     # memo пачки ищем параллельно: они в одной транзакции, и последовательные
     # окна по 30 с лишь растянули бы ответ на пустом месте.
     found = await asyncio.gather(*(_test_wait_memo(comment) for comment in memos))
@@ -482,6 +498,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
                 "⚠ memo за 30 с в истории не нашёлся — это и есть риск sent vs confirmed: "
                 "деньги могли уйти, а подтверждение не прийти. Глянуть: /treasury, /blockchain."
             )
+    lines.append(f"Канал: {channel}")
     lines.append(
         "В /treasury движение попадёт в «self-переводы», а не в тревоги: "
         "баланс сдвинулся только на газ."

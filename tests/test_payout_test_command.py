@@ -185,6 +185,9 @@ async def test_preflight_reports_everything_and_sends_nothing(
     assert "сам кошелёк казны" in text
     assert "Ничего не отправлено" in text
     assert "confirm" in text
+    # Подсказка — готовая команда, а не шаблон с [confirm] внутри и «confirm»
+    # сбоку (тот дубль сбивал с толку).
+    assert "Увести деньги: <code>/payout test &lt;сумма Gram&gt; confirm</code>" in text
 
 
 async def test_confirm_sends_self_transfer_and_reports_tx(
@@ -210,6 +213,69 @@ async def test_confirm_sends_self_transfer_and_reports_tx(
     assert sent["comment"].startswith("payout-test ")
     assert "0xdeadbeef" in text
     assert "self-переводы" in text
+
+
+async def test_report_names_liteserver_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Успех обычного пути называет канал: лайтсерверы."""
+    _patch_preflight(monkeypatch)
+    _patch_history(monkeypatch, "0x8")
+    monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", None)
+
+    async def send(dest, nano, comment):
+        return "bcast:8"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", send)
+    message = make_message("/payout test 0.001 confirm")
+    await cmd_payout(message)
+
+    assert "Канал: лайтсерверы" in message.answer.call_args.args[0]
+
+
+async def test_report_names_http_fallback_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Успех по фолбэку не маскируется под обычный путь: отчёт называет HTTP.
+
+    После классификации лагующей ноды «batch2» может пройти по HTTP-каналу —
+    если отчёт промолчит, лайтсерверная нога останется недоказанной незаметно.
+    """
+    _patch_preflight(monkeypatch)
+    _patch_history(monkeypatch, "0x7")
+    monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", None)
+
+    async def send(dest, nano, comment):
+        # Так ведёт себя реальный фолбэк: вещание ставит флаг канала.
+        ton_pay.state._http_channel_engaged_at = datetime.now(UTC)
+        return "bcast:7"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", send)
+    message = make_message("/payout test 0.001 confirm")
+    await cmd_payout(message)
+
+    text = message.answer.call_args.args[0]
+    assert "Канал: HTTP (фолбэк — лайтсерверы не отдали отправку)" in text
+
+
+async def test_report_does_not_guess_channel_when_flag_was_engaged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Флаг канала стоял ещё до репетиции и не сменился — честное «не определить».
+
+    Так выглядит HTTP-вещание при уже стоящем флаге: по состоянию флага
+    отличить его от лайтсерверного успеха нельзя, выдумывать канал — врать
+    в отчёте.
+    """
+    _patch_preflight(monkeypatch)
+    _patch_history(monkeypatch, "0x9")
+    before = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", before)
+
+    async def send(dest, nano, comment):
+        return "bcast:9"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", send)
+    message = make_message("/payout test 0.001 confirm")
+    await cmd_payout(message)
+
+    assert "не определить" in message.answer.call_args.args[0]
 
 
 async def test_send_happens_under_dispatch_lock(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,13 +326,15 @@ async def test_forced_http_channel_and_flag_restored(
     monkeypatch.setattr(ton_pay, "send_ton_transfer", auto_send)
     monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", before)
 
-    await cmd_payout(make_message("/payout test 0.001 confirm http"))
+    message = make_message("/payout test 0.001 confirm http")
+    await cmd_payout(message)
 
     assert called == {"http": 1, "auto": 0}
     assert ton_pay.state._http_channel_engaged_at is before, (
         "флаг должен вернуться к исходному значению: принудительная репетиция — "
         "не переключение канала"
     )
+    assert "Канал: HTTP (принудительно)" in message.answer.call_args.args[0]
 
     preflight = make_message("/payout test 0.001 http")
     await cmd_payout(preflight)
