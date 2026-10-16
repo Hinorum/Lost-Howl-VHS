@@ -5,6 +5,7 @@ import logging
 from datetime import time
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -713,23 +714,24 @@ def _reminder_text(stake_mode: bool, rule_phrase: str, stakes: tuple[int, int]) 
     сколько, чтобы человек знал, чего ждать после закрытия.
     """
     body = f"🐺 Голосование закрывается через час.\n🎬 Сцена дня: {rule_phrase}."
+    action = "<b>жми кнопку сцены под постом дня</b>"
     if not stake_mode:
-        return f"{body}\nПуть ещё не выбран — жми кнопку сцены под постом дня."
+        return f"{body}\nПуть ещё не выбран — {action}."
     confirmed, pending = stakes
     if confirmed > 0:
         words = (
             f"Твоя ставка {confirmed / 1e9:.2f} Gram уже принята, но путь ещё "
-            "не выбран — жми кнопку сцены под постом дня."
+            f"не выбран — {action}."
         )
     elif pending > 0:
         words = (
             f"Твоя ставка {pending / 1e9:.2f} Gram подтверждается (обычно до минуты), "
-            "а путь ещё не выбран — жми кнопку сцены под постом дня."
+            f"а путь ещё не выбран — {action}."
         )
     else:
         words = (
-            "Ставка не сделана и путь не выбран: переведи Gram казначею и жми "
-            "кнопку сцены под постом дня."
+            "Ставка не сделана и путь не выбран: <b>переведи Gram казначею "
+            "(/stake) и жми кнопку сцены под постом дня</b>."
         )
     return f"{body}\n{words}"
 
@@ -832,6 +834,7 @@ async def _vote_reminder_job() -> None:
                         rule_phrase,
                         stake_totals.get(pid, (0, 0)),
                     ),
+                    parse_mode=ParseMode.HTML,
                 )
 
             sent = await _dm_send_all(

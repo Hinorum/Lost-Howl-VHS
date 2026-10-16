@@ -1525,7 +1525,7 @@ async def test_vote_reminder_stake_and_no_stake_lines(monkeypatch) -> None:
 
     sends = AsyncMock()
     texts: dict[int, str] = {}
-    sends.side_effect = lambda pid, text: texts.update({pid: text})
+    sends.side_effect = lambda pid, text, **kw: texts.update({pid: text})
     monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "player_dm", True)
@@ -1569,7 +1569,7 @@ async def test_vote_reminder_pending_stake_line(monkeypatch) -> None:
 
     sends = AsyncMock()
     texts: dict[int, str] = {}
-    sends.side_effect = lambda pid, text: texts.update({pid: text})
+    sends.side_effect = lambda pid, text, **kw: texts.update({pid: text})
     monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "player_dm", True)
@@ -1596,6 +1596,10 @@ async def test_vote_reminder_pending_stake_line(monkeypatch) -> None:
         await sched._vote_reminder_job()
         assert sends.await_count == 1
         assert "700.00 Gram подтверждается" in texts[531]
+        from aiogram.enums import ParseMode
+
+        assert "<b>" in texts[531]
+        assert sends.await_args.kwargs["parse_mode"] == ParseMode.HTML
     finally:
         await _clear_rounds()
 
@@ -1610,7 +1614,7 @@ async def test_vote_reminder_vote_only_mode_phrase(monkeypatch) -> None:
 
     sends = AsyncMock()
     texts: list[str] = []
-    sends.side_effect = lambda _pid, text: texts.append(text)
+    sends.side_effect = lambda _pid, text, **kw: texts.append(text)
     monkeypatch.setattr(sched, "_bot", Mock(send_message=sends))
     monkeypatch.setattr(settings, "ton_enabled", False)
     monkeypatch.setattr(settings, "player_dm", True)

@@ -60,7 +60,7 @@ def test_build_win_prize(monkeypatch) -> None:
     text = _build_player_result_text(_round(1, winner=1), _CARDS, 1, _stake(), [_payout("prize", 4_750_000_000)])
     assert "Ты угадал сцену дня!" in text
     assert "«Маяк»" in text
-    assert "0.5 Gram в выигрыш: +4.75 Gram" in text
+    assert "0.5 Gram в выигрыш: <b>+4.75 Gram</b>" in text
 
 
 def test_build_loss_refund(monkeypatch) -> None:
@@ -68,7 +68,7 @@ def test_build_loss_refund(monkeypatch) -> None:
     text = _build_player_result_text(_round(2, winner=1), _CARDS, 0, _stake(), [_payout("refund", 495_000_000)])
     assert "Твоя сцена не победила" in text
     assert "«Казарма»" in text
-    assert "0.5 Gram возвращается: 0.495 Gram" in text
+    assert "0.5 Gram возвращается: <b>0.495 Gram</b>" in text
 
 
 def test_build_loss_stake_stays_in_bank(monkeypatch) -> None:

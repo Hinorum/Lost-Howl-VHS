@@ -30,12 +30,14 @@ week_leaderboard_ready в watcher_state). Претендент обязан им
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
 from datetime import UTC, date, datetime, timedelta
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import case, delete, func, or_, select, text
 
@@ -390,10 +392,9 @@ async def _notify_tied_players(
     label = f"недели ({human})" if kind == "week" else f"месяца ({human})"
     text = (
         f"🏆 Ничья за призовые места leaderboard {label}!\n\n"
-        "Ты и ещё кто-то набрали одинаковые верные сцены и вклад Gram. "
-        "Чтобы решить, кто выше — нажми кнопку заявки ниже. "
-        "Кто раньше нажал — тот выше. "
-        f"Дедлайм: {settings.claim_window_hours}ч."
+        "Ты и ещё кто-то набрали одинаковые верные сцены и вклад Gram.\n"
+        f"<b>Нажми кнопку заявки ниже</b> — кто раньше заявил, тот выше. "
+        f"Окно заявки: {settings.claim_window_hours} ч."
     )
     button_text = (
         "🗓 Заявить приз недели" if kind == "week"
@@ -404,7 +405,7 @@ async def _notify_tied_players(
     ])
     for pid in tied_player_ids:
         try:
-            await bot.send_message(pid, text, reply_markup=kb)
+            await bot.send_message(pid, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception as exc:
             logger.warning("DM tied-игроку %s не доставлен: %s", pid, exc)
 
@@ -1085,20 +1086,19 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
     )
     lines = ["🏆 Итоги недели Стаи:"]
     for medal, name, amount in paid:
-        lines.append(f"{medal} {name} — {amount / 1e9:.2f} Gram")
+        lines.append(f"{medal} {html.escape(name)} — <b>{amount / 1e9:.2f} Gram</b>")
     lines.append(
-        "При равенстве верных сцен Стая смотрит на вклад Gram, а затем — "
-        "кто раньше всех заявил о месте."
+        "При равенстве — вклад Gram, затем кто раньше заявил о месте."
     )
     if rolled > 0:
-        lines.append("Незаполненные места недели перешли в копилку новой.")
-    lines.append("Неделя началась заново — копилка копится с нуля. Удачи!")
+        lines.append("Незаполненные места перешли в копилку новой недели.")
+    lines.append("Копилка новой недели копится с нуля. Удачи!")
     ceremony = "\n".join(lines)
     if bot is not None:
         from app.broadcast import whisper_to_chats
 
         try:
-            await whisper_to_chats(bot, ceremony)
+            await whisper_to_chats(bot, ceremony, parse_mode=ParseMode.HTML)
         except Exception as exc:
             logger.warning("Церемония недели не разослана: %s", exc)
     if bot is not None and settings.admin_id_set:

@@ -657,6 +657,12 @@ async def test_resolve_claim_window_opens_and_notifies_on_tie(session: AsyncSess
     window = await _load_claim_window(session, "week")
     assert window is not None and window["players"] == [1, 2]
     assert bot.send_message.await_count == 2  # 444: DM ушли
+    from aiogram.enums import ParseMode
+
+    dm_text = bot.send_message.await_args_list[0].args[1]
+    assert "Нажми кнопку заявки ниже" in dm_text
+    assert "Дедлайм" not in dm_text
+    assert bot.send_message.await_args_list[0].kwargs["parse_mode"] == ParseMode.HTML
 
 
 async def test_resolve_claim_window_repairs_opened_at(session: AsyncSession) -> None:

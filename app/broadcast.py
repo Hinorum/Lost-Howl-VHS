@@ -1133,9 +1133,15 @@ def _build_player_result_text(
             prize = sum(p.amount_nanotons for p in payouts if p.kind == "prize")
             refund = max((p.amount_nanotons for p in payouts if p.kind == "refund"), default=0)
             if prize > 0:
-                money = f"💰 Ставка {stake_g} Gram в выигрыш: +{from_nano(prize):g} Gram (перевод уже в очереди)."
+                money = (
+                    f"💰 Ставка {stake_g} Gram в выигрыш: "
+                    f"<b>+{from_nano(prize):g} Gram</b> (перевод уже в очереди)."
+                )
             elif refund > 0:
-                money = f"💰 Ставка {stake_g} Gram возвращается: {from_nano(refund):g} Gram (минус газ сети) — перевод в очереди."
+                money = (
+                    f"💰 Ставка {stake_g} Gram возвращается: "
+                    f"<b>{from_nano(refund):g} Gram</b> (минус газ сети) — перевод в очереди."
+                )
             elif stake.status == "confirmed":
                 # Ставка игрока разыграна в пользу уцелевшей сцены: деньги
                 # остались в банке дня и пошли призовым победителям. Формулировка
@@ -1268,9 +1274,12 @@ async def announce_player_results(bot: Bot | None, finished: Round) -> int:
     return delivered
 
 
-async def whisper_to_chats(bot: Bot | None, text: str) -> int:
+async def whisper_to_chats(
+    bot: Bot | None, text: str, parse_mode: ParseMode | None = None
+) -> int:
     """Полуденный шёпот мира: короткое сообщение во все живые чаты.
 
+    parse_mode — формат разметки: церемония недели несёт жирные суммы.
     Возвращает число доставленных чатов; провалы не критичны по определению.
     """
     if bot is None or not text:
@@ -1282,12 +1291,12 @@ async def whisper_to_chats(bot: Bot | None, text: str) -> int:
     async def worker(chat_id: int) -> bool:
         async with semaphore:
             try:
-                await bot.send_message(chat_id, text)
+                await bot.send_message(chat_id, text, parse_mode=parse_mode)
                 return True
             except TelegramRetryAfter as exc:
                 await asyncio.sleep(exc.retry_after + 1)
                 try:
-                    await bot.send_message(chat_id, text)
+                    await bot.send_message(chat_id, text, parse_mode=parse_mode)
                     return True
                 except Exception as exc2:
                     logger.warning("Шёпот дня не доставлен в чат %s (после ретрая): %s", chat_id, exc2)
@@ -1327,7 +1336,9 @@ async def whisper_to_chats(bot: Bot | None, text: str) -> int:
     )
     # Вечерний привал — и в личку подписчикам (личный дубликат вечернего поста).
     delivered_dm = await _dm_send_all(
-        bot, lambda pid: bot.send_message(pid, text), "Личный шёпот (текст)"
+        bot,
+        lambda pid: bot.send_message(pid, text, parse_mode=parse_mode),
+        "Личный шёпот (текст)",
     )
     return delivered + delivered_dm
 

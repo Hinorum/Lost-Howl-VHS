@@ -432,8 +432,8 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                     f"↩️ Перевод {amount} Gram возвращается: эта сумма ниже минимума "
                     f"ставки ({settings.stake_min_ton:g} Gram). Если ты менял путь — "
                     "бот не распознал комментарий rv:… за переводом. Переведи снова "
-                    "без мемо (сумма из вилки зачтётся автоматически) либо с `rv:день` "
-                    "в комментарии. Или выбери Stars в /change — надёжнее.",
+                    "без мемо (сумма из вилки зачтётся автоматически) либо с "
+                    "<code>rv:день</code> в комментарии. Или выбери Stars в /change — надёжнее.",
                 )
             elif result == "money_off":
                 await _dm_stake(

@@ -1044,6 +1044,8 @@ async def test_submin_already_staked_is_refunded_with_revote_hint(
             assert row["kind"] == "refund" and row["round_id"] == round_row.id
             sent = bot.send_message.await_args.args[1]
             assert "не распознал комментарий rv" in sent
+            assert "<code>rv:день</code>" in sent
+            assert "`" not in sent
         finally:
             # Журнал входящих ссылается на раунд и игрока — сначала он,
             # иначе Postgres не отдаст удаление родителя (SQLite молчит).

@@ -731,6 +731,29 @@ async def test_whisper_requires_bot_and_text(monkeypatch) -> None:
     assert await bc.whisper_to_chats(SimpleNamespace(send_message=AsyncMock()), "") == 0
 
 
+async def test_whisper_forwards_parse_mode_to_chats_and_dms(monkeypatch) -> None:
+    """Церемония недели несёт HTML: parse_mode обязан дойти и до чатов, и до DM."""
+    from aiogram.enums import ParseMode
+
+    monkeypatch.setattr(settings, "player_dm", True)
+    await _wipe(Chat)
+    chat = 777_621
+    pid = 777_622
+    async with SessionLocal() as db:
+        db.add(Chat(id=chat, type="group", active=True))
+        db.add(Player(id=pid, username=f"p{pid}", dm_subscribed=True))
+        await db.commit()
+    try:
+        bot = SimpleNamespace(send_message=AsyncMock())
+        monkeypatch.setattr(bc, "active_chat_ids", AsyncMock(return_value=[chat]))
+        monkeypatch.setattr(bc, "active_player_ids", AsyncMock(return_value=[pid]))
+        assert await bc.whisper_to_chats(bot, "🏆 Итоги недели Стаи", parse_mode=ParseMode.HTML) == 2
+        modes = [call.kwargs.get("parse_mode") for call in bot.send_message.await_args_list]
+        assert modes == [ParseMode.HTML, ParseMode.HTML]
+    finally:
+        await _wipe(Chat, Player)
+
+
 async def test_whisper_handles_every_failure_mode(monkeypatch) -> None:
     """Шёпот не должен ни рассылаться не туда, ни падать из-за одного чата."""
     _no_sleep(monkeypatch)
