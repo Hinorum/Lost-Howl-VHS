@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 async def _alert_http_channel_switch(bot: Bot | None, network: str) -> None:
     """Разово (не чаще раза в кулдаун) сообщает хранителю: казначей пишет
-    исходящие через HTTP-канал, лайтсерверы недоступны. Без bot — тихо."""
+    исходящие через HTTP-канал, лайтсерверы не отдают отправку. Без bot — тихо."""
     # Флаги берём из app.ton_pay.state: их туда пишет http_channel при уходе
     # в HTTP-канал. Раньше тут стоял алиас `ton_pay._http_channel_engaged_at` —
     # это снапшот значения на момент импорта (None), который в проде никто не
@@ -38,7 +38,8 @@ async def _alert_http_channel_switch(bot: Bot | None, network: str) -> None:
 
         await notify_admins(
             bot,
-            "⚠️ Казначей: лайтсерверы недоступны (ADNL/TCP режется окружением) — "
+            "⚠️ Казначей: лайтсерверы не отдали отправку (недоступны или узел "
+            "отстал) — "
             f"исходящие идут через HTTP-канал (оффлайн-подпись + Toncenter sendBoc) "
             f"[{network}]. Вернусь к лайтсерверам сам, когда они оживут.",
         )

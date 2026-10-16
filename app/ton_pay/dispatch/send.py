@@ -1,6 +1,6 @@
 """Вещание перевода с казначея: батч-seqno на цикл, лайтсерверы
-и уход в HTTP-канал (оффлайн-подпись + Toncenter), когда ADNL/TCP
-режется окружением."""
+и уход в HTTP-канал (оффлайн-подпись + Toncenter), когда лайтсерверы
+не отдают отправку (нет пиров, таймауты, отстающий узел)."""
 
 from __future__ import annotations
 
@@ -106,8 +106,9 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
 
         if not _tp._is_liteserver_down(exc):
             raise
-        # Лайтсерверы мертвы (ADNL/TCP режется окружением), а деньги слать
-        # надо: оффлайн-подпись + HTTPS-вещание через Toncenter.
+        # Лайтсерверы не отдают вещание (нет пиров, таймауты, отстающий
+        # узел), а деньги слать надо: оффлайн-подпись + HTTPS-вещание
+        # через Toncenter.
         logger.warning(
             "Лайтсерверы недоступны (%s) — переключаюсь на HTTP-канал (toncenter)",
             exc,
