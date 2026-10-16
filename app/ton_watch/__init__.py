@@ -23,18 +23,18 @@ from aiogram import Bot
 from sqlalchemy import select
 
 from app.config import settings
-from app.core.registry import BEAT_KEY as BEAT_KEY  # noqa: F401  (ре-экспорт ключей watcher_state)
-from app.core.registry import CURSOR_KEY as CURSOR_KEY  # noqa: F401
-from app.core.registry import SCAN_BOOST_KEY as SCAN_BOOST_KEY  # noqa: F401
-from app.core.registry import SCAN_GAP_KEY as SCAN_GAP_KEY  # noqa: F401
-from app.core.registry import SOURCE_KEY as SOURCE_KEY  # noqa: F401
+from app.core.registry import BEAT_KEY as BEAT_KEY
+from app.core.registry import CURSOR_KEY as CURSOR_KEY
+from app.core.registry import SCAN_BOOST_KEY as SCAN_BOOST_KEY
+from app.core.registry import SCAN_GAP_KEY as SCAN_GAP_KEY
+from app.core.registry import SOURCE_KEY as SOURCE_KEY
 from app.core.registry import STUCK_TX_KEY, WALLET_NORM_KEY
 from app.db import SessionLocal
 from app.http_utils import (
-    get_http_client as get_http_client,  # noqa: F401  (подменяется в тестах скриптованным клиентом)
+    get_http_client as get_http_client,
 )
 from app.models import Player, Round, RoundStatus, WatcherState
-from app.ops import claim_once as claim_once  # noqa: F401  (тесты чистят маркеры через ton_watch.claim_once)
+from app.ops import claim_once as claim_once
 from app.ops import is_game_paused
 from app.payments import parse_bank_memo, parse_revote_memo, parse_verify_memo
 from app.stakes import confirm_stake, register_stake
@@ -60,24 +60,24 @@ logger = logging.getLogger(__name__)
 
 # Подмодули пакета доступны как app.ton_watch.<имя> -- тем же способом, чем
 # раньше было app.ton_pay.
-from app.ton_watch import ledger as ledger  # noqa: F401
-from app.ton_watch import notify as notify  # noqa: F401
-from app.ton_watch import refunds as refunds  # noqa: F401
-from app.ton_watch import revote as revote  # noqa: F401
-from app.ton_watch import sources as sources  # noqa: F401
-from app.ton_watch import state as state  # noqa: F401
+from app.ton_watch import ledger as ledger
+from app.ton_watch import notify as notify
+from app.ton_watch import refunds as refunds
+from app.ton_watch import revote as revote
+from app.ton_watch import sources as sources
+from app.ton_watch import state as state
 from app.ton_watch.ledger import (  # noqa: F401
     PAUSE_REFUND_COMMENT,
     _ledger_incoming,
     _ledger_stuck_incoming,
     _record_bank_credit,
 )
-from app.ton_watch.notify import (  # noqa: F401
+from app.ton_watch.notify import (
     _dm_stake,
     _dm_verify_mismatch,
     _kick_dispatch_after_verify,
 )
-from app.ton_watch.refunds import (  # noqa: F401
+from app.ton_watch.refunds import (
     _stash_refund,
 )
 from app.ton_watch.revote import (  # noqa: F401

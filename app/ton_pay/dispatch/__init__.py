@@ -35,11 +35,11 @@ logger = logging.getLogger(__name__)
 
 # Листы пакета. Доступны и как app.ton_pay.dispatch.<имя> — тем же
 # способом, как раньше был плоский модуль.
-from . import alerts as alerts  # noqa: F401
-from . import confirm as confirm  # noqa: F401
-from . import memo as memo  # noqa: F401
-from . import queue as queue  # noqa: F401
-from . import send as send  # noqa: F401
+from . import alerts as alerts
+from . import confirm as confirm
+from . import memo as memo
+from . import queue as queue
+from . import send as send
 from .alerts import _alert_admin, _alert_http_channel_switch
 from .confirm import _BROADCAST_CONFIRM_POLL, _wait_for_broadcast_memo, confirm_broadcast_payouts  # noqa: F401
 from .memo import (

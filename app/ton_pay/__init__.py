@@ -41,7 +41,7 @@ from sqlalchemy import func, select
 # HTTP-хелперы остаются ре-экспортом пакета: reconcile.py и http_channel.py
 # берут их через app.ton_pay, чтобы monkeypatch.setattr(ton_pay, ...) доходил.
 from app.db import SessionLocal  # noqa: F401
-from app.http_utils import (  # noqa: F401
+from app.http_utils import (
     get_http_client as get_http_client,
 )
 from app.http_utils import (
@@ -59,11 +59,11 @@ logger = logging.getLogger(__name__)
 # Все обращения через `state.<имя>` (см. ниже). Этот шаг — первый шаг
 # рефакторинга ton_pay.py в пакет; wallet.py и http_channel.py используют
 # то же состояние через короткие псевдонимы внизу файла.
-from . import (  # noqa: E402,F401  (submodules exposed as `app.ton_pay.{state,wallet,...}`)
+from . import (  # noqa: F401  (submodules exposed as `app.ton_pay.{state,wallet,...}`)
     state,
 )
-from . import state as _state  # noqa: E402
-from . import wallet as _wallet_pkg  # noqa: E402,F401  (re-export as `app.ton_pay.wallet`)
+from . import state as _state
+from . import wallet as _wallet_pkg  # noqa: F401  (re-export as `app.ton_pay.wallet`)
 
 # Удобные алиасы внутри модуля (для краткости ссылок в __init__).
 _wallet_lock = _state._wallet_lock
@@ -92,20 +92,20 @@ async def dispatch_lock():
 
 # Совместимость с тестами и старым кодом: алиасы для приватных имён из старого
 # ton_pay.py. Реальные реализации живут в wallet.py, здесь — тонкие обёртки.
-def _wallet_address(version, public_key, network_global_id, wc=0):  # noqa: ANN001,ANN201
+def _wallet_address(version, public_key, network_global_id, wc=0):
     from .wallet import wallet_address as _impl
 
     return _impl(version, public_key, network_global_id, wc)
 
 
-def _detect_wallet_version(public_key, treasury_address, network_global_id):  # noqa: ANN001,ANN201
+def _detect_wallet_version(public_key, treasury_address, network_global_id):
     from .wallet import detect_wallet_version as _impl
 
     return _impl(public_key, treasury_address, network_global_id)
 
 
 # Алиас для константы из wallet.py (тесты используют ton_pay._V4R2_WALLET_ID).
-from .wallet import _V4R2_WALLET_ID  # noqa: E402,F401
+from .wallet import _V4R2_WALLET_ID  # noqa: F401
 
 
 async def pending_payout_count(session) -> int:

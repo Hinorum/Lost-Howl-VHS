@@ -120,12 +120,11 @@ async def _claim_marker_lock(session, key: str) -> WatcherState:
         ),
         {"k": key},
     )
-    row = (
+    return (
         await session.execute(
             select(WatcherState).where(WatcherState.key == key).with_for_update()
         )
     ).scalar_one()
-    return row
 
 
 def _capped(expr, cap: int):

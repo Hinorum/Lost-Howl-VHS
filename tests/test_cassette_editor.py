@@ -415,15 +415,6 @@ async def test_today_road_resolves_fork_with_engine_winner(session) -> None:
 # --- панель: сцена «Редактор плёнки» --------------------------------------
 
 
-def _make_message(text: str = "/cassette") -> SimpleNamespace:
-    return SimpleNamespace(
-        chat=SimpleNamespace(type="private"),
-        from_user=SimpleNamespace(id=HOLDER_ID),
-        text=text,
-        answer=AsyncMock(),
-    )
-
-
 def _make_callback(data: str) -> SimpleNamespace:
     return SimpleNamespace(
         data=data,

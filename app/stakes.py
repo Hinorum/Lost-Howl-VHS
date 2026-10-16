@@ -752,7 +752,7 @@ async def refundable_stakes(session, limit: int = 25) -> list[tuple[Stake, Playe
         )
         .subquery()
     )
-    rows = (
+    return (
         await session.execute(
             select(Stake, Player, Round)
             .join(Player, Player.id == Stake.player_id)
@@ -770,7 +770,6 @@ async def refundable_stakes(session, limit: int = 25) -> list[tuple[Stake, Playe
             .limit(limit)
         )
     ).all()
-    return rows
 
 
 async def create_manual_refund(session, stake_id: int) -> str:
