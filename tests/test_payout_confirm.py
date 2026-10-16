@@ -168,15 +168,22 @@ async def test_confirm_skips_when_history_empty(monkeypatch) -> None:
 
 
 async def test_confirm_uses_comment_override(monkeypatch) -> None:
-    """Выплаты со свободным комментарием сверяются по нему же."""
+    """Выплаты со свободным комментарием сверяются по нему же.
+
+    Свободный текст в цепочке несёт уникальный суффикс way:…#id: сверка
+    обязана искать полную строку. Сырой текст кандидатом больше не является
+    (досуффиксные переводы давно вне окна сверки) — иначе чужая транзакция
+    с тем же текстом могла бы отметиться как «уже ушла»."""
     payout_id = await _seed_sent_payout()
     async with SessionLocal() as session:
         row = await session.get(Payout, payout_id)
         row.comment_override = "техработы 12.09"
         await session.commit()
+    expected = f"техработы 12.09 | way:64:prize#{payout_id}"
+    assert ton_pay._payout_comment_candidates(row) == [expected]
 
     async def fake_tx_map(**kwargs) -> dict[str, str]:
-        return {"техработы 12.09": "1" * 64}
+        return {expected: "1" * 64}
 
     monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
 

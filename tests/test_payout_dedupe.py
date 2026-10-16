@@ -982,13 +982,12 @@ def test_payout_comment_candidates_keep_unique_suffix() -> None:
     p2 = Payout(round_id=7, kind="refund", id=12, comment_override=override)
     c1 = ton_pay._payout_comment_candidates(p1)
     c2 = ton_pay._payout_comment_candidates(p2)
-    assert c1[0] != c2[0]
-    assert c1[0].endswith("| way:7:refund#11")
-    assert c2[0].endswith("| way:7:refund#12")
-    assert override in c1[0]
-    # Легаси-кандидат — сырой текст: старые переводы (до суффикса) всё ещё
-    # находятся в истории, иначе сверка вернёт в очередь уже разосланное.
-    assert c1[1] == override
+    assert c1 == [f"{override} | way:7:refund#11"]
+    assert c2 == [f"{override} | way:7:refund#12"]
+    # Сырой текст кандидатом больше не считается: досуффиксные переводы
+    # (до 88ee317, 2026-09-21) давно выпали из окна сверки, а расширенное
+    # совпадение по сырому тексту только увеличивало шанс чужой отметки.
+    assert override not in c1
     # Без переопределения — привычное служебное memo.
     assert ton_pay._payout_comment_candidates(Payout(round_id=7, kind="prize", id=5)) == ["way:7:prize#5"]
     # Длинный текст не съедает суффикс (лимит ячейки 120): режется сам текст.
