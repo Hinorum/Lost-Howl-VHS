@@ -337,9 +337,9 @@ async def _resolve_player_arg(session, raw: str) -> int | None:
 
 
 @router.message(Command("dispute"), F.chat.type == ChatType.PRIVATE)
-@require_admin("Только для хранителя игры.")
 async def cmd_dispute(message: Message) -> None:
-    """Жалоба на итог дня. Хранителю доступны open/resolve/reject/compensate."""
+    """Жалоба на итог дня: игрок подаёт сам (последний сыгранный день),
+    хранителю доступны open/resolve/reject/compensate."""
     from app import disputes as dispute_mod
 
     parts = message.text.split()
