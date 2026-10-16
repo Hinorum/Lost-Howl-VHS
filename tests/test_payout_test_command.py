@@ -81,6 +81,11 @@ def _patch_history(monkeypatch: pytest.MonkeyPatch, tx: str | None) -> None:
         ["0.06"],
         ["0.0000000001"],
         ["0.001", "nope"],
+        ["0.001", "batch"],
+        ["0.001", "batch1"],
+        ["0.001", "batch4"],
+        ["0.001", "batchx"],
+        ["0.03", "batch2"],
     ],
 )
 def test_parse_refuses_anything_suspicious(tokens: list[str]) -> None:
@@ -91,9 +96,30 @@ def test_parse_refuses_anything_suspicious(tokens: list[str]) -> None:
 
 
 def test_parse_accepts_case_insensitive_flags() -> None:
-    assert _parse_test_args(["0.001"]) == (Decimal("0.001"), False, False)
-    assert _parse_test_args(["0.001", "confirm", "http"]) == (Decimal("0.001"), True, True)
-    assert _parse_test_args(["0,001", "HTTP", "Confirm"]) == (Decimal("0.001"), True, True)
+    assert _parse_test_args(["0.001"]) == (Decimal("0.001"), False, False, 0)
+    assert _parse_test_args(["0.001", "confirm", "http"]) == (Decimal("0.001"), True, True, 0)
+    assert _parse_test_args(["0,001", "HTTP", "Confirm"]) == (Decimal("0.001"), True, True, 0)
+    assert _parse_test_args(["0.001", "confirm", "Batch2"]) == (
+        Decimal("0.001"),
+        True,
+        False,
+        2,
+    )
+    assert _parse_test_args(["0.001", "batch3", "confirm"]) == (
+        Decimal("0.001"),
+        True,
+        False,
+        3,
+    )
+
+
+def test_parse_batch_cap_applies_to_total() -> None:
+    """Потолок 0.05 — на ВСЮ отправку: 0.02×3 не проходит, 0.01×3 проходит."""
+    assert _parse_test_args(["0.01", "batch3"])[3] == 3
+    with pytest.raises(ValueError, match="потолок"):
+        _parse_test_args(["0.02", "batch3"])
+    with pytest.raises(ValueError, match="потолок"):
+        _parse_test_args(["0.03", "batch2"])
 
 
 async def test_outsider_cannot_reach_test_command(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -298,3 +324,145 @@ async def test_ton_disabled_is_reported_not_silently_dropped(
     await cmd_payout(message)
 
     assert "Не отправлено" in said(message)
+
+
+async def test_batch_preflight_refuses_non_v5_wallet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пачка — механизм v5r1: на v4r2 предполёт отказывает до движения денег."""
+    _patch_preflight(monkeypatch)
+    monkeypatch.setattr(ton_pay, "build_offline_treasury_wallet", lambda: (object(), "v4r2"))
+    sent = False
+
+    async def batch(transfers):
+        nonlocal sent
+        sent = True
+        return "bcast:1"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", batch)
+    message = make_message("/payout test 0.001 confirm batch2")
+    await cmd_payout(message)
+
+    text = said(message)
+    assert "Предполёт не прошёл" in text
+    assert "v5r1" in text
+    assert not sent, "отказ предполёта обязан случиться до отправки"
+
+
+async def test_batch_confirm_sends_one_message_with_distinct_memos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """batch2 → два пылевых перевода ОДНИМ вызовом пачки, memo различимы,
+    оба подтверждаются одной транзакцией."""
+    _patch_preflight(monkeypatch)
+
+    async def tx_map(targets):
+        return {target: "0xsame" for target in targets}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", tx_map)
+    monkeypatch.setattr("app.handlers.payout._TEST_POLL_SECONDS", 0)
+    seen: dict = {}
+
+    async def batch(transfers):
+        seen["transfers"] = transfers
+        return "bcast:9"
+
+    single = AsyncMock()
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", batch)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", single)
+    message = make_message("/payout test 0.002 confirm batch2")
+    await cmd_payout(message)
+
+    transfers = seen["transfers"]
+    assert len(transfers) == 2
+    assert {dest for dest, _nano, _comment in transfers} == {TREASURY}
+    assert all(nano == to_nano(0.002) for _dest, nano, _comment in transfers)
+    comments = [comment for _dest, _nano, comment in transfers]
+    assert all(comment.startswith("payout-test ") for comment in comments)
+    assert len(set(comments)) == 2, "memo пачки обязаны различаться"
+    single.assert_not_awaited()
+    text = said(message)
+    assert "в одной транзакции" in text
+    assert "0xsame" in text
+    assert "Пачка: 2 перевода" in message.answer.call_args_list[0].args[0]
+
+
+async def test_batch_http_variant_uses_http_batch_and_restores_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """batch + http — принудительная репетиция пачки через HTTP-канал:
+    обычный путь не трогает, флаг «канал задействован» возвращается как был."""
+    _patch_preflight(monkeypatch)
+
+    async def tx_map(targets):
+        return {target: "0x3" for target in targets}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", tx_map)
+    monkeypatch.setattr("app.handlers.payout._TEST_POLL_SECONDS", 0)
+    called = {"http": 0, "auto": 0}
+
+    async def http_batch(transfers):
+        called["http"] += 1
+        assert len(transfers) == 2
+        return "bcast:2"
+
+    async def auto_batch(transfers):
+        called["auto"] += 1
+        return "bcast:3"
+
+    monkeypatch.setattr(ton_pay, "_send_ton_transfers_http", http_batch)
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", auto_batch)
+    before = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", before)
+
+    await cmd_payout(make_message("/payout test 0.001 confirm http batch2"))
+
+    assert called == {"http": 1, "auto": 0}
+    assert ton_pay.state._http_channel_engaged_at is before, (
+        "флаг должен вернуться к исходному значению: принудительная репетиция — "
+        "не переключение канала"
+    )
+
+
+async def test_batch_missing_memos_reported_as_risk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ни один memo пачки не нашёлся — хранитель должен увидеть риск словами."""
+    _patch_preflight(monkeypatch)
+
+    async def tx_map(targets):
+        return {}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", tx_map)
+    monkeypatch.setattr("app.handlers.payout._TEST_POLL_SECONDS", 0)
+
+    async def batch(transfers):
+        return "bcast:5"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", batch)
+    message = make_message("/payout test 0.001 confirm batch2")
+    await cmd_payout(message)
+
+    text = said(message)
+    assert "Не все memo нашлись" in text
+    assert "sent vs confirmed" in text
+
+
+async def test_batch_memos_in_different_txs_reported_as_anomaly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """memo в разных транзакциях — для v5r1 это аномалия, и она называется."""
+    _patch_preflight(monkeypatch)
+
+    async def tx_map(targets):
+        # _test_wait_memo зовёт карту по ОДНОМУ memo за раз: хеш привязываем
+        # к содержимому memo, иначе все вызовы вернули бы один и тот же хеш.
+        return {target: f"0x{target[-1]}" for target in targets}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", tx_map)
+    monkeypatch.setattr("app.handlers.payout._TEST_POLL_SECONDS", 0)
+
+    async def batch(transfers):
+        return "bcast:6"
+
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", batch)
+    message = make_message("/payout test 0.001 confirm batch3")
+    await cmd_payout(message)
+
+    assert "РАЗНЫЕ транзакции" in said(message)

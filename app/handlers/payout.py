@@ -221,20 +221,22 @@ async def cmd_resume_payouts(message: Message) -> None:
 # скрипт, которого раньше не существовало вовсе — в день X владелец импровизировал
 # бы с боевым кошельком.
 _TEST_MAX_GRAM = Decimal("0.05")
-_TEST_USAGE = "/payout test <сумма Gram> [confirm] [http]"
+_TEST_USAGE = "/payout test <сумма Gram> [confirm] [http] [batch2|batch3]"
 _TEST_MEMO_PREFIX = "payout-test"
 _TEST_POLL_ATTEMPTS = 6
 _TEST_POLL_SECONDS = 5
 
 
-def _parse_test_args(tokens: list[str]) -> tuple[Decimal, bool, bool]:
-    """(сумма Gram, отправлять, принудительный HTTP-канал).
+def _parse_test_args(tokens: list[str]) -> tuple[Decimal, bool, bool, int]:
+    """(сумма Gram на перевод, отправлять, принудительный HTTP, размер пачки).
 
     Назначение НЕ выбирается: только сам кошелёк казны. Холостой перевод не
     имеет права увести деньги из казны — иначе после репетиции ожидания БД
     разошлись бы с балансом, и автосверка честно подняла бы тревогу «ручной
     вывод?». Любая непонятная лексема — отказ до отправки, а не «разберёмся
     как получится»: опечатка в confirm должна остановить до движения денег.
+    batchN — репетиция пачки v5r1: N пылевых переводов одним внешним
+    сообщением; потолок применяется к сумме ВСЕЙ отправки.
     """
     if not tokens:
         raise ValueError("нет суммы")
@@ -248,23 +250,34 @@ def _parse_test_args(tokens: list[str]) -> tuple[Decimal, bool, bool]:
         raise ValueError("сумма должна быть больше нуля")
     if amount * 1_000_000_000 < 1:
         raise ValueError("сумма меньше одного нанотона")
-    if amount > _TEST_MAX_GRAM:
-        raise ValueError(
-            f"потолок {_TEST_MAX_GRAM} Gram: это репетиция, а не способ увести деньги"
-        )
     confirm = force_http = False
+    batch_count = 0
     for token in tokens[1:]:
         lowered = token.lower()
         if lowered == "confirm":
             confirm = True
         elif lowered == "http":
             force_http = True
+        elif lowered.startswith("batch"):
+            suffix = lowered[len("batch") :]
+            if not suffix.isdigit() or not 2 <= int(suffix) <= 3:
+                raise ValueError(
+                    f"«{token}»: пачка — это batch2 или batch3 "
+                    "(2–3 перевода одним сообщением)"
+                )
+            batch_count = int(suffix)
         else:
             raise ValueError(f"непонятный аргумент «{token}»")
-    return amount, confirm, force_http
+    total = amount * batch_count if batch_count else amount
+    if total > _TEST_MAX_GRAM:
+        raise ValueError(
+            f"потолок {_TEST_MAX_GRAM} Gram на всю отправку: это репетиция, "
+            "а не способ увести деньги"
+        )
+    return amount, confirm, force_http, batch_count
 
 
-async def _test_preflight(amount: Decimal, force_http: bool) -> str:
+async def _test_preflight(amount: Decimal, force_http: bool, batch_count: int) -> str:
     """Блок «что будет отправлено» — всё, что узнаётся без единого движения денег.
 
     Каждая строка закрывает свой класс отказа, который иначе всплыл бы впервые
@@ -277,11 +290,20 @@ async def _test_preflight(amount: Decimal, force_http: bool) -> str:
     network = "testnet" if settings.is_testnet else "mainnet"
     lines = [f"🧪 Холостой перевод · {network} · потолок {_TEST_MAX_GRAM} Gram"]
     wallet = None
+    version: str | None = None
     try:
         wallet, version = _tp.build_offline_treasury_wallet()
         lines.append(f"Пара мнемоник/адрес: {version} ✓ · BoC собирается")
     except Exception as exc:
         lines.append(f"Пара мнемоник/адрес: {html_escape(str(exc))} ⚠️")
+    if batch_count and version != "v5r1":
+        # Пачка — механизм v5r1 (out_list). На v4r2 предполёт обязан отказать
+        # ДО движения денег: pytoniq упакует что-то своё, и репетиция проверит
+        # не тот путь, которым пойдут боевые выплаты.
+        raise ValueError(
+            f"пачка — механизм контракта v5r1, а казначей {version or 'не определён'}: "
+            "смоук пачки невозможен — отправь поштучно (без batchN)"
+        )
     try:
         balance, status, source = await _tp.fetch_account_state()
     except Exception as exc:
@@ -302,7 +324,16 @@ async def _test_preflight(amount: Decimal, force_http: bool) -> str:
     )
     lines.append(f"Куда: сам кошелёк казны <code>{shown}</code>")
     lines.append("Деньги вернутся в казну — израсходуется только газ.")
-    lines.append(f"Сколько: {amount} Gram")
+    if batch_count:
+        lines.append(
+            f"Сколько: {amount} Gram × {batch_count} = {amount * batch_count} Gram"
+        )
+        lines.append(
+            f"Пачка: {batch_count} перевода одним внешним сообщением "
+            "(out_list v5r1: один seqno, одна транзакция)"
+        )
+    else:
+        lines.append(f"Сколько: {amount} Gram")
     lines.append(
         "Канал: "
         + (
@@ -336,7 +367,7 @@ async def _test_wait_memo(memo: str) -> str | None:
 async def _payout_test(message: Message, tokens: list[str]) -> None:
     """Холостой перевод: предполёт всегда, отправка только с явным confirm."""
     try:
-        amount, confirm, force_http = _parse_test_args(tokens)
+        amount, confirm, force_http, batch_count = _parse_test_args(tokens)
     except ValueError as exc:
         await message.answer(
             f"{warn_mark('nopay')} Формат: <code>{html_escape(_TEST_USAGE)}</code>\n"
@@ -345,7 +376,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
         )
         return
     try:
-        report = await _test_preflight(amount, force_http)
+        report = await _test_preflight(amount, force_http, batch_count)
     except Exception as exc:
         await message.answer(
             f"{warn_mark('nopay')} Предполёт не прошёл: {html_escape(str(exc))}",
@@ -363,7 +394,14 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
     import app.ton_pay as _tp
 
     dest = settings.active_treasury_address
-    memo = f"{_TEST_MEMO_PREFIX} {int(datetime.now(UTC).timestamp())}"
+    stamp = int(datetime.now(UTC).timestamp())
+    # У каждого перевода пачки — своё memo: анти-дубль и подтверждение ищут
+    # строки по memo, одинаковые схлопнули бы поиск.
+    memos = (
+        [f"{_TEST_MEMO_PREFIX} {stamp} #{index + 1}" for index in range(batch_count)]
+        if batch_count
+        else [f"{_TEST_MEMO_PREFIX} {stamp}"]
+    )
     nano = int(amount * 1_000_000_000)
     await message.answer(
         f"{report}\n\n⏳ Отправляю… memo ищу в истории казначея до 30 с.",
@@ -374,10 +412,16 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
         # Лок диспетчера обязателен: цикл очереди держит один seqno на пачку,
         # параллельный перевод с тем же seqno молча потерялся бы.
         async with _tp.dispatch_lock():
-            if force_http:
-                marker = await _tp._send_ton_transfer_http(dest, nano, memo)
+            if batch_count:
+                transfers = [(dest, nano, comment) for comment in memos]
+                if force_http:
+                    marker = await _tp._send_ton_transfers_http(transfers)
+                else:
+                    marker = await _tp.send_ton_transfers_batch(transfers)
+            elif force_http:
+                marker = await _tp._send_ton_transfer_http(dest, nano, memos[0])
             else:
-                marker = await _tp.send_ton_transfer(dest, nano, memo)
+                marker = await _tp.send_ton_transfer(dest, nano, memos[0])
     except Exception as exc:
         await message.answer(
             f"{warn_mark('nopay')} Отправка не удалась: {html_escape(str(exc))}",
@@ -394,22 +438,50 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
     if marker is None:
         await message.answer(
             f"{warn_mark('nopay')} Не отправлено: TON выключен или не задана "
-            "мнемоника (send_ton_transfer вернул None).",
+            "мнемоника (канал отправки вернул None).",
             parse_mode=ParseMode.HTML,
         )
         return
-    tx = await _test_wait_memo(memo)
-    lines = [
-        f"{ok_mark()} Отправлено: <code>{marker}</code>",
-        f"memo: <code>{html_escape(memo)}</code>",
-    ]
-    if tx:
-        lines.append(f"✓ memo в истории казначея → tx <code>{html_escape(tx)}</code>")
+    # memo пачки ищем параллельно: они в одной транзакции, и последовательные
+    # окна по 30 с лишь растянули бы ответ на пустом месте.
+    found = await asyncio.gather(*(_test_wait_memo(comment) for comment in memos))
+    if batch_count:
+        hashes = {tx for tx in found if tx}
+        lines = [
+            f"{ok_mark()} Отправлено пачкой: <code>{marker}</code> · "
+            f"{batch_count} перевода одним сообщением",
+        ]
+        for comment, tx in zip(memos, found, strict=True):
+            where = f"→ tx <code>{html_escape(tx)}</code>" if tx else "→ в истории НЕ нашёлся"
+            lines.append(f"memo <code>{html_escape(comment)}</code> {where}")
+        if all(found) and len(hashes) == 1:
+            lines.append(
+                f"✓ Все {batch_count} перевода — в одной транзакции "
+                f"<code>{html_escape(next(iter(hashes)))}</code>: пачка v5r1 работает."
+            )
+        elif all(found):
+            lines.append(
+                "⚠ memo легли в РАЗНЫЕ транзакции — пачка распалась на несколько "
+                "внешек, разбирай вручную (для v5r1 это аномалия)."
+            )
+        else:
+            lines.append(
+                "⚠ Не все memo нашлись за 30 с — это и есть риск sent vs confirmed: "
+                "деньги могли уйти, а подтверждение не прийти. Глянуть: /treasury, /blockchain."
+            )
     else:
-        lines.append(
-            "⚠ memo за 30 с в истории не нашёлся — это и есть риск sent vs confirmed: "
-            "деньги могли уйти, а подтверждение не прийти. Глянуть: /treasury, /blockchain."
-        )
+        lines = [
+            f"{ok_mark()} Отправлено: <code>{marker}</code>",
+            f"memo: <code>{html_escape(memos[0])}</code>",
+        ]
+        tx = found[0]
+        if tx:
+            lines.append(f"✓ memo в истории казначея → tx <code>{html_escape(tx)}</code>")
+        else:
+            lines.append(
+                "⚠ memo за 30 с в истории не нашёлся — это и есть риск sent vs confirmed: "
+                "деньги могли уйти, а подтверждение не прийти. Глянуть: /treasury, /blockchain."
+            )
     lines.append(
         "В /treasury движение попадёт в «self-переводы», а не в тревоги: "
         "баланс сдвинулся только на газ."
