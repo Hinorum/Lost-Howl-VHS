@@ -867,6 +867,35 @@ async def test_purge_never_runs_on_partial_walk(ton_mirror, monkeypatch) -> None
         await _wipe_mirror()
 
 
+async def test_purge_skipped_when_bootstrap_spans_cycles(ton_mirror, monkeypatch) -> None:
+    """Генезис достигнут на следующем цикле — чистка не имеет права бежать.
+
+    Лимит страниц режет спуск на циклы; seen_hashes финального цикла — только
+    его страницы, а строки ранних циклов для чистки «неизвестны». Раньше purge
+    сносил их — и вернуть было нечем: зеркало уже bootstrapped, инкремент
+    читает только голову, тождество ломалось навсегда.
+    """
+    ledger = [_tonapi_item(f"cy{i}", lt=90_000 + i * 3) for i in range(250)]
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    monkeypatch.setattr(settings, "treasury_mirror_max_pages_per_sync", 2)
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        first = await treasury_mirror.sync_treasury_mirror()
+        assert first["added"] == 200 and first["bootstrapped"] is False
+
+        # Второй цикл: последние 50 + пустая страница. Спуск начат НЕ с головы —
+        # seen_hashes этого цикла не описывает историю целиком.
+        second = await treasury_mirror.sync_treasury_mirror()
+        assert second["bootstrapped"] is True
+        assert await _count_moves() == 250, "строки ранних циклов обязаны выжить"
+        assert second["exact"] is True and second["diff_nanotons"] == 0
+    finally:
+        await _wipe_mirror()
+
+
 # ---------- Re-bootstrap по команде хранителя (/mirror reset confirm) ----------
 
 
