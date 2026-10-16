@@ -44,7 +44,9 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
         перевод, а failed с attempts < max гигиена очереди оживляет сама —
         такая строка ждёт только ручного разбора через /payouts;
       • карта истории пуста (оба провайдера молчат) → НЕ трогаем строки:
-        «не знаю» не имеет права ни подтверждать, ни возвращать в очередь.
+        «не знаю» не имеет права ни подтверждать, ни возвращать в очередь;
+      • скан окна усечён (payout_reconcile_max_pages) → «memo не найдено»
+        тоже «не знаю»: строки не трогаем, пока скан не станет полным.
     """
     # Локальный импорт: карта берётся через app.ton_pay, чтобы
     # monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", ...) доходил.
@@ -78,6 +80,11 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
             targets = {
                 candidate for payout in rows for candidate in _payout_comment_candidates(payout)
             }
+            # Полнота окна — как и в диспетчере, считается ЗАНОВО на цикл:
+            # реальный fetch перепишет флаг по факту прохода (усечение по
+            # payout_reconcile_max_pages → False), а протухшее False прошлого
+            # цикла не имеет права блокировать решения этого.
+            _state._RECONCILE_WINDOW_COMPLETE = True
             tx_map = await _tp.fetch_broadcast_tx_map(targets=targets)
             if not tx_map:
                 logger.warning("История казначея недоступна — сверка sent-выплат пропущена")
@@ -136,6 +143,13 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                     window_lost += 1
                     continue
                 # memo нет в истории, окно верификации истекло — перевод не ушёл.
+                if not _state._RECONCILE_WINDOW_COMPLETE:
+                    # ...но скан мог не покрыть окно сверки целиком (упёрся в
+                    # payout_reconcile_max_pages): «не найдено» здесь — «не знаю».
+                    # Возврат в очередь рискнул бы задвоить ушедший перевод —
+                    # ждём полного скана; строка либо подтвердится, либо дойдёт
+                    # до ветки «за окном сверки» и уйдёт на ручной разбор.
+                    continue
                 payout.status = "pending"
                 payout.attempts += 1
                 payout.last_error = (

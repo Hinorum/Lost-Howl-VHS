@@ -65,6 +65,8 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
     import app.ton_pay as _tp
 
     if not settings.active_treasury_address:
+        # Казначей не задан — истории нет вовсе, искать нечего.
+        _state._RECONCILE_WINDOW_COMPLETE = True
         return {}
     url = (
         f"{settings.active_ton_api_base}/v2/blockchain/accounts/"
@@ -81,6 +83,12 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
     tx_map: dict[str, str] = {}
     cutoff = time.time() - settings.payout_reconcile_history_seconds
     max_pages = max(1, settings.payout_reconcile_max_pages)
+    # Полнота окна считается по ФАКТУ прохода, а не по «провайдер ответил»:
+    # скан может упереться в max_pages, не дойдя до границы окна, и тогда
+    # «memo не найдено» — это «не знаю», а не «перевода нет». Стартовое False
+    # пессимистично: аварийный выход (raise, истощение страниц) оставляет
+    # отрицательные ответы недоказанными (см. app.ton_pay.state).
+    _state._RECONCILE_WINDOW_COMPLETE = False
     before_lt: str | None = None
     first_hash: str | None = None
     client = _tp.get_http_client()
@@ -107,6 +115,7 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
             )
         items = data.get("transactions") or []
         if not items:
+            _state._RECONCILE_WINDOW_COMPLETE = True  # пустая страница — хвост истории
             break
         page_first_hash = str(items[0].get("hash") or "")
         if page_first_hash and page_first_hash == first_hash:
@@ -122,12 +131,15 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
             for comment in _out_comments_tonapi(item):
                 tx_map[comment] = tx_hash
         if targets and targets <= set(tx_map):
-            break  # цели найдены — дальше вглубь незачем (экономия запросов)
+            _state._RECONCILE_WINDOW_COMPLETE = True  # все цели найдены — вопросов нет
+            break
         oldest_utime = items[-1].get("utime")
         if oldest_utime is not None and float(oldest_utime) < cutoff:
-            break  # окно истории покрыто
+            _state._RECONCILE_WINDOW_COMPLETE = True  # окно истории покрыто целиком
+            break
         if len(items) < _state._RECONCILE_PAGE_LIMIT:
-            break  # неполная страница = хвост истории, следующая запрос пуста
+            _state._RECONCILE_WINDOW_COMPLETE = True  # неполная страница = хвост истории
+            break
         before_lt = str(items[-1].get("lt") or "")
         if not before_lt:
             break  # lt нет — следующий шаг невозможен, пагинация провалится
@@ -144,12 +156,17 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
     import app.ton_pay as _tp
 
     if not settings.active_treasury_address:
+        # Казначей не задан — истории нет вовсе, искать нечего.
+        _state._RECONCILE_WINDOW_COMPLETE = True
         return {}
     url = f"{settings.active_toncenter_api_base.rstrip('/')}/api/v3/transactions"
     headers = {"X-API-Key": settings.toncenter_api_key} if settings.toncenter_api_key else {}
     tx_map: dict[str, str] = {}
     cutoff = time.time() - settings.payout_reconcile_history_seconds
     max_pages = max(1, settings.payout_reconcile_max_pages)
+    # Полнота окна — по факту прохода (см. _tx_map_via_tonapi): усечение по
+    # max_pages оставляет отрицательные ответы недоказанными.
+    _state._RECONCILE_WINDOW_COMPLETE = False
     offset = 0
     first_hash: str | None = None
     client = _tp.get_http_client()
@@ -172,10 +189,11 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
             )
         items = data.get("transactions") or []
         if not items:
+            _state._RECONCILE_WINDOW_COMPLETE = True  # пустая страница — хвост истории
             break
         page_first_hash = str(items[0].get("hash") or "")
         if page_first_hash and page_first_hash == first_hash:
-            break
+            break  # пагинация не сдвинулась (провайдер не взял offset) — хватит
         first_hash = page_first_hash
         for item in items:
             tx_hash = str(item.get("hash") or "")
@@ -184,12 +202,15 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
             for comment in _out_comments_toncenter(item):
                 tx_map[comment] = tx_hash
         if targets and targets <= set(tx_map):
-            break  # цели найдены — дальше вглубь незачем (экономия запросов)
+            _state._RECONCILE_WINDOW_COMPLETE = True  # все цели найдены — вопросов нет
+            break
         oldest_utime = items[-1].get("utime")
         if oldest_utime is not None and float(oldest_utime) < cutoff:
+            _state._RECONCILE_WINDOW_COMPLETE = True  # окно истории покрыто целиком
             break
         if len(items) < _state._RECONCILE_PAGE_LIMIT:
-            break  # неполная страница = хвост истории, дальше пусто
+            _state._RECONCILE_WINDOW_COMPLETE = True  # неполная страница = хвост истории
+            break
         # Шаг — от ФАКТИЧЕСКИ пришедших записей, а не от запрошенного лимита.
         # Провайдер вправе отдать страницу короче запроса: при жёстком шаге по
         # константе следующий offset перепрыгнул бы через неперечитанный кусок,
@@ -211,6 +232,10 @@ async def fetch_broadcast_tx_map(targets: set[str] | None = None) -> dict[str, s
     targets (необязательно) — подмножество memo, ради которого ходим:
     скан останавливается, как только все цели найдены. Кому-то ещё нужен
     полный скан окна — зовут без targets и получают прежнее поведение.
+
+    Полнота покрытия окна пишется в _state._RECONCILE_WINDOW_COMPLETE:
+    усечённый скан (payout_reconcile_max_pages) — «не знаю» для отрицательных
+    ответов, и потребители (confirm, диспетчер) обязаны это проверять.
     """
     import app.ton_pay as _tp
 
@@ -222,6 +247,7 @@ async def fetch_broadcast_tx_map(targets: set[str] | None = None) -> dict[str, s
         except Exception as exc:
             logger.warning("Карта исходящих казначея (%s) недоступна: %s", fetch.__name__, exc)
     _state._RECONCILE_HISTORY_OK = False
+    _state._RECONCILE_WINDOW_COMPLETE = False  # оба молчат — «не знаю» и о полноте
     return {}
 
 

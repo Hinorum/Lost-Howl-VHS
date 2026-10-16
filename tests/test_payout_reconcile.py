@@ -319,6 +319,82 @@ async def test_tonapi_reconcile_stops_at_first_page_when_target_clean(monkeypatc
     assert tx_map["way:1:pr#5"] == "h1000379"
 
 
+# ---------- Полнота окна сверки ----------
+
+
+async def test_window_flag_false_when_scan_truncated_by_max_pages(monkeypatch) -> None:
+    """Окно не покрыто (упёрлись в max_pages) — флаг полноты False.
+
+    Усечённый скан нельзя выдавать за честный: «memo не найдено» в нём —
+    «не знаю», а не «перевода нет». Раньше такой ответ молча считался полным,
+    и повтор мог уехать на уже ушедший перевод.
+    """
+    now = int(time.time())
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 2)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    items = _build_stream(now, _toncenter_item, count=_LIMIT * 3)  # длиннее двух страниц
+    capture: list[dict] = []
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
+
+    tx_map = await ton_pay._tx_map_via_toncenter()
+    assert len(tx_map) < len(items), "скан обязан быть усечён — иначе тест ни о чём"
+    assert ton_pay.state._RECONCILE_WINDOW_COMPLETE is False
+
+
+async def test_window_flag_false_when_tonapi_scan_truncated(monkeypatch) -> None:
+    """То же на основном провайдере: истощение страниц без покрытия окна — False."""
+    now = int(time.time())
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 2)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    items = _build_stream(now, _tonapi_item, count=_LIMIT * 3)
+    capture: list[dict] = []
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
+
+    tx_map = await ton_pay._tx_map_via_tonapi()
+    assert len(tx_map) < len(items)
+    assert ton_pay.state._RECONCILE_WINDOW_COMPLETE is False
+
+
+async def test_window_flag_true_on_natural_tail(monkeypatch) -> None:
+    """Хвост истории (неполная страница) — окно покрыто целиком: True."""
+    now = int(time.time())
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    items = _build_stream(now, _toncenter_item, count=_LIMIT // 2)
+    capture: list[dict] = []
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
+
+    tx_map = await ton_pay._tx_map_via_toncenter()
+    assert len(tx_map) == len(items)
+    assert ton_pay.state._RECONCILE_WINDOW_COMPLETE is True
+
+
+async def test_window_flag_true_when_targets_found(monkeypatch) -> None:
+    """Досрочный стоп по целям — все вопросы отвечены: окно «полное» для них.
+
+    Вглубь ушли не все страницы, но отрицательных ответов не осталось —
+    каждая цель найдена, и повтор решать не о чем.
+    """
+    now = int(time.time())
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 3600 * 24)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 2)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    items = _build_stream(now, _toncenter_item, count=_LIMIT * 3)
+    capture: list[dict] = []
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
+
+    tx_map = await ton_pay._tx_map_via_toncenter(targets={"way:1:pr#0"})
+    assert "way:1:pr#0" in tx_map
+    assert ton_pay.state._RECONCILE_WINDOW_COMPLETE is True
+
+
 async def test_fetch_broadcast_tx_map_passes_targets_to_fetchers(monkeypatch) -> None:
     """fetch_broadcast_tx_map пробрасывает цели в оба фетчера."""
     seen: dict[str, set[str]] = {}
@@ -432,6 +508,41 @@ async def test_retry_held_when_history_unavailable(monkeypatch) -> None:
             row = await session.get(Payout, payout_id)
         assert row.status == "pending"  # вернётся, когда история оживёт
         assert "анти-дубль" in (row.last_error or "")
+    finally:
+        async with SessionLocal() as session:
+            await session.delete(await session.get(Payout, payout_id))
+            await session.commit()
+
+
+async def test_retry_held_when_window_truncated(monkeypatch) -> None:
+    """Усечённое окно сверки — тоже «не знаю»: повтор не вещается.
+
+    История жива (OK=True), но скан упёрся в payout_reconcile_max_pages и не
+    дотянулся до глубины: пустой ответ маркеров по цели — не «перевода нет».
+    Раньше флаг полноты не проверялся, и такой повтор уезжал в сеть поверх уже
+    ушедшего перевода — двойной платёж.
+    """
+    payout_id = await _seed_payout(attempts=1)
+
+    transfer = AsyncMock(return_value="bcast:321")
+
+    async def markers_window_truncated() -> set[str]:
+        # Так ведёт себя настоящий fetch после усечённого скана.
+        ton_pay.state._RECONCILE_HISTORY_OK = True
+        ton_pay.state._RECONCILE_WINDOW_COMPLETE = False
+        return set()
+
+    _patch_send_environment(monkeypatch, transfer, markers_window_truncated)
+
+    try:
+        sent = await ton_pay.dispatch_pending_payouts(bot=None)
+        assert sent == 0
+        assert transfer.await_count == 0, "усечённое окно не даёт права на повтор"
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert row.status == "pending"
+        assert "неполн" in (row.last_error or "")
+        assert row.attempts == 1, "попытка клейма возвращена — отправки не было"
     finally:
         async with SessionLocal() as session:
             await session.delete(await session.get(Payout, payout_id))

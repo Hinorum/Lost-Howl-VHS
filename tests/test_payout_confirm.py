@@ -90,6 +90,34 @@ async def test_confirm_requeues_lost_transfer(monkeypatch) -> None:
         await _cleanup(payout_id)
 
 
+async def test_confirm_keeps_row_when_scan_truncated(monkeypatch) -> None:
+    """Усечённый скан окна — «не знаю»: в очередь НЕ возвращаем.
+
+    sent_at вне окна верификации, но внутри окна сверки; скан не покрыл окно
+    целиком (упёрся в payout_reconcile_max_pages). «memo не найдено» здесь не
+    доказывает, что перевода нет: возврат в очередь рискнул бы задвоить уже
+    ушедший перевод.
+    """
+    payout_id = await _seed_sent_payout()
+
+    async def fake_tx_map(**kwargs) -> dict[str, str]:
+        # Как настоящий fetch после усечённого скана.
+        ton_pay.state._RECONCILE_WINDOW_COMPLETE = False
+        return {"way:63:prize#1": "0" * 64}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+
+    try:
+        changed = await ton_pay.confirm_broadcast_payouts(bot=None)
+        assert changed == 0
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert row.status == "sent", "«не знаю» не имеет права возвращать в очередь"
+        assert row.tx_hash == "bcast:1789470019"
+    finally:
+        await _cleanup(payout_id)
+
+
 
 async def test_confirm_leaves_fresh_broadcast_alone(monkeypatch) -> None:
     """Свежая вещация (окно верификации не истекло) не трогается: блокчейн
