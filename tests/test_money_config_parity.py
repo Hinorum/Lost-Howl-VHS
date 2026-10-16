@@ -39,6 +39,12 @@ MONEY_LEVERS = (
     ("REFUND_FEE_RATIO", "refund_fee_ratio"),
     ("REFERRAL_PCT", "referral_pct"),
     ("REFERRAL_MIN_PAYOUT_GRAM", "referral_min_payout_gram"),
+    # Правила зачёта тоже двигают деньги: порог недели решает, кому вообще
+    # достаётся приз, а потолок верности — как делится зачёт. Указ b754d15
+    # (4 → 1) разошёлся с манифестом и .env.example и жил так неделю ровно
+    # потому, что этих строк здесь не было.
+    ("WEEKLY_MIN_DAYS", "weekly_min_days"),
+    ("LEADERBOARD_CORRECT_CAP", "leaderboard_correct_cap"),
 )
 
 

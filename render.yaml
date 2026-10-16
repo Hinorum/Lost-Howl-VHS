@@ -130,8 +130,11 @@ services:
         value: "2"
       - key: PACK_FUND_PCT
         value: "1"
+      # 1 = порога нет: недельный зачёт без требования четырёх дней (указ,
+      # b754d15 от 2026-10-09). В манифесте оставалось «4» — прод продолжал
+      # жить со старым порогом, хотя config.py уже был на 1.
       - key: WEEKLY_MIN_DAYS
-        value: "4"
+        value: "1"
       - key: WEEKLY_PRIZE_PCTS
         value: "50,30,20"
       - key: OWNER_WALLET_ADDRESS
