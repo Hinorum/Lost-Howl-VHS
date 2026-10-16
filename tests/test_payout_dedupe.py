@@ -783,7 +783,12 @@ async def test_http_channel_failure_records_reason(monkeypatch) -> None:
 
 
 async def test_send_timeout_is_retry_not_freeze(monkeypatch) -> None:
-    """Зависший лайтсервер не морозит цикл: таймаут = ретрай с причиной."""
+    """Зависший лайтсервер не морозит цикл: таймаут = ретрай с причиной.
+
+    Перед возвратом в очередь диспетчер выжидает окно memo (перевод мог
+    успеть уйти в сеть до отмены корутины). Здесь memo так и не появилось —
+    исход прежний: pending с видимой причиной.
+    """
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "treasury_mnemonic", " ".join(["слово"] * 24))
@@ -797,9 +802,13 @@ async def test_send_timeout_is_retry_not_freeze(monkeypatch) -> None:
     async def empty_markers() -> set[str]:
         return set()
 
+    async def memo_never(memo, seconds):
+        return False
+
     monkeypatch.setattr(ton_pay, "_get_wallet", AsyncMock(return_value=object()))
     monkeypatch.setattr(ton_pay, "send_ton_transfer", hang_forever)
     monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
+    monkeypatch.setattr("app.ton_pay.dispatch._wait_for_broadcast_memo", memo_never)
 
     try:
         started = _time_now()
@@ -812,6 +821,51 @@ async def test_send_timeout_is_retry_not_freeze(monkeypatch) -> None:
             row = await session.get(Payout, payout_id)
         assert row.status == "pending"  # attempts=1 < max → вернётся в очередь
         assert "таймаут вещания" in (row.last_error or "")
+    finally:
+        async with SessionLocal() as session:
+            await session.delete(await session.get(Payout, payout_id))
+            await session.commit()
+
+
+async def test_send_timeout_with_memo_found_marks_sent(monkeypatch) -> None:
+    """Таймаут вещания, но memo успело лечь в цепочку — sent без повтора.
+
+    Отменённая по таймауту корутина могла отдать внешний месседж в сеть:
+    раньше строка сразу шла в pending, и следующий цикл переотправлял тот же
+    memo, пока первый перевод ещё не проиндексирован, — двойной платёж.
+    Теперь диспетчер ждёт окно memo: нашлось — фиксируем доставку без новой
+    отправки (реальный хеш дожмёт confirm_broadcast_payouts).
+    """
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_mnemonic", " ".join(["слово"] * 24))
+    monkeypatch.setattr(settings, "payout_send_timeout_seconds", 1)
+    payout_id = await _seed_payout(attempts=0)
+
+    async def hang_forever(dest, amount, comment):
+        await _asyncio.sleep(30)
+        return None
+
+    async def empty_markers() -> set[str]:
+        return set()
+
+    async def memo_found(memo, seconds):
+        return True
+
+    transfer = AsyncMock(side_effect=hang_forever)
+    monkeypatch.setattr(ton_pay, "_get_wallet", AsyncMock(return_value=object()))
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", empty_markers)
+    monkeypatch.setattr("app.ton_pay.dispatch._wait_for_broadcast_memo", memo_found)
+
+    try:
+        await _asyncio.wait_for(ton_pay.dispatch_pending_payouts(bot=None), timeout=10)
+        async with SessionLocal() as session:
+            row = await session.get(Payout, payout_id)
+        assert transfer.await_count == 1, "вещание было одно — повтора нет"
+        assert row.status == "sent"
+        assert row.tx_hash is None, "реальный хеш допишет сверка, фейковый bcast не пишем"
+        assert row.last_error is None
+        assert row.attempts == 0, "доставленная выплата сбрасывает счётчик попыток"
     finally:
         async with SessionLocal() as session:
             await session.delete(await session.get(Payout, payout_id))

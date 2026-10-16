@@ -378,10 +378,34 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                         timeout=settings.payout_send_timeout_seconds,
                     )
                 except TimeoutError:
-                    # Зависший лайтсервер не имеет права замораживать цикл:
-                    # таймаут — обычный ретрай с видимой причиной.
+                    # Зависший лайтсервер не имеет права замораживать цикл, но
+                    # «таймаут» — ещё не «перевод не ушёл»: отменённая корутина
+                    # могла успеть отдать внешний месседж в сеть. Раньше строка
+                    # сразу уходила в pending, и следующий цикл переотправлял тот
+                    # же memo, пока первый перевод ещё не проиндексирован, —
+                    # реальный двойной платёж. Ждём memo ограниченное окно (как
+                    # после успешного вещания): нашёлся — перевод в цепочке,
+                    # фиксируем sent без повтора (реальный хеш дожмёт
+                    # confirm_broadcast_payouts); нет — обычный ретрай с видимой
+                    # причиной, как раньше.
                     logger.warning("Выплата %s: таймаут вещания >%ss", payout.id, settings.payout_send_timeout_seconds)
                     payout.last_error = f"таймаут вещания (>{settings.payout_send_timeout_seconds} с)"
+                    if await _wait_for_broadcast_memo(
+                        set(candidates), settings.payout_batch_confirm_seconds
+                    ):
+                        payout.tx_hash = None
+                        payout.status = "sent"
+                        payout.sent_at = datetime.now(UTC)
+                        payout.attempts = 0
+                        payout.last_error = None
+                        sent += 1
+                        prev_memo = set(candidates)
+                        logger.warning(
+                            "Выплата %d: таймаут вещания, но memo найдено у казначея — "
+                            "помечена sent без повтора",
+                            payout.id,
+                        )
+                        continue
                     tx_hash = None
                 except Exception as exc:
                     # «no alive peers» сюда уже не доходит: send_ton_transfer
