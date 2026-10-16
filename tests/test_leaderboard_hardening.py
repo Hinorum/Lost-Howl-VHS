@@ -568,7 +568,7 @@ async def test_notify_tied_players_covers_kinds_and_failures() -> None:
     month_call = broken.send_message.await_args_list[0]
     assert "месяца (октября 2026)" in month_call.args[1]  # 374
     month_kb = month_call.kwargs["reply_markup"]
-    assert month_kb.inline_keyboard[0][0].text == "🗓 Заявить приз месяца"  # 382-385
+    assert month_kb.inline_keyboard[0][0].text == "🎟 Заявить приз месяца"  # 382-385
 
 
 async def test_claim_window_overwrites_and_garbage_is_none(session: AsyncSession) -> None:

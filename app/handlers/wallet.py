@@ -416,7 +416,7 @@ async def _cmd_wallet_impl(message: Message) -> None:
             return
         await message.answer(
             "Информация о кошельке видна только тебе — нажми кнопку.",
-            reply_markup=_personal_keyboard("wallet:view", "Мой кошелёк"),
+            reply_markup=_personal_keyboard("wallet:view", "💰 Мой кошелёк"),
         )
         return
     if message.chat.type == ChatType.PRIVATE:
@@ -534,10 +534,10 @@ def _stake_pay_keyboard() -> InlineKeyboardMarkup | None:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💸 Keeper", url=f"https://app.tonkeeper.com/transfer/{addr}"
+                    text="💳 Keeper", url=f"https://app.tonkeeper.com/transfer/{addr}"
                 ),
                 InlineKeyboardButton(
-                    text="🪙 Tonhub", url=f"https://tonhub.com/transfer/{addr}"
+                    text="💳 Tonhub", url=f"https://tonhub.com/transfer/{addr}"
                 ),
             ],
             [InlineKeyboardButton(text="📋 Скопировать адрес", callback_data="stake:copy")],
@@ -595,7 +595,7 @@ async def cmd_stake(message: Message) -> None:
     if message.chat.type != ChatType.PRIVATE:
         await message.answer(
             "Как поставить Gram на свой выбор — нажми кнопку.",
-            reply_markup=_personal_keyboard("stake:view", "Как поставить"),
+            reply_markup=_personal_keyboard("stake:view", "💸 Как поставить"),
         )
         return
     await message.answer(
@@ -708,7 +708,7 @@ async def _fund_text() -> str:
             .scalars()
             .all()
         )
-    lines = [f"🐾 Фонд Стаи на плёнке: <b>{fund_nano / 1e9:.2f} Gram</b>", ""]
+    lines = [f"🏦 Фонд Стаи на плёнке: <b>{fund_nano / 1e9:.2f} Gram</b>", ""]
     lines.append("Журнал фонда, последние записи:")
     if not rows:
         lines.append("  — пока пусто —")

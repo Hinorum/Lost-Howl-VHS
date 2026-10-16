@@ -14,17 +14,24 @@ def _by_data(markup):
 def test_menu_keyboard_covers_daily_actions() -> None:
     kb = _by_data(_menu_keyboard())
     assert kb["menu:today"] == "▶️ Сегодня"
-    assert kb["score:view"] == "⭐ Карточка Стаи"
+    assert kb["score:view"] == "🏅 Карточка Стаи"
     assert "rank:view" not in kb
     assert kb["menu:wallet"] == "💰 Кошелёк"
     assert kb["stake:view"] == "💸 Ставка"
     assert kb["menu:top"] == "🏆 Копилки"
-    assert kb["menu:fund"] == "🐾 Фонд"
-    assert kb["menu:invite"] == "🐾 Позвать в стаю"
+    assert kb["menu:fund"] == "🏦 Фонд"
+    assert kb["menu:invite"] == "📨 Позвать в стаю"
     # Кнопки-дублёры /start сняты владельцем: «Итоги в личку» (Telegram
     # сам умеет отключать уведомления) и «Помощь» (дублировала /start).
     assert "menu:help" not in kb
     assert "dm:toggle" not in kb
+
+
+def test_menu_marks_are_unique() -> None:
+    """Одна марка — один смысл: 🐾 не должна стоять на двух кнопках."""
+    labels = [b.text for row in _menu_keyboard().inline_keyboard for b in row]
+    marks = [label.split(" ", 1)[0] for label in labels]
+    assert len(set(marks)) == len(marks)
 
 
 def test_commands_help_mentions_start_and_invite() -> None:

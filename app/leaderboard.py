@@ -397,8 +397,8 @@ async def _notify_tied_players(
         f"Окно заявки: {settings.claim_window_hours} ч."
     )
     button_text = (
-        "🗓 Заявить приз недели" if kind == "week"
-        else "🗓 Заявить приз месяца"
+        "🎟 Заявить приз недели" if kind == "week"
+        else "🎟 Заявить приз месяца"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=button_text, callback_data=f"claim:{kind}")]

@@ -203,6 +203,21 @@ async def _record_start_referral(session, message: Message) -> None:
         logging.getLogger(__name__).exception("Реферальный переход не записан")
 
 
+# Быстрые действия — одни и те же на пульте и на карточке Стаи: одна марка
+# на смысл, состав собирается из этого кортежа, а не дублируется по коду.
+_QUICK_ACTIONS: tuple[tuple[tuple[str, str], ...], ...] = (
+    (("💰 Кошелёк", "menu:wallet"), ("💸 Ставка", "stake:view")),
+    (("🏆 Копилки", "menu:top"), ("🏦 Фонд", "menu:fund")),
+)
+
+
+def _quick_rows() -> list[list[InlineKeyboardButton]]:
+    return [
+        [InlineKeyboardButton(text=text, callback_data=data) for text, data in row]
+        for row in _QUICK_ACTIONS
+    ]
+
+
 def _menu_keyboard() -> InlineKeyboardMarkup:
     """Пульт LOST HOWL: кнопки-действия вместо вызова команд слепым меню.
 
@@ -212,18 +227,11 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(text="▶️ Сегодня", callback_data="menu:today"),
-            InlineKeyboardButton(text="⭐ Карточка Стаи", callback_data="score:view"),
+            InlineKeyboardButton(text="🏅 Карточка Стаи", callback_data="score:view"),
         ],
+        *_quick_rows(),
         [
-            InlineKeyboardButton(text="💰 Кошелёк", callback_data="menu:wallet"),
-            InlineKeyboardButton(text="💸 Ставка", callback_data="stake:view"),
-        ],
-        [
-            InlineKeyboardButton(text="🏆 Копилки", callback_data="menu:top"),
-            InlineKeyboardButton(text="🐾 Фонд", callback_data="menu:fund"),
-        ],
-        [
-            InlineKeyboardButton(text="🐾 Позвать в стаю", callback_data="menu:invite"),
+            InlineKeyboardButton(text="📨 Позвать в стаю", callback_data="menu:invite"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -242,8 +250,8 @@ async def _start_keyboard(session, player) -> InlineKeyboardMarkup:
         from app.leaderboard import _claim_window_players
 
         for kind, text, data in (
-            ("week", "🗓 Заявить приз недели", "claim:week"),
-            ("month", "🗓 Заявить приз месяца", "claim:month"),
+            ("week", "🎟 Заявить приз недели", "claim:week"),
+            ("month", "🎟 Заявить приз месяца", "claim:month"),
         ):
             tied_players, _period = await _claim_window_players(session, kind)
             if player.id in tied_players:
@@ -460,7 +468,7 @@ async def _score_text(user) -> str:
         )
     lines.append("")
     lines.append("🐾 Лестница титулов (верных сцен подряд):")
-    ladder = [f"{t.correct_needed} {t.name}" for t in TITLES[1:]]
+    ladder = [f"{t.correct_needed} {t.emoji} {t.name}" for t in TITLES[1:]]
     for i in range(0, len(ladder), 3):
         lines.append(" · ".join(ladder[i : i + 3]))
     if personal:
@@ -487,19 +495,8 @@ async def _score_short(user) -> str:
 
 
 def _score_keyboard() -> InlineKeyboardMarkup:
-    """Быстрые действия с карточки Стаи: кошелёк, ставка, копилки и фонд."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="💰 Кошелёк", callback_data="menu:wallet"),
-                InlineKeyboardButton(text="💸 Ставка", callback_data="stake:view"),
-            ],
-            [
-                InlineKeyboardButton(text="🏆 Копилки", callback_data="menu:top"),
-                InlineKeyboardButton(text="🐾 Фонд", callback_data="menu:fund"),
-            ],
-        ]
-    )
+    """Быстрые действия с карточки Стаи — те же марки, что на пульте."""
+    return InlineKeyboardMarkup(inline_keyboard=_quick_rows())
 
 
 @router.message(Command("score", "rank"))
@@ -512,7 +509,7 @@ async def cmd_score(message: Message) -> None:
         # В группе личные цифры не показываем: только кнопка с приватным окном.
         await message.answer(
             "Твой счёт увидишь только ты — нажми кнопку.",
-            reply_markup=_personal_keyboard("score:view", "Мой счёт"),
+            reply_markup=_personal_keyboard("score:view", "🏅 Мой счёт"),
         )
         return
     await message.answer(

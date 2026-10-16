@@ -128,7 +128,7 @@ async def cmd_change(message: Message) -> None:
     # В группе деталей не даём: только приватная кнопка — как у /score и /wallet.
     await message.answer(
         "Перемотка кадра видна только тебе — нажми кнопку.",
-        reply_markup=_personal_keyboard("change:view", "Перемотать кадр"),
+        reply_markup=_personal_keyboard("change:view", "⏪ Перемотать кадр"),
     )
 
 

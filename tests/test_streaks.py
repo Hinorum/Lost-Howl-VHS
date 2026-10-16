@@ -63,9 +63,24 @@ def test_title_for_streak_thresholds():
     assert title_for_streak(5).key == "scout"
     assert title_for_streak(6).key == "scout"
     assert title_for_streak(7).key == "ranger"
-    assert title_for_streak(49).key == "legend"
+    assert title_for_streak(13).key == "shaman"
+    assert title_for_streak(24).key == "elder"
+    assert title_for_streak(25).key == "chronicler"
+    assert title_for_streak(39).key == "legend"
+    assert title_for_streak(40).key == "keeper"
+    assert title_for_streak(49).key == "keeper"
     assert title_for_streak(50).key == "prophet"
     assert title_for_streak(1000).key == "prophet"
+
+
+def test_titles_have_unique_marks_and_names():
+    """Марки и имена титулов уникальны: 🐾/🐾 и ⭐/🌟 читались как один титул."""
+    from app.streaks import TITLES
+
+    marks = [t.emoji for t in TITLES]
+    names = [t.name for t in TITLES]
+    assert len(set(marks)) == len(marks)
+    assert len(set(names)) == len(names)
 
 
 def test_next_title_boundaries():
