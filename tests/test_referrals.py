@@ -19,6 +19,8 @@ from app.handlers import cmd_invite, cmd_start
 from app.handlers import player as player_mod
 from app.models import Referral, Round, RoundStatus, Stake, WinRule
 from app.referrals import (
+    _legacy_referral_token,
+    _referral_token,
     invited_count,
     parse_referral_arg,
     record_referral,
@@ -103,6 +105,25 @@ def test_parse_referral_arg_rejects_tampering_and_garbage() -> None:
     assert parse_referral_arg("ref_abc_whatever") is None
     assert parse_referral_arg("") is None
     assert parse_referral_arg(None) is None
+
+
+def test_referral_link_token_is_128_bits() -> None:
+    arg = referral_link(42, "the_ways_bot").split("?start=", 1)[1]
+    assert len(arg.split("_", 2)[2]) == 32
+
+
+def test_parse_referral_arg_accepts_legacy_short_token() -> None:
+    """Ссылки, выданные до усиления подписи (digest[:10]), ещё работают."""
+    legacy = _legacy_referral_token(42)
+    assert legacy is not None
+    assert _referral_token(42)[:10] == legacy  # легаси — префикс нового формата
+    assert parse_referral_arg(f"ref_42_{legacy}") == 42
+
+
+def test_parse_referral_arg_rejects_truncated_new_token() -> None:
+    token = _referral_token(42)
+    assert token is not None
+    assert parse_referral_arg(f"ref_42_{token[:-1]}") is None
 
 
 def test_parse_referral_arg_disabled_when_secret_empty(monkeypatch) -> None:

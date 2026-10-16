@@ -2,7 +2,10 @@
 
 У каждого игрока есть личная ссылка ?start=ref_<id>_<токен>. Токен — HMAC
 от id игрока на settings.referral_secret, поэтому вписать в ссылку чужой id
-нельзя без секрета. Первый валидный переход фиксируется в таблице Referral
+нельзя без секрета. Подпись нового формата — первые 128 бит (32 hex);
+выданные ранее 40-битные ссылки (10 hex) ещё принимаются, чтобы не рвать
+уже разосланные приглашения.
+Первый валидный переход фиксируется в таблице Referral
 строго один раз на игрока; повторные /start с чужими ссылками игнорируются.
 Приведённым становится только НОВЫЙ игрок: у него ещё нет ни одной ставки
 в статусе pending/confirmed. Иначе действующий кит сам кликнул бы чужую
@@ -41,15 +44,30 @@ from app.models import Player, Referral, ReferralPot, Stake
 _BOT_USERNAME_CACHE: str | None = None
 
 
-def _referral_token(player_id: int) -> str | None:
-    """HMAC-подпись id игрока. None — рефералки выключены (нет секрета)."""
+def _referral_digest(player_id: int) -> str | None:
+    """Полный HMAC-SHA256 (hex) от id игрока. None — нет секрета (каркас выключен)."""
     if not settings.referral_secret:
         return None
-    digest = hmac.new(
+    return hmac.new(
         settings.referral_secret.encode("utf-8"),
         str(player_id).encode("ascii"),
         hashlib.sha256,
     ).hexdigest()
+
+
+def _referral_token(player_id: int) -> str | None:
+    """Подпись нового формата: digest[:32] (128 бит). None — нет секрета."""
+    digest = _referral_digest(player_id)
+    if digest is None:
+        return None
+    return digest[:32]
+
+
+def _legacy_referral_token(player_id: int) -> str | None:
+    """Подпись старого формата digest[:10] (40 бит): принимаем уже выданные ссылки."""
+    digest = _referral_digest(player_id)
+    if digest is None:
+        return None
     return digest[:10]
 
 
@@ -66,16 +84,17 @@ def referral_link(player_id: int, username: str | None) -> str | None:
 
 def parse_referral_arg(arg: str | None) -> int | None:
     """Referrer_id из аргумента /start (ref_<id>_<токен>) при совпавшей
-    подписи. Мусор, чужие id и выключенный каркас → None."""
+    подписи. Принимаются оба формата: новый digest[:32] и легаси digest[:10]
+    (ссылки, выданные до усиления). Мусор, чужие id и выключенный каркас → None."""
     if not arg or not arg.startswith("ref_"):
         return None
     parts = arg.split("_", 2)
     if len(parts) != 3 or not parts[1].isdigit():
         return None
     referrer_id = int(parts[1])
-    expected = _referral_token(referrer_id)
-    if expected and hmac.compare_digest(parts[2], expected):
-        return referrer_id
+    for expected in (_referral_token(referrer_id), _legacy_referral_token(referrer_id)):
+        if expected and hmac.compare_digest(parts[2], expected):
+            return referrer_id
     return None
 
 
