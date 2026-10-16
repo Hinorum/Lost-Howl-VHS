@@ -287,7 +287,7 @@ python -m scripts.cassette_tool lint <файл.json> # кассета перед
 ### Покрытие тестами
 
 CI enforced `--cov-fail-under=88` по всему пакету `app/` (джоба `test`). Факт
-на последнем замере — **92 %**: 1482 passed, 10 skipped, полный прогон ≈3 минуты
+на последнем замере — **92 %**: 1577 passed, 11 skipped, полный прогон ≈3 минуты
 (`python -m pytest -q --cov=app --cov-report=term`). Покрытие — это floor, не цель:
 качественные тесты (инварианты экономики, property-тесты, конкурентные сценарии)
 важнее числа; конкретные сценарии описаны в `docs/architecture.md`, раздел
@@ -298,17 +298,17 @@ CI enforced `--cov-fail-under=88` по всему пакету `app/` (джоб�
 | Подмодуль          | Покрытие |
 |--------------------|----------|
 | `state.py`         | 100 %    |
-| `__init__.py` (фасад) | 98 %  |
+| `__init__.py` (фасад) | 100 % |
 | `dispatch/memo.py` | 100 %    |
 | `dispatch/confirm.py` | 100 % |
 | `dispatch/send.py` | 98 %     |
-| `dispatch/queue.py` | 98 %    |
+| `dispatch/queue.py` | 94 %    |
 | `dispatch/alerts.py` | 89 %   |
 | `dispatch/__init__.py` (цикл) | 92 % |
 | `http_channel.py`  | 90 %     |
 | `reconcile.py`     | 93 %     |
 | `treasury.py`      | 89 %     |
-| `wallet.py`        | 76 %     |
+| `wallet.py`        | 85 %     |
 
 `wallet.py` — самое низкое покрытие: часть функций вызывается админ-хендлерами
 под `ADMIN_IDS` и e2e-тестом на тестнете, в SQLite-прогоне они не исполняются.

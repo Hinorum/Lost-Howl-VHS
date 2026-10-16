@@ -466,7 +466,10 @@ async def cmd_payout(message: Message) -> None:
     if new_status == "dismissed":
         await message.answer(f"{ok_mark(str(payout_id))} Выплата #{payout_id} помечена как спам: из очереди ушла, сбросу больше не мешает.")
     elif new_status == "pending":
-        await message.answer(f"{ok_mark(str(payout_id))} Выплата #{payout_id} вернулась в очередь с нулевым счётом попыток.")
+        await message.answer(
+            f"{ok_mark(str(payout_id))} Выплата #{payout_id} вернулась в очередь; "
+            "счётчик попыток сохранён — повтор пройдёт анти-дубль по истории казначея."
+        )
     else:
         await message.answer(f"{warn_mark('nopay')} Выплата #{payout_id} не найдена или уже отправлена.")
 

@@ -333,8 +333,8 @@ class Settings(BaseSettings):
     # Закрывать /health при пустом токене (fail closed). True по умолчанию:
     # инстанс без HEALTH_TOKEN отвечает 401, и Render помечает его нездоровым —
     # тревога конфигурации вместо открытого операционного снимка. Чек жизни
-    # Render на free-плане токен не передаёт: healthCheckPath в render.yaml уже
-    # ходит с ним в query (см. P0-1).
+    # Render на free-плане заголовков не передаёт: healthCheckPath в render.yaml
+    # ходит на /alive, где токена нет вовсе (см. render.yaml, P0-1).
     health_require_token: bool = True
     render_external_url: str = ""
     render_external_hostname: str = ""
