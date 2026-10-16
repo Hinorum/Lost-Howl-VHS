@@ -423,22 +423,47 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
         # же seqno — в блок входил бы только один, второй тихо терялся.
         _state._batch_seqno = None
         v5_batch_capable = False
+        wallet_for_batch = None
         if payouts and settings.ton_enabled and settings.active_treasury_mnemonic:
-            try:
-                import app.ton_pay as _tp
+            # Через app.ton_pay: тесты патчат ton_pay._get_wallet /
+            # ton_pay._http_get_wallet_seqno / ton_pay._is_liteserver_down.
+            import app.ton_pay as _tp
 
+            try:
                 wallet_for_batch = await _tp._get_wallet()
                 _state._batch_seqno = await wallet_for_batch.get_seqno()
                 # Пачка одним внешним сообщением — механизм контракта v5r1
                 # (out_list). Проверяем класс кошелька, которым реально
                 # подписываем, а не строку версии из настроек.
                 v5_batch_capable = _tp.wallet_supports_batch(wallet_for_batch)
-            except Exception:
+            except Exception as exc:
                 # Сбой не критичен: выродимся в старый путь, где send_ton_transfer
                 # сам получает seqno (а её тред-безопасность отдельная история).
+                # Исключение — сбой лайтсерверного канала (лагующая нода не
+                # отдаёт стейт для seqno): читаем seqno по HTTP. Иначе пачка
+                # цикла рассыпалась бы в поштучные отправки, хотя само вещание
+                # тот же классификатор всё равно уведёт в HTTP-канал.
                 _state._batch_seqno = None
                 v5_batch_capable = False
-                logger.warning("Не удалось получить seqno для батч-отправки — отправлю по одному", exc_info=True)
+                if wallet_for_batch is not None and _tp._is_liteserver_down(exc):
+                    try:
+                        _state._batch_seqno = await _tp._http_get_wallet_seqno(wallet_for_batch)
+                        v5_batch_capable = _tp.wallet_supports_batch(wallet_for_batch)
+                    except Exception as http_exc:
+                        _state._batch_seqno = None
+                        v5_batch_capable = False
+                        logger.warning(
+                            "seqno не прочитан ни лайтсерверами (%s), ни по HTTP (%s) — отправлю по одному",
+                            exc,
+                            http_exc,
+                        )
+                    else:
+                        logger.warning(
+                            "seqno лайтсерверами не прочитан (%s) — прочитан по HTTP, пачка остаётся пачкой",
+                            exc,
+                        )
+                else:
+                    logger.warning("Не удалось получить seqno для батч-отправки — отправлю по одному", exc_info=True)
         # Известен ли уже разосланный на этом цикле перевод? Если да — ждём его
         # memo в блоке перед подписью следующего (гонка двух быстрых переводов
         # HTTP-канала: вплотную разосланные месседжи со следующими seqno

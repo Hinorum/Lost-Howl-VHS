@@ -31,13 +31,19 @@ def is_liteserver_down(exc: BaseException) -> bool:
     """Сбой именно лайтсерверного канала, а не самой выплаты.
 
     «have no alive peers» — LiteBalancer не поднял ни одного пира;
-    TimeoutError — зависло ADNL-рукопожатие/отклик (порт режется файрволом).
+    TimeoutError — зависло ADNL-рукопожатие/отклик (порт режется файрволом);
+    «cannot load block … is not in db» — узел отстал/рассинхронизирован и не
+    может отдать блок для proof-чтения стейта (seqno казны, account state);
+    балансер pytoniq на такой ответ-ошибку пиры не перебирает (ротация только
+    на таймаут/обрыв), поэтому ретрай попадает на ту же ноду и падает тем же
+    текстом — это сбой канала, а не выплаты.
     В этих случаях уходим в HTTP-вещание. Прочие ошибки (пара мнемоника/адрес,
     отказ контракта, нехватка средств) — настоящие: их показываем как есть.
     """
     if isinstance(exc, asyncio.TimeoutError):
         return True
-    return "no alive peers" in str(exc).lower()
+    text = str(exc).lower()
+    return "no alive peers" in text or "cannot load block" in text
 
 
 def parse_run_method_seqno(data: dict) -> int | None:

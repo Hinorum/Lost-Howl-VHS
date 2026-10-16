@@ -65,6 +65,17 @@ def test_parse_run_method_seqno() -> None:
 def test_is_liteserver_down_classification() -> None:
     assert ton_pay._is_liteserver_down(TimeoutError("adnl timeout"))
     assert ton_pay._is_liteserver_down(RuntimeError("LiteServerError: have no alive peers"))
+    # Лагующая нода (mainnet 2026-10-17): балансер pytoniq такие ответы-ошибки
+    # пиры не перебирает — без этой классификации ретрай вечно падает тем же
+    # текстом вместо ухода в HTTP-канал.
+    assert ton_pay._is_liteserver_down(
+        RuntimeError(
+            "Liteserver crashed with 651 code. Message: cannot load block "
+            "(0,8000000000000000,104058279):FE70C1982B83E2DA5EFB8B8D268F7832B607CA48BE2CBF0DEF4F2F97EA97EB8D"
+            " : block (0,8000000000000000,104058279) is not in db "
+            "(possibly out of sync: shard_client_seqno=99469337 ls_seqno=99469392)"
+        )
+    )
     assert not ton_pay._is_liteserver_down(ValueError("Адрес казначея не совпадает"))
     assert not ton_pay._is_liteserver_down(RuntimeError("Лайтсерверы не приняли перевод (результат 0)"))
     assert not ton_pay._is_liteserver_down(asyncio.CancelledError())

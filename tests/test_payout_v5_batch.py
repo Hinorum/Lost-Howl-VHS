@@ -390,8 +390,17 @@ async def _payout_rows(ids: list[int]) -> list[Payout]:
         return [await session.get(Payout, payout_id) for payout_id in ids]
 
 
-def _setup_batch_cycle(monkeypatch: pytest.MonkeyPatch, *, capable: bool = True) -> None:
-    """Казна v5r1 и сеть диспетчера без живых лайтсерверов/индексаторов."""
+def _setup_batch_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    capable: bool = True,
+    seqno_error: Exception | None = None,
+) -> None:
+    """Казна v5r1 и сеть диспетчера без живых лайтсерверов/индексаторов.
+
+    seqno_error — падение лайтсерверного чтения seqno (как у лагующей ноды
+    с «cannot load block»): проверяем HTTP-подстраховку цикла.
+    """
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "ton_network", "testnet")
     monkeypatch.setattr(settings, "treasury_testnet_mnemonic", "word " * 24)
@@ -406,6 +415,8 @@ def _setup_batch_cycle(monkeypatch: pytest.MonkeyPatch, *, capable: bool = True)
 
     class _FakeWallet:
         async def get_seqno(self):
+            if seqno_error is not None:
+                raise seqno_error
             return 4242
 
     async def fake_wallet():
@@ -496,6 +507,114 @@ async def test_dispatch_batch_skipped_for_v4_wallet(monkeypatch: pytest.MonkeyPa
         assert transfer.await_count == 1
         rows = await _payout_rows(ids)
         assert rows[0].status == "sent"
+    finally:
+        await _drop_payouts(ids)
+
+
+async def test_dispatch_seqno_liteserver_down_reads_http_and_keeps_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Лагующая нода не отдала стейт для seqno — читаем по HTTP, пачка остаётся пачкой.
+
+    Иначе цикл выродился бы в поштучные отправки, хотя само вещание тот же
+    классификатор всё равно уведёт в HTTP-канал: терять пачку из-за чтения
+    seqno незачем.
+    """
+    _setup_batch_cycle(
+        monkeypatch,
+        seqno_error=RuntimeError(
+            "Liteserver crashed with 651 code. Message: cannot load block "
+            "(0,8000000000000000,104058279):… : block … is not in db "
+            "(possibly out of sync: shard_client_seqno=99469337 ls_seqno=99469392)"
+        ),
+    )
+    monkeypatch.setattr(settings, "payout_v5_batch", True)
+    ids = await _seed_payouts(2)
+    seen: dict = {}
+    transfer = AsyncMock(return_value="bcast:old")
+
+    async def http_seqno(wallet):
+        return 99
+
+    async def record_batch(transfers):
+        seen["seqno"] = ton_pay.state._batch_seqno
+        return "bcast:7"
+
+    monkeypatch.setattr(ton_pay, "_http_get_wallet_seqno", http_seqno)
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", record_batch)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    monkeypatch.setattr(
+        "app.ton_pay.dispatch._wait_for_broadcast_memo", AsyncMock(return_value=True)
+    )
+    try:
+        sent = await ton_pay.dispatch_pending_payouts(bot=None)
+
+        assert sent == 2
+        assert seen["seqno"] == 99, "пачка обязана уйти с seqno, прочитанным по HTTP"
+        transfer.assert_not_awaited()
+        rows = await _payout_rows(ids)
+        assert [row.status for row in rows] == ["sent", "sent"]
+    finally:
+        await _drop_payouts(ids)
+
+
+async def test_dispatch_seqno_http_fallback_failure_degrades_to_per_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ни лайтсерверы, ни HTTP не отдали seqno — прежняя деградация: поштучно."""
+    _setup_batch_cycle(monkeypatch, seqno_error=RuntimeError("no alive peers"))
+    monkeypatch.setattr(settings, "payout_v5_batch", True)
+    ids = await _seed_payouts(1)
+    batch = AsyncMock(return_value="bcast:7")
+    transfer = AsyncMock(return_value="bcast:old")
+
+    async def http_boom(wallet):
+        raise RuntimeError("toncenter 429")
+
+    monkeypatch.setattr(ton_pay, "_http_get_wallet_seqno", http_boom)
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", batch)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    monkeypatch.setattr(
+        "app.ton_pay.dispatch._wait_for_broadcast_memo", AsyncMock(return_value=True)
+    )
+    try:
+        await ton_pay.dispatch_pending_payouts(bot=None)
+
+        batch.assert_not_awaited()
+        assert transfer.await_count == 1
+        rows = await _payout_rows(ids)
+        assert rows[0].status == "sent"
+    finally:
+        await _drop_payouts(ids)
+
+
+async def test_dispatch_seqno_real_error_skips_http_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Нелайтсерверный сбой seqno — не повод для HTTP: прежняя деградация.
+
+    Пара мнемоника/адрес, криптография и прочие «настоящие» ошибки не прячутся
+    за фолбэком: их текст должен дойти до last_error как есть.
+    """
+    _setup_batch_cycle(monkeypatch, seqno_error=ValueError("мнемоника не сходится"))
+    monkeypatch.setattr(settings, "payout_v5_batch", True)
+    ids = await _seed_payouts(1)
+    batch = AsyncMock(return_value="bcast:7")
+    transfer = AsyncMock(return_value="bcast:old")
+    http_seqno = AsyncMock(return_value=99)
+
+    monkeypatch.setattr(ton_pay, "_http_get_wallet_seqno", http_seqno)
+    monkeypatch.setattr(ton_pay, "send_ton_transfers_batch", batch)
+    monkeypatch.setattr(ton_pay, "send_ton_transfer", transfer)
+    monkeypatch.setattr(
+        "app.ton_pay.dispatch._wait_for_broadcast_memo", AsyncMock(return_value=True)
+    )
+    try:
+        await ton_pay.dispatch_pending_payouts(bot=None)
+
+        http_seqno.assert_not_awaited()
+        batch.assert_not_awaited()
+        assert transfer.await_count == 1
     finally:
         await _drop_payouts(ids)
 
