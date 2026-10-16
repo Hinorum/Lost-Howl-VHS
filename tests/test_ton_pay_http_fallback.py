@@ -501,26 +501,26 @@ async def test_send_wallet_transfer_http_success(monkeypatch: pytest.MonkeyPatch
 
 async def test_wait_for_broadcast_memo_found_on_first_poll(monkeypatch: pytest.MonkeyPatch) -> None:
     """memo уже в истории — ожидание завершается сразу, без опросов."""
-    calls = []
+    calls: list[set[str]] = []
 
-    async def fake_markers() -> set[str]:
-        calls.append(1)
-        return {"way:9:prize#1"}
+    async def fake_tx_map(targets: set[str] | None = None) -> dict[str, str]:
+        calls.append(set(targets or ()))
+        return {"way:9:prize#1": "hash"}
 
-    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
     assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=5.0) is True
-    assert len(calls) == 1
+    assert calls == [{"way:9:prize#1"}]
 
 
 async def test_wait_for_broadcast_memo_appears_after_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     """Перевод ложится в блок между опросами — дожидаемся и возвращаем True."""
     state = {"count": 0}
 
-    async def fake_markers() -> set[str]:
+    async def fake_tx_map(targets: set[str] | None = None) -> dict[str, str]:
         state["count"] += 1
-        return {"way:9:prize#1"} if state["count"] >= 2 else set()
+        return {"way:9:prize#1": "hash"} if state["count"] >= 2 else {}
 
-    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
     monkeypatch.setattr(ton_pay, "_BROADCAST_CONFIRM_POLL", 0.01)
     assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=1.0) is True
     assert state["count"] == 2
@@ -528,19 +528,44 @@ async def test_wait_for_broadcast_memo_appears_after_polls(monkeypatch: pytest.M
 
 async def test_wait_for_broadcast_memo_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Перевод за окно не пришёл — False: диспетчер сбросит батч-счётчик."""
-    async def fake_markers() -> set[str]:
-        return set()
+    async def fake_tx_map(targets: set[str] | None = None) -> dict[str, str]:
+        return {}
 
-    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
     monkeypatch.setattr(ton_pay, "_BROADCAST_CONFIRM_POLL", 0.01)
     assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=0.03) is False
 
 
 async def test_wait_for_broadcast_memo_none_of_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
     """В истории есть чужие memo — свой не найден до таймаута."""
-    async def fake_markers() -> set[str]:
-        return {"way:9:rake#2"}
+    async def fake_tx_map(targets: set[str] | None = None) -> dict[str, str]:
+        return {"way:9:rake#2": "hash"}
 
-    monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", fake_markers)
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
     monkeypatch.setattr(ton_pay, "_BROADCAST_CONFIRM_POLL", 0.01)
     assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=0.03) is False
+
+
+async def test_wait_for_broadcast_memo_target_scan_is_state_neutral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Целевой скан ожидания не переписывает флаги полноты сверки.
+
+    Настоящий fetch пишет _RECONCILE_* по факту прохода страниц; ранний стоп
+    по цели неполон по построению, и вердикт «повтор или заморозка» соседних
+    строк обязан опираться на скан цикла (маркеры диспетчера, сверка), а не
+    на опрос ожидания.
+    """
+    from app.ton_pay import state as _st
+
+    async def fake_tx_map(targets: set[str] | None = None) -> dict[str, str]:
+        _st._RECONCILE_HISTORY_OK = True
+        _st._RECONCILE_WINDOW_COMPLETE = True
+        return {"way:9:prize#1": "hash"}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+    monkeypatch.setattr(_st, "_RECONCILE_HISTORY_OK", False)
+    monkeypatch.setattr(_st, "_RECONCILE_WINDOW_COMPLETE", False)
+    assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=5.0) is True
+    assert _st._RECONCILE_HISTORY_OK is False
+    assert _st._RECONCILE_WINDOW_COMPLETE is False

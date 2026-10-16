@@ -180,14 +180,33 @@ async def _wait_for_broadcast_memo(candidates: set[str], seconds: float) -> bool
     успешного вещания и до подписи следующего убирает гонку. Таймаут → False:
     вызывающий сбрасывает батч-счётчик, и следующая отправка возьмёт свежий
     живой seqno (переживший перевод дожмёт сверка confirm_broadcast_payouts).
+
+    Опрос — целевой (targets=candidates): скан останавливается на странице,
+    где найден нужный memo, а не читает до конца окно сверки (до
+    payout_reconcile_max_pages страниц) на каждый опрос — с ростом истории
+    казны «честный» скан сам становился бы тормозом пачки. У выплаты кандидат
+    ровно один (_payout_comment_candidates), так что ранний стоп срабатывает
+    на первом же найденном memo.
+
+    Флаги полноты (_RECONCILE_*) ожидание не переписывает: их описывает скан
+    цикла (маркеры диспетчера, сверка), а целевой скан с ранним стопом
+    неполон по построению — он не имеет права менять вердикт «повтор или
+    заморозка» у соседних строк очереди.
     """
     import app.ton_pay as _tp
 
-    deadline = time.monotonic() + seconds
-    while True:
-        markers = await _tp.fetch_broadcast_markers()
-        if any(c in markers for c in candidates):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        await asyncio.sleep(_BROADCAST_CONFIRM_POLL)
+    # Снапшот входа: любой выход (в т.ч. исключение) возвращает флаги как были.
+    saved_ok = _state._RECONCILE_HISTORY_OK
+    saved_window = _state._RECONCILE_WINDOW_COMPLETE
+    try:
+        deadline = time.monotonic() + seconds
+        while True:
+            markers = set(await _tp.fetch_broadcast_tx_map(targets=candidates))
+            if any(c in markers for c in candidates):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_BROADCAST_CONFIRM_POLL)
+    finally:
+        _state._RECONCILE_HISTORY_OK = saved_ok
+        _state._RECONCILE_WINDOW_COMPLETE = saved_window
