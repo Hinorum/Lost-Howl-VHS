@@ -63,8 +63,15 @@ services:
       # остаться закрытыми, даже если дефолт в app/config.py поменяют.
       - key: HEALTH_REQUIRE_TOKEN
         value: "true"
+      # Боевой режим денег: mainnet живёт с 2026-10-13 (переключение выполнено,
+      # холостые переводы и HTTP-фоллбэк прогнаны — docs/MAINNET_READINESS.md).
+      # Здесь стояло «false» — манифест расходился с боевым состоянием, а он
+      # источник правды для прода: синк или пересоздание сервиса из манифеста
+      # молча выключили бы деньги. Экстренный стоп — не правкой файла, а
+      # степенью 2 процедуры отката (Environment: TON_ENABLED=false + Manual
+      # Deploy), см. docs/MAINNET_READINESS.md.
       - key: TON_ENABLED
-        value: "false"
+        value: "true"
       - key: TON_NETWORK
         value: mainnet
       - key: TREASURY_ADDRESS
