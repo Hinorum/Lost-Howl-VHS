@@ -21,7 +21,12 @@ for _suffix in ("", "-journal", "-wal", "-shm"):
 #   $env:E2E_TESTNET=1; $env:TON_NETWORK=testnet; pytest -m e2e
 os.environ.setdefault("TON_ENABLED", "false")
 os.environ.setdefault("TON_NETWORK", "mainnet")
-os.environ.setdefault("BOT_TOKEN", "")
+# BOT_TOKEN/ADMIN_IDS — ровно CI-шные (см. .github/workflows/ci.yml): чистый
+# клон без них падал на пяти тестах (test_log_scrub: пустой набор секретов
+# выключает краску, и счётчик сбоев не растёт; test_backup_command: пустой
+# admin_id_set). Значения не боевые — dummy-токен и id=1, как в CI.
+os.environ.setdefault("BOT_TOKEN", "123456:ci-dummy-token")
+os.environ.setdefault("ADMIN_IDS", "1")
 os.environ.setdefault("TREASURY_ADDRESS", "")
 os.environ.setdefault("TREASURY_MNEMONIC", "")
 # /health закрыт по умолчанию (fail closed): пользовательский .env с
