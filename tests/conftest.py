@@ -33,6 +33,15 @@ os.environ.setdefault("TREASURY_MNEMONIC", "")
 # HEALTH_REQUIRE_TOKEN=false не смеет разблокировать снимок в прогоне —
 # тесты дефолта (test_metrics) строят Settings() из реального окружения.
 os.environ.setdefault("HEALTH_REQUIRE_TOKEN", "true")
+# Сам токен тоже держим пустым: боевой .env с непустым HEALTH_TOKEN иначе
+# закрывает /health и /metrics для тестов без заголовка (401 вместо 200) —
+# прогон снова зависел бы от машины разработчика при зелёном CI (в CI .env
+# нет). Тесты, которым нужен закрытый контур, задают токен сами.
+os.environ.setdefault("HEALTH_TOKEN", "")
+# DATABASE_CA из боевого .env подставляет кастомный SSL-контекст ЛЮБОМУ
+# Postgres-хосту (settings.database_ca приоритетнее автоматики pooler-суффикса),
+# и тесты connect-args, ожидающие ssl=True, падали при зелёном CI.
+os.environ.setdefault("DATABASE_CA", "")
 
 import asyncio
 import datetime as _dt

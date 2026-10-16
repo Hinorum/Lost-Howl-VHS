@@ -18,7 +18,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from app.config import Settings, settings
 from app.core.registry import RUN_START_KEY, WEEK_CLAIM_WINDOW_KEY
 from app.db import SessionLocal
 from app.leaderboard import (
@@ -1497,10 +1497,15 @@ async def test_settle_week_one_day_participant_qualifies_by_default(
 ) -> None:
     """Указ: порога 4 дней больше нет — дефолт min_days=1, одного дня хватает.
 
-    Настройку НЕ пинаем: проверяем сам дефолт конфига; если порог поднимут
-    снова, тест сломается первым.
+    Дефолт читаем из модели, а не из собранного `settings`: тот впитывает
+    .env рабочей копии, и выставленный локально WEEKLY_MIN_DAYS=4 красил
+    тест на машине разработчика при зелёном CI (в CI .env нет). Рантайм
+    пинаем проверенным дефолтом — поведение проверяем ровно то, что обещает
+    код; если дефолт поднимут снова, тест сломается первым на assert выше.
     """
-    assert settings.weekly_min_days == 1
+    default = Settings.model_fields["weekly_min_days"].default
+    assert default == 1
+    monkeypatch.setattr(settings, "weekly_min_days", default)
     monkeypatch.setattr(settings, "ton_enabled", True)
     week_key = previous_week_key()
     prev_start, _ = week_bounds(week_key)
