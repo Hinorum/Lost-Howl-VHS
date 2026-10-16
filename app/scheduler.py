@@ -453,11 +453,11 @@ async def _ton_maintenance() -> None:
         # возвращаются в очередь, подтверждённые получают реальный хеш.
         await confirm_broadcast_payouts(bot=_bot)
     except Exception:
-        logger.exception("confirm_broadcast_payouts упал (повторится через 120с)")
+        logger.exception("confirm_broadcast_payouts упал (повторится через 60с)")
     try:
         await settle_closed_rounds(bot=_bot)
     except Exception:
-        logger.exception("settle_closed_rounds упал (повторится через 120с)")
+        logger.exception("settle_closed_rounds упал (повторится через 60с)")
     try:
         await settle_week_if_due(bot=_bot)
     except Exception:
@@ -666,7 +666,11 @@ def start_scheduler() -> None:
     )
     if settings.ton_enabled:
         _register_job("ton-watch", _watch_job_guarded, "interval", seconds=settings.ton_watch_interval_seconds)
-        _register_job("ton-settle", _ton_maintenance_guarded, "interval", seconds=120)
+        # Такт обслуживания денежного контура — 60с (было 120): хвост очереди
+        # после срыва пачки и повторная сверка ждут не до двух минут, а до
+        # одной. Стоимость простоя — пара запросов на цикл; в историю сверка
+        # ходит только когда есть sent-строки без реального хеша.
+        _register_job("ton-settle", _ton_maintenance_guarded, "interval", seconds=60)
         _register_job(
             "treasury-mirror",
             _treasury_mirror_guarded,

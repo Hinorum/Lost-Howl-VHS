@@ -110,7 +110,7 @@ app/
           │   - db-backup       @ 04:17 MSK                                  │
           │   - ws-cleanup      @ вс 03:30 MSK                               │
           │   - vote-reminder   @ 10:00 UTC (за час до закрытия)             │
-          │   - при TON_ENABLED: ton-watch, ton-settle @ 2m,                 │
+          │   - при TON_ENABLED: ton-watch, ton-settle @ 1m,                 │
           │                       treasury-mirror                            │
           │   (self-ping живёт отдельно в main.py)                           │
           ▼                                │                                 │
