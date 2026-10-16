@@ -70,6 +70,32 @@ async def _reset_retriable(session, network: str) -> None:
         )
         .values(status="pending")
     )
+    # Мёртвый клейм с ИСЧЕРПАННЫМ лимитом попыток — рестарт/краш ровно на
+    # последней попытке. Оживить его гигиена не имеет права (attempts == max),
+    # а сверка sent такие строки не видит вовсе: без этого UPDATE строка висит
+    # в sending вечно — деньги не двигаются, долг блокирует /resetgame, алерта
+    # нет. В dead-letter с видимой причиной: судьбу решает ручной разбор
+    # (/payouts → retry; повтор всё равно пройдёт анти-дубль по memo).
+    await session.execute(
+        update(Payout)
+        .where(
+            Payout.status == "sending",
+            Payout.network == network,
+            Payout.attempts >= settings.payout_max_attempts,
+            Payout.dest_address != "",
+            or_(
+                Payout.claimed_at.is_(None),
+                Payout.claimed_at <= cutoff,
+            ),
+        )
+        .values(
+            status="failed",
+            last_error=(
+                "вещание оборвалось на последней попытке (рестарт процесса?) — "
+                "судьба перевода неизвестна, нужен ручной разбор"
+            ),
+        )
+    )
 
 async def _hydrate_player_dests(session, network: str) -> int:
     """Оживляет выплаты без получателя, когда кошелёк уже привязан.

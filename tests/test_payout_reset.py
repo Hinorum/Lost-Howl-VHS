@@ -6,7 +6,10 @@ payout_send_timeout_seconds) перехватывалось и вещалось 
 расход казны; memo-антидубль бессилен, перевод ещё не в цепочке. Теперь
 sending возвращается в очередь только когда клейм старше окна вещания + 30 с,
 либо при claimed_at NULL (сирота, упавшая до мига колонки); failed оживает
-по-прежнему сразу.
+по-прежнему сразу. Мёртвый клейм с ИСЧЕРПАННЫМ лимитом попыток уходит в
+failed с видимой причиной: оживить его нельзя (attempts == max), и без этого
+строка висела бы в sending вечно — деньги не двигаются, долг блокирует
+/resetgame, алерта нет.
 
 Предикаты — в UPDATE, а не в Python: чтобы повторный запуск цикла на строке,
 которая УЖЕ в pending, оставался no-op даже на двух репликах. Это страховка
@@ -54,7 +57,13 @@ async def test_sending_resets_only_when_stale() -> None:
         attempts=settings.payout_max_attempts,
         claimed_at=now - timedelta(hours=1),
     )
-    rows = [fresh, stale, orphan, failed, exhausted]
+    # Исчерпанный лимит при ЖИВОМ клейме — не трогаем: вещание ещё может идти.
+    exhausted_fresh = _payout(
+        "sending",
+        attempts=settings.payout_max_attempts,
+        claimed_at=now,
+    )
+    rows = [fresh, stale, orphan, failed, exhausted, exhausted_fresh]
     async with SessionLocal() as session:
         session.add_all(rows)
         await session.commit()
@@ -65,19 +74,22 @@ async def test_sending_resets_only_when_stale() -> None:
         await session.commit()
 
     async with SessionLocal() as session:
-        got = {
-            r.id: r.status
-            for r in (
-                await session.execute(select(Payout).where(Payout.id.in_(ids)))
-            )
+        rows_got = (
+            (await session.execute(select(Payout).where(Payout.id.in_(ids))))
             .scalars()
             .all()
-        }
+        )
+    got = {r.id: r.status for r in rows_got}
+    errors = {r.id: r.last_error for r in rows_got}
     assert got[fresh.id] == "sending", "живой клейм не перехватывается"
     assert got[stale.id] == "pending", "«мёртвый» клейм возвращается в очередь"
     assert got[orphan.id] == "pending", "сирота до колонки — завис по определению"
     assert got[failed.id] == "pending", "failed оживает сразу"
-    assert got[exhausted.id] == "sending", "attempts==max — не кандидат ретрая"
+    assert got[exhausted.id] == "failed", (
+        "мёртвый клейм на последней попытке — в dead-letter, иначе висел бы вечно"
+    )
+    assert "ручной разбор" in (errors[exhausted.id] or ""), "причина должна быть видимой"
+    assert got[exhausted_fresh.id] == "sending", "живой клейм не трогается даже на лимите"
 
 
 async def test_predicate_in_update_not_in_python() -> None:
