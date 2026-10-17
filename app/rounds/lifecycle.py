@@ -407,6 +407,21 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
         if tie_note is None:
             tie_note = f"{head} ({path_names}) — {theater}"
         tie_note = tie_note[:200]
+    # «Равные банки → голоса»: счёт Gram разделился, и ничью разрешил голос
+    # стаи. Игрок должен видеть, ПОЧЕМУ день ушёл не по деньгам, — иначе
+    # правило работает втихую, и это выглядит как жребий на пустом месте.
+    if (
+        tie_note is None
+        and used_stakes
+        and getattr(settings, "tie_break_by_votes", False)
+    ):
+        pre_vote = tied_positions(counts, round_row.win_rule)
+        if len(pre_vote) > 1 and winner in pre_vote:
+            path_names = " и ".join(_ROMAN[p] for p in pre_vote)
+            tie_note = (
+                f"Счёт Gram на сценах разделился ({path_names}) — "
+                f"голос стаи вывел сцену {_ROMAN[winner]}"
+            )[:200]
     if not round_row.cards:
         loaded = await get_round(session, round_row.id)
         if loaded is not None:

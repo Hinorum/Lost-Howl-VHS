@@ -454,6 +454,17 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
             await _ledger_incoming(
                 session, transfer, player.id, round_row.id, f"stake:{result}"
             )
+        elif result == "too_big":
+            await _dm_stake(
+                bot,
+                player.id,
+                f"↩️ Ставка {amount} Gram не принята (выше потолка "
+                f"{settings.stake_max_ton:g} Gram) — вернём после закрытия дня. "
+                "Поставить можно сумму в пределах потолка.",
+            )
+            await _ledger_incoming(
+                session, transfer, player.id, round_row.id, f"stake:{result}"
+            )
         elif result == "wallet_unverified":
             await _stash_refund(
                 session,

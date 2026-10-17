@@ -133,8 +133,10 @@ def test_minority_zero_tie_with_equal_votes_keeps_draw() -> None:
     assert tied_positions(stakes, WinRule.MINORITY, votes) == [1, 2]
 
 
-def test_minority_nonzero_tie_unaffected_by_votes() -> None:
-    # Не-нулевая ничья голосами не разрешается — только жребием.
+def test_minority_nonzero_tie_unaffected_by_votes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Не-нулевая ничья голосами не разрешается — только жребием:
+    # tie_break_by_votes выключен (дефолт), прежнее поведение сохранено.
+    monkeypatch.setattr(settings, "tie_break_by_votes", False)
     stakes = {0: 5, 1: 3, 2: 3}
     votes = {0: 9, 1: 1, 2: 8}
     assert tied_positions(stakes, WinRule.MINORITY, votes) == [1, 2]

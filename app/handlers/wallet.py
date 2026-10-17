@@ -119,7 +119,7 @@ async def _today_stake_line(session, player_id: int) -> str | None:
     state = {
         "confirmed": "подтверждена ✅",
         "pending": "ждёт подтверждения сети ⏳",
-        "rejected": "не принята (меньше минимума) — вернём после итогов ↩️",
+        "rejected": "не принята (лимит суммы) — вернём после итогов ↩️",
     }.get(stake.status, "ждёт подтверждения сети ⏳")
     return f"Ставка сегодня: {from_nano(stake.amount_nanotons):g} Gram ({state})."
 
@@ -456,14 +456,14 @@ async def on_wallet_view(callback: CallbackQuery) -> None:
 _STAKE_HOWTO = (
     "{mark} Ставка на кадр дня — три шага:\n"
     "1. Привяжи кошелёк: /wallet (перепривязка — просто новый адрес, старый перестанет считаться).\n"
-    "2. Переведи от {min:g} Gram (потолка нет) со своего кошелька — любой TON-кошелёк "
+    "2. Переведи {limits} со своего кошелька — любой TON-кошелёк "
     "(Keeper, Tonhub, MyTonWallet…):\n"
     "<code>{treasury}</code>\n"
     "Кнопки ниже: открыть кошелёк с готовым получателем или скопировать адрес. "
     "<b>Memo не нужен</b> — перевод найдётся по отправителю.\n"
     "3. Нажми кнопку кадра — когда угодно до закрытия голосования.\n\n"
-    "Победителя считает счёт Gram на кадрах (закон дня); если за день не поставлено "
-    "ни одного Gram — исход решат голоса.\n"
+    "Победителя считает счёт Gram на кадрах (закон дня); при равных банках исход "
+    "добирает голос стаи, если за день не поставлено ни одного Gram — решат голоса.\n"
     "Порядок не важен: голос и перевод — в любой последовательности, главное успеть "
     "до «Голосование до». Одна ставка на игрока в день.\n"
     "Перевод, не ставший ставкой (нет кошелька, ставка уже есть, день закрылся), "
@@ -471,6 +471,13 @@ _STAKE_HOWTO = (
     "остаётся в казне). Сумма {revote:g}–{min:g} Gram при уже выбранном сегодня кадре "
     "зачтётся как оплата перемотки — и без мемо."
 )
+
+
+def _stake_bounds_text() -> str:
+    """Границы ставки для текстов: «от X Gram» или «от X до Y Gram»."""
+    if settings.stake_max_ton > 0:
+        return f"от {settings.stake_min_ton:g} до {settings.stake_max_ton:g} Gram"
+    return f"от {settings.stake_min_ton:g} Gram"
 
 
 async def _stake_view_text(user) -> str:
@@ -487,6 +494,7 @@ async def _stake_view_text(user) -> str:
                 return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
     head = _STAKE_HOWTO.format(
         mark=money_mark(str(user.id)),
+        limits=_stake_bounds_text(),
         min=settings.stake_min_ton,
         revote=settings.revote_ton,
         rmin=settings.refund_min_gram,
@@ -617,7 +625,7 @@ async def on_stake_view(callback: CallbackQuery) -> None:
         return
     # Попап кнопки виден только нажавшему — личные цифры можно показывать
     # прямо в группе, как у /score: сумма ставки и её статус.
-    hint = f"Ставка: переведи от {settings.stake_min_ton:g} Gram казначею со своего привязанного кошелька (/wallet), потом жми свой вариант. Подробности: /stake в личке."
+    hint = f"Ставка: переведи {_stake_bounds_text()} казначею со своего привязанного кошелька (/wallet), потом жми свой вариант. Подробности: /stake в личке."
     try:
         async with SessionLocal() as session:
             player = await upsert_player(session, callback.from_user)
@@ -627,8 +635,8 @@ async def on_stake_view(callback: CallbackQuery) -> None:
                 hint = "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
             elif not player.wallet_address:
                 hint = (
-                    f"Кошелёк не привязан: /wallet в личке. Потом переведи от "
-                    f"{settings.stake_min_ton:g} Gram казначею и жми свой вариант."
+                    f"Кошелёк не привязан: /wallet в личке. Потом переведи "
+                    f"{_stake_bounds_text()} казначею и жми свой вариант."
                 )
             else:
                 line = await _today_stake_line(session, player.id)
@@ -638,7 +646,7 @@ async def on_stake_view(callback: CallbackQuery) -> None:
                     hint = "Сейчас открытого дня нет: ставки принимаются на открытый день."
                 else:
                     hint = (
-                        f"Ставки сегодня нет. Переведи от {settings.stake_min_ton:g} Gram "
+                        f"Ставки сегодня нет. Переведи {_stake_bounds_text()} "
                         "казначею со своего кошелька — адрес: /stake в личке."
                     )
     except Exception:

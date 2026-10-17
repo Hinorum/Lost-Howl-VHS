@@ -104,26 +104,56 @@ def tied_positions(
 ) -> list[int]:
     """Все пути, претендующие на победу по закону дня (без учёта позиций).
 
-    votes (бесплатные голоса) — только для тай-брейка «ничьей на нуле»
-    Меньшинства: пути с 0 Gram делят минимум, но сцена, где игроки
-    голосовали без ставок, не равна невыбранной вовсе — уцелеет путь с
-    меньшим числом голосов. Не-нулевые и прочие ничьи решаются жребием.
+    votes (бесплатные голоса) — тай-брейк «равные банки → голоса»: если
+    закон дня по счёту оставил несколько претендентов, среди них побеждает
+    тот, кого выбирает ТОТ ЖЕ закон по голосам — Большинство берёт больше
+    голосов, Меньшинство меньше, Медиана середину. Ничья на нуле у
+    Меньшинства решалась голосами и раньше (сцена, где игроки голосовали
+    без ставок, не равна невыбранной вовсе); остальные ничьи подключаются
+    флагом tie_break_by_votes (false — прежний жребий). Если и голоса
+    равны — претенденты остаются, и жребий (энтропия мастерчейна) решает
+    исход, как прежде.
     """
     items = [(counts.get(i, 0), i) for i in range(3)]
     if rule is WinRule.MAJORITY:
         best = max(item[0] for item in items)
-        return sorted(i for total, i in items if total == best)
-    if rule is WinRule.MINORITY:
+        candidates = sorted(i for total, i in items if total == best)
+    elif rule is WinRule.MINORITY:
         worst = min(item[0] for item in items)
         candidates = sorted(i for total, i in items if total == worst)
-        # Ничья на нуле: пустые пути (0 Gram) разделили минимум — решают голоса.
         if worst == 0 and votes is not None and len(candidates) > 1:
-            fewest = min(votes.get(i, 0) for i in candidates)
-            candidates = sorted(i for i in candidates if votes.get(i, 0) == fewest)
+            candidates = _narrow_by_votes(candidates, rule, votes)
+    else:
+        ordered = sorted(items, key=lambda item: (item[0], item[1]))
+        median = ordered[1][0]
+        candidates = sorted(i for total, i in items if total == median)
+    if (
+        getattr(settings, "tie_break_by_votes", False)
+        and votes is not None
+        and len(candidates) > 1
+    ):
+        candidates = _narrow_by_votes(candidates, rule, votes)
+    return candidates
+
+
+def _narrow_by_votes(
+    candidates: list[int], rule: WinRule, votes: dict[int, int]
+) -> list[int]:
+    """Сужение претендентов голосом стаи — тем же законом дня по голосам."""
+    valued = [(votes.get(i, 0), i) for i in candidates]
+    if rule is WinRule.MAJORITY:
+        best = max(value for value, _ in valued)
+        return sorted(i for value, i in valued if value == best)
+    if rule is WinRule.MINORITY:
+        worst = min(value for value, _ in valued)
+        return sorted(i for value, i in valued if value == worst)
+    # Медиана: середина по голосам; при трёх претендентах — настоящая
+    # середина, при двух — верхний из средних (голос стаи перевешивает).
+    # Все голоса равны — медиана не различает: набор остаётся жребию.
+    if len({value for value, _ in valued}) == 1:
         return candidates
-    ordered = sorted(items, key=lambda item: (item[0], item[1]))
-    median = ordered[1][0]
-    return sorted(i for total, i in items if total == median)
+    ordered = sorted(valued)
+    return [ordered[len(ordered) // 2][1]]
 
 
 def pick_winner(

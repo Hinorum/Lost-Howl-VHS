@@ -184,8 +184,8 @@ async def test_register_stake_flow(session: AsyncSession, monkeypatch: pytest.Mo
     assert await stakes_mod.register_stake(session, round_row, player, to_nano(2), "tx2") == "already_staked"
     # Лимиты: отклонённая микровставка НЕ занимает слот игрока в дне — валидная
     # ставка записывается на её место, а пылевой остаток возвращается сразу
-    # (тем же расчётом, что и поток финализации). Верхней границы нет —
-    # крупная сумма принимается как обычная ставка.
+    # (тем же расчётом, что и поток финализации). Потолка по умолчанию нет
+    # (STAKE_MAX_TON=0) — крупная сумма принимается как обычная ставка.
     other = Player(id=12)
     session.add(other)
     third = Player(id=13)

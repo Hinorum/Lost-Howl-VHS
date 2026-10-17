@@ -231,6 +231,13 @@ def validate_config() -> list[str]:
             f" + referral {settings.referral_pct}%) — "
             "prize_pool станет отрицательным, и все ставки уйдут в копилку недели."
         )
+    if settings.stake_max_ton > 0 and settings.stake_max_ton < settings.stake_min_ton:
+        problems.append(
+            f"Потолок ставки STAKE_MAX_TON={settings.stake_max_ton:g} ниже минимума "
+            f"STAKE_MIN_TON={settings.stake_min_ton:g}: ни одна сумма не пройдёт лимиты, "
+            "и все ставки дня будут отклоняться. Подними потолок или обнули его "
+            "(0 = потолка нет)."
+        )
     if settings.health_require_token and not settings.health_token.strip():
         problems.append(
             "HEALTH_REQUIRE_TOKEN=true, но HEALTH_TOKEN пуст: "

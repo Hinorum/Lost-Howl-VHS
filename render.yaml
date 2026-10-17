@@ -134,6 +134,11 @@ services:
         value: "false"
       - key: STAKE_MIN_TON
         value: "0.5"
+      # Потолок одной ставки (Gram): перевод выше отклоняется и возвращается
+      # после итогов дня. 0 = потолка нет (прежнее поведение). Боевое значение
+      # ставится в панели Render — здесь дефолт для Blueprint Sync.
+      - key: STAKE_MAX_TON
+        value: "0"
       - key: OWNER_RAKE_PCT
         value: "0.5"
       - key: LEADERBOARD_RAKE_PCT
@@ -221,6 +226,11 @@ services:
       # молча меняет механику выплат на проде.
       - key: WINNER_BY_STAKES
         value: "true"
+      # Равные банки → голоса: ничья Gram на решающем уровне разрешается тем же
+      # законом дня по голосам (жребий — только если и голоса равны). false —
+      # прежнее поведение (любую ничью решает жребий блока). Включается в панели.
+      - key: TIE_BREAK_BY_VOTES
+        value: "false"
       - key: LEADERBOARD_CLAIM_ENABLED
         value: "true"
       - key: CLAIM_WINDOW_HOURS

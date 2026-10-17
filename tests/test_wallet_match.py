@@ -189,6 +189,31 @@ async def test_rejected_stake_tells_the_reason(ton_on) -> None:
     assert "не принята" in bot.messages[0][1]
 
 
+async def test_over_cap_stake_tells_the_reason(ton_on, monkeypatch) -> None:
+    """Потолок ставки: перевод выше — отклонён, возврат, и причина в личке."""
+    monkeypatch.setattr(settings, "stake_max_ton", 1.0)
+    await _open_round(906)
+    raw = _raw(0xC4)
+    async with SessionLocal() as session:
+        session.add(Player(id=910_006, username="whale", first_name="W", wallet_address=raw))
+        await session.commit()
+
+    bot = _RecorderBot()
+    status = await process_transfer(
+        Transfer(
+            tx_hash="dm-big-1",
+            source=raw,
+            value_nanotons=to_nano(2),
+            comment="",
+            utime=int(datetime.now(UTC).timestamp()),
+        ),
+        bot=bot,
+    )
+    assert status == "too_big"
+    assert len(bot.messages) == 1
+    assert "потолк" in bot.messages[0][1]
+
+
 async def test_dust_stake_does_not_block_real_stake(ton_on) -> None:
     """Регрессия: отклонённая микровставка больше не занимает слот дня —
     валидная ставка записывается на её место, пыль возвращается сразу."""

@@ -40,8 +40,9 @@
 Если на победивший путь не поставлено ни одной подтвержденной ставки —
 все ставки возвращаются без рейка и копилок, но с вычетом газа сети (~payout_fee_gram
 с каждого перевода, как и у призов: казначей не финансирует чужие транзы).
-Отклонённые лимитами и неподтверждённые ставки возвращаются всегда (так же с
-вычетом газа); если газ больше самой ставки — возвращать нечего.
+Отклонённые лимитами (ниже минимума или выше потолка) и неподтверждённые
+ставки возвращаются всегда (так же с вычетом газа); если газ больше самой
+ставки — возвращать нечего.
 
 Сети изолированы: каждая ставка и выплата помечена network (mainnet/testnet),
 финализация и watcher работают только со ставками активной сети — тестнет
@@ -174,10 +175,16 @@ async def register_stake(
     )
     previous = existing.scalar_one_or_none()
     min_nano = to_nano(settings.stake_min_ton)
+    max_nano = to_nano(settings.stake_max_ton) if settings.stake_max_ton > 0 else 0
     status = "pending"
     reason = ""
     if amount_nanotons < min_nano:
         status, reason = "rejected", "too_small"
+    elif max_nano and amount_nanotons > max_nano:
+        # Потолок (stake_max_ton): перевод выше отклоняется тем же контуром,
+        # что и пыль ниже минимума — деньги возвращаются после итогов дня
+        # (или сразу, когда валидная ставка вытеснит отклонённую строку).
+        status, reason = "rejected", "too_big"
     if previous is not None and (previous.status != "rejected" or status == "rejected"):
         # Повтор неотклонённой ставки (confirmed/pending) — уже_staked; пылевая
         # ставка поверх пылевой тоже не валидная замена — как вторая ставка дня.
