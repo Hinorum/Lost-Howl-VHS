@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from app.config import settings
 from app.ton_utils import normalize_address
@@ -154,6 +155,52 @@ async def fetch_remote_json(url: str) -> dict:
     )
 
 
+def notify_liteserver_down(exc: BaseException) -> None:
+    """Сбой лайтсерверного канала: серия подряд → пересборка пула.
+
+    Больной узел в pytoniq остаётся «живым» (высокий кэш masterchain seqno —
+    приоритет выбора выше), а execute_method на ошибку-класс 651 пиры не
+    перебирает: без пересборки каждый ретрай снова попадает в ту же ноду, и
+    «больное окно» длится часами. После порога _LITESERVER_REBUILD_AFTER
+    сбоев подряд (не чаще раза в кулдаун) выставляется запрос пересборки —
+    его исполняет get_wallet при следующем обращении. Флаг
+    TON_PROVIDER_REBUILD выключен — функция ничего не делает (поведение
+    деплоя не меняется).
+
+    Честная оговорка: пересборка не гарантирует смену пиров — свежий пул
+    может снова выбрать ту же ноду (она отвечает на пинг и держит высокий
+    seqno). Это шанс, а не лечение; нормальный режим при больном канале —
+    HTTP-фолбэк.
+    """
+    if not settings.ton_provider_rebuild:
+        return
+    state._liteserver_down_streak += 1
+    if state._liteserver_down_streak < state._LITESERVER_REBUILD_AFTER:
+        return
+    now = datetime.now(UTC)
+    if (
+        state._last_provider_reset_at is not None
+        and now - state._last_provider_reset_at < state._PROVIDER_RESET_COOLDOWN
+    ):
+        # Кулдаун после недавней пересборки. Серию НЕ сбрасываем: сразу после
+        # кулдауна один сбой снова попросит пересборку, а не будет ждать
+        # полный порог заново.
+        return
+    logger.warning(
+        "Лайтсерверы: %d сбоев подряд (%s) — пересоберу пул при следующем обращении",
+        state._liteserver_down_streak,
+        exc,
+    )
+    state._liteserver_down_streak = 0
+    state._last_provider_reset_at = now
+    state._provider_reset_requested = True
+
+
+def notify_liteserver_ok() -> None:
+    """Успешное чтение/вещание по лайтсерверам: серия сбоев оборвалась."""
+    state._liteserver_down_streak = 0
+
+
 async def get_wallet():
     """Ленивая инициализация кошелька казначея для активной сети.
 
@@ -162,10 +209,23 @@ async def get_wallet():
     производный адрес не совпал, отправлять нельзя в принципе — падаем с
     внятной ошибкой, а не молчаливыми неудачными выплатами. Источник
     лайтсерверов: LITESERVER_CONFIG_URL (свежий JSON), иначе встроенный
-    конфиг pytoniq для сети.
+    конфиг pytoniq для сети. Запрошенная пересборка пула (см.
+    notify_liteserver_down) исполняется здесь: старый провайдер закрывается,
+    при следующем обращении поднимается свежий.
     """
     network = "testnet" if settings.is_testnet else "mainnet"
     async with state._wallet_lock:
+        if state._provider_reset_requested:
+            # Фолбэк-путь заметил серию сбоев лайтсерверов: больной узел
+            # остаётся «живым» и приоритетным, ретраи бесполезны — обнуляем
+            # кошелёк, и блок ниже закроет старый пул и поднимет свежий
+            # (шанс сменить набор пиров). Флаг снимаем всегда: если кошелёк
+            # уже None, следующий блок сам пересоберёт провайдера, а снятый
+            # флаг не слал бы пересборку на каждом обращении.
+            state._provider_reset_requested = False
+            if state._wallet is not None:
+                state._wallet = None
+                logger.info("Пересборка пула лайтсерверов: серия сбоев исчерпала порог")
         if state._wallet is not None and state._wallet_network == network:
             return state._wallet
         if not settings.active_treasury_mnemonic:

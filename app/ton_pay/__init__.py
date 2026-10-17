@@ -243,6 +243,8 @@ from .wallet import (  # noqa: F401  # noqa: E402,F401
     build_offline_wallet,
     detect_wallet_version,
     get_wallet,
+    notify_liteserver_down,
+    notify_liteserver_ok,
     wallet_address,
 )
 from .wallet import (  # noqa: F401

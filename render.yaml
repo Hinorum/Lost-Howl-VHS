@@ -100,6 +100,12 @@ services:
       # таком пересечении; для testnet ставь testnet-global.config.json.
       - key: LITESERVER_CONFIG_URL
         value: https://ton.org/global.config.json
+      # Пересборка пула лайтсерверов после серии сбоев: больной узел остаётся
+      # «живым» и приоритетным для pytoniq (высокий кэш seqno), ретраи снова
+      # попадают в него — свежий пул даёт шанс сменить набор пиров. false —
+      # прежнее поведение (ретраи в тот же пул).
+      - key: TON_PROVIDER_REBUILD
+        value: "false"
       # Цикл наблюдателя входящих (сек) = скорость подтверждения ставок.
       # 60 — минута; 120/180 — вдвое-втрое дешевле по квоте TonAPI/Toncenter.
       - key: TON_WATCH_INTERVAL_SECONDS

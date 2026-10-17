@@ -432,6 +432,8 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
             try:
                 wallet_for_batch = await _tp._get_wallet()
                 _state._batch_seqno = await wallet_for_batch.get_seqno()
+                # Seqno прочитан лайтсерверами — серия сбоев канала оборвалась.
+                _tp.notify_liteserver_ok()
                 # Пачка одним внешним сообщением — механизм контракта v5r1
                 # (out_list). Проверяем класс кошелька, которым реально
                 # подписываем, а не строку версии из настроек.
@@ -446,6 +448,9 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                 _state._batch_seqno = None
                 v5_batch_capable = False
                 if wallet_for_batch is not None and _tp._is_liteserver_down(exc):
+                    # Серия сбоев лайтсерверов: после порога пул пересоберётся
+                    # при следующем обращении (флаг TON_PROVIDER_REBUILD).
+                    _tp.notify_liteserver_down(exc)
                     try:
                         _state._batch_seqno = await _tp._http_get_wallet_seqno(wallet_for_batch)
                         v5_batch_capable = _tp.wallet_supports_batch(wallet_for_batch)

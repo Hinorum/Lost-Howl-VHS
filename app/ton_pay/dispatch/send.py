@@ -88,6 +88,8 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
             )
         if result != 1:
             raise RuntimeError(f"Лайтсерверы не приняли перевод (результат {result})")
+        # Лайтсерверы ответили: серия сбоев канала оборвалась.
+        _tp.notify_liteserver_ok()
         if _state._http_channel_engaged_at is not None:
             # Лайтсерверы снова принимают вещание — канал откатился, флаг
             # снимается. Иначе алерт «лайтсерверы недоступны» повторялся бы
@@ -106,6 +108,9 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
 
         if not _tp._is_liteserver_down(exc):
             raise
+        # Серия сбоев лайтсерверов: после порога пул пересоберётся при
+        # следующем обращении к кошельку (флаг TON_PROVIDER_REBUILD).
+        _tp.notify_liteserver_down(exc)
         # Лайтсерверы не отдают вещание (нет пиров, таймауты, отстающий
         # узел), а деньги слать надо: оффлайн-подпись + HTTPS-вещание
         # через Toncenter.
@@ -241,6 +246,8 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
             )
         if result != 1:
             raise BatchRejected(f"Лайтсерверы не приняли пачку (результат {result})")
+        # Лайтсерверы ответили: серия сбоев канала оборвалась.
+        _tp.notify_liteserver_ok()
         if _state._http_channel_engaged_at is not None:
             # Лайтсерверы снова принимают вещание — флаг HTTP-канала снимается
             # (симметрично одиночному пути, иначе алерт «недоступны» врал бы
@@ -258,6 +265,9 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
 
         if not _tp._is_liteserver_down(exc):
             raise
+        # Серия сбоев лайтсерверов: после порога пул пересоберётся при
+        # следующем обращении к кошельку (флаг TON_PROVIDER_REBUILD).
+        _tp.notify_liteserver_down(exc)
         logger.warning(
             "Лайтсерверы недоступны (%s) — пачка из %d переводов уходит в HTTP-канал (toncenter)",
             exc,
