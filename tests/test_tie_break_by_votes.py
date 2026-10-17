@@ -12,10 +12,12 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import stakes as stakes_mod
 from app.config import settings
-from app.models import Card, Player, Round, RoundStatus, Stake, Vote, WinRule
+from app.models import Card, Payout, Player, Round, RoundStatus, Stake, Vote, WinRule
 from app.rounds import close_voting, finish_tally, pick_winner, tied_positions
 from app.ton_utils import to_nano
 
@@ -246,3 +248,104 @@ async def test_close_voting_flag_on_skips_entropy_when_votes_resolve(
     assert loaded.winner_card == 1
     assert captured == []  # энтропии не снимали — ничью решили голоса
     assert loaded.tie_entropy is None
+
+
+# ---------- Выплаты: деньги идут строго за победившим путём ----------
+
+
+def test_votes_cannot_resurrect_non_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Голоса не могут вытащить путь, проигравший по банкам.
+
+    Сужение идёт только внутри списка кандидатов закона дня: путь III
+    с 4 Gram (меньше максимума) не станет победителем даже с 999 голосами.
+    """
+    monkeypatch.setattr(settings, "tie_break_by_votes", True)
+    stakes = {0: 5, 1: 5, 2: 4}
+    votes_equal = {0: 1, 1: 1, 2: 999}
+    assert tied_positions(stakes, WinRule.MAJORITY, votes_equal) == [0, 1]
+    votes_decided = {0: 9, 1: 1, 2: 999}
+    assert tied_positions(stakes, WinRule.MAJORITY, votes_decided) == [0]
+    assert pick_winner(stakes, WinRule.MAJORITY, "9:majority:zzz", votes_decided) == 0
+
+
+async def test_vote_tie_pays_stakers_of_chosen_path(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ничья банков, решённая голосами: приз получают поставившие на
+    победившую сторону, а проигравшая равная сторона не получает ни приза,
+    ни возврата — её ставка уходит в пул, как и при любой развязке дня."""
+    monkeypatch.setattr(settings, "tie_break_by_votes", True)
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    round_row = await _seed_day(
+        session,
+        WinRule.MAJORITY,
+        votes={
+            0: [811_001, 811_002],
+            1: [811_003, 811_004, 811_005, 811_006, 811_007],
+        },
+        stakes={0: [(811_001, 2.0)], 1: [(811_003, 2.0)]},
+        day_index=704,
+    )
+    closed, done = await finish_tally(session, round_row)
+    assert done and closed.winner_card == 1
+    assert "голос стаи" in (closed.tie_note or "")
+
+    created = await stakes_mod.finalize_day_payouts(session, closed)
+    assert created >= 1
+    payouts = list((await session.execute(select(Payout))).scalars())
+    prizes = {row.player_id: row.amount_nanotons for row in payouts if row.kind == "prize"}
+    # Приз — только поставившему на победивший путь (II).
+    assert set(prizes) == {811_003}
+    assert prizes[811_003] > 0
+    # Проигравшая сторона (I): ни приза, ни возврата.
+    assert not [row for row in payouts if row.kind == "refund"]
+    lost = (
+        await session.execute(
+            select(Stake).where(
+                Stake.round_id == round_row.id, Stake.player_id == 811_001
+            )
+        )
+    ).scalar_one()
+    assert lost.status == "confirmed"
+
+
+async def test_vote_tie_on_empty_paths_refunds_everyone(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ничья на нулях (Меньшинство): голоса указали на сцену без ставивших —
+    деньги не пропадают: все подтверждённые ставки возвращаются."""
+    monkeypatch.setattr(settings, "tie_break_by_votes", True)
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    round_row = await _seed_day(
+        session,
+        WinRule.MINORITY,
+        votes={
+            0: [812_001, 812_002],
+            1: [812_003],
+            2: [812_004, 812_005, 812_006, 812_007, 812_008],
+        },
+        stakes={0: [(812_001, 5.0)]},
+        day_index=705,
+    )
+    # Банки 5/0/0: у Меньшинства ничья нулей у путей II и III; голоса: II — 1, III — 5.
+    closed, done = await finish_tally(session, round_row)
+    assert done and closed.winner_card == 1
+    assert "голос стаи вывел сцену II" in (closed.tie_note or "")
+
+    created = await stakes_mod.finalize_day_payouts(session, closed)
+    assert created == 1  # один возврат, призов нет
+    refunds = [
+        row
+        for row in (await session.execute(select(Payout))).scalars()
+        if row.kind == "refund"
+    ]
+    assert [row.player_id for row in refunds] == [812_001]
+    assert refunds[0].amount_nanotons == stakes_mod.refund_net_amount(to_nano(5))
+    refunded = (
+        await session.execute(
+            select(Stake).where(
+                Stake.round_id == round_row.id, Stake.player_id == 812_001
+            )
+        )
+    ).scalar_one()
+    assert refunded.status == "refunded"
