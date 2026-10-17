@@ -106,6 +106,13 @@ class Settings(BaseSettings):
     toncenter_api_base: str = "https://toncenter.com"
     toncenter_api_base_testnet: str = "https://testnet.toncenter.com"
     toncenter_api_key: str = ""
+    # Второй вещатель HTTP-канала: Toncenter — основной (sendBoc v2), но он
+    # может отказать (429-лимит, 5xx, сети нет). true — тот же подписанный BoC
+    # повторяется через TonAPI /v2/blockchain/message; false — прежнее
+    # поведение (отказ Toncenter уходит наружу как есть). Повтор задвоить не
+    # может: у второй отправки тот же BoC/hash — сеть включит его ровно один
+    # раз, а счётчик seqno наращивается по факту успеха одного из вещателей.
+    http_tonapi_fallback: bool = False
     # Нижняя граница ставки; верхней нет — «кит» ограничен только своим кошельком.
     stake_min_ton: float = 0.5
     # Распределение фонда дня (в сумме со ставками победителей — 100%):

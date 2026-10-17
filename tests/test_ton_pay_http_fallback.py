@@ -2,8 +2,9 @@
 
 Fallback лайтсерверов (ADNL/TCP режется окружением, REST жив): казна
 переводы не теряет — внешнее сообщение подписывается локально (seqno и статус
-через REST), BoC уходит через Toncenter v2 jsonRPC sendBoc. Слой чисто
-оффлайн: никаких живых лайтсерверов в тестах, HTTP-вызовы подменяются.
+через REST), BoC уходит через Toncenter v2 jsonRPC sendBoc; при включённом
+HTTP_TONAPI_FALLBACK отказ Toncenter повторяется тем же BoC через TonAPI.
+Слой чисто оффлайн: никаких живых лайтсерверов в тестах, HTTP-вызовы подменяются.
 """
 
 from __future__ import annotations
@@ -170,6 +171,152 @@ async def test_http_broadcast_rejects_ok_false(monkeypatch: pytest.MonkeyPatch) 
     )
     with pytest.raises(RuntimeError, match="rejected by node"):
         await ton_pay._http_broadcast_external(wallet, seqno=1, internal_msg=body)
+
+
+# ---------- Второй вещатель HTTP-канала (HTTP_TONAPI_FALLBACK) ----------
+
+
+async def test_http_broadcast_flag_off_keeps_toncenter_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Флаг выключен (дефолт): отказ Toncenter уходит наружу, TonAPI не зовём."""
+    _setup_testnet_treasury(monkeypatch)
+    monkeypatch.setattr(settings, "http_tonapi_fallback", False)
+    wallet, _ = ton_pay._build_offline_treasury_wallet()
+    urls: list[str] = []
+
+    async def fake_post(client, url, *, json=None, headers=None, timeout=None, **kw):
+        urls.append(url)
+        return _Resp(status_code=500, text="toncenter down")
+
+    monkeypatch.setattr(ton_pay, "http_post_with_retry", fake_post)
+    body = wallet.create_wallet_internal_message(
+        destination=wallet.address, value=to_nano(0.475)
+    )
+    with pytest.raises(RuntimeError, match="Toncenter"):
+        await ton_pay._http_broadcast_external(wallet, seqno=1, internal_msg=body)
+    assert len(urls) == 1
+    assert all("tonapi" not in url for url in urls)
+
+
+async def test_http_broadcast_tonapi_fallback_second_provider_saves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Флаг включён: Toncenter отказал (429) — тот же BoC принимает TonAPI.
+
+    Тот же подписанный BoC: у повторной отправки тот же hash, задвоить нечего.
+    Ключ TonAPI обязан уйти заголовком Authorization: Bearer (X-API-Key
+    TonAPI молча игнорирует — «сломанный ключ» при валидном).
+    """
+    _setup_testnet_treasury(monkeypatch)
+    monkeypatch.setattr(settings, "http_tonapi_fallback", True)
+    monkeypatch.setattr(settings, "ton_api_key", "k-tonapi")
+    wallet, _ = ton_pay._build_offline_treasury_wallet()
+    calls: list[dict] = []
+
+    async def fake_post(client, url, *, json=None, headers=None, timeout=None, **kw):
+        calls.append({"url": url, "json": json, "headers": headers})
+        if "toncenter" in url:
+            return _Resp(status_code=429, text="rate limit")
+        return _Resp(body={})
+
+    monkeypatch.setattr(ton_pay, "http_post_with_retry", fake_post)
+    body = wallet.create_wallet_internal_message(
+        destination=wallet.address, value=to_nano(0.475)
+    )
+    await ton_pay._http_broadcast_external(wallet, seqno=1, internal_msg=body)
+
+    assert len(calls) == 2
+    first, second = calls
+    assert "jsonRPC" in first["url"] and first["json"]["method"] == "sendBoc"
+    assert second["url"].endswith("/v2/blockchain/message")
+    assert second["json"]["boc"] == first["json"]["params"]["boc"]
+    assert second["headers"] == {"Authorization": "Bearer k-tonapi"}
+
+
+async def test_http_broadcast_toncenter_ok_skips_tonapi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Успех Toncenter: второй вещатель не дёргается даже при включённом флаге."""
+    _setup_testnet_treasury(monkeypatch)
+    monkeypatch.setattr(settings, "http_tonapi_fallback", True)
+    wallet, _ = ton_pay._build_offline_treasury_wallet()
+    urls: list[str] = []
+
+    async def fake_post(client, url, *, json=None, headers=None, timeout=None, **kw):
+        urls.append(url)
+        return _Resp(body={"ok": True, "result": {"@type": "ok"}})
+
+    monkeypatch.setattr(ton_pay, "http_post_with_retry", fake_post)
+    body = wallet.create_wallet_internal_message(
+        destination=wallet.address, value=to_nano(0.475)
+    )
+    await ton_pay._http_broadcast_external(wallet, seqno=1, internal_msg=body)
+    assert len(urls) == 1
+    assert "jsonRPC" in urls[0]
+
+
+async def test_http_broadcast_both_providers_fail_reports_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Оба вещателя отказали: наружу — одна ошибка с причинами обоих."""
+    _setup_testnet_treasury(monkeypatch)
+    monkeypatch.setattr(settings, "http_tonapi_fallback", True)
+    wallet, _ = ton_pay._build_offline_treasury_wallet()
+
+    async def fake_post(client, url, *, json=None, headers=None, timeout=None, **kw):
+        if "toncenter" in url:
+            return _Resp(status_code=503, text="toncenter 503")
+        return _Resp(status_code=422, body={"error": "boc rejected by lite servers"})
+
+    monkeypatch.setattr(ton_pay, "http_post_with_retry", fake_post)
+    body = wallet.create_wallet_internal_message(
+        destination=wallet.address, value=to_nano(0.475)
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await ton_pay._http_broadcast_external(wallet, seqno=1, internal_msg=body)
+    text = str(excinfo.value)
+    assert "Toncenter" in text
+    assert "TonAPI" in text
+    assert "boc rejected by lite servers" in text
+
+
+async def test_send_http_transfer_survives_toncenter_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Сквозной путь перевода: Toncenter лежит, флаг включён — перевод ушёл,
+    счётчик seqno наращён по факту успеха второго вещателя."""
+    _setup_testnet_treasury(monkeypatch)
+    monkeypatch.setattr(settings, "http_tonapi_fallback", True)
+    monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
+    monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", None)
+    monkeypatch.setattr(ton_pay.state, "_warned_no_toncenter_key", True)
+    calls: list[str] = []
+
+    async def fake_account_state():
+        return to_nano(3), "active", "tonapi"
+
+    async def fake_post(client, url, *, json=None, headers=None, timeout=None, **kw):
+        calls.append(url)
+        if "runGetMethod" in url:
+            return _Resp(body={"exit_code": 0, "stack": [{"type": "num", "value": "0x9"}]})
+        if "jsonRPC" in url:
+            return _Resp(status_code=500, text="toncenter down")
+        return _Resp(body={})
+
+    monkeypatch.setattr(ton_pay, "fetch_account_state", fake_account_state)
+    monkeypatch.setattr(ton_pay, "http_post_with_retry", fake_post)
+
+    marker = await ton_pay._send_ton_transfer_http(
+        "0:" + "66" * 32, to_nano(0.1), comment="way:9:prize#7"
+    )
+    assert marker and marker.startswith("bcast:")
+    assert len(calls) == 3
+    assert "runGetMethod" in calls[0]
+    assert "jsonRPC" in calls[1]
+    assert "tonapi" in calls[2]
+    assert ton_pay.state._batch_seqno == 10
+    assert ton_pay.state._http_channel_engaged_at is not None
 
 
 async def test_send_http_uses_local_seqno_when_batch_active(monkeypatch: pytest.MonkeyPatch) -> None:

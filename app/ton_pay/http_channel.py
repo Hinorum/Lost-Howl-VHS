@@ -4,7 +4,10 @@ ADNL/TCP до лайтсерверов может быть закрыт окру
 файрволом: чтение через REST-индексаторы работает, а вещание — нет, payout
 висит в очереди навсегда). Чтобы казна не «зависала», исходящие собираются
 ОФФЛАЙН (чистая локальная математика + seqno/публичный ключ через Toncenter
-v3 runGetMethod) и вещаются через HTTPS (Toncenter v2 jsonRPC sendBoc).
+v3 runGetMethod) и вещаются через HTTPS (Toncenter v2 jsonRPC sendBoc), а при
+включённом HTTP_TONAPI_FALLBACK отказ основного вещателя повторяется тем же
+подписанным BoC через TonAPI (/v2/blockchain/message) — второй провайдер на
+случай 429-лимита или недоступности Toncenter.
 
 Жизненный цикл строки и анти-дубль по memo не меняются: диспетчер перед
 повтором по-прежнему сверяется с историей исходящих.
@@ -18,7 +21,7 @@ from datetime import UTC, datetime
 
 from app.config import settings
 from app.http_utils import get_http_client
-from app.ton_codec import api_headers
+from app.ton_codec import api_headers, tonapi_headers
 
 from . import state
 from . import wallet as _wallet_pkg
@@ -125,33 +128,10 @@ async def http_get_wallet_seqno(wallet, *, address: str | None = None) -> int:
     return 0
 
 
-async def _http_broadcast_external(wallet, seqno: int, internal_msg) -> None:
-    """Подписывает внешнее сообщение оффлайн и вещает через Toncenter sendBoc.
-
-    internal_msg — одно внутреннее сообщение ИЛИ список сообщений: пачка
-    v5r1 несёт все переводы в out_list одного внешнего месседжа тем же
-    контрактным механизмом, что и одиночный перевод.
-    seqno == 0 (казна ещё не развёрнута) → сообщение несёт state_init и
-    деплоит кошелёк той же транзакцией. Возвращает None; неуспех — исключение
-    с текстом от провайдера.
-    """
-    messages = internal_msg if isinstance(internal_msg, list) else [internal_msg]
-    transfer_msg = wallet.raw_create_transfer_msg(
-        private_key=wallet.private_key,
-        seqno=seqno,
-        wallet_id=wallet.wallet_id,
-        messages=messages,
-    )
-    external = wallet.create_external_msg(
-        src=None,
-        dest=wallet.address,
-        state_init=wallet.state_init if seqno == 0 else None,
-        body=transfer_msg,
-    )
-    boc_b64 = base64.b64encode(external.serialize().to_boc()).decode()
+async def _send_boc_via_toncenter(client, boc_b64: str) -> None:
+    """sendBoc через Toncenter v2 jsonRPC. Неуспех — исключение с текстом."""
     url = f"{settings.active_toncenter_api_base.rstrip('/')}/api/v2/jsonRPC"
     headers = api_headers(settings.toncenter_api_key)
-    client = get_http_client()
     # Делаем так же, как в http_get_wallet_seqno: ищем патч через app.ton_pay,
     # чтобы monkeypatch.setattr(ton_pay, "http_post_with_retry", ...) работал.
     import app.ton_pay as _tp
@@ -169,6 +149,77 @@ async def _http_broadcast_external(wallet, seqno: int, internal_msg) -> None:
     if response.status_code != 200 or not data.get("ok"):
         reason = str((data.get("error") if isinstance(data, dict) else None) or response.text)
         raise RuntimeError(f"Toncenter не принял сообщение ({response.status_code}): {reason[:160]}")
+
+
+async def _send_boc_via_tonapi(client, boc_b64: str) -> None:
+    """Тот же BoC через TonAPI v2 — второй вещатель HTTP-канала.
+
+    Ключ уходит заголовком Authorization: Bearer (TonAPI не читает X-API-Key
+    и молча уходит в анонимный режим — см. tonapi_headers в ton_codec).
+    Успех — 200; отказ — 4xx/5xx с полем error/message в JSON-теле.
+    """
+    url = f"{settings.active_ton_api_base.rstrip('/')}/v2/blockchain/message"
+    headers = tonapi_headers(settings.ton_api_key)
+    import app.ton_pay as _tp
+
+    response = await _tp.http_post_with_retry(
+        client, url, json={"boc": boc_b64}, headers=headers
+    )
+    if response.status_code == 200:
+        return
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    reason = ""
+    if isinstance(data, dict):
+        reason = str(data.get("error") or data.get("message") or "")
+    raise RuntimeError(
+        f"TonAPI не принял сообщение ({response.status_code}): {(reason or response.text)[:160]}"
+    )
+
+
+async def _http_broadcast_external(wallet, seqno: int, internal_msg) -> None:
+    """Подписывает внешнее сообщение оффлайн и вещает через HTTP.
+
+    Основной вещатель — Toncenter sendBoc; при включённом HTTP_TONAPI_FALLBACK
+    его отказ повторяется тем же BoC через TonAPI. internal_msg — одно
+    внутреннее сообщение ИЛИ список сообщений: пачка v5r1 несёт все переводы
+    в out_list одного внешнего месседжа тем же контрактным механизмом, что и
+    одиночный перевод.
+    seqno == 0 (казна ещё не развёрнута) → сообщение несёт state_init и
+    деплоит кошелёк той же транзакцией. Возвращает None; неуспех — исключение
+    с текстом от провайдера(-ов).
+    """
+    messages = internal_msg if isinstance(internal_msg, list) else [internal_msg]
+    transfer_msg = wallet.raw_create_transfer_msg(
+        private_key=wallet.private_key,
+        seqno=seqno,
+        wallet_id=wallet.wallet_id,
+        messages=messages,
+    )
+    external = wallet.create_external_msg(
+        src=None,
+        dest=wallet.address,
+        state_init=wallet.state_init if seqno == 0 else None,
+        body=transfer_msg,
+    )
+    boc_b64 = base64.b64encode(external.serialize().to_boc()).decode()
+    client = get_http_client()
+    try:
+        await _send_boc_via_toncenter(client, boc_b64)
+    except Exception as exc:
+        if not settings.http_tonapi_fallback:
+            raise
+        logger.warning(
+            "Toncenter не принял сообщение (%s) — повторяю вещание через TonAPI", exc
+        )
+        try:
+            await _send_boc_via_tonapi(client, boc_b64)
+        except Exception as tonapi_exc:
+            raise RuntimeError(
+                f"вещание не принято ни одним провайдером: {exc}; TonAPI: {tonapi_exc}"
+            ) from tonapi_exc
 
 
 async def _send_ton_transfer_http(dest_address: str, amount_nanotons: int, comment: str) -> str:

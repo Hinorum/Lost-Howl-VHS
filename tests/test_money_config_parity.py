@@ -49,6 +49,10 @@ MONEY_LEVERS = (
     # «в render.yaml true, в коде false» — та же тихая дивергенция копий,
     # ради которой этот тест и существует.
     ("PAYOUT_V5_BATCH", "payout_v5_batch"),
+    # Второй вещатель HTTP-канала — тоже выключатель денежного пути: при
+    # «render.yaml true, код false» отказавший Toncenter не будет продублирован
+    # через TonAPI, и выплаты встанут там, где задумано было не вставать.
+    ("HTTP_TONAPI_FALLBACK", "http_tonapi_fallback"),
 )
 
 

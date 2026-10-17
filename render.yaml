@@ -121,6 +121,11 @@ services:
         value: https://testnet.toncenter.com
       - key: TONCENTER_API_KEY
         sync: false
+      # Второй вещатель HTTP-канала: отказ Toncenter (429-лимит, 5xx, сеть) —
+      # тот же подписанный BoC повторяется через TonAPI. false — прежнее
+      # поведение: отказ Toncenter уходит наружу как есть.
+      - key: HTTP_TONAPI_FALLBACK
+        value: "false"
       - key: STAKE_MIN_TON
         value: "0.5"
       - key: OWNER_RAKE_PCT
