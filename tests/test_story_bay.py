@@ -31,7 +31,6 @@ from app.story.bay import (
 def _day(index: int) -> dict:
     return {
         "day_index": index,
-        "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
         "chapter_text": "Стая собирается у котла и смотрит на рельсы.",
         "dilemma": f"Что решит день {index}?",

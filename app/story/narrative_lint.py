@@ -7,14 +7,14 @@
 (находка анализа ядра кассет).
 
 Замечания — не гейт: схема чиста, а редакционные накопления (дубли
-станций, эхо-пересказ канона, штампы, обвал ротации тегов) замечает
+заголовков дней, эхо-пересказ канона, штампы, обвал ротации тегов) замечает
 только человек. CLI по умолчанию печатает и выходит с 0, `--strict`
 валит процесс для редакционного прогона; панель только показывает.
 
 Проверки (промпт §4 редактора):
 * ротация — каждая стратегия care/dare/trick сидит в каждой позиции
   не меньше N/12 дней и не держится в позиции три дня подряд;
-* дубли — станции и имена карт внутри дороги не повторяются;
+* дубли — заголовки дней и имена карт внутри дороги не повторяются;
 * эхо — `prev` докладывает, ЧТО изменилось, а не пересказывает канон;
 * штампы — ≤1 «как будто/будто» на день, ≤2 «впервые» на месяц.
 """
@@ -71,18 +71,18 @@ def _plural_days(count: int) -> str:
 
 
 def _duplicate_warnings(cassette: Cassette) -> list[str]:
-    """Дубли внутри дороги: станции и имена карт не повторяются (промпт §4)."""
+    """Дубли внутри дороги: заголовки дней и имена карт не повторяются (промпт §4)."""
     warnings: list[str] = []
     for road, days in _roads(cassette):
-        stations: dict[str, int] = {}
+        headers: dict[str, int] = {}
         for day in days:
-            if day.station in stations:
+            if day.chapter_title in headers:
                 warnings.append(
-                    f"дубль станции ({road}): «{day.station}» в дни "
-                    f"{stations[day.station]} и {day.day_index}"
+                    f"дубль заголовка дня ({road}): «{day.chapter_title}» в дни "
+                    f"{headers[day.chapter_title]} и {day.day_index}"
                 )
             else:
-                stations[day.station] = day.day_index
+                headers[day.chapter_title] = day.day_index
         titles: dict[str, list[int]] = {}
         for day in days:
             for card in day.cards:
@@ -158,7 +158,7 @@ def _style_warnings(cassette: Cassette) -> list[str]:
     first_time_days: list[int] = []
     for road, days in _roads(cassette):
         for day in days:
-            fields = [day.chapter_title, day.chapter_text, day.station]
+            fields = [day.chapter_title, day.chapter_text]
             if day.dilemma:
                 fields.append(day.dilemma)
             if day.diary:

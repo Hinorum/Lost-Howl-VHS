@@ -44,7 +44,6 @@ FIELD_LIMITS = {
     "dilemma": 400,
     "card_title": 80,
     "card_consequence": 220,
-    "attribution": 200,
     "track_name": 32,
     "diary": 200,
     "prev_value": 160,
@@ -99,9 +98,8 @@ def _prev_overlap(left: str, right: str) -> float:
 
 
 # Стоп-слова: реальные бренды/криптобиржи/обещания дохода. Канон «Lost Dogs:
-# The Way» (Догтаун, имена персонажей) ДОЗВОЛЕН: кассеты — открытый фанфик,
-# его обязательное клеймо живёт в attribution. Эвристика — подстрока в нижнем
-# регистре; совпадение = кассета отвергнута.
+# The Way» (Догтаун, имена персонажей) ДОЗВОЛЕН: кассеты — открытый фанфик.
+# Эвристика — подстрока в нижнем регистре; совпадение = кассета отвергнута.
 TABOO_WORDS = (
     "woof",
     "notcoin",
@@ -148,10 +146,9 @@ class CardModel(BaseModel):
 
 
 class DayModel(BaseModel):
-    """Один день пути: станция, глава и ровно три карты голосования."""
+    """Один день пути: глава и ровно три карты голосования."""
 
     day_index: int = Field(ge=1)
-    station: str = Field(min_length=1)
     chapter_title: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_title"])
     chapter_text: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_text"])
     dilemma: str = Field(
@@ -227,14 +224,12 @@ class Cassette(BaseModel):
 
     `days` — главная дорога (main) на весь месяц. `switch` — перемотки:
     альтернативные дороги, которые включаются, только если по итогам дня
-    до развилки движок отдал нужную карту. `attribution` — клеймо плёнки
-    (фанатский фанфик, не канон).
+    до развилки движок отдал нужную карту.
     """
 
     cassette_id: str = Field(min_length=1)
     month: str
     title: str = Field(min_length=1)
-    attribution: str | None = Field(default=None, max_length=FIELD_LIMITS["attribution"])
     switch: list[SwitchModel] = Field(default_factory=list)
     days: list[DayModel]
 
@@ -487,7 +482,7 @@ def _taboo_hits(cassette: Cassette) -> list[str]:
     for fork in cassette.switch:
         all_days.extend(fork.days)
     for day in all_days:
-        parts = [day.chapter_title, day.chapter_text, day.station]
+        parts = [day.chapter_title, day.chapter_text]
         if day.dilemma:
             parts.append(day.dilemma)
         for card in day.cards:
@@ -523,10 +518,6 @@ def validate_payload(payload: dict) -> ValidationResult:
     warnings.extend(cassette.dead_prev_warnings())
     warnings.extend(cassette.prev_alignment_warnings())
     warnings.extend(cassette.style_warnings())
-    if not (cassette.attribution or "").strip():
-        warnings.append(
-            "attribution не указано — клеймо плёнки-фанфика («по мотивам …») желательно"
-        )
     return ValidationResult(cassette=cassette, errors=[], warnings=warnings)
 
 

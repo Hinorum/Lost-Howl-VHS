@@ -22,7 +22,6 @@ def _day(index: int, chapter: str | None = None) -> dict:
     chapter = chapter or f"Глава {index}"
     return {
         "day_index": index,
-        "station": f"Колодец {index}",
         "chapter_title": chapter,
         "chapter_text": "Стая слушает шорох плёнки.",
         "dilemma": "Что ответит стая шороху?",
@@ -55,7 +54,6 @@ def _fork_payload() -> dict:
         "cassette_id": "fork-kasseta",
         "month": "2026-11",
         "title": "Перемотанная плёнка",
-        "attribution": "фанатская плёнка по мотивам «Lost Dogs: The Way»",
         "switch": [
             {
                 "to": "b",
@@ -73,7 +71,6 @@ def test_valid_fork_passes() -> None:
     assert result.cassette is not None, result.errors
     cassette = result.cassette
     assert cassette is not None
-    assert cassette.attribution
     assert cassette.switch[0].to == "b"
     assert len(cassette.switch[0].days) == 23  # 8..30
 

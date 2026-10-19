@@ -49,7 +49,6 @@ def _mk_cassette(
     days = [
         {
             "day_index": i,
-            "station": f"станция {i}",
             "chapter_title": f"глава {i}",
             "chapter_text": f"текст {i}",
             "dilemma": f"Что решит день {i}?",
@@ -65,7 +64,6 @@ def _mk_cassette(
         "cassette_id": "mel.json".removesuffix(".json"),
         "month": month,
         "title": "Метель",
-        "attribution": "Фанфик по мотивам.",
         "days": days,
         "switch": [
             {
@@ -860,7 +858,7 @@ async def test_back_returns_to_library(monkeypatch, tmp_path) -> None:
 async def test_cassette_menu_shows_narrative_lint(monkeypatch, tmp_path) -> None:
     """Меню библиотеки показывает повествовательный линт — раньше он жил только в CLI.
 
-    Схема дубль станции не считает (редакционный признак), поэтому без
+    Схема дубль заголовка дня не считает (редакционный признак), поэтому без
     narrative_lint панель молчала о таких замечаниях вовсе: 35 замечаний
     октябрьской кассеты существовали вне бота.
     """
@@ -868,13 +866,13 @@ async def test_cassette_menu_shows_narrative_lint(monkeypatch, tmp_path) -> None
 
     source = _enable_library(monkeypatch, tmp_path)
     payload = json.loads(source.read_text(encoding="utf-8"))
-    payload["days"][1]["station"] = payload["days"][0]["station"]
+    payload["days"][1]["chapter_title"] = payload["days"][0]["chapter_title"]
     source.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     callback = _make_callback("cassette:back")
     await panel_mod.on_cassette_action(callback)
     text = callback.message.edit_text.call_args.args[0]
     assert "повествовательный линт" in text
-    assert "дубль станции" in text, "каждый непустой разряд показывает свой пример"
+    assert "дубль заголовка дня" in text, "каждый непустой разряд показывает свой пример"
     assert "ротация" in text
     assert "… и ещё" in text, "хвост списка свёрнут, а не потерян молча"
 

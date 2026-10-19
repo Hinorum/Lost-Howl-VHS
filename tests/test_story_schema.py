@@ -21,7 +21,6 @@ from app.story.schema import (
 def _day(index: int, **overrides) -> dict:
     data = {
         "day_index": index,
-        "station": f"Станция {index}",
         "chapter_title": f"Глава {index}",
         "chapter_text": "Стая собирается у котла. Огонь лижет бак, дождь трогает крыши. Пути ждут до рассвета.",
         "dilemma": "Куда пойдёт стая на рассвете?",
@@ -159,13 +158,15 @@ def test_taboo_word_rejected() -> None:
     assert any("стоп-слова" in error for error in result.errors)
 
 
-def test_missing_attribution_is_soft_warning() -> None:
-    """Отсутствие клейма (attribution) — warning, а не ошибка (см. промпт §5)."""
-    result = validate_payload(_payload("2026-04", 30))
+def test_unknown_fields_are_ignored() -> None:
+    """Лишние ключи JSON валидатор игнорирует (промпт §9)."""
+    payload = _payload("2026-04", 30)
+    payload["attribution"] = "старое поле"
+    payload["days"][0]["station"] = "старая станция"
+    result = validate_payload(payload)
     assert result.cassette is not None
-    assert result.cassette is not None
-    assert not (result.cassette.attribution or "").strip()
-    assert any("attribution" in warning for warning in result.warnings)
+    assert not hasattr(result.cassette, "attribution")
+    assert not hasattr(result.cassette.days[0], "station")
 
 
 def test_field_limits_tighten_to_display() -> None:

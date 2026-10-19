@@ -165,7 +165,6 @@ def _valid_cassette_text() -> bytes:
     days = [
         {
             "day_index": index,
-            "station": f"станция {index}",
             "chapter_title": f"глава {index}",
             "chapter_text": f"текст {index}",
             "dilemma": f"Что решит день {index}?",

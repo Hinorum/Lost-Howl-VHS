@@ -27,7 +27,6 @@ def _mk_cassette(month: str = "2026-02", days_n: int = 28) -> dict:
         days.append(
             {
                 "day_index": i,
-                "station": f"станция {i}",
                 "chapter_title": f"глава {i}",
                 "chapter_text": f"текст {i}",
                 "dilemma": f"Что решит день {i}?",
@@ -42,7 +41,6 @@ def _mk_cassette(month: str = "2026-02", days_n: int = 28) -> dict:
         "cassette_id": "testovaya",
         "month": month,
         "title": "Тестовая",
-        "attribution": "Фанфик по мотивам.",
         "days": days,
         "switch": [
             {
@@ -142,7 +140,6 @@ def test_dump_day_view_is_readable(tmp_path, capsys) -> None:
     assert cassette is not None
     day1 = cassette.days[0]
     assert f"День {day1.day_index}" in out
-    assert day1.station in out
     assert day1.chapter_title in out
     assert day1.cards[0].title in out
     assert day1.cards[0].consequence in out
@@ -272,7 +269,7 @@ def test_patch_check_validates_without_write(tmp_path) -> None:
 
 def _clean_cassette_payload(month: str = "2026-12", n: int = 31) -> dict:
     """Ротационно-чистая кассета: стратегии циклят по позициям без залипаний,
-    станции/имена уникальны, эхо не пересказывает канон, штампов нет."""
+    заголовки/имена уникальны, эхо не пересказывает канон, штампов нет."""
     tags = _TAGS_CYCLE
     days = []
     for i in range(1, n + 1):
@@ -280,7 +277,6 @@ def _clean_cassette_payload(month: str = "2026-12", n: int = 31) -> dict:
         days.append(
             {
                 "day_index": i,
-                "station": f"станция {i}",
                 "chapter_title": f"глава {i}",
                 "chapter_text": f"текст {i}",
                 "dilemma": f"Что решит день {i}?",
@@ -304,7 +300,6 @@ def _clean_cassette_payload(month: str = "2026-12", n: int = 31) -> dict:
         "cassette_id": "chistaya",
         "month": month,
         "title": "Чистая",
-        "attribution": "Фанфик по мотивам.",
         "days": days,
     }
 
@@ -345,16 +340,16 @@ def test_lint_rotation_underuse_warns() -> None:
     assert any("позиции 2" in warning and "dare" in warning for warning in warnings)
 
 
-def test_lint_duplicate_station_and_title_warn() -> None:
+def test_lint_duplicate_header_and_title_warn() -> None:
     from app.story.schema import validate_payload
 
     payload = _clean_cassette_payload()
-    payload["days"][1]["station"] = payload["days"][0]["station"]
+    payload["days"][1]["chapter_title"] = payload["days"][0]["chapter_title"]
     payload["days"][1]["cards"][0]["title"] = payload["days"][0]["cards"][0]["title"]
     cassette = validate_payload(payload).cassette
     assert cassette is not None
     warnings = cassette_tool.lint_warnings(cassette)
-    assert any("дубль станции" in warning for warning in warnings)
+    assert any("дубль заголовка дня" in warning for warning in warnings)
     assert any("дубль имени карты" in warning for warning in warnings)
 
 
@@ -390,7 +385,7 @@ def test_lint_cli_reports_and_strict_exit(tmp_path) -> None:
 
     ke = tmp_path / "linty.json"
     payload = _clean_cassette_payload()
-    payload["days"][0]["station"] = payload["days"][1]["station"]  # дубль станции
+    payload["days"][0]["chapter_title"] = payload["days"][1]["chapter_title"]  # дубль заголовка
     ke.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     assert _run("lint", str(ke)) == 0
     assert _run("lint", str(ke), "--strict") == 1
