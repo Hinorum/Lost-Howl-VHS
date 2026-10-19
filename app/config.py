@@ -347,7 +347,7 @@ class Settings(BaseSettings):
     world_name: str = "LOST HOWL"
 
     # Каталог библиотеки сюжетных кассет (*.json, стандарт
-    # docs/lost_howl_prompts.md). Пусто — библиотека в app/story/cassettes/.
+    # docs/Lost Howl VHS.md). Пусто — библиотека в app/story/cassettes/.
     # Это КЭШ-зеркало: источник правды — таблица story_cassettes (app/story/store.py),
     # потому что на Render диск эфемерен и правки /panel не переживали рестарт.
     story_cassettes_dir: str = ""

@@ -310,7 +310,7 @@ CI enforced: `--cov-fail-under=88` (при последнем замере 92 %)
    обязана быть идемпотентно-применимой (см. `legacy_convergence` как образец).
 2. Новый Telegram-команды → `app/handlers/...` + регистрация роутера в `app/main.py`.
 3. Новая механика дня → `app/rounds/` (state-machine) + UI в `handlers/panel.py`.
-4. Новая кассета → JSON в `app/story/cassettes/` по контракту `docs/lost_howl_prompts.md`,
+4. Новая кассета → JSON в `app/story/cassettes/` по контракту `docs/Lost Howl VHS.md`,
    валидация через `python -m scripts.cassette_tool lint path.json`.
 5. Любое изменение в пакетах `ton_pay/` или `ton_watch/` — обязательно
    `scripts/e2e_testnet.py` на testnet перед мержем.
