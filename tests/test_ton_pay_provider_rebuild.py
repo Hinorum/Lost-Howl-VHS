@@ -123,6 +123,9 @@ def _setup_treasury(monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setattr(settings, "treasury_testnet_mnemonic", " ".join(words))
     monkeypatch.setattr(settings, "treasury_testnet_address", address)
     monkeypatch.setattr(settings, "treasury_wallet_version", "v5r1")
+    # URL конфига лайтсерверов из .env разработчика не должен подменять
+    # ветку from_testnet_config: тест про пересборку пула, а не про URL.
+    monkeypatch.setattr(settings, "liteserver_config_url", "")
     monkeypatch.setattr(ton_pay.state, "_batch_seqno", None)
     monkeypatch.setattr(ton_pay.state, "_http_channel_engaged_at", None)
     return address
