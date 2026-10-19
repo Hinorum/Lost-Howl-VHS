@@ -11,6 +11,7 @@
 """
 
 import logging
+from pathlib import Path
 
 import pytest
 from sqlalchemy import delete
@@ -234,3 +235,64 @@ async def test_persist_backup_refuses_missing_or_broken_snapshot(library) -> Non
     _payload, edited_at, backup = await _row(name)
     assert backup is None
     assert edited_at is None
+
+
+async def test_delete_removes_file_backup_and_row(library) -> None:
+    """Удаление из /panel убирает пару «файл + слепок + строка»: воскрешать нечем."""
+    name = "store-del-2099-13.json"
+    _write_cassette(library, name, "2099-10", 31, "del")
+    await store.bootstrap()
+    assert await _row(name) is not None, "предусловие: строка поднялась"
+    (library / f"{name}.bak").write_text("{}", encoding="utf-8")
+
+    result = await store.delete(name)
+
+    assert (result.file_gone, result.row_gone) == (True, True)
+    assert not (library / name).exists()
+    assert not (library / f"{name}.bak").exists()
+    assert await _row(name) is None
+
+
+async def test_delete_keeps_row_when_file_not_removable(library, monkeypatch) -> None:
+    """Диск не отдал файл — строку не трогаем: иначе sync вернёт файл обратно."""
+    name = "store-del-2099-14.json"
+    _write_cassette(library, name, "2099-11", 30, "stuck")
+    await store.bootstrap()
+    assert await _row(name) is not None, "предусловие: строка поднялась"
+
+    def boom(self, *args, **kwargs):
+        raise OSError("диск занят")
+
+    monkeypatch.setattr(Path, "unlink", boom)
+
+    result = await store.delete(name)
+
+    assert result.file_gone is False
+    assert (library / name).exists()
+    assert await _row(name) is not None, "живая строка обязана остаться с файлом"
+
+
+async def test_delete_with_disabled_flag_touches_only_file(library, monkeypatch) -> None:
+    """STORY_CASSETTES_DB=false: источник правды — диск, строку не читаем."""
+    name = "store-del-2099-15.json"
+    _write_cassette(library, name, "2099-12", 31, "off")
+    await store.bootstrap()
+    assert await _row(name) is not None, "предусловие: строка поднялась"
+    monkeypatch.setattr(settings, "story_cassettes_db", False)
+
+    result = await store.delete(name)
+
+    assert (result.file_gone, result.row_gone) == (True, True)
+    assert not (library / name).exists()
+    assert await _row(name) is not None, "выключенный флаг: базу не трогаем"
+
+
+async def test_delete_rejects_unsafe_name(library) -> None:
+    """Имя с выходом из каталога: ни файла, ни строки, без исключений."""
+    outside = library.parent / "evil-2099-16.json"
+    outside.write_text("{}", encoding="utf-8")
+
+    result = await store.delete("../evil-2099-16.json")
+
+    assert (result.file_gone, result.row_gone) == (False, False)
+    assert outside.is_file()

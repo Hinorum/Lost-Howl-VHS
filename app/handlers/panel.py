@@ -648,6 +648,10 @@ async def _cassette_keyboard() -> InlineKeyboardMarkup:
                     text="🎞",
                     callback_data=f"cassette:scene:{entry.file_name}",
                 ),
+                InlineKeyboardButton(
+                    text="🗑",
+                    callback_data=f"cassette:del:{entry.file_name}",
+                ),
             ]
         )
     if next_name:
@@ -736,6 +740,29 @@ def _new_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [_cb("⏹ Отменить", "cassette:stop")],
+            [_cb("🔙 К библиотеке", "cassette:back")],
+        ]
+    )
+
+
+def _delete_text(entry: LibraryEntry) -> str:
+    """Экран подтверждения удаления: что исчезнет и чем это необратимо."""
+    cassette = entry.cassette
+    assert cassette is not None
+    return (
+        f"🗑 <b>Удалить «{cassette.title}»?</b>\n"
+        f"Файл: {entry.file_name} · {cassette.month} · {len(cassette.days)} дней\n\n"
+        "Кассета уйдёт из зеркала и из строки базы — иначе она вернулась бы "
+        "при следующем старте. Восстановить можно только повторным коммитом "
+        "в репозиторий."
+    )
+
+
+def _delete_keyboard(file_name: str) -> InlineKeyboardMarkup:
+    """Кнопки подтверждения удаления: удалить или вернуться без изменений."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_cb("🗑 Удалить", f"cassette:delok:{file_name}")],
             [_cb("🔙 К библиотеке", "cassette:back")],
         ]
     )
@@ -1098,6 +1125,45 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 else "Кассета восстановлена в кэш, но не в базу — правка "
                 "пропадёт при рестарте."
             )
+            return
+        elif op == "del":
+            entry = _library_entry(file_name)
+            if entry is None or entry.cassette is None:
+                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
+                return
+            await callback.message.edit_text(
+                _delete_text(entry),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_delete_keyboard(file_name),
+            )
+        elif op == "delok":
+            result = await story_store.delete(file_name, default_cassettes_dir())
+            if not result.file_gone:
+                await callback.answer(
+                    "Файл не удалился (см. лог бота) — кассета на месте.",
+                    show_alert=True,
+                )
+                return
+            # Указатели на удалённую плёнку: «следующая» и намерение правки.
+            # Иначе меню назначало бы призрака, а документ уходил бы в никуда.
+            async with SessionLocal() as session:
+                if await get_next_cassette(session) == file_name:
+                    await set_next_cassette(session, None)
+                edit_file, _unused = await get_edit_intent(session)
+                if edit_file == file_name:
+                    await clear_edit_intent(session)
+                text = await _cassette_menu_text(session)
+            await callback.message.edit_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
+            )
+            if result.row_gone:
+                await callback.answer("Кассета удалена из зеркала и базы.")
+            else:
+                await callback.answer(
+                    "Файл удалён, но строка в базе осталась — кассета вернётся "
+                    "зеркалом в течение минуты.",
+                    show_alert=True,
+                )
             return
         elif op == "stop":
             async with SessionLocal() as session:

@@ -25,6 +25,9 @@
 * **Правка** из `/panel` пишет в каталог (как раньше) и следом сохраняет
   результат в базу, ставя `edited_at`. Если процесс убьют между этими
   шагами, максимум теряется одна правка, а не библиотека.
+* **Удаление** из `/panel` убирает пару «файл + строка» (`delete`): одного
+  unlink мало — bootstrap вернул бы файл в базу (`_adopt_disk`), одной
+  строки мало — она вернула бы файл зеркалом.
 * **Отказ базы не валит сюжет**: `bootstrap`/`persist` логируют ошибку и
   оставляют движок на диске (fail-open — как и при битой кассете). При этом
   `/panel` говорит хранителю, что правка ушла только в кэш.
@@ -101,6 +104,14 @@ class SyncResult:
     written: int = 0
     removed: int = 0
     failed: bool = False
+
+
+@dataclass
+class DeleteResult:
+    """Итог удаления кассеты: что убрано и чем её может воскресить система."""
+
+    file_gone: bool = False
+    row_gone: bool = False
 
 
 class _Row(NamedTuple):
@@ -301,6 +312,57 @@ async def sync_from_db() -> SyncResult:
                 result.removed += 1
             except OSError:
                 result.failed = True
+    return result
+
+
+async def delete(file_name: str, directory: Path | None = None) -> DeleteResult:
+    """Удалить кассету из зеркала и базы — чтобы её нечем было воскресить.
+
+    Порядок жёсткий: сначала файл (+ слепок), потом строка.
+    * Файл не удалился (сбой диска) — строку не трогаем: живая строка
+      выложит файл обратно ближайшим тактом story-sync, и «удаление»
+      оказалось бы видимостью;
+    * строка не удалилась (сбой базы) — честный отчёт вызывающему: файл
+      вернётся зеркалом в течение минуты, пока строка жива;
+    * при выключенном STORY_CASSETTES_DB базы нет вовсе — источник правды
+      диск, строку считать удалённой.
+
+    Отдельная тонкость, из-за которой простое unlink-из-репозитория не
+    работает: bootstrap() принимает файлы каталога в базу (_adopt_disk),
+    поэтому удалять надо именно пару «файл + строка», а не файл.
+    """
+    result = DeleteResult()
+    if not is_safe_cassette_name(file_name):
+        logger.error("Кассета %s: недопустимое имя — не удаляем", file_name)
+        return result
+    directory = directory or default_cassettes_dir()
+    path = directory / file_name
+    try:
+        backup = path.with_name(path.name + _BACKUP_SUFFIX)
+        if backup.is_file():
+            backup.unlink()
+        if path.is_file():
+            path.unlink()
+        result.file_gone = not path.exists()
+    except OSError:
+        logger.exception("Кассета %s не удалилась с диска — строку не трогаем", file_name)
+        return result
+    if not enabled():
+        result.row_gone = True
+        logger.info("Кассета %s удалена из каталога (база кассет выключена)", file_name)
+        return result
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(StoryCassette, file_name)
+            if row is not None:
+                await session.delete(row)
+                await session.commit()
+        result.row_gone = True
+        logger.info("Кассета %s удалена: зеркало и строка", file_name)
+    except Exception:
+        logger.exception(
+            "Строка кассеты %s не удалилась — файл вернётся зеркалом", file_name
+        )
     return result
 
 

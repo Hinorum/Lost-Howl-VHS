@@ -26,6 +26,7 @@ from app.story import editor as ed
 from app.story.bay import (
     clear_edit_intent,
     get_edit_intent,
+    get_next_cassette,
     set_edit_intent,
     set_next_cassette,
     today_road,
@@ -638,6 +639,58 @@ async def test_restore_callback_without_backup(monkeypatch, tmp_path) -> None:
     callback = _make_callback("cassette:restore:mel.json")
     await panel_mod.on_cassette_action(callback)
     assert "Бэкапа" in callback.answer.call_args.args[0]
+
+
+async def test_library_menu_has_delete_button(monkeypatch, tmp_path) -> None:
+    """В списке библиотеки у каждой плёнки есть 🗑 — вход в удаление."""
+    _enable_library(monkeypatch, tmp_path)
+    callback = _make_callback("cassette:back")
+    await panel_mod.on_cassette_action(callback)
+    labels = _flat(callback.message.edit_text.call_args.kwargs["reply_markup"])
+    assert "🗑" in labels
+
+
+async def test_delete_callback_confirms_then_removes(monkeypatch, tmp_path) -> None:
+    """🗑 → подтверждение → удаление: файл уходит, меню честно пустеет."""
+    source = _enable_library(monkeypatch, tmp_path)
+
+    confirm = _make_callback("cassette:del:mel.json")
+    await panel_mod.on_cassette_action(confirm)
+    text = confirm.message.edit_text.call_args.args[0]
+    assert "Удалить" in text and "mel.json" in text
+    labels = _flat(confirm.message.edit_text.call_args.kwargs["reply_markup"])
+    assert "🗑 Удалить" in labels
+    assert "🔙 К библиотеке" in labels
+    assert source.is_file(), "экран подтверждения ничего не удаляет"
+
+    ok = _make_callback("cassette:delok:mel.json")
+    await panel_mod.on_cassette_action(ok)
+    assert not source.exists()
+    assert "пуста" in ok.message.edit_text.call_args.args[0]
+    assert "удалена" in ok.answer.call_args.args[0]
+
+
+async def test_delete_clears_pointer_and_edit_intent(monkeypatch, tmp_path) -> None:
+    """Указатели на удалённую плёнку снимаются: «следующая» и ждущая правка."""
+    _enable_library(monkeypatch, tmp_path)
+    async with SessionLocal() as session:
+        await set_next_cassette(session, "mel.json")
+        await set_edit_intent(session, "mel.json", "day")
+
+    callback = _make_callback("cassette:delok:mel.json")
+    await panel_mod.on_cassette_action(callback)
+
+    assert not (tmp_path / "mel.json").exists(), "файл удалён"
+    async with SessionLocal() as session:
+        assert await get_next_cassette(session) is None
+        assert await get_edit_intent(session) == (None, None)
+
+
+async def test_delete_confirm_rejects_unknown_file(monkeypatch, tmp_path) -> None:
+    _enable_library(monkeypatch, tmp_path)
+    callback = _make_callback("cassette:del:ghost.json")
+    await panel_mod.on_cassette_action(callback)
+    assert "нет в библиотеке" in callback.answer.call_args.args[0]
 
 
 async def test_snapshot_callback_takes_backup_without_edit(monkeypatch, tmp_path) -> None:
