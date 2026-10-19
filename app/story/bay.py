@@ -35,7 +35,7 @@ from app.core.registry import (
     STORY_CASSETTE_EDIT_KEY,
     STORY_CASSETTE_NEXT_KEY,
 )
-from app.story.schema import Cassette, DayModel, validate_file
+from app.story.schema import Cassette, validate_file
 
 logger = logging.getLogger(__name__)
 
@@ -188,20 +188,36 @@ async def _decision_day_winner(session, decision: date) -> int | None:
     return int(row.winner_card) if row is not None else None
 
 
-async def _prev_echo(session, today: date, day: DayModel) -> str:
-    """Эхо вчерашнего выбора (поле `prev` дня): как стая вспомнит канон.
+async def _prev_echo(session, today: date) -> str:
+    """Эхо вчерашнего выбора: канон победившей карты дня N−1.
 
-    Отвечает на вопрос «когда следующий день знает о предыдущем»: здесь, при
-    рендере дня N — ровно по закрытому кадру дня N−1 (winner_card движка).
-    Победителя нет / эха под него нет / день первый — пусто (fail-open).
+    При рендере дня N берём вчерашний закрытый кадр движка, а из него — его
+    `day_index`, по которому в StoryBeat записан `winning_text`: consequence
+    победившей карты. Победителя нет / канона нет / день первый — пусто
+    (fail-open).
     """
-    if not day.prev or today.day <= 1:
+    if today.day <= 1:
         return ""
+    from sqlalchemy import select
+
+    from app.models import Round, StoryBeat
+
     yesterday = today - timedelta(days=1)
-    winner = await _decision_day_winner(session, yesterday)
-    if winner in day.prev:
-        return day.prev[winner].strip()
-    return ""
+    row = await session.scalar(
+        select(Round)
+        .where(
+            Round.opens_at >= yesterday,
+            Round.opens_at < today,
+            Round.winner_card.is_not(None),
+        )
+        .order_by(Round.id.desc())
+    )
+    if row is None:
+        return ""
+    text = await session.scalar(
+        select(StoryBeat.winning_text).where(StoryBeat.day_index == row.day_index)
+    )
+    return (text or "").strip()
 
 
 async def day_diary(session, round_row) -> str:
@@ -364,7 +380,7 @@ async def _plan_and_render(
     )
     chapter_text = day.chapter_text
     try:
-        echo = await _prev_echo(session, today, day)
+        echo = await _prev_echo(session, today)
         if echo:
             chapter_text = f"{echo}\n\n{chapter_text}"
     except Exception:

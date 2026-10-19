@@ -269,7 +269,7 @@ def test_patch_check_validates_without_write(tmp_path) -> None:
 
 def _clean_cassette_payload(month: str = "2026-12", n: int = 31) -> dict:
     """Ротационно-чистая кассета: стратегии циклят по позициям без залипаний,
-    заголовки/имена уникальны, эхо не пересказывает канон, штампов нет."""
+    заголовки/имена уникальны, штампов нет."""
     tags = _TAGS_CYCLE
     days = []
     for i in range(1, n + 1):
@@ -280,11 +280,6 @@ def _clean_cassette_payload(month: str = "2026-12", n: int = 31) -> dict:
                 "chapter_title": f"глава {i}",
                 "chapter_text": f"текст {i}",
                 "dilemma": f"Что решит день {i}?",
-                "prev": (
-                    {p: "Мимо след вчерашнего дня" for p in (0, 1, 2)}
-                    if i > 1
-                    else None
-                ),
                 "cards": [
                     {
                         "position": p,
@@ -351,18 +346,6 @@ def test_lint_duplicate_header_and_title_warn() -> None:
     warnings = cassette_tool.lint_warnings(cassette)
     assert any("дубль заголовка дня" in warning for warning in warnings)
     assert any("дубль имени карты" in warning for warning in warnings)
-
-
-def test_lint_echo_retelling_consequence_warns() -> None:
-    from app.story.schema import validate_payload
-
-    payload = _clean_cassette_payload()
-    yester = payload["days"][0]
-    payload["days"][1]["prev"] = {0: yester["cards"][0]["consequence"]}
-    cassette = validate_payload(payload).cassette
-    assert cassette is not None
-    warnings = cassette_tool.lint_warnings(cassette)
-    assert any("пересказывает канон" in warning for warning in warnings)
 
 
 def test_lint_style_antipatterns_warn() -> None:

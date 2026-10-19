@@ -1,4 +1,4 @@
-"""Повествовательный линт кассет: ротация, дубли, эхо, штампы.
+"""Повествовательный линт кассет: ротация, дубли, штампы.
 
 Ядро одно на двух клиентов: CLI хранителя (`cassette_tool lint`, та же
 команда гоняется в CI) и панель `/cassette`. Раньше линт жил только в
@@ -7,7 +7,7 @@
 (находка анализа ядра кассет).
 
 Замечания — не гейт: схема чиста, а редакционные накопления (дубли
-заголовков дней, эхо-пересказ канона, штампы, обвал ротации тегов) замечает
+заголовков дней, штампы, обвал ротации тегов) замечает
 только человек. CLI по умолчанию печатает и выходит с 0, `--strict`
 валит процесс для редакционного прогона; панель только показывает.
 
@@ -15,7 +15,6 @@
 * ротация — каждая стратегия care/dare/trick сидит в каждой позиции
   не меньше N/12 дней и не держится в позиции три дня подряд;
 * дубли — заголовки дней и имена карт внутри дороги не повторяются;
-* эхо — `prev` докладывает, ЧТО изменилось, а не пересказывает канон;
 * штампы — ≤1 «как будто/будто» на день, ≤2 «впервые» на месяц.
 """
 
@@ -95,61 +94,6 @@ def _duplicate_warnings(cassette: Cassette) -> list[str]:
     return warnings
 
 
-def _echo_retells(echo: str, consequence: str) -> bool:
-    """Эхо (prev) — последствие, а не пересказ канона: редакционный признак."""
-    left = " ".join(echo.lower().split())
-    right = " ".join(consequence.lower().split())
-    if not left or not right:
-        return False
-    if left in right or right in left:
-        return True
-    words_l = set(left.split())
-    words_r = set(right.split())
-    if len(words_l) >= 4 and words_l & words_r and len(words_l & words_r) / len(words_l) > 0.8:
-        return True
-    return False
-
-
-def _consequence_for(day: DayModel, position: int) -> str | None:
-    for card in day.cards:
-        if card.position == position:
-            return card.consequence
-    return None
-
-
-def _echo_warnings(cassette: Cassette) -> list[str]:
-    """prev докладывает, ЧТО изменилось после выбора, а не повторяет его текст."""
-    warnings: list[str] = []
-    main = list(cassette.days)
-    by_road = {"main": main}
-    for fork in cassette.switch:
-        by_road[fork.to] = list(fork.days)
-    forks = {"main": None, **{fork.to: fork for fork in cassette.switch}}
-    for road, days in by_road.items():
-        for i, day in enumerate(days):
-            if not day.prev:
-                continue
-            if i == 0 and road == "main":
-                continue  # первый день месяца — без эха
-            if i >= 1:
-                yester = days[i - 1]
-            else:
-                fork = forks[road]
-                idx = fork.at_day - 2
-                if not 0 <= idx < len(main):
-                    continue
-                yester = main[idx]
-            for position, echo in day.prev.items():
-                consequence = _consequence_for(yester, position)
-                if consequence and _echo_retells(echo, consequence):
-                    preview = echo[:60] + ("…" if len(echo) > 60 else "")
-                    warnings.append(
-                        f"эхо {road} д. {day.day_index} пересказывает канон карты "
-                        f"{position} д. {yester.day_index}: «{preview}»"
-                    )
-    return warnings
-
-
 def _style_warnings(cassette: Cassette) -> list[str]:
     """Антипаттерны текста (промпт §4): ≤1 «как будто/будто» на день,
     ≤2 «впервые» на месяц."""
@@ -163,8 +107,6 @@ def _style_warnings(cassette: Cassette) -> list[str]:
                 fields.append(day.dilemma)
             if day.diary:
                 fields.append(day.diary)
-            if day.prev:
-                fields.extend(day.prev.values())
             for card in day.cards:
                 fields.extend((card.title, card.consequence))
             haystack = " ".join(fields)
@@ -188,18 +130,17 @@ def _style_warnings(cassette: Cassette) -> list[str]:
 def lint_groups(cassette: Cassette) -> list[tuple[str, list[str]]]:
     """Замечания по разрядам — для панели (/cassette) и человекочитаемых отчётов.
 
-    Порядок разрядов фиксирован (ротация → дубли → эхо → штампы): первый
+    Порядок разрядов фиксирован (ротация → дубли → штампы): первый
     показанный фрагмент каждого непустого разряда даёт полную картину
     кассеты, не заставляя листать хвост из десятков строк.
     """
     return [
         ("ротация", _rotation_warnings(cassette)),
         ("дубли", _duplicate_warnings(cassette)),
-        ("эхо", _echo_warnings(cassette)),
         ("штампы", _style_warnings(cassette)),
     ]
 
 
 def lint_warnings(cassette: Cassette) -> list[str]:
-    """Повествовательный линт кассеты: ротация, дубли, эхо, штампы."""
+    """Повествовательный линт кассеты: ротация, дубли, штампы."""
     return [warning for _label, group in lint_groups(cassette) for warning in group]

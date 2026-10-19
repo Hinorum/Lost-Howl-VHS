@@ -14,10 +14,8 @@
 
 Проверка делится на жёсткую (кассета отвергнута) и мягкую (warning):
 жёстко — структура, длины, позиции карт, уникальность дорог и пар
-(at_day, winner) перемоток, стоп-слова; мягко — мёртвые ключи prev на входе
-дороги перемотки, привязка эха prev к тому дню, которому оно принадлежит
-(сдвиг на день и копипаст блока), стилевые замечания (описания одним экраном,
-кадр не тянется, заголовок карты не повторяет дословно своё описание).
+(at_day, winner) перемоток, стоп-слова; мягко — стилевые замечания
+(глава не выглядит заголовком и не тянется).
 """
 
 from __future__ import annotations
@@ -46,7 +44,6 @@ FIELD_LIMITS = {
     "card_consequence": 220,
     "track_name": 32,
     "diary": 200,
-    "prev_value": 160,
 }
 
 # Максимум перемоток (развилок) в одной кассете: ветвление месяца держим
@@ -60,42 +57,6 @@ _CHAPTER_TOO_LONG = 600  # выше этого кадр тянется (жёст
 _CHAPTER_TOO_SHORT = 140  # короче и в одно предложение — «заголовок», не кадр
 
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?…]+")
-
-# Линтер эха prev (мягкие warning'и). prev — рукописный пересказ, и главная его
-# беда — сдвиг на день: автор пишет «что стая вспомнит про СВОИ карты» и кладёт
-# текст в prev этого же дня, а рендер показывает его в начале СЛЕДУЮЩЕГО, где
-# оно читается как спойлер и разрыв преемственности. Ловим сравнением текста
-# эха с последствиями: своего дня (ошибка) против предыдущего (как надо).
-#
-# Мера — доля общих значимых слов (Жаккар). Грубая: пересказ словами не
-# повторяет, поэтому пороги выбраны по разбору действующей библиотеки так,
-# чтобы ловить уверенные случаи и молчать на неоднозначных. На текущих
-# кассетах: 47 дней уверенно «свой день», 0 ложных срабатываний.
-_PREV_WORD_RE = re.compile(r"[а-яёa-z0-9]+")
-_PREV_MIN_WORD_LEN = 4  # короче — служебные слова («стая», «путь» не отличить)
-_PREV_STOPWORDS = frozenset(
-    """это как все они она его её им их но а то из за у же бы вы по при для от этот эта эти
-    того этом если под над без через чтобы один свой своих своей всего к уже ещё еще так вот
-    там тут где когда лишь даже либо том тем нас вас ней нему них пусть будто после перед между
-    через""".split()
-)
-_PREV_SAME_DAY_MARGIN = 0.05  # «свой день» увереннее «предыдущего» хотя бы на столько
-_PREV_SAME_DAY_FLOOR = 0.25  # либо совпадение со своим днём настолько сильное, что сомнений нет
-
-
-def _prev_words(text: str) -> set[str]:
-    return {
-        word
-        for word in _PREV_WORD_RE.findall((text or "").casefold())
-        if len(word) >= _PREV_MIN_WORD_LEN and word not in _PREV_STOPWORDS
-    }
-
-
-def _prev_overlap(left: str, right: str) -> float:
-    """Доля общих значимых слов двух текстов: 0 — ничего общего, 1 — один текст."""
-    a, b = _prev_words(left), _prev_words(right)
-    return len(a & b) / len(a | b) if a and b else 0.0
-
 
 # Стоп-слова: реальные бренды/криптобиржи/обещания дохода. Канон «Lost Dogs:
 # The Way» (Догтаун, имена персонажей) ДОЗВОЛЕН: кассеты — открытый фанфик.
@@ -134,7 +95,13 @@ class CardModel(BaseModel):
 
     position: int
     title: str = Field(min_length=1, max_length=FIELD_LIMITS["card_title"])
-    consequence: str = Field(min_length=1, max_length=FIELD_LIMITS["card_consequence"])
+    consequence: str = Field(
+        min_length=1,
+        max_length=FIELD_LIMITS["card_consequence"],
+        description="Исход, если уцелеет эта карта: канон дня и эхо, которым "
+        "откроется глава следующего дня. Пиши факт, который читается как "
+        "воспоминание стаи.",
+    )
     tag: str = "care"
 
     @field_validator("position")
@@ -159,33 +126,12 @@ class DayModel(BaseModel):
         "в кнопках (подписи — названия карт), без последствий.",
     )
     cards: list[CardModel] = Field(min_length=3, max_length=3)
-    prev: dict[int, str] | None = Field(
-        default=None,
-        description="Эхо вчерашнего выбора стаи: {позиция победителя: как стая "
-        "вспомнит его последствие}. Рендерится в начале главы следующего дня.",
-    )
     diary: str | None = Field(
         default=None,
         max_length=FIELD_LIMITS["diary"],
-        description="Запись дневника (ПОВ-контраст к эпической главе): звучит "
-        "в итогах дня после канона.",
+        description="Запись дневника (ПОВ-контраст к эпической главе): уходит "
+        "отдельной рассылкой в 17:00 UTC.",
     )
-
-    @field_validator("prev")
-    @classmethod
-    def _prev_echo_sane(cls, value: dict[int, str] | None) -> dict[int, str] | None:
-        if value is None:
-            return value
-        for position, text in value.items():
-            if position not in (0, 1, 2):
-                raise ValueError("ключи prev — только позиции карт 0, 1 или 2")
-            if not text.strip():
-                raise ValueError("текст эха prev не может быть пустым")
-            if len(text) > FIELD_LIMITS["prev_value"]:
-                raise ValueError(
-                    f"эхо prev не длиннее {FIELD_LIMITS['prev_value']} знаков"
-                )
-        return value
 
     @model_validator(mode="after")
     def _cards_positions_complete(self) -> DayModel:
@@ -319,120 +265,6 @@ class Cassette(BaseModel):
             return None
         return None
 
-    def dead_prev_warnings(self) -> list[str]:
-        """Мёртвые ключи эха на входе дороги перемотки (warning).
-
-        Первый день дороги (at_day) помнит победителя дня at_day − 1, а это РОВНО
-        фиксированный winner перемотки — ключи prev, не равные ему, не покажутся
-        никогда: эхо рендерится только под честного победителя, которым может быть
-        только этот winner. Дубликаты (at_day, winner) запрещены жёстко (см.
-        _days_match_month); здесь — предупреждение о мёртвом тексте.
-        """
-        warnings: list[str] = []
-        for fork in self.switch:
-            first_day = fork.days[0] if fork.days else None
-            if first_day is None or not first_day.prev:
-                continue
-            dead = sorted(key for key in first_day.prev if key != fork.winner)
-            if dead:
-                warnings.append(
-                    f"перемотка «{fork.to}» (at_day={fork.at_day}): ключи prev первого "
-                    f"дня {dead} — мёртвые, дорога играет только при winner={fork.winner}"
-                )
-        return warnings
-
-    def prev_alignment_warnings(self) -> list[str]:
-        """Эхо prev, привязанное не к тому дню (warning, не ошибка).
-
-        Контракт `prev` жёсткий: поле дня N — «как стая вспомнит ПОБЕДИТЕЛЯ
-        ДНЯ N−1», и рендерится оно в начале главы дня N (см. DayModel.prev и
-        bay._prev_echo). Текст в prev дня N, пересказывающий последствия карт
-        САМОГО дня N, — это эхо, поставленное на день раньше нужного: игрок
-        читает последствия выбора, которого ещё не сделал, и приписанные
-        вчерашнему победителю.
-
-        Ловим две разновидности, обе — обычная ошибка при рукописном наборе
-        кассеты на месяц:
-
-        * сдвиг (основное): текст эха дня N совпадает с последствиями карт дня N
-          заметнее, чем с последствиями дня N−1;
-        * копипаст: эхо под ту же карту повторяет эхо более раннего дня этой же
-          дороги — «забытый» текст. Ловим и целый блок, и отдельные ключи: в
-          библиотеке был день, у которого повторялся только ключ "0", а ключи
-          "1"/"2" были дописаны заново, и блок целиком потому не совпал.
-
-        Проверяются ВСЕ дороги, включая главную: dead_prev_warnings смотрит
-        только на вход в ветку, а сдвиг живёт именно на главной дороге, где
-        дней больше всего.
-
-        Мера лексическая и поэтому не видит слабый пересказ: день, который
-        пересказывает прошлое чужими словами, может остаться непойманным.
-        Линтер — не приговор, а повод автору глазами прочитать перечисленные
-        дни.
-        """
-        warnings: list[str] = []
-        roads: list[tuple[str, list[DayModel], bool]] = [("главная", self.days, False)]
-        roads += [(f"ветка «{fork.to}»", fork.days, True) for fork in self.switch]
-        for road, days, is_fork in roads:
-            seen_blocks: dict[tuple, int] = {}
-            seen_fields: dict[tuple[int, str], int] = {}
-            for index, day in enumerate(days):
-                block = day.prev or {}
-                if not block:
-                    continue
-
-                normalized = {pos: " ".join(text.split()) for pos, text in block.items()}
-                signature = tuple(sorted(normalized.items()))
-                if signature in seen_blocks:
-                    warnings.append(
-                        f"{road} день {day.day_index}: блок prev дословно повторяет "
-                        f"день {seen_blocks[signature]} — это эхо чужого дня"
-                    )
-                else:
-                    seen_blocks[signature] = day.day_index
-                for position, text in normalized.items():
-                    field_key = (position, text)
-                    if field_key in seen_fields:
-                        warnings.append(
-                            f"{road} день {day.day_index}: prev[{position}] дословно "
-                            f"повторяет день {seen_fields[field_key]} — эхо под карту "
-                            f"{position} не может быть одинаковым в разные дни"
-                        )
-                    else:
-                        seen_fields[field_key] = day.day_index
-
-                if index == 0 and not is_fork:
-                    continue  # день 1: вчерашнего дня в кассете нет, эха нет и не нужно
-                if index == 0:
-                    # Первый день ветки помнит победителя дня at_day − 1 главной дороги.
-                    prior = self.days[day.day_index - 2]
-                else:
-                    prior = days[index - 1]
-
-                own_best = 0.0
-                prior_best = 0.0
-                for position, text in block.items():
-                    if position not in (0, 1, 2):
-                        continue
-                    own_best = max(
-                        own_best, _prev_overlap(text, day.cards[position].consequence)
-                    )
-                    prior_best = max(
-                        prior_best, _prev_overlap(text, prior.cards[position].consequence)
-                    )
-
-                if (
-                    own_best > prior_best + _PREV_SAME_DAY_MARGIN
-                    or own_best >= _PREV_SAME_DAY_FLOOR
-                ):
-                    warnings.append(
-                        f"{road} день {day.day_index}: prev пересказывает последствия "
-                        f"СВОЕГО дня ({own_best:.2f} против {prior_best:.2f} за вчера) — "
-                        "эхо ждёт дня на +1; сегодня игрок прочтёт последствия "
-                        "несделанного выбора"
-                    )
-        return warnings
-
     def style_warnings(self) -> list[str]:
         """Стилевые замечания (warning, не ошибка): глава дня читается легко.
 
@@ -515,8 +347,6 @@ def validate_payload(payload: dict) -> ValidationResult:
             cassette=None,
             errors=[f"стоп-слова: {', '.join(taboo)}"],
         )
-    warnings.extend(cassette.dead_prev_warnings())
-    warnings.extend(cassette.prev_alignment_warnings())
     warnings.extend(cassette.style_warnings())
     return ValidationResult(cassette=cassette, errors=[], warnings=warnings)
 

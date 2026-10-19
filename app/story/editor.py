@@ -73,10 +73,6 @@ def day_view_text(cassette: Cassette, day: int, road: str = "main") -> str:
     lines = [header, item.chapter_title, "", item.chapter_text, ""]
     lines.append(f"(что предстоит решить) {item.dilemma}")
     lines.append("")
-    for position in (0, 1, 2):
-        echo = (item.prev or {}).get(position)
-        if echo:
-            lines.append(f"(эхо, если вчера победила карта {position}) {echo}")
     for card in sorted(item.cards, key=lambda entry: entry.position):
         lines.append(f"[{card.position}] {card.title}")
         lines.append(f"    Канон, если уцелеет: {card.consequence}")

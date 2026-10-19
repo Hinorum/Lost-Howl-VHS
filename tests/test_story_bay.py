@@ -273,33 +273,44 @@ async def test_editor_edit_picked_up_on_next_render(
 async def test_plan_day_prepends_echo_of_yesterday_winner(
     session, tmp_path, monkeypatch
 ) -> None:
-    """Поле `prev`: следующий день «знает» вчерашний выбор по закрытому кадру.
+    """Эхо: следующий день «знает» канон вчерашнего победителя.
 
-    День 11 (2026-05-11) помнит победителя дня 10: эхо в начале главы, ровно
-    тот вариант, что уцелел по движку. Других победителей нет — эха нет.
+    День 11 (2026-05-11) открывает главу каноном дня 10 — consequence карты,
+    уцелевшей по движку (StoryBeat.winning_text). Нет вчерашнего кадра/канона —
+    эха нет.
     """
+    from app.models import Round, RoundStatus, StoryBeat, WinRule
+
     monkeypatch.setattr(bay, "datetime", _FakeDatetime)  # сегодня: 2026-05-11
-
-    async def fake_winner(session_arg, decision: date) -> int | None:
-        return 1 if decision.day == 10 else None
-
-    monkeypatch.setattr(bay, "_decision_day_winner", fake_winner)
+    session.add(
+        Round(
+            day_index=10,
+            status=RoundStatus.CLOSED,
+            win_rule=WinRule.MAJORITY,
+            chapter_title="Глава 10",
+            chapter_text="Текст 10",
+            opens_at=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+            voting_ends_at=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+            tally_ends_at=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+            winner_card=1,
+        )
+    )
+    session.add(
+        StoryBeat(
+            day_index=10,
+            winning_title="ход 10-1",
+            winning_text="Вчера стая пошла на тень.",
+            win_rule="majority",
+            vote_counts="{}",
+        )
+    )
+    await session.commit()
 
     payload = {
         "cassette_id": "echo-kasseta",
         "month": "2026-05",
         "title": "Эхо",
-        "days": [
-            {
-                **_day(i),
-                "prev": {
-                    0: "Вчера стая пошла на свет.",
-                    1: "Вчера стая пошла на тень.",
-                    2: "Вчера стая осталась.",
-                },
-            }
-            for i in range(1, 32)
-        ],
+        "days": [_day(i) for i in range(1, 32)],
     }
     (tmp_path / "may-echo.json").write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
@@ -319,21 +330,14 @@ async def test_plan_day_prepends_echo_of_yesterday_winner(
 async def test_plan_day_echo_absent_without_yesterday_winner(
     session, tmp_path, monkeypatch
 ) -> None:
-    """Нет закрытого кадра за вчера — глава дня идёт без эха (fail-open)."""
+    """Нет закрытого кадра/канона за вчера — глава дня идёт без эха (fail-open)."""
     monkeypatch.setattr(bay, "datetime", _FakeDatetime)
-
-    async def fake_winner(session_arg, decision: date) -> int | None:
-        return None
-
-    monkeypatch.setattr(bay, "_decision_day_winner", fake_winner)
 
     payload = {
         "cassette_id": "echo-kasseta",
         "month": "2026-05",
         "title": "Эхо",
-        "days": [
-            {**_day(i), "prev": {0: "Вчера стая пошла на свет."}} for i in range(1, 32)
-        ],
+        "days": [_day(i) for i in range(1, 32)],
     }
     (tmp_path / "may-echo.json").write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
