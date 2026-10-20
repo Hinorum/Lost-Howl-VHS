@@ -19,7 +19,7 @@ from aiogram.types import (
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.broadcast import POSITIONS, cards_keyboard, scene_label, status_text
+from app.broadcast import CARD_POSITIONS, POSITIONS, cards_keyboard, scene_label, status_text
 from app.config import settings
 from app.db import SessionLocal
 from app.models import LeaderboardClaim, RoundStatus
@@ -659,7 +659,7 @@ async def on_vote(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Некорректный выбор.", show_alert=True)
         return
-    if position not in (0, 1, 2):
+    if position not in CARD_POSITIONS:
         # POSITIONS[position] ниже бросил бы IndexError (а отрицательный индекс
         # молча взял бы чужую сцену) и оставил кнопку со спиннером. cast_vote и
         # change_vote такую позицию всё равно отвергают — отвечаем тем же.

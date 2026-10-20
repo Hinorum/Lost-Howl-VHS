@@ -170,16 +170,18 @@ def test_unknown_fields_are_ignored() -> None:
 
 
 def test_field_limits_tighten_to_display() -> None:
-    """Капы схемы = потолкам показа в app/broadcast.py: пост дня не режется «…»."""
+    """Капы схемы не дают посту дня резать поля «…»."""
     assert FIELD_LIMITS["chapter_title"] == 80
+    assert FIELD_LIMITS["chapter_text"] == 900
+    assert FIELD_LIMITS["dilemma"] == 450
     assert FIELD_LIMITS["card_title"] == 80
-    assert FIELD_LIMITS["card_consequence"] == 220
+    assert FIELD_LIMITS["card_consequence"] == 260
 
 
 def test_style_chapter_long_warns() -> None:
     """Глава заметно выше канона (мягкий порог) — кадр тянется."""
     payload = _payload("2026-04", 30)
-    payload["days"][0]["chapter_text"] = "а" * 605
+    payload["days"][0]["chapter_text"] = "а" * 755
     result = validate_payload(payload)
     assert result.cassette is not None
     assert any("мягкий порог" in warning for warning in result.warnings)

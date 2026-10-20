@@ -267,6 +267,21 @@ async def test_status_keeps_deadline_when_core_overflows(tmp_path, monkeypatch) 
     assert len(status) <= 300
 
 
+async def test_status_trims_story_before_dilemma(tmp_path, monkeypatch) -> None:
+    """Лимит поднят: при переполнении сначала режется глава, вопрос и HTML целы."""
+    from app import broadcast
+    from app.broadcast import status_text
+
+    round_row = _round(9307, tmp_path)
+    round_row.chapter_text = "глава " * 300
+    round_row.dilemma = "Вопрос & выбор?"
+    monkeypatch.setattr(broadcast, "_MAX_TEXT_LEN", 1000)
+    status = await status_text(round_row)
+    assert "Вопрос &amp; выбор?" in status
+    assert "…" in status
+    assert len(status) <= 1000
+
+
 def _finished(day_index: int, media_dir) -> Round:
     finished = _round(day_index, media_dir)
     finished.status = RoundStatus.CLOSED

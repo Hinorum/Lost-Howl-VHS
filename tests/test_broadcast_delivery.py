@@ -181,6 +181,27 @@ def test_cards_keyboard_signs_buttons_with_scene_titles() -> None:
     assert labels[2].endswith("…")
 
 
+def test_cards_keyboard_orders_by_position_and_collapses_titles() -> None:
+    """Порядок кнопок задаёт position, а не порядок строк в выборке; переносы
+    и лишние пробелы из кассеты в подписи кнопки не протекают."""
+    cards = [
+        SimpleNamespace(position=2, title="  Третья\nсцена  "),
+        SimpleNamespace(position=0, title="Первая   сцена"),
+        SimpleNamespace(position=1, title="Вторая сцена"),
+    ]
+    rows = bc.cards_keyboard(7, cards=cards).inline_keyboard
+    assert [row[0].text for row in rows] == [
+        "Первая сцена",
+        "Вторая сцена",
+        "Третья сцена",
+    ]
+    assert [row[0].callback_data for row in rows] == [
+        "vote:7:0",
+        "vote:7:1",
+        "vote:7:2",
+    ]
+
+
 async def test_status_text_for_closed_and_tallying_phases() -> None:
     """Фаза дня читается из статуса: «подсчёт» и «день закрыт» — разные
     сообщения, а не одна и та же строка."""

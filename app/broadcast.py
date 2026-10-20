@@ -21,17 +21,24 @@ from app.config import settings
 from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
 from app.db import SessionLocal
 from app.models import Chat, Round, RoundStatus, StatusPost, WatcherState
+from app.story.schema import FIELD_LIMITS
 from app.style import day_mark
 from app.tally import format_results
 
 logger = logging.getLogger(__name__)
 
 POSITIONS = ("I", "II", "III")
+CARD_POSITIONS = (0, 1, 2)
 _MAX_TEXT_LEN = 3900
-_TITLE_CLAMP = 80
-_DILEMMA_CLAMP = 400  # == FIELD_LIMITS["dilemma"]: лимит схемы равен показу
+_TITLE_CLAMP = FIELD_LIMITS["chapter_title"]
+_DILEMMA_CLAMP = FIELD_LIMITS["dilemma"]  # лимит схемы равен показу
 _BUTTON_TEXT_MAX = 64  # текст inline-кнопки Telegram — до 64 знаков
 _FORGET_MARKS = ("forbidden", "not found", "kicked", "deactivated", "migrated")
+
+
+def _one_line(text: str) -> str:
+    """Название сцены в одну строку: кнопка не умеет переносы и лишние пробелы."""
+    return " ".join((text or "").split())
 
 
 def cards_keyboard(round_id: int, cards) -> InlineKeyboardMarkup:
@@ -45,14 +52,13 @@ def cards_keyboard(round_id: int, cards) -> InlineKeyboardMarkup:
     их текст дня не показывает; канон дня хранится в StoryBeat и в пост
     игрокам не идёт.
     """
-    titles = {card.position: (card.title or "").strip() for card in cards}
+    titles = {card.position: _one_line(card.title) for card in cards}
     rows: list[list[InlineKeyboardButton]] = []
-    for position in range(3):
+    for position in CARD_POSITIONS:
         # Позиции 0–2 гарантирует схема кассеты; `or` — страховка от битой
         # строки в базе, чтобы рассылка не падала на отправке.
         label = titles.get(position) or f"Сцена {POSITIONS[position]}"
-        if len(label) > _BUTTON_TEXT_MAX:
-            label = _clamp(label, _BUTTON_TEXT_MAX - 1)
+        label = _clamp(label, _BUTTON_TEXT_MAX - 1)
         rows.append(
             [
                 InlineKeyboardButton(
@@ -140,23 +146,54 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
         title = html.escape(_clamp(round_row.chapter_title, _TITLE_CLAMP), quote=False)
         head += f"{day_mark(str(round_row.id))} {title}\n\n"
     # Глава кассеты живым текстом между заголовком и развилкой: сначала стая
-    # слышит день, потом видит три сцены. Жёсткий потолок кассеты — 700 знаков
+    # слышит день, потом видит три сцены. Жёсткий потолок кассеты — 900 знаков
     # (schema.py), обрезка по словам ниже лишь страхует легаси-раунды без кассеты.
-    story = (
-        f"{html.escape(_clamp(round_row.chapter_text, 1500), quote=False)}\n\n"
-        if getattr(round_row, "chapter_text", "")
-        else ""
-    )
+    story_raw = (getattr(round_row, "chapter_text", "") or "").strip()
+    dilemma_html = html.escape(_clamp(dilemma, _DILEMMA_CLAMP), quote=False)
     # Хвост поста (правило дня, банк, дедлайн) неприкосновенен: при упоре в
     # потолок режется «верх», а не обещание игроку сроков исхода голосования.
     tail = f"\n\n{phase}{bank_line}\n{deadline}"
-    # Эхо и сюжет уже стоят в head/story; дилемма замыкает повествование
-    # ровно там, где игрок должен сделать выбор.
-    core = f"{head}{story}{html.escape(_clamp(dilemma, _DILEMMA_CLAMP), quote=False)}"
     budget = _MAX_TEXT_LEN - len(tail)
-    if len(core) > budget:
-        core = _clamp(core, budget)
-    return core + tail
+    # Вопрос — точка выбора, поэтому он важнее главы. Если места не хватает,
+    # сначала режем главу; вопрос трогаем только когда не помещается даже он.
+    if len(head) + len(dilemma_html) > budget:
+        dilemma_raw = dilemma
+        dilemma_limit = budget - len(head) - 1
+        if dilemma_limit >= 1:
+            dilemma_raw = _clamp(dilemma_raw, dilemma_limit)
+            dilemma_html = html.escape(dilemma_raw, quote=False)
+        else:
+            dilemma_raw = ""
+            dilemma_html = ""
+        while dilemma_raw and len(head) + len(dilemma_html) > budget:
+            overflow = len(head) + len(dilemma_html) - budget
+            next_limit = len(dilemma_raw) - overflow - 1
+            if next_limit < 1:
+                dilemma_html = ""
+                break
+            dilemma_raw = _clamp(dilemma_raw, next_limit)
+            dilemma_html = html.escape(dilemma_raw, quote=False)
+    story_html = ""
+    if story_raw:
+        allowed = budget - len(head) - len(dilemma_html) - 2
+        if allowed >= 2:
+            story_raw = _clamp(story_raw, min(1500, allowed))
+            story_html = f"{html.escape(story_raw, quote=False)}\n\n"
+            # Экранирование (`&` → `&amp;`) может удлинить строку: добираем
+            # остаток уже по фактической длине, не разрывая сущности.
+            while (
+                story_raw
+                and len(head) + len(story_html) + len(dilemma_html) > budget
+            ):
+                overflow = len(head) + len(story_html) + len(dilemma_html) - budget
+                next_limit = len(story_raw) - overflow - 1
+                if next_limit < 2:
+                    story_raw = ""
+                    story_html = ""
+                    break
+                story_raw = _clamp(story_raw, next_limit)
+                story_html = f"{html.escape(story_raw, quote=False)}\n\n"
+    return f"{head}{story_html}{dilemma_html}{tail}"
 
 
 async def active_chat_ids() -> list[int]:
@@ -1092,7 +1129,7 @@ async def announce_day_diary(bot: Bot | None, round_row: Round) -> int:
 
 def scene_label(cards: dict[int, str], position: int) -> str:
     """Подпись сцены: «Вскрыть крышу» — и в алерты, и в личные итоги."""
-    title = cards.get(position, "")
+    title = _one_line(cards.get(position, ""))
     if title:
         return f"«{html.escape(title)}»"
     return POSITIONS[position] if position < len(POSITIONS) else str(position + 1)
