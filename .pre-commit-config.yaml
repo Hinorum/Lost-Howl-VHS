@@ -32,3 +32,11 @@ repos:
         stages: [pre-commit]
         types_or: [python]
         pass_filenames: true
+
+      - id: mypy-core
+        name: Mypy (ton_pay / ton_watch / rounds)
+        entry: python -m mypy app/ton_pay app/ton_watch app/rounds
+        language: system
+        stages: [pre-commit]
+        files: ^(app/(ton_pay|ton_watch|rounds)/|mypy\.ini$)
+        pass_filenames: false

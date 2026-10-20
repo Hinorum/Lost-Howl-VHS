@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from typing import Any, cast
 
 from aiogram import Bot
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 
 from app.config import settings
 from app.db import SessionLocal
@@ -72,12 +74,13 @@ async def _alert_admin(bot: Bot | None, network: str) -> None:
         # UPDATE вернул rowcount=1 (второй уже видит alerted=True).
         claimed = []
         for payout_id, reason in rows:
-            marked = (
+            marked = cast(
+                CursorResult[Any],
                 await session.execute(
                     update(Payout)
                     .where(Payout.id == payout_id, Payout.alerted.is_(False))
                     .values(alerted=True)
-                )
+                ),
             ).rowcount
             if marked:
                 claimed.append((payout_id, reason))

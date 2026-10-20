@@ -256,15 +256,16 @@ async def get_wallet():
                 )
             version = requested
         else:
-            version, candidates = detect_wallet_version(
+            detected, candidates = detect_wallet_version(
                 public_key, settings.active_treasury_address, network_global_id
             )
-            if version is None:
+            if detected is None:
                 raise ValueError(
                     "Адрес казначея не совпадает ни с одной поддерживаемой версией "
                     f"кошелька для этой мнемоники: {candidates}. Проверь адрес и "
                     "мнемонику, либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
                 )
+            version = detected
 
         if state._provider is not None:
             try:
@@ -330,14 +331,16 @@ def build_offline_wallet(
             )
         version = requested
     else:
-        version, candidates = detect_wallet_version(public_key, address, network_global_id)
-        if version is None:
+        detected, candidates = detect_wallet_version(public_key, address, network_global_id)
+        if detected is None:
             raise ValueError(
                 "Адрес не совпадает ни с одной поддерживаемой версией кошелька "
                 f"для этой мнемоники: {candidates}. Проверь адрес и мнемонику, "
                 "либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
             )
+        version = detected
 
+    wallet_class: type[WalletV5R1] | type[WalletV4R2]
     if version == "v5r1":
         data = WalletV5R1.create_data_cell(public_key=public_key, wc=0, network_global_id=network_global_id)
         code = WALLET_V5_R1_CODE
@@ -352,7 +355,7 @@ def build_offline_wallet(
         # wallet_id — свойство, читающее data из self.state; кода на аккаунте
         # для этого не нужно, но self.state обязан быть заполнен.
         wallet = wallet_class(
-            provider=None,
+            provider=None,  # type: ignore[arg-type]  # оффлайн: провайдер не нужен
             address=address_obj,
             state_init=state_init,
             private_key=private_key,
@@ -362,7 +365,7 @@ def build_offline_wallet(
         # v4: wallet_id — read-only свойство, читающее data из self.state
         # (константа контракта внутри data-ячейки); kwarg'ом задать нельзя.
         wallet = wallet_class(
-            provider=None,
+            provider=None,  # type: ignore[arg-type]  # оффлайн: провайдер не нужен
             address=address_obj,
             state_init=state_init,
             private_key=private_key,

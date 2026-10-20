@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from aiogram import Bot
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 
 from app.config import settings
 from app.db import SessionLocal
@@ -53,7 +55,7 @@ async def confirm_aged_pending(bot: Bot | None = None) -> int:
                 .where(Stake.id == stake.id, Stake.status == "pending")
                 .values(status="confirmed", confirmed_at=now)
             )
-            if claimed.rowcount != 1:
+            if cast(CursorResult[Any], claimed).rowcount != 1:
                 continue  # уже не pending (возврат/дубль) — не трогаем
             confirmed += 1
             await _dm_stake(

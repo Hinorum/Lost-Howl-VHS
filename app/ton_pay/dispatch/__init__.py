@@ -20,9 +20,11 @@ import asyncio
 import logging
 import time
 from datetime import UTC, datetime
+from typing import Any, cast
 
 from aiogram import Bot
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 
 from app.config import settings
 from app.db import SessionLocal
@@ -389,7 +391,7 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                 .where(Payout.id == payout.id, Payout.status == "pending")
                 .values(status="sending")
             )
-            if gate.rowcount != 1:
+            if cast(CursorResult[Any], gate).rowcount != 1:
                 # Строку уже забрала другая копия — не трогаем и не вещаем.
                 continue
             prior_attempts[payout.id] = int(payout.attempts or 0)

@@ -176,8 +176,8 @@ async def fetch_recent_transfers_page(
         if response.status_code == 404:
             # Пустая история бывает у двух причин: кошелёк правда молчал
             # или индексатор потерял историю. Различаем честно.
-            transfers, ok = await _resolve_tonapi_empty_history(since_utime)
-            return Page(transfers, _PAGE_OK if ok else _PAGE_DEGRADED, 0, 0)
+            empty_transfers, ok = await _resolve_tonapi_empty_history(since_utime)
+            return Page(empty_transfers, _PAGE_OK if ok else _PAGE_DEGRADED, 0, 0)
         response.raise_for_status()
         items = response.json().get("transactions", [])
     except Exception as exc:

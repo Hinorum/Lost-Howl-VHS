@@ -284,6 +284,7 @@ python -m app.main
 ```powershell
 python -m pytest -q                              # тесты без сети и Telegram
 python -m ruff check .                           # линтер
+python -m mypy app/ton_pay app/ton_watch app/rounds  # типы (постепенный охват)
 python -m scripts.cassette_tool lint <файл.json> # кассета перед коммитом (по одному файлу)
 ```
 
@@ -339,6 +340,10 @@ python scripts/e2e_testnet.py full      # все фазы по порядку (�
 процедура отката). Полный чек-лист с процедурами и журналом инцидентов —
 `docs/MAINNET_READINESS.md`. Пока в нём есть хоть один неотмеченный пункт,
 переключать сеть нельзя.
+
+### Проверка типов (mypy)
+
+Mypy внедряется постепенно: обязательный охват — `app/ton_pay`, `app/ton_watch`, `app/rounds` (денежный контур и жизненный цикл дня). Конфиг — `mypy.ini`; `follow_imports = silent` намеренно не валит джобу ошибками в остальных пакетах, но использует их типы. CI-шаг `Type check` и pre-commit-хук `mypy-core` гоняют ровно этот охват; расширять — добавлением пакетов в оба места. Ошибки в остальном коде чинятся по мере перевода модулей, а не отключением проверок.
 
 ### Pre-commit хук на утечку секретов
 

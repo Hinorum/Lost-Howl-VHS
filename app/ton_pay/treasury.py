@@ -235,7 +235,7 @@ async def treasury_diagnostics() -> str:
         from app.ton_watch import BEAT_KEY, CURSOR_KEY, SOURCE_KEY
 
         beat_iso = None
-        source = None
+        watcher_source = None
         cursor_raw = None
         for key, slot in ((BEAT_KEY, "b"), (SOURCE_KEY, "s"), (CURSOR_KEY, "c")):
             row = await session.get(WatcherState, key)
@@ -243,7 +243,7 @@ async def treasury_diagnostics() -> str:
                 if slot == "b":
                     beat_iso = row.value
                 elif slot == "s":
-                    source = row.value
+                    watcher_source = row.value
                 else:
                     cursor_raw = row.value
     lines.append(f"Очередь выплат: ожидает {waiting} · failed {dead}")
@@ -268,8 +268,8 @@ async def treasury_diagnostics() -> str:
             logger.debug("Метка времени успешного цикла не разобрана (%r): %s", beat_iso, exc)
     lines.append(
         f"  успешный цикл: {'never' if beat_age is None else f'{beat_age} с назад'}"
-        + (f" · источник {source}" if source else "")
-    )
+        + (f" · источник {watcher_source}" if watcher_source else "")
+        )
     if beat_age is not None and beat_age > 180:
         lines.append("  ⚠️ циклы не проходят >3 мин: индексаторы недоступны или процесс спит")
     if cursor_raw and cursor_raw.isdigit():
@@ -371,7 +371,7 @@ async def blockchain_diagnostics() -> str:
         lines.append(
             f"Watcher: курсор {cursor_dt:%d.%m %H:%M} UTC "
             f"({int((now - cursor_dt).total_seconds()):+d} с)"
-            + (f" · источник {source}" if source else "")
+        + (f" · источник {source}" if source else "")
         )
     else:
         lines.append("Watcher: курсора нет — стартует с отката 12 ч")
