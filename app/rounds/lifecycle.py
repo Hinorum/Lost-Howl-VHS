@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 from types import SimpleNamespace
+from typing import Any, cast
 
 from sqlalchemy import delete, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -28,7 +30,7 @@ from app.models import (
 
 from .materialization import _materialize_round, _stamp_day_money_mode
 from .queries import get_active_round, get_latest_round, get_round
-from .rendering import _plan_and_render
+from .rendering import plan_and_render
 from .time import _ROMAN, _now, utc_aware
 from .voting import (
     _TIE_THEATER,
@@ -102,7 +104,7 @@ async def create_next_round_detailed(
     from app.ton_pay import fetch_masterchain_entropy
 
     entropy = await fetch_masterchain_entropy()
-    payload = await _plan_and_render(session, day_index, opens_hint=opens_hint, entropy=entropy)
+    payload = await plan_and_render(session, day_index, opens_hint=opens_hint, entropy=entropy)
     try:
         round_row = await _materialize_round(session, payload, latest)
         await _stamp_day_money_mode(session, round_row)
@@ -168,11 +170,11 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
 
     fresh_anchor = default_anchor(_now())
     payload = json.dumps(fresh_anchor, ensure_ascii=False)
-    row = await session.get(WatcherState, RUN_START_KEY)
-    if row is None:
+    state_row = await session.get(WatcherState, RUN_START_KEY)
+    if state_row is None:
         session.add(WatcherState(key=RUN_START_KEY, value=payload))
     else:
-        row.value = payload
+        state_row.value = payload
     await session.commit()
     row, _created = await create_next_round_detailed(session)
     return row
@@ -186,7 +188,7 @@ async def claim_announcement(session: AsyncSession, round_row: Round) -> bool:
         .values(announced_at=_now())
     )
     await session.commit()
-    return result.rowcount > 0
+    return cast(CursorResult[Any], result).rowcount > 0
 
 
 async def unclaim_announcement(session: AsyncSession, round_id: int) -> None:
@@ -281,7 +283,7 @@ async def heal_stale_rounds(session: AsyncSession) -> int:
 
 def public_round_view(round_row: Round) -> dict:
     """Counts stay secret while the round is open; the law is public from the start."""
-    view = {
+    view: dict[str, object] = {
         "day_index": round_row.day_index,
         "status": round_row.status.value,
         "title": round_row.chapter_title,
@@ -307,12 +309,13 @@ async def close_voting(session: AsyncSession, round_row: Round) -> Round:
     if round_row.status != RoundStatus.OPEN:
         return round_row
     # Условный UPDATE: один из двух процессов переводит день OPEN → TALLYING.
-    claimed = (
+    claimed = cast(
+        CursorResult[Any],
         await session.execute(
             update(Round)
             .where(Round.id == round_row.id, Round.status == RoundStatus.OPEN)
             .values(status=RoundStatus.TALLYING)
-        )
+        ),
     ).rowcount
     if not claimed:
         return round_row
@@ -324,8 +327,8 @@ async def close_voting(session: AsyncSession, round_row: Round) -> Round:
         .values(status="expired")
     )
     counts = await _tally_counts_for(session, round_row)
-    round_row._tally_counts = counts
-    votes = round_row._tally_votes
+    round_row._tally_counts = counts  # type: ignore[attr-defined]
+    votes = getattr(round_row, "_tally_votes", {})
     # Честная жеребьёвка: при ничьей снимаем энтропию мастерчейна TON и
     # фиксируем в дне ОДИН раз. heal/пересчёт используют ту же сохранённую
     # энтропию, исход не зависит от состояния сети в момент подсчёта.
@@ -347,8 +350,8 @@ async def _tally_counts_for(session: AsyncSession, round_row: Round) -> dict[int
     """
     vote_counts = await plain_vote_counts(session, round_row.id)
     counts, used_stakes = await _decisive_counts(session, round_row, vote_counts)
-    round_row._tally_votes = vote_counts
-    round_row._tally_used_stakes = used_stakes
+    round_row._tally_votes = vote_counts  # type: ignore[attr-defined]
+    round_row._tally_used_stakes = used_stakes  # type: ignore[attr-defined]
     return counts
 
 
@@ -448,7 +451,7 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
             status=RoundStatus.CLOSED,
         )
     )
-    if result.rowcount == 0:
+    if cast(CursorResult[Any], result).rowcount == 0:
         await session.rollback()
         loaded = await get_round(session, round_row.id)
         return (loaded or round_row), False

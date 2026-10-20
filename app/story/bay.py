@@ -1,15 +1,16 @@
 """Проигрыватель кассет (VCR).
 
 Модуль-обработчик между движком и библиотекой кассет. install_bay()
-подменяет источник дня — _plan_and_render в app.rounds.rendering — обёрткой:
+регистрирует провайдера дня в app.rounds.rendering (register_plan_provider):
 сперва спрашивает активную кассету (месяц кассеты == текущему календарному
 месяцу), есть день — подставляет его главу и три пути поверх честного payload
 движка (закон дня rule/rule_entropy неизменно считает движок из энтропии TON)
-и возвращает результат; нет — вызывает оригинал, движок живёт шаблоном.
+и возвращает результат; нет — вызывает шаблонный рендер, движок живёт
+шаблоном.
 
-Важно: app/rounds/lifecycle.py делает `from .rendering import _plan_and_render`
-(импорт по значению), поэтому патчится ОБА атрибута — на модуле rendering и на
-модуле lifecycle. uninstall_bay() восстанавливает оригиналы.
+Контракт явный: rendering.plan_and_render ищет провайдера в момент вызова,
+поэтому lifecycle импортирует функцию по значению без monkeypatch-патчей.
+uninstall_bay() снимает регистрацию.
 
 Библиотека — файлы *.json в app/story/cassettes/ (или STORY_CASSETTES_DIR).
 Кассета играется, только когда её месяц совпал с текущим: день = день месяца;
@@ -39,8 +40,6 @@ from app.story.schema import Cassette, validate_file
 
 logger = logging.getLogger(__name__)
 
-_original_rendering = None
-_original_lifecycle = None
 _patched = False
 _library_dir: Path | None = None
 _library: dict[str, Cassette] = {}
@@ -342,7 +341,9 @@ async def _plan_and_render(
     кассеты включаются победителем движка за день до развилки; сбой расчёта
     дороги не роняет кадр — играем главную дорогу (fail-open).
     """
-    payload = await _original_rendering(
+    from app.rounds.rendering import render_template_day
+
+    payload = await render_template_day(
         session, day_index, opens_hint=opens_hint, entropy=entropy
     )
     try:
@@ -393,13 +394,13 @@ async def _plan_and_render(
 
 
 def install_bay(directory: Path | None = None) -> bool:
-    """Включает проигрыватель кассет (идемпотентно). True = патч активен.
+    """Включает проигрыватель кассет (идемпотентно). True = провайдер активен.
 
-    Если каталог библиотеки отсутствует — ничего не патчим, движок живёт
-    шаблоном (нулевое вмешательство). Патчим оба атрибута _plan_and_render:
-    rendering и lifecycle (lifecycle импортировал функцию по значению).
+    Если каталог библиотеки отсутствует — ничего не регистрируем, движок живёт
+    шаблоном (нулевое вмешательство). Регистрация идёт в rendering; lifecycle
+    зовёт ту же точку входа и отдельного патча не требует.
     """
-    global _original_rendering, _original_lifecycle, _patched, _library_dir
+    global _patched, _library_dir
     if _patched:
         _read_library(directory)
         return True
@@ -409,14 +410,10 @@ def install_bay(directory: Path | None = None) -> bool:
             "Кассетная библиотека %s не найдена — движок без сюжета", library_dir
         )
         return False
-    from app.rounds import lifecycle as lifecycle_mod
     from app.rounds import rendering as rendering_mod
 
     _library_dir = library_dir
-    _original_rendering = rendering_mod._plan_and_render
-    _original_lifecycle = lifecycle_mod._plan_and_render
-    rendering_mod._plan_and_render = _plan_and_render
-    lifecycle_mod._plan_and_render = _plan_and_render
+    rendering_mod.register_plan_provider(_plan_and_render)
     _patched = True
     found = _read_library(directory)
     if found:
@@ -432,18 +429,12 @@ def install_bay(directory: Path | None = None) -> bool:
 
 
 def uninstall_bay() -> None:
-    """Выключает проигрыватель и возвращает движку оригиналы _plan_and_render."""
-    global _original_rendering, _original_lifecycle, _patched
+    """Снимает регистрацию провайдера — движок снова играет шаблон."""
+    global _patched
     if not _patched:
         return
-    from app.rounds import lifecycle as lifecycle_mod
     from app.rounds import rendering as rendering_mod
 
-    if rendering_mod._plan_and_render is _plan_and_render:
-        rendering_mod._plan_and_render = _original_rendering
-    if lifecycle_mod._plan_and_render is _plan_and_render:
-        lifecycle_mod._plan_and_render = _original_lifecycle
-    _original_rendering = None
-    _original_lifecycle = None
+    rendering_mod.unregister_plan_provider(_plan_and_render)
     _patched = False
     logger.info("Проигрыватель кассет выключен — движок играет шаблон")

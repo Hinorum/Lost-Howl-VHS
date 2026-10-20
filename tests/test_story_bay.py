@@ -1,9 +1,10 @@
-"""Проигрыватель кассет: библиотека, активация по календарному месяцу, патч.
+"""Проигрыватель кассет: библиотека, активация по календарному месяцу, провайдер.
 
 Кассета играется, только когда её месяц (YYYY-MM) совпал с текущим; день =
 день календарного месяца; на стыке месяцев движок молчит шаблоном. install_bay
-патчит _plan_and_render в ДВУХ местах (rendering и lifecycle — тот импортировал
-функцию по значению) и всегда возвращает оригинал при uninstall.
+регистрирует провайдера в rendering.plan_and_render; lifecycle зовёт ту же
+точку входа, поэтому отдельных monkeypatch-патчей нет. uninstall снимает
+регистрацию.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from app.db import SessionLocal
-from app.rounds import lifecycle as lifecycle_mod
 from app.rounds import rendering as rendering_mod
 from app.story import bay
 from app.story import editor as ed
@@ -90,21 +90,38 @@ def _bay_off_after_each_test():
         uninstall_bay()
 
 
-def test_install_patches_both_modules_and_restores(tmp_path) -> None:
+def test_install_registers_provider_and_uninstall_restores(tmp_path) -> None:
     _write_cassette(tmp_path, "may.json", "2026-05", 31, "may-kasseta")
-    original_rendering = rendering_mod._plan_and_render
-    original_lifecycle = lifecycle_mod._plan_and_render
+    assert rendering_mod.get_plan_provider() is None
     assert install_bay(tmp_path) is True
     try:
-        assert rendering_mod._plan_and_render is bay._plan_and_render
-        assert lifecycle_mod._plan_and_render is bay._plan_and_render
-        # Повторная установка не заворачивает обёртку в обёртку.
+        assert rendering_mod.get_plan_provider() is bay._plan_and_render
+        # Повторная установка не регистрирует обёртку поверх обёртки.
         assert install_bay(tmp_path) is True
-        assert rendering_mod._plan_and_render is bay._plan_and_render
+        assert rendering_mod.get_plan_provider() is bay._plan_and_render
     finally:
         uninstall_bay()
-    assert rendering_mod._plan_and_render is original_rendering
-    assert lifecycle_mod._plan_and_render is original_lifecycle
+    assert rendering_mod.get_plan_provider() is None
+
+
+async def test_plan_and_render_dispatches_registered_provider(
+    session, tmp_path, monkeypatch
+) -> None:
+    """Движок зовёт провайдера через контракт, без патча модулей."""
+    monkeypatch.setattr(bay, "datetime", _FakeDatetime)
+    _write_cassette(tmp_path, "may.json", "2026-05", 31, "may-kasseta")
+    await set_next_cassette(session, "may.json")
+    assert install_bay(tmp_path) is True
+    try:
+        payload = await rendering_mod.plan_and_render(
+            session, 7, entropy="100:deadbeef"
+        )
+        assert payload["chapter_title"] == "Глава 11"
+        assert payload["rule_entropy"] == "100:deadbeef"
+    finally:
+        uninstall_bay()
+    template = await rendering_mod.plan_and_render(session, 7, entropy="100:deadbeef")
+    assert template["chapter_title"] == "День 7"
 
 
 def test_rounds_package_has_no_plan_and_render_alias() -> None:
@@ -122,7 +139,7 @@ def test_rounds_package_has_no_plan_and_render_alias() -> None:
 def test_install_skips_without_library_dir(tmp_path) -> None:
     missing = tmp_path / "net_takogo"
     assert install_bay(missing) is False
-    assert rendering_mod._plan_and_render is not bay._plan_and_render
+    assert rendering_mod.get_plan_provider() is None
 
 
 def test_active_cassette_respects_calendar_month(tmp_path) -> None:

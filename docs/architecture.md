@@ -51,7 +51,7 @@ app/
 ├── story/               # Сюжетный слой — изолирован от экономики и блокчейна
 │   ├── schema.py        # Контракт кассеты: Pydantic + валидаторы
 │   ├── store.py         # Библиотека в БД — источник правды, каталог — зеркало
-│   ├── bay.py           # Проигрыватель: install_bay() патчит rendering._plan_and_render
+│   ├── bay.py           # Проигрыватель: install_bay() регистрирует провайдера дня
 │   ├── editor.py        # Dry-run редактирование кассеты (preview)
 │   └── cassettes/       # Зеркало библиотеки (файлы кладёт store; пока пусто)
 │
@@ -243,7 +243,7 @@ property-тестом (`tests/test_invariants.py`).
 |---|---|---|
 | `handlers/` | aiogram, форматирование, клавиатуры | SQL, TON, схема раундов |
 | `rounds/` | SQL, состояние раундов, закон дня | Telegram API, конкретные кассеты |
-| `story/` | Кассеты, формат `YYYY-MM`, лор | БД, TON, состояние раундов (получает через патч `rendering._plan_and_render`) |
+| `story/` | Кассеты, формат `YYYY-MM`, лор | БД, TON, состояние раундов (получает через контракт `rendering.plan_and_render`) |
 | `ton_pay/` | Активный/фоллбэк канал, seqno, memo | Что выплачивается и зачем |
 | `ton_watch/` | Inbox, мемпул, идемпотентность по `tx_hash` | Payouts, UI |
 | `treasury_mirror.py` | Цепочка, комиссии, эталонный баланс | Кто получает выплаты |
@@ -251,7 +251,7 @@ property-тестом (`tests/test_invariants.py`).
 **Правило добавления нового:** если фича меняет экономику — идёт в `rounds/` или
 `payments.py` (исходящие) / `handlers/payout.py` (выплаты), Telegram-обёртка — в `handlers/`. Сюжет — только в
 `story/cassettes/`. Никогда не импортировать `story/` из `rounds/` напрямую:
-единственный стык — `app/rounds/rendering.py::_plan_and_render` (см. `bay.install_bay`).
+единственный стык — `app/rounds/rendering.py::plan_and_render` (`register_plan_provider`, см. `bay.install_bay`).
 
 ---
 

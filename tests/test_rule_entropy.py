@@ -4,7 +4,7 @@
 («seqno:root_hash»), и rule выводится детерминированно: root_hash % 3.
 
 Свойства:
-- _plan_and_render с энтропией даёт детерминированный закон, payload хранит
+- render_template_day с энтропией даёт детерминированный закон, payload хранит
   саму энтропию — хранитель проверит закон по блоку в эксплорере;
 - create_next_round_detailed снимает энтропию и сохраняет её в день
   (rule_entropy), а not локальный secrets-жребий;
@@ -23,9 +23,8 @@ from app.config import settings
 from app.models import Card, Round, RoundStatus, WinRule
 from app.rounds import create_next_round_detailed
 
-# Не из пакета: app.rounds._plan_and_render удалён как нетронутый install_bay
-# алиас, обходивший кассетный отсек.
-from app.rounds.rendering import _plan_and_render
+# Шаблонный рендер напрямую: провайдер кассет здесь не участвует.
+from app.rounds.rendering import render_template_day
 
 NOW = datetime.now(UTC)
 
@@ -62,15 +61,15 @@ async def test_plan_and_render_rule_derived_from_entropy(session) -> None:
     """Закон детерминирован блоком: root_hash % 3, энтропия уходит в payload."""
     cases = (("100", "3", WinRule.MAJORITY), ("101", "7", WinRule.MINORITY), ("102", "5", WinRule.MEDIAN))
     for seqno, root, expected in cases:
-        payload = await _plan_and_render(session, 7, entropy=f"{seqno}:{root}")
+        payload = await render_template_day(session, 7, entropy=f"{seqno}:{root}")
         assert payload["rule_entropy"] == f"{seqno}:{root}"
         assert payload["rule"] == expected.value
         assert payload["rule"] == _expected_rule(root).value
 
 
 async def test_plan_and_render_same_block_same_rule(session) -> None:
-    a = await _plan_and_render(session, 7, entropy="100:deadbeef")
-    b = await _plan_and_render(session, 7, entropy="100:deadbeef")
+    a = await render_template_day(session, 7, entropy="100:deadbeef")
+    b = await render_template_day(session, 7, entropy="100:deadbeef")
     assert a["rule"] == b["rule"] == _expected_rule("deadbeef").value
 
 
