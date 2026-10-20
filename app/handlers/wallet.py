@@ -716,6 +716,8 @@ async def _fund_text() -> str:
             .scalars()
             .all()
         )
+    # SUM(BigInteger) на Postgres приходит Decimal — приводим к int до деления.
+    fund_nano = int(fund_nano or 0)
     lines = [f"🏦 Фонд Стаи на плёнке: <b>{fund_nano / 1e9:.2f} Gram</b>", ""]
     lines.append("Журнал фонда, последние записи:")
     if not rows:

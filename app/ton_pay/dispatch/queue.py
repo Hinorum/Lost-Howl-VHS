@@ -42,9 +42,14 @@ async def _reset_retriable(session, network: str) -> None:
     (WHERE status='pending' перед переводом в sending): двойная отправка
     закрывается целиком (атомарный клейм + атомарный reset).
     """
-    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+    cutoff_dt = datetime.now(UTC) - timedelta(
         seconds=settings.payout_send_timeout_seconds + 30
     )
+    # На Postgres колонка timezone=True сравнивается с aware-значением; naive
+    # cutoff там трактуется в TZ сессии, и на сервере не в UTC «мёртвый» клейм
+    # выглядел бы живым. SQLite хранит naive UTC — ему aware-параметр не годится.
+    is_postgres = session.get_bind().dialect.name == "postgresql"
+    cutoff = cutoff_dt if is_postgres else cutoff_dt.replace(tzinfo=None)
     base_predicates = (
         Payout.network == network,
         Payout.attempts < settings.payout_max_attempts,

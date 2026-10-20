@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from conftest import ensure_player
 from sqlalchemy import select
 
 from app.config import settings
@@ -52,6 +53,8 @@ async def test_panel_builder_contains_core_sections(session, monkeypatch) -> Non
     """Панель читает ГЛОБАЛЬНУЮ базу (как прод): сеем туда и чистим после."""
     monkeypatch.setattr(settings, "admin_ids", "4242")
     monkeypatch.setattr(settings, "ton_enabled", True)
+    for player_id in (97_510, 97_511, 97_512):
+        await ensure_player(player_id)
     now = datetime.now(UTC)
     async with SessionLocal() as db:
         db.add(Round(
@@ -115,6 +118,7 @@ async def test_panel_shows_prizes_waiting_for_wallet(session, monkeypatch) -> No
     monkeypatch.setattr(settings, "admin_ids", "4242")
     async with SessionLocal() as db:
         db.add(Player(id=975_011, username="late", wallet_address=""))
+        await db.flush()
         db.add(Payout(
             round_id=None,
             player_id=975_011,

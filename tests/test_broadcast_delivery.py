@@ -23,7 +23,7 @@ from sqlalchemy import delete, select
 from app import broadcast as bc
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Card, Chat, Player, Round, RoundStatus, WatcherState, WinRule
+from app.models import Card, Chat, Player, Round, RoundStatus, StatusPost, WatcherState, WinRule
 
 
 def _round(day_index: int = 9300) -> Round:
@@ -231,7 +231,7 @@ async def test_retry_after_failure_does_not_abort_day(monkeypatch) -> None:
         async with SessionLocal() as db:
             assert (await db.get(Chat, loud)).active is True
     finally:
-        await _wipe(Chat, Round)
+        await _wipe(Chat, Card, Round)
 
 
 async def test_retry_after_then_success_keeps_chat(monkeypatch) -> None:
@@ -245,7 +245,7 @@ async def test_retry_after_then_success_keeps_chat(monkeypatch) -> None:
         bot = _flaky_bot({chat: [TelegramRetryAfter(None, "flood", retry_after=1)]})
         assert await bc.announce_new_day(bot, _round(9302), finished=None) == [chat]
     finally:
-        await _wipe(Chat, Round)
+        await _wipe(Chat, Card, Round)
 
 
 async def test_announce_delivers_round_fetched_without_cards() -> None:
@@ -260,10 +260,9 @@ async def test_announce_delivers_round_fetched_without_cards() -> None:
     from sqlalchemy import inspect as sa_inspect
     from sqlalchemy.orm.attributes import NO_VALUE
 
-    # Чистый слэб: _wipe(Round) не трогает карты (FK не каскадит в SQLite),
-    # и вставка раунда в пустую таблицу повторила бы id=1 на осиротевших
-    # картах — UNIQUE round_id+position.
-    await _wipe(Chat, Round, Card)
+    # Дети раньше родителя: Postgres не каскадит FK, и DELETE FROM rounds
+    # упирается в осиротевшие карты.
+    await _wipe(Chat, Card, Round)
     chat = 777_106
     async with SessionLocal() as db:
         db.add(Chat(id=chat, type="group", active=True))
@@ -280,7 +279,7 @@ async def test_announce_delivers_round_fetched_without_cards() -> None:
         delivered = await bc.announce_new_day(_flaky_bot({}), bare, finished=None)
         assert delivered == [chat]
     finally:
-        await _wipe(Chat, Round, Card)
+        await _wipe(Chat, StatusPost, Card, Round)
 
 
 # ── личные дубликаты ────────────────────────────────────────────────────────
@@ -887,7 +886,7 @@ async def test_announce_without_audience_leaves_a_trace(monkeypatch, caplog) -> 
         assert "ушёл в пустоту" in caplog.text
     finally:
         metrics_mod.reset()
-        await _wipe(Round)
+        await _wipe(StatusPost, Card, Round)
         async with SessionLocal() as db:
             await db.execute(
                 delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY)
@@ -915,7 +914,7 @@ async def test_announce_clears_empty_marker_when_audience_returns(monkeypatch) -
         async with SessionLocal() as db:
             assert await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY) is None
     finally:
-        await _wipe(Chat, Round)
+        await _wipe(Chat, StatusPost, Card, Round)
         async with SessionLocal() as db:
             await db.execute(
                 delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY)
@@ -946,7 +945,7 @@ async def test_announce_without_bot_leaves_a_trace(monkeypatch, caplog) -> None:
             assert await db.get(WatcherState, ANNOUNCE_EMPTY_DAY_KEY) is None
     finally:
         metrics_mod.reset()
-        await _wipe(Round)
+        await _wipe(StatusPost, Card, Round)
 
 
 def test_failure_reason_normalizes_for_counter() -> None:

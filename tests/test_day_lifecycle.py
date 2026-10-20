@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from conftest import ensure_player
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, NoInspectionAvailable
 
@@ -33,6 +34,7 @@ from app.models import (
     Round,
     RoundStatus,
     Stake,
+    StatusPost,
     StoryBeat,
     Vote,
     WatcherState,
@@ -91,6 +93,8 @@ async def _wipe(days: list[int]) -> None:
         await db.execute(delete(Income))
         await db.execute(delete(RevoteGrant))
         await db.execute(delete(Payout))
+        await db.execute(delete(StatusPost))
+        await db.execute(delete(PreparedDay))
         for round_row in (
             await db.execute(select(Round).where(Round.day_index.in_(days)))
         ).scalars().all():
@@ -278,6 +282,7 @@ async def test_resetgame_refused_with_unfinalized_stakes(offline_all) -> None:
 
     round_row = _round(740, RoundStatus.CLOSED, voting_in_minutes=-40)
     round_row.winner_card = 0  # payouts_finalized остаётся False
+    await ensure_player(1)
     async with SessionLocal() as db:
         db.add(round_row)
         await db.flush()
@@ -312,6 +317,7 @@ async def test_announce_new_day_is_text_only(monkeypatch, tmp_path) -> None:
     from app.broadcast import announce_new_day
 
     monkeypatch.setattr(settings, "media_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "player_dm", False)
     cover = Path(tmp_path) / "day8001_cover.jpg"
     cover.write_bytes(b"\xff\xd8\xfffakejpeg")
     round_row = Round(
@@ -332,6 +338,7 @@ async def test_announce_new_day_is_text_only(monkeypatch, tmp_path) -> None:
     )
     async with SessionLocal() as db:
         db.add(Chat(id=555_777, type="group", active=True))
+        db.add(round_row)
         await db.commit()
     try:
         bot = SimpleNamespace(
@@ -345,6 +352,7 @@ async def test_announce_new_day_is_text_only(monkeypatch, tmp_path) -> None:
         bot.send_photo.assert_not_awaited()
         bot.send_message.assert_awaited_once()  # статус с кнопками дошёл
     finally:
+        await _wipe([8001])
         async with SessionLocal() as db:
             chat = await db.get(Chat, 555_777)
             if chat is not None:

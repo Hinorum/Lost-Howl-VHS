@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest
-from conftest import ensure_player
+from conftest import ensure_player, ensure_round
 from sqlalchemy import delete, select
 
 import app.handlers.panel as panel_mod
@@ -107,6 +107,9 @@ async def _seed_day(
                 vote_counts_json='{"0":2,"1":1}',
             )
         )
+        # Родитель раньше детей: без flush SQLAlchemy вставляет Payout/Vote
+        # до Round (связей в ORM нет), и Postgres честно ругается на FK.
+        await db.flush()
         db.add(Vote(round_id=round_id, player_id=770011, card_position=0))
         db.add(Vote(round_id=round_id, player_id=770012, card_position=1))
         db.add(
@@ -270,6 +273,8 @@ async def test_dispute_compensate_requires_verified_wallet(monkeypatch) -> None:
 async def test_dispute_compensate_pays_out(monkeypatch) -> None:
     monkeypatch.setattr(settings, "admin_ids", str(ADMIN_ID))
     await ensure_player(88004)
+    # Компенсация создаёт Payout с round_id=779999 — день обязан существовать.
+    await ensure_round(779999)
     async with SessionLocal() as db:
         player = await db.get(Player, 88004)
         player.wallet_address = "UQ_test_wallet"

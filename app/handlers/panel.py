@@ -183,7 +183,8 @@ async def _build_panel_text(session) -> str:
                     select(func.coalesce(func.sum(_Fund.nanotons), 0))
                 )
             ).scalar_one()
-            lines.append(f"🐾 Фонд Стаи: {fund_nano / 1e9:.2f} Gram")
+            # SUM(BigInteger) на Postgres приходит Decimal — приводим к int.
+            lines.append(f"🐾 Фонд Стаи: {int(fund_nano or 0) / 1e9:.2f} Gram")
         except Exception:
             logger.warning("Строка Фонда Стаи в панели не собралась", exc_info=True)
         # Метрики суток: явка вчера, всплывшие эха, оставшиеся заглушки.

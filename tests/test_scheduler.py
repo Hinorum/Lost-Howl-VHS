@@ -1756,6 +1756,7 @@ async def test_vote_reminder_clears_stale_marker_when_audience_empty(monkeypatch
         async with SessionLocal() as db:
             assert await db.get(WatcherState, "delivery:dm:vote-reminder") is None
     finally:
+        await _clear_rounds()
         async with SessionLocal() as db:
             await db.execute(
                 delete(WatcherState).where(
@@ -1764,5 +1765,4 @@ async def test_vote_reminder_clears_stale_marker_when_audience_empty(monkeypatch
             )
             await db.execute(delete(Player).where(Player.id == 541))
             await db.commit()
-        await _clear_rounds()
 
