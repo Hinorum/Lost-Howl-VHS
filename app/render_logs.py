@@ -188,17 +188,20 @@ async def resolve_service_id() -> str:
 def _log_query_shapes(since: datetime) -> list[dict[str, Any]]:
     """Формы запроса логов — от строгой к простой.
 
-    Формат `/v1/logs` не документирован публично (спека Render закрыта), и
-    бот узнаёт форму на живой сети: перебирает варианты и запоминает
-    сработавший. Порядок отражает документированное поведение CLI Render:
-    стартовый запрос отдаёт не больше 100 строк, пагинация — до 1000.
+    Имена параметров взяты из сгенерированного клиента Render (CLI
+    render-oss/cli, репозиторий public-api-schema): `resource` (список
+    resource id), `startTime`/`endTime` (date-time, RFC3339), `direction`
+    (backward/forward), `limit`. Формат не документирован на сайте Render, но
+    зашит в клиент — и бот узнаёт форму на живой сети: перебирает варианты и
+    запоминает сработавший. Порядок отражает поведение CLI: стартовый запрос
+    отдаёт не больше 100 строк, пагинация — до 1000.
     """
     stamp = since.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     return [
-        {"resources": None, "start": stamp, "limit": 100},
-        {"resources": None, "limit": 100},
-        {"resources": None, "start": stamp, "limit": 1000},
-        {"resources": None, "limit": 1000},
+        {"startTime": stamp, "limit": 100, "direction": "backward"},
+        {"limit": 100},
+        {"startTime": stamp, "limit": 1000, "direction": "backward"},
+        {"limit": 1000},
     ]
 
 
@@ -211,8 +214,8 @@ async def fetch_logs(service_id: str, since: datetime, limit: int) -> tuple[list
     """
     last_error: Exception | None = None
     for shape in _log_query_shapes(since):
-        params = {key: value for key, value in shape.items() if value is not None}
-        params["resources"] = service_id
+        params: dict[str, Any] = {key: value for key, value in shape.items() if value is not None}
+        params["resource"] = service_id
         if "limit" in params and int(params["limit"]) > limit:
             params["limit"] = limit
         try:
@@ -228,7 +231,9 @@ async def fetch_logs(service_id: str, since: datetime, limit: int) -> tuple[list
             message = entry.get("message")
             if isinstance(message, str):
                 out.append(message)
-        used = ",".join(f"{key}={value}" for key, value in params.items() if key != "resources")
+        used = ",".join(
+            f"{key}={value}" for key, value in params.items() if key != "resource"
+        )
         return out, used
     raise RuntimeError(f"ни одна форма запроса логов не подошла: {last_error}")
 
