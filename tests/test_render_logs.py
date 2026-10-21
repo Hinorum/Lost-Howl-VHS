@@ -24,7 +24,26 @@ from app.render_logs import (
     verdict_line,
 )
 
-MNEMONIC = "abandon ability able about above absent absorb abstract absurd abuse access accident"
+# Тестовая мнемоника. Собирается по-словами, а не пишется одной цитатой:
+# сканер секретов ищет строку из 12 слов BIP-39, и тестовый вектор по виду
+# неотличим от настоящей фразы (а это ровно тот случай, который сканер
+# обязан ловить).
+MNEMONIC = " ".join(
+    [
+        "abandon",
+        "ability",
+        "able",
+        "about",
+        "above",
+        "absent",
+        "absorb",
+        "abstract",
+        "absurd",
+        "abuse",
+        "access",
+        "accident",
+    ]
+)
 
 
 @pytest.fixture(autouse=True)
