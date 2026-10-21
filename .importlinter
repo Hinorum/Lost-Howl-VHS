@@ -16,6 +16,12 @@ include_external_packages = False
 # поэтому спрятаны внутрь функций). Список обязан быть точным: несовпавший
 # ignore валит контракт, поэтому развязка любой из этих пар обязана удалить
 # строку отсюда. Всё, что вне списка, контракт проверяет как есть.
+#
+# app.ton_pay.wallet -> app.ton_pay.http_channel: холодный старт сверяет
+# seqno лайтсерверов с Toncenter (HTTP). Импорт ленивый (внутри функции),
+# но ребро остаётся в СТАТИЧЕСКОМ графе: http_channel тянет wallet на
+# уровне модуля — иначе получилась бы петля. В рантайме петли нет: wallet
+# грузится первым, а http_channel подтягивается уже после.
 [importlinter:contract:1]
 name = Нет циклических импортов в app
 type = acyclic_siblings
@@ -32,6 +38,7 @@ ignore_imports =
     app.stakes -> app.handlers.wallet
     app.stakes -> app.rounds.time
     app.ton_pay.treasury -> app.ton_watch
+    app.ton_pay.wallet -> app.ton_pay.http_channel
     app.treasury_mirror -> app.ton_pay
 
 # Контракт 2: денежный контур не знает про Telegram-слой и сюжет.
