@@ -288,7 +288,13 @@ python -m pytest -q                              # тесты без сети и
 python -m ruff check .                           # линтер
 python -m mypy app/ton_pay app/ton_watch app/rounds  # типы (постепенный охват)
 python -m scripts.cassette_tool lint <файл.json> # кассета перед коммитом (по одному файлу)
+lint-imports                                     # контракты импортной архитектуры
 ```
+
+`lint-imports` на Windows требует UTF-8: конфиг `.importlinter` с русскими
+именами контрактов читается в кодировке локали, и без
+`$env:PYTHONUTF8=1` проверка падает с ошибкой кодировки, а не с вердиктом.
+В CI (Linux) это неактуально.
 
 ### Покрытие тестами
 
