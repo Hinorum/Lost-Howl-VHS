@@ -23,6 +23,7 @@ from aiogram import Bot
 from sqlalchemy import select
 
 from app.config import settings
+from app.core.processed import KIND_STAKE, transfer_claim_kind
 from app.core.registry import BEAT_KEY as BEAT_KEY
 from app.core.registry import CURSOR_KEY as CURSOR_KEY
 from app.core.registry import SCAN_BOOST_KEY as SCAN_BOOST_KEY
@@ -37,7 +38,7 @@ from app.models import Player, Round, RoundStatus, WatcherState
 from app.ops import claim_once as claim_once
 from app.ops import is_game_paused
 from app.payments import parse_bank_memo, parse_revote_memo, parse_verify_memo
-from app.stakes import confirm_stake, register_stake
+from app.stakes import confirm_stake, current_network, register_stake
 from app.ton_codec import (
     api_headers,
     clean_comment,
@@ -492,7 +493,20 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
             await _ledger_incoming(
                 session, transfer, player.id, round_row.id, f"stake:{result}"
             )
-        elif result != "duplicate_tx":
+        elif result == "duplicate_tx":
+            # Перевод уже разобран. Если это была ставка, строка дохода
+            # обязана быть в журнале: без неё перевод невидим для сверки
+            # казны — расхождение висит молча (тревога срабатывает только на
+            # нехватке, а здесь излишек). Повторный проход чинит журнал
+            # (идемпотентно по unit_ref=tx_hash), а не плодит деньги.
+            if (
+                await transfer_claim_kind(session, transfer.tx_hash, current_network())
+                == KIND_STAKE
+            ):
+                await _ledger_incoming(
+                    session, transfer, player.id, round_row.id, "stake:repair"
+                )
+        else:
             await _ledger_incoming(
                 session, transfer, player.id, round_row.id, f"stake:{result}"
             )

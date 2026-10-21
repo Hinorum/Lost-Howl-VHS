@@ -58,6 +58,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.processed import KIND_STAKE, claim_transfer, transfer_claim_kind
 from app.models import (
     LeaderboardPot,
     PackFund,
@@ -159,6 +160,13 @@ async def register_stake(
 
     if await is_game_paused(session):
         return "paused"
+    # Перевод уже разобран (повторный проход watcher'а, сброс курсора, ре-скан
+    # после деплоя): трогать его второй раз нельзя — ни ставкой, ни возвратом.
+    # Источник правды — журнал обработанных переводов: Stake.tx_hash мог быть
+    # перезаписан, когда пылевую ставку вытесняла валидная, и след перевода
+    # исчезал — а вместе с ним и защита от второго авто-возврата.
+    if await transfer_claim_kind(session, tx_hash, current_network()) is not None:
+        return "duplicate_tx"
     # Владелец кошелька не доказан: код подтверждения (мемо bv:<код>) ещё ждёт
     # встречного микро-перевода. Пока он не подтверждён, ставки с адреса не
     # считаются — иначе привязка чужого публичного адреса приписывала бы чужие
@@ -190,6 +198,14 @@ async def register_stake(
         # ставка поверх пылевой тоже не валидная замена — как вторая ставка дня.
         return "already_staked"
     if previous is not None:
+        # Метка «перевод разобран» — ДО любых записей и в той же транзакции,
+        # что и сама ставка: падение между ними не оставит перевод
+        # «наполовину разобранным» (а падение ПОСЛЕ метки откатит её вместе
+        # с эффектом — перевод будет разобран заново).
+        if not await claim_transfer(
+            session, tx_hash, current_network(), KIND_STAKE, amount_nanotons
+        ):
+            return "duplicate_tx"
         # Отклонённая (пылевая) ставка НЕ занимает слот дня: валидная ставка
         # записывается на её место — иначе игрок, пославший микро-перевод ниже
         # минимума, физически не поставил бы в этот день (вторая попытка ловила
@@ -211,6 +227,13 @@ async def register_stake(
                     dest_address=(
                         player.wallet_address if player.wallet_verified else ""
                     ),
+                    # tx_hash возврата — хеш ВХОДЯЩЕГО перевода, который
+                    # возвращается (по конвенции авто-возвратов в
+                    # app/ton_watch/refunds.py): он же защита от второго
+                    # возврата того же перевода и след для аудита. Раньше
+                    # здесь был NULL, и повторный проход watcher'а не находил
+                    # этот возврат ни по одной из проверок — и создавал второй.
+                    tx_hash=previous.tx_hash[:80],
                     network=current_network(),
                 )
             )
@@ -223,6 +246,10 @@ async def register_stake(
         previous.confirmed_at = None
         await session.commit()
         return reason or "ok"
+    if not await claim_transfer(
+        session, tx_hash, current_network(), KIND_STAKE, amount_nanotons
+    ):
+        return "duplicate_tx"
     session.add(
         Stake(
             round_id=round_row.id,

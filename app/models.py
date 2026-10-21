@@ -576,6 +576,39 @@ class Income(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ProcessedTransfer(Base):
+    """Журнал обработанных входящих переводов: один хеш — одна обработка.
+
+    Строка появляется в той же транзакции, что и денежный эффект перевода
+    (ставка, возврат), поэтому:
+    - повторный проход watcher'а (overlap-окно, сброс курсора, ре-скан после
+      деплоя) не может размножить эффект;
+    - падение процесса не оставляет «половину обработки»: транзакция
+      откатывается целиком, перевод будет разобран заново.
+
+    До этой таблицы «перевод уже разобран» проверялся тремя разными
+    способами (Stake.tx_hash, Income.unit_ref, метка watcher_state), и у
+    каждого была своя дыра: перезапись tx_hash при вытеснении пылевой
+    ставки стирала след перевода, а отсутствие строки Income оставляло его
+    невидимым для сверки казны.
+    """
+
+    __tablename__ = "processed_transfers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tx_hash: Mapped[str] = mapped_column(String(80))
+    network: Mapped[str] = mapped_column(String(16), default="mainnet")
+    # Чем перевод стал: stake — ставка, refund — авто-возврат.
+    kind: Mapped[str] = mapped_column(String(32), default="")
+    amount_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tx_hash", "network", name="uq_processed_transfer_tx_network"),
+        Index("ix_processed_transfer_network_created", "network", "created_at"),
+    )
+
+
 class TreasuryMove(Base):
     """Зеркало транзакций казначея: точная копия истории активного кошелька.
 

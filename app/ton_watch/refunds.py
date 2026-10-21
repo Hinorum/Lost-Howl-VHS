@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from sqlalchemy import func, select
 
 from app.config import settings
+from app.core.processed import KIND_REFUND, claim_transfer, transfer_claim_kind
 from app.models import Income, Payout, Stake
 from app.ops import claim_once
 from app.stakes import current_network
@@ -114,6 +115,26 @@ async def _stash_refund(
     # Повторный проход (сброс курсора, overlap-окно, пауза, ре-скан) НЕ должен
     # создавать второй авто-возврат: монета уже легла в банк дня (приз/Фонд)
     # или в выручку, и повторный refund — это двойной расход казны.
+    # Журнал обработанных переводов — общий источник правды для всех веток
+    # watcher'а: он ловит и те случаи, когда Stake.tx_hash был перезаписан
+    # (пылевая ставка, вытесненная валидной), и те, когда возврат создал
+    # другой путь (вытеснение пылевой ставки).
+    claimed_kind = await transfer_claim_kind(session, transfer.tx_hash, current_network())
+    if claimed_kind is not None:
+        if claimed_kind == KIND_REFUND:
+            logger.warning(
+                "Перевод %s уже возвращён (журнал обработанных переводов) — "
+                "повторный возврат отменён (защита от двойной выплаты)",
+                transfer.tx_hash[:16],
+            )
+            return "refund_duplicated"
+        logger.warning(
+            "Перевод %s уже учтён как %s (журнал обработанных переводов) — "
+            "авто-возврат отменён (защита от двойной выплаты)",
+            transfer.tx_hash[:16],
+            claimed_kind,
+        )
+        return "already_booked"
     booked = await session.execute(
         select(Stake.id).where(
             Stake.tx_hash == transfer.tx_hash, Stake.network == current_network()
@@ -164,6 +185,19 @@ async def _stash_refund(
             session, transfer, ledger_player_id, capped.split(":")[0]
         )
         return "refund_capped"
+    # Метка «перевод разобран» — в той же транзакции, что и сам возврат:
+    # возврат без метки (или метка без возврата) невозможны, и повторный
+    # проход watcher'а не создаст второй выплат. Потолок проверяется ДО
+    # метки: перевод, который упёрся в потолок, ждёт ручного возврата и
+    # должен получить шанс снова.
+    if not await claim_transfer(
+        session,
+        transfer.tx_hash,
+        current_network(),
+        KIND_REFUND,
+        transfer.value_nanotons,
+    ):
+        return "refund_duplicated"
     session.add(
         Payout(
             round_id=round_id,
