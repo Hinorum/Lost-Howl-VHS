@@ -75,6 +75,40 @@ async def cast_vote(session: AsyncSession, round_row: Round, player_id: int, pos
     return "ok"
 
 
+def _claim_grant_stmt(round_id: int, player_id: int):
+    """UPDATE, списывающий ровно один грант игрока (at-most-once).
+
+    Условий два, и нужны оба:
+    - подзапрос выбирает старейший ещё не использованный грант;
+    - ВНЕШНЕЕ условие повторно проверяет status='granted'.
+
+    Без внешней проверки гонка двух процессов проходила насквозь. В Postgres
+    подзапрос без корреляции вычисляется ОДИН раз на оператор и при
+    переоценке WHERE не перечитывается: условие «id = <снимок>» остаётся
+    истинным даже после того, как первый процесс поставил status='used', и
+    второй UPDATE списывает тот же грант. Игрок платил за одну переделку, а
+    голос переписывался дважды.
+    """
+    return (
+        update(RevoteGrant)
+        .where(
+            RevoteGrant.id
+            == (
+                select(RevoteGrant.id)
+                .where(
+                    RevoteGrant.round_id == round_id,
+                    RevoteGrant.player_id == player_id,
+                    RevoteGrant.status == "granted",
+                )
+                .order_by(RevoteGrant.id.asc())
+                .limit(1)
+            ).scalar_subquery(),
+            RevoteGrant.status == "granted",
+        )
+        .values(status="used", used_at=datetime.now(UTC))
+    )
+
+
 async def change_vote(session: AsyncSession, round_row: Round, player_id: int, position: int) -> str:
     """Платная смена выбора: списывает один оплаченный грант и переписывает голос.
 
@@ -91,23 +125,7 @@ async def change_vote(session: AsyncSession, round_row: Round, player_id: int, p
         return "same"
     # Атомарный захват старейшего гранта: условный UPDATE не даёт списать один
     # грант дважды при гонке параллельных вызовов.
-    claim_result = await session.execute(
-        update(RevoteGrant)
-        .where(
-            RevoteGrant.id
-            == (
-                select(RevoteGrant.id)
-                .where(
-                    RevoteGrant.round_id == round_row.id,
-                    RevoteGrant.player_id == player_id,
-                    RevoteGrant.status == "granted",
-                )
-                .order_by(RevoteGrant.id.asc())
-                .limit(1)
-            ).scalar_subquery()
-        )
-        .values(status="used", used_at=datetime.now(UTC))
-    )
+    claim_result = await session.execute(_claim_grant_stmt(round_row.id, player_id))
     if claim_result.rowcount != 1:
         # Гранта нет (или его перехватил параллельный вызов). Пустой commit
         # закрывает транзакцию, не истекая объекты сессии (expire_on_commit=False).
