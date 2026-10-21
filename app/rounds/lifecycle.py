@@ -5,7 +5,7 @@ import logging
 from types import SimpleNamespace
 from typing import Any, cast
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -462,14 +462,34 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
     round_row.status = RoundStatus.CLOSED
     # Канон дня — только победивший кадр. Крючка для следующей кассеты больше
     # нет: каждая кассета — самостоятельная история, месяц не обязан ничем.
-    session.add(
-        StoryBeat(
-            day_index=round_row.day_index,
-            winning_title=winning_card.title,
-            winning_text=winning_card.consequence,
-            win_rule=round_row.win_rule.value,
-            vote_counts=counts_json,
-        )
+    #
+    # Запись идёт UPSERT'ом (ON CONFLICT DO UPDATE), а не session.add():
+    # story_beats.day_index уникален, и после сброса с сохранением канона
+    # (/resetgame confirm keepstory) строка прошлого забега с тем же номером
+    # дня ещё лежит в базе. Обычный INSERT падал IntegrityError ВНУТРИ
+    # транзакции закрытия дня — откат уносил и UPDATE статуса ('closed'),
+    # и день залипал в TALLYING навсегда: heal_stale_rounds лечит только дни
+    # СТРОГО позади последнего, тик повторял тот же сбой. Канон нового
+    # забега переписывает канон прошлого за тот же номер дня — иначе эхо
+    # следующего дня рассказывало бы о событиях чужого забега.
+    await session.execute(
+        text(
+            "INSERT INTO story_beats "
+            "(day_index, winning_title, winning_text, win_rule, vote_counts) "
+            "VALUES (:day_index, :winning_title, :winning_text, :win_rule, :vote_counts) "
+            "ON CONFLICT (day_index) DO UPDATE SET "
+            "winning_title = excluded.winning_title, "
+            "winning_text = excluded.winning_text, "
+            "win_rule = excluded.win_rule, "
+            "vote_counts = excluded.vote_counts"
+        ),
+        {
+            "day_index": round_row.day_index,
+            "winning_title": winning_card.title,
+            "winning_text": winning_card.consequence,
+            "win_rule": round_row.win_rule.value,
+            "vote_counts": counts_json,
+        },
     )
     try:
         await session.commit()

@@ -312,6 +312,75 @@ async def test_resetgame_refused_with_unfinalized_stakes(offline_all) -> None:
         await _wipe([740])
 
 
+async def test_resetgame_keepstory_does_not_stick_next_day(offline_all) -> None:
+    """Сброс с сохранением канона НЕ ломает закрытие первого дня нового забега.
+
+    Регресс: story_beats.day_index уникален, а /resetgame confirm keepstory
+    оставляет строки прошлого забега. Новый забег начинается с дня 1, и
+    закрытие первого дня падало IntegrityError на вставке канона — откат
+    уносил и UPDATE статуса ('closed'), и день залипал в TALLYING навсегда
+    (heal_stale_rounds лечит только дни строго позади последнего).
+    """
+    await ensure_player(1)
+    old = _round(901, RoundStatus.CLOSED, voting_in_minutes=-40)
+    old.winner_card = 0
+    async with SessionLocal() as db:
+        db.add(old)
+        await db.flush()
+        # Канон ПРОШЛОГО забега за первый день — тот же номер, что у нового.
+        db.add(
+            StoryBeat(
+                day_index=1,
+                winning_title="Прошлый канон",
+                winning_text="Прошлый канон.",
+                win_rule="majority",
+                vote_counts="{}",
+            )
+        )
+        await db.commit()
+    try:
+        message = _message("/resetgame confirm keepstory")
+        await cmd_resetgame(message)
+        texts = [c.args[0] for c in message.answer.await_args_list if c.args]
+        assert any("Игра обнулена" in t for t in texts), texts
+
+        async with SessionLocal() as db:
+            fresh = (
+                await db.execute(select(Round).where(Round.day_index == 1))
+            ).scalar_one()
+            fresh_id = fresh.id
+            # Первый день нового забега уходит в подсчёт.
+            await db.execute(
+                update(Round).where(Round.id == fresh_id).values(status=RoundStatus.TALLYING)
+            )
+            await db.commit()
+
+        async with SessionLocal() as db:
+            # Карты тянутся eagerly — как в бою (get_round/selectinload):
+            # finish_tally читает round_row.cards, а ленивая загрузка вне
+            # greenlet-контекста падает MissingGreenlet.
+            row = await lifecycle_mod.get_round(db, fresh_id)
+            closed, closed_here = await lifecycle_mod.finish_tally(db, row)
+        assert closed_here is True, (
+            "день не закрылся: IntegrityError канона откатил и UPDATE статуса — "
+            "день залипает в TALLYING навсегда"
+        )
+        async with SessionLocal() as db:
+            status = (
+                await db.execute(select(Round.status).where(Round.id == fresh_id))
+            ).scalar_one()
+            beat = (
+                await db.execute(select(StoryBeat).where(StoryBeat.day_index == 1))
+            ).scalars().all()
+        assert status == RoundStatus.CLOSED
+        # Канон нового забега переписал канон прошлого за тот же номер дня:
+        # иначе эхо следующего дня рассказывало бы о чужом забеге.
+        assert len(beat) == 1, "канон прошлого забега и нового — одна строка"
+        assert beat[0].winning_text != "Прошлый канон."
+    finally:
+        await _wipe([901, 1])
+
+
 async def test_announce_new_day_is_text_only(monkeypatch, tmp_path) -> None:
     """Шаблонный день: медиа снято — анонс идёт текстом статуса с кнопками."""
     from app.broadcast import announce_new_day
@@ -740,7 +809,14 @@ async def test_finish_tally_lost_update_race(session) -> None:
 
 
 async def test_finish_tally_commit_race_on_duplicate_story_beat(session) -> None:
-    """Конфликт канона (day_index уникален): commit падает, закрытие откатывается (475-478)."""
+    """Занятый day_index канона НЕ отменяет закрытие дня.
+
+    Регресс: канон писался обычным INSERT, а story_beats.day_index уникален —
+    конфликт (гонка с другим процессом или канон прошлого забега после
+    /resetgame confirm keepstory) ронял commit, откат уносил и UPDATE
+    статуса ('closed') — день залипал в TALLYING навсегда. Теперь канон
+    пишется UPSERT'ом: занятой строкой он перезаписывается, день закрывается.
+    """
     round_row = _round(9950, RoundStatus.TALLYING, voting_in_minutes=-30)
     session.add(round_row)
     session.add(
@@ -758,9 +834,13 @@ async def test_finish_tally_commit_race_on_duplicate_story_beat(session) -> None
     round_row_id = round_row.id
     session.expunge(round_row)
     loaded, closed_here = await lifecycle_mod.finish_tally(session, round_row)
-    assert closed_here is False
+    assert closed_here is True, "занятый day_index канона не должен отменять закрытие"
     assert loaded is not None and loaded.id == round_row_id
-    assert loaded.status == RoundStatus.TALLYING  # закрытие откатилось
+    assert loaded.status == RoundStatus.CLOSED
+    beat = (
+        await session.execute(select(StoryBeat).where(StoryBeat.day_index == 9950))
+    ).scalar_one()
+    assert beat.winning_text != "x", "канон прошлого забега переписан каноном дня"
 
 
 async def test_close_voting_lost_claim_race(session) -> None:
