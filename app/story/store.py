@@ -58,6 +58,7 @@ from app.db import SessionLocal
 from app.models import StoryCassette
 from app.story.bay import default_cassettes_dir
 from app.story.editor import is_safe_cassette_name
+from app.story.schema import validate_payload
 
 logger = logging.getLogger(__name__)
 
@@ -390,9 +391,24 @@ async def persist(file_name: str, directory: Path | None = None) -> bool:
         logger.error("Кассета %s не читается — в базу не сохраняем", file_name)
         return False
     try:
-        json.loads(payload)  # зеркало базы должно быть читаемым JSON
+        parsed = json.loads(payload)  # зеркало базы должно быть читаемым JSON
     except ValueError as exc:
         logger.error("Кассета %s не сохранится в базу: %s", file_name, exc)
+        return False
+    if not isinstance(parsed, dict):
+        logger.error("Кассета %s не сохранится в базу: корень кассеты — объект JSON", file_name)
+        return False
+    # Контракт проверяется и здесь, а не только в редакторе: база — источник
+    # правды, и мусор в ней перезаписывает диск зеркалом (sync_from_db),
+    # оставаясь там навсегда. Приём диска (_adopt_disk) кассету валидирует,
+    # а этот путь — нет.
+    checked = validate_payload(parsed)
+    if checked.cassette is None:
+        logger.error(
+            "Кассета %s не проходит контракт — в базу не сохраняем: %s",
+            file_name,
+            "; ".join(checked.errors),
+        )
         return False
     try:
         await _upsert(file_name, payload, _read_backup(path), edited_at=_now())

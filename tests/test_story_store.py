@@ -10,6 +10,7 @@
 - выключенный флаг STORY_CASSETTES_DB — честный no-op без базы.
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -162,6 +163,25 @@ async def test_persist_marks_edited_and_rejects_unsafe_name(library) -> None:
     assert await store.persist("../evil-2099-07.json") is False
     assert await _row("../evil-2099-07.json") is None
     assert not (library.parent / "evil-2099-07.json").exists()
+
+
+async def test_persist_refuses_cassette_failing_contract(library) -> None:
+    """Битая по контракту кассета не попадает в базу — источник правды.
+
+    persist проверял только, что файл — читаемый JSON. Структурно битая
+    кассета селилась в базу и оттуда зеркалом перезаписывала диск, оставаясь
+    там навсегда: движок её отвергал, а «источник правды» хранил мусор.
+    Приём диска (_adopt_disk) контракт проверяет — этот путь обязан тоже.
+    """
+    name = "store-badschema-2099-11.json"
+    _write_cassette(library, name, "2099-11", 30, "broken")
+    # Ломаем контракт: месяц не существует (календарь — жёсткое правило).
+    payload = json.loads((library / name).read_text(encoding="utf-8"))
+    payload["month"] = "2099-13"
+    (library / name).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert await store.persist(name) is False
+    assert await _row(name) is None
 
 
 async def test_broken_catalog_file_is_not_adopted(library) -> None:
