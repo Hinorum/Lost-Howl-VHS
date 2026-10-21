@@ -129,6 +129,17 @@ def scan_messages(messages: list[str]) -> dict[str, Any]:
     return {"hits": hits, "samples": samples, "scanned": len(messages)}
 
 
+def _entry_time(raw: Any) -> datetime | None:
+    """Время записи лога (RFC3339) — для постраничного обхода."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
 async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
     """GET к Render API. Только чтение — ключ никогда не уходит на запись.
 
@@ -225,41 +236,110 @@ async def resolve_service() -> tuple[str, str]:
 
 async def fetch_logs(
     service_id: str, owner_id: str, since: datetime, limit: int
-) -> tuple[list[str], str]:
-    """Забирает тексты логов сервиса за окно назад.
+) -> tuple[list[str], dict[str, Any]]:
+    """Забирает тексты логов сервиса за окно назад — постранично.
 
-    Возвращает (тексты, использованная форма запроса). Формы перебираются по
-    очереди: какая сработала — пишется в вердикт, чтобы следующий прогон
-    не тратил время на подбор.
+    Логи Render листаются временем (курсора у списка нет), поэтому страницы
+    идут ОТ САМОГО СТАРОГО к новому: утечка при старте процесса (главный
+    кандидат — мнемоника в первых же строках) живёт в начале окна, а в хвосте
+    лежит шум тиков. Направление — forward.
+
+    Возвращает (тексты, сводка): сколько строк, какое окно реально покрыто
+    и доводилось ли окно до конца. Если страницы кончились, а окно — нет,
+    вердикт говорит об этом прямо: молчаливая частичная проверка хуже
+    явной.
     """
     last_error: Exception | None = None
-    for shape in _log_query_shapes(since):
+    for candidate in _log_query_shapes(since):
         params: dict[str, Any] = {
-            key: value for key, value in shape.items() if value is not None
+            key: value for key, value in candidate.items() if value is not None
         }
         params["resource"] = service_id
         params["ownerId"] = owner_id
-        if "limit" in params and int(params["limit"]) > limit:
-            params["limit"] = limit
+        params["direction"] = "forward"
+        page_limit = int(params.get("limit") or 100)
+        max_pages = max(1, int(settings.render_logs_max_pages))
+        total_limit = max(page_limit, int(settings.render_logs_limit))
+        messages: list[str] = []
+        stamps: list[datetime] = []
+        seen_ids: set[str] = set()
+        cursor = since
+        pages = 0
         try:
-            payload = await _api_get("/logs", params)
+            while pages < max_pages and len(messages) < total_limit:
+                params["startTime"] = (
+                    cursor.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                )
+                payload = await _api_get("/logs", params)
+                entries = (
+                    payload if isinstance(payload, list) else (payload or {}).get("logs") or []
+                )
+                pages += 1
+                if not entries:
+                    break
+                page_stamps: list[datetime] = []
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    message = entry.get("message")
+                    if isinstance(message, str):
+                        messages.append(message)
+                    stamp = _entry_time(entry.get("timestamp"))
+                    if stamp is not None:
+                        page_stamps.append(stamp)
+                if not page_stamps:
+                    break
+                fresh = [
+                    entry
+                    for entry in entries
+                    if isinstance(entry, dict)
+                    and str(entry.get("id") or "") not in seen_ids
+                ]
+                if not fresh:
+                    # Страница повторилась — дальше идти бессмысленно.
+                    break
+                for entry in fresh:
+                    seen_ids.add(str(entry.get("id") or ""))
+                    stamp = _entry_time(entry.get("timestamp"))
+                    if stamp is not None:
+                        stamps.append(stamp)
+                # Дальше идём ЗА самой свежей записью страницы: фильтр startTime
+                # отсекает всё, что раньше, поэтому следующая страница — это
+                # продолжение окна, а не повтор той же порции.
+                cursor = max(page_stamps) + timedelta(seconds=1)
+                if len(entries) < page_limit:
+                    break
         except Exception as exc:
+            # Форма не подошла — пробуем следующую.
             last_error = exc
             continue
-        entries = payload if isinstance(payload, list) else (payload or {}).get("logs") or []
-        out: list[str] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            message = entry.get("message")
-            if isinstance(message, str):
-                out.append(message)
-        used = ",".join(
+        now = datetime.now(UTC)
+        if stamps:
+            oldest = min(stamps)
+            newest = max(stamps)
+            span = (now - since).total_seconds() or 1
+            share = min(1.0, max(0.0, (newest - oldest).total_seconds() / span))
+            summary = {
+                "pages": pages,
+                "oldest": oldest.isoformat(),
+                "newest": newest.isoformat(),
+                "covered_share": round(share, 3),
+                "window_covered": share >= 0.99,
+            }
+        else:
+            summary = {
+                "pages": pages,
+                "oldest": None,
+                "newest": None,
+                "covered_share": 0.0,
+                "window_covered": True,
+            }
+        summary["query"] = ",".join(
             f"{key}={value}"
             for key, value in params.items()
-            if key not in ("resource", "ownerId")
+            if key not in ("resource", "ownerId", "startTime")
         )
-        return out, used
+        return messages, summary
     raise RuntimeError(f"ни одна форма запроса логов не подошла: {last_error}")
 
 
@@ -276,6 +356,11 @@ async def check_render_logs() -> dict[str, Any]:
         "samples": {},
         "service": None,
         "query": None,
+        "pages": 0,
+        "oldest": None,
+        "newest": None,
+        "covered_share": 0.0,
+        "window_covered": False,
         "window_hours": int(settings.render_logs_lookback_hours),
         "error": None,
     }
@@ -283,10 +368,10 @@ async def check_render_logs() -> dict[str, Any]:
         service_id, owner_id = await resolve_service()
         verdict["service"] = service_id
         since = datetime.now(UTC) - timedelta(hours=verdict["window_hours"])
-        messages, used = await fetch_logs(
+        messages, summary = await fetch_logs(
             service_id, owner_id, since, int(settings.render_logs_limit)
         )
-        verdict["query"] = used
+        verdict.update(summary)
         verdict.update(scan_messages(messages))
     except Exception as exc:
         verdict["error"] = f"{type(exc).__name__}: {exc}"[:300]
@@ -343,7 +428,20 @@ def verdict_line(verdict: dict[str, Any] | None) -> str:
     hits = verdict.get("hits") or {}
     scanned = int(verdict.get("scanned") or 0)
     checked = str(verdict.get("checked_at") or "")[:16].replace("T", " ")
+    window = verdict.get("window_hours")
+    share = verdict.get("covered_share")
+    coverage = ""
+    if share is not None and window:
+        if verdict.get("window_covered"):
+            coverage = f", окно {window} ч пройдено целиком"
+        else:
+            coverage = f", окно {window} ч пройдено на {int(float(share) * 100)}%"
     if hits:
         names = ", ".join(f"{name} ×{count}" for name, count in sorted(hits.items()))
-        return f"⚠️ Логи Render: утечки секретов! {names} (строк {scanned}, проверено {checked})"
-    return f"Логи Render: секретов в логах нет (строк {scanned}, окно {verdict.get('window_hours')} ч, проверено {checked})"
+        return (
+            f"⚠️ Логи Render: утечки секретов! {names} "
+            f"(строк {scanned}{coverage}, проверено {checked})"
+        )
+    return (
+        f"Логи Render: секретов в логах нет (строк {scanned}{coverage}, проверено {checked})"
+    )

@@ -405,6 +405,8 @@ class Settings(BaseSettings):
     # Окно просмотра логов (часов) и потолок строк за один проход.
     render_logs_lookback_hours: int = 24
     render_logs_limit: int = 2000
+    # Потолок страниц за один проход (страница логов — до 100 строк).
+    render_logs_max_pages: int = 20
     # Как часто проверять логи (часов): чаще — больше нагрузки на API Render.
     render_logs_check_interval_hours: int = 6
     # Username бота без «@» (t.me/<username>?start=...). Пусто — бот запросит

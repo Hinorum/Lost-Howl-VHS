@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import delete
@@ -239,3 +240,76 @@ async def test_check_records_error_without_raising(monkeypatch) -> None:
     assert "401" in verdict["error"]
     stored = await last_verdict()
     assert stored is not None and stored["error"]
+
+
+async def test_fetch_logs_walks_window_by_time(monkeypatch) -> None:
+    """Страницы идут от самого старого к новому: утечка при старте — в начале."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_max_pages", 5)
+    # Страница логов — до 100 строк; в тесте делаем её короче, чтобы обход
+    # уложился в две страницы.
+    monkeypatch.setattr(
+        "app.render_logs._log_query_shapes", lambda since: [{"limit": 2}]
+    )
+
+    pages = [
+        [
+            {"id": "1", "message": "старт", "timestamp": "2026-10-21T09:00:00Z"},
+            {"id": "2", "message": "старт2", "timestamp": "2026-10-21T09:00:01Z"},
+        ],
+        [
+            {"id": "3", "message": "хвост", "timestamp": "2026-10-21T09:10:00Z"},
+        ],
+    ]
+    seen_starts: list[str] = []
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return [
+                {"service": {"id": "srv-1", "name": "bot", "type": "web", "ownerId": "own-1"}}
+            ]
+        seen_starts.append(str(params.get("startTime")))
+        index = min(len(seen_starts) - 1, len(pages) - 1)
+        return pages[index]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import fetch_logs
+
+    since = datetime(2026, 10, 21, 8, 0, 0, tzinfo=UTC)
+    messages, summary = await fetch_logs("srv-1", "own-1", since, 2000)
+
+    assert messages == ["старт", "старт2", "хвост"]
+    assert summary["pages"] == 2
+    assert summary["oldest"].startswith("2026-10-21T09:00:00")
+    assert summary["newest"].startswith("2026-10-21T09:10:00")
+    # Первая страница — от начала окна; вторая — сразу ЗА самой свежей записью
+    # первой (фильтр startTime отсекает всё, что раньше).
+    assert seen_starts[0].startswith("2026-10-21T08:00:00")
+    assert seen_starts[1].startswith("2026-10-21T09:00:02")
+
+
+async def test_check_reports_uncovered_window(monkeypatch, secrets) -> None:
+    """Если окно не покрыто целиком — вердикт говорит об этом прямо."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_max_pages", 1)
+    monkeypatch.setattr(settings, "render_logs_lookback_hours", 24)
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return [
+                {"service": {"id": "srv-1", "name": "bot", "type": "web", "ownerId": "own-1"}}
+            ]
+        return [
+            {"id": "1", "message": "строка", "timestamp": "2026-10-21T09:00:00Z"},
+        ]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+    assert verdict["error"] is None
+    assert verdict["scanned"] == 1
+    assert verdict["covered_share"] < 1.0
+    assert verdict["window_covered"] is False
