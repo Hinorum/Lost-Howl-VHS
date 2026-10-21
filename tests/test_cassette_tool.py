@@ -335,6 +335,38 @@ def test_lint_rotation_underuse_warns() -> None:
     assert any("позиции 2" in warning and "dare" in warning for warning in warnings)
 
 
+def test_lint_rotation_reads_tag_by_position_not_by_list_index() -> None:
+    """Ротация считается по полю position, а не по индексу карты в списке.
+
+    Контракт требует лишь множество позиций {0,1,2}: порядок карт в списке
+    не зафиксирован (YAML-патч может переставить карты). Линт, читавший
+    cards[position], считал бы не тот тег — замечания о ротации выходили бы
+    ложными (и молчали там, где нужен был).
+    """
+    from app.story.schema import validate_payload
+
+    payload = _clean_cassette_payload()
+    for day in payload["days"]:
+        for card in day["cards"]:
+            # Тег привязан к ПОЗИЦИИ, а не к месту в списке.
+            card["tag"] = "care" if card["position"] in (0, 1) else "dare"
+        # Порядок карт в списке переставлен: индекс 0 — это карта позиции 2.
+        day["cards"] = [
+            {**day["cards"][2], "position": 2},
+            {**day["cards"][1], "position": 1},
+            {**day["cards"][0], "position": 0},
+        ]
+    cassette = validate_payload(payload).cassette
+    assert cassette is not None
+    warnings = cassette_tool.lint_warnings(cassette)
+    # «dare» стоит в позиции 2 — недостаёт в позициях 0 и 1.
+    # Проверяем именно замечание о недостаче («лишь N дней»), а не залипание
+    # («три дня подряд»): обе строки называют тег и позицию.
+    assert any("«dare» в позиции 0 лишь" in warning for warning in warnings), warnings
+    assert any("«dare» в позиции 1 лишь" in warning for warning in warnings), warnings
+    assert not any("«dare» в позиции 2 лишь" in warning for warning in warnings), warnings
+
+
 def test_lint_duplicate_header_and_title_warn() -> None:
     from app.story.schema import validate_payload
 

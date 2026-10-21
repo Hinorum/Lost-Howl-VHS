@@ -34,6 +34,19 @@ def _roads(cassette: Cassette) -> list[tuple[str, list[DayModel]]]:
     return roads
 
 
+def _tag_at(day: DayModel, position: int) -> str | None:
+    """Тег карты, стоящей в позиции position, — по полю position.
+
+    Контракт требует лишь МНОЖЕСТВО позиций {0,1,2}: порядок карт в списке
+    не зафиксирован. По индексу списка линт считал бы не тот тег — замечания
+    о ротации выходили бы ложными (или молчали там, где нужен был).
+    """
+    for card in day.cards:
+        if card.position == position:
+            return card.tag
+    return None
+
+
 def _rotation_warnings(cassette: Cassette) -> list[str]:
     """Ротация стратегий (промпт §4) — только для главной дороги: каждая
     стратегия care/dare/trick обязана садиться в каждую позицию (0/1/2)
@@ -45,7 +58,7 @@ def _rotation_warnings(cassette: Cassette) -> list[str]:
     warnings: list[str] = []
     for position in range(3):
         for tag in _CARD_TAGS:
-            met = [day for day in days if day.cards[position].tag == tag]
+            met = [day for day in days if _tag_at(day, position) == tag]
             if len(met) < floor:
                 warnings.append(
                     f"ротация (main): стратегия «{tag}» в позиции {position} лишь "
@@ -53,7 +66,7 @@ def _rotation_warnings(cassette: Cassette) -> list[str]:
                 )
             streak = 0
             for day in days:
-                streak = streak + 1 if day.cards[position].tag == tag else 0
+                streak = streak + 1 if _tag_at(day, position) == tag else 0
                 if streak >= 3:
                     warnings.append(
                         f"ротация (main): «{tag}» в позиции {position} три дня подряд "
