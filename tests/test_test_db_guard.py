@@ -96,6 +96,11 @@ def test_temp_database_file_is_unique_per_process(test_db_guard) -> None:
     друг у друга и ловят чужие ошибки.
     """
     db_path = test_db_guard.db_path
+    if not db_path:
+        # Явно объявленная тестовая база (TEST_DATABASE_URL — так, например,
+        # в CI на Postgres): временного файла нет, и проверять тут нечего.
+        assert test_db_guard.test_db_url
+        return
     assert str(os.getpid()) in db_path, db_path
     assert db_path.startswith(str(Path(tempfile.gettempdir()))), db_path
     assert test_db_guard.test_db_url.endswith(db_path), test_db_guard.test_db_url
