@@ -499,8 +499,12 @@ async def _ops_sweep() -> None:
     await _render_logs_check_due()
 
 
-async def _render_logs_check_due() -> None:
-    """Проверка логов Render, если подошло время (не чаще раза в N часов)."""
+async def _render_logs_check_due(force: bool = False) -> None:
+    """Проверка логов Render, если подошло время (не чаще раза в N часов).
+
+    force=True — принудительно (после подъёма): свежие строки логов после
+    деплоя надо проверить в первую очередь.
+    """
     from app.config import settings
 
     if not (settings.render_api_key or "").strip():
@@ -508,7 +512,7 @@ async def _render_logs_check_due() -> None:
     from app.render_logs import check_render_logs, last_verdict
 
     interval_hours = max(1, int(settings.render_logs_check_interval_hours))
-    verdict = await last_verdict()
+    verdict = None if force else await last_verdict()
     if verdict:
         try:
             checked = datetime.fromisoformat(str(verdict.get("checked_at") or ""))
@@ -542,6 +546,10 @@ async def boot_maintenance() -> None:
     from app.backups import backup_job
 
     await _alert_guarded("db-backup@boot", backup_job)
+    # Проверка собственных логов Render — сразу после подъёма: деплой меняет
+    # версию кода, и свежие строки логов надо проверить в первую очередь. По
+    # расписанию (раз в 6 часов) проверка шла бы уже по старой версии.
+    await _render_logs_check_due(force=True)
 
 
 def _register_job(job_id: str, func, trigger: str, **kwargs) -> None:
