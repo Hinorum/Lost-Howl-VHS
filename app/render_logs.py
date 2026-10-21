@@ -130,7 +130,12 @@ def scan_messages(messages: list[str]) -> dict[str, Any]:
 
 
 async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
-    """GET к Render API. Только чтение — ключ никогда не уходит на запись."""
+    """GET к Render API. Только чтение — ключ никогда не уходит на запись.
+
+    Тело ответа при ошибке попадает в сообщение: API объясняет, что именно
+    ему не понравилось, — а без этого вердикт проверки был бы «400» без
+    причины.
+    """
     key = (settings.render_api_key or "").strip()
     if not key:
         raise RuntimeError("RENDER_API_KEY не задан")
@@ -143,7 +148,9 @@ async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
         timeout=30.0,
         max_retries=1,
     )
-    response.raise_for_status()
+    if response.status_code >= 400:
+        body = (response.text or "").strip().replace("\n", " ")[:240]
+        raise RuntimeError(f"HTTP {response.status_code} от Render API: {body}")
     return response.json()
 
 
@@ -178,30 +185,58 @@ async def resolve_service_id() -> str:
     )
 
 
-async def fetch_logs(service_id: str, since: datetime, limit: int) -> list[str]:
-    """Забирает тексты логов сервиса за окно назад."""
-    params: dict[str, Any] = {
-        "resources": service_id,
-        "start": since.astimezone(UTC).isoformat(),
-        "limit": limit,
-        "direction": "backward",
-    }
-    payload = await _api_get("/logs", params)
-    entries = payload if isinstance(payload, list) else (payload or {}).get("logs") or []
-    out: list[str] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
+def _log_query_shapes(since: datetime) -> list[dict[str, Any]]:
+    """Формы запроса логов — от строгой к простой.
+
+    Формат `/v1/logs` не документирован публично (спека Render закрыта), и
+    бот узнаёт форму на живой сети: перебирает варианты и запоминает
+    сработавший. Порядок отражает документированное поведение CLI Render:
+    стартовый запрос отдаёт не больше 100 строк, пагинация — до 1000.
+    """
+    stamp = since.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return [
+        {"resources": None, "start": stamp, "limit": 100},
+        {"resources": None, "limit": 100},
+        {"resources": None, "start": stamp, "limit": 1000},
+        {"resources": None, "limit": 1000},
+    ]
+
+
+async def fetch_logs(service_id: str, since: datetime, limit: int) -> tuple[list[str], str]:
+    """Забирает тексты логов сервиса за окно назад.
+
+    Возвращает (тексты, использованная форма запроса). Формы перебираются по
+    очереди: какая сработала — пишется в вердикт, чтобы следующий прогон
+    не тратил время на подбор.
+    """
+    last_error: Exception | None = None
+    for shape in _log_query_shapes(since):
+        params = {key: value for key, value in shape.items() if value is not None}
+        params["resources"] = service_id
+        if "limit" in params and int(params["limit"]) > limit:
+            params["limit"] = limit
+        try:
+            payload = await _api_get("/logs", params)
+        except Exception as exc:
+            last_error = exc
             continue
-        message = entry.get("message")
-        if isinstance(message, str):
-            out.append(message)
-    return out
+        entries = payload if isinstance(payload, list) else (payload or {}).get("logs") or []
+        out: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            message = entry.get("message")
+            if isinstance(message, str):
+                out.append(message)
+        used = ",".join(f"{key}={value}" for key, value in params.items() if key != "resources")
+        return out, used
+    raise RuntimeError(f"ни одна форма запроса логов не подошла: {last_error}")
 
 
 async def check_render_logs() -> dict[str, Any]:
     """Проверяет логи Render на секреты и пишет вердикт в watcher_state.
 
-    Вердикт: {checked_at, scanned, hits, samples, service, window_hours,
+    Вердикт: {checked_at, scanned, hits, samples, service, query, window_hours,
     error}. Значений секретов в нём нет — только счётчики.
     """
     verdict: dict[str, Any] = {
@@ -210,6 +245,7 @@ async def check_render_logs() -> dict[str, Any]:
         "hits": {},
         "samples": {},
         "service": None,
+        "query": None,
         "window_hours": int(settings.render_logs_lookback_hours),
         "error": None,
     }
@@ -217,7 +253,10 @@ async def check_render_logs() -> dict[str, Any]:
         service_id = await resolve_service_id()
         verdict["service"] = service_id
         since = datetime.now(UTC) - timedelta(hours=verdict["window_hours"])
-        messages = await fetch_logs(service_id, since, int(settings.render_logs_limit))
+        messages, used = await fetch_logs(
+            service_id, since, int(settings.render_logs_limit)
+        )
+        verdict["query"] = used
         verdict.update(scan_messages(messages))
     except Exception as exc:
         verdict["error"] = f"{type(exc).__name__}: {exc}"[:300]

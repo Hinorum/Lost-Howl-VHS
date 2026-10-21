@@ -515,7 +515,10 @@ async def _render_logs_check_due() -> None:
             if checked.tzinfo is None:
                 checked = checked.replace(tzinfo=UTC)
             age_hours = (_now() - checked).total_seconds() / 3600
-            if age_hours < interval_hours:
+            # После сбоя повторяем скоро (10 минут): проверка должна выйти из
+            # ошибки сама, не дожидаясь следующего шестичасового цикла.
+            limit_hours = 10 / 60 if verdict.get("error") else interval_hours
+            if age_hours < limit_hours:
                 return
         except ValueError:
             # Битая метка времени = «не знаю, когда проверяли» — считаем, что
