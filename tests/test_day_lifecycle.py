@@ -843,6 +843,33 @@ async def test_finish_tally_commit_race_on_duplicate_story_beat(session) -> None
     assert beat.winning_text != "x", "канон прошлого забега переписан каноном дня"
 
 
+async def test_finish_tally_survives_expired_object_after_rollback(session) -> None:
+    """Ветка отката не читает истёкший объект: id дня снят ДО commit/rollback.
+
+    Регресс: session.rollback() истекает прикреплённые инстансы, и чтение
+    round_row.id после отката — lazy load вне greenlet-контекста: вместо
+    честного «день не закрыт» вылетал MissingGreenlet. Ветка «UPDATE не
+    захватил день» (гонка с другим процессом) читала id ровно так же.
+    """
+    round_row = _round(9951, RoundStatus.TALLYING, voting_in_minutes=-30)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+        round_row_id = round_row.id
+        async with SessionLocal() as other:
+            await other.execute(
+                update(Round).where(Round.id == round_row_id).values(status=RoundStatus.CLOSED)
+            )
+            await other.commit()
+        # round_row остаётся ПРИКРЕПЛЁННЫМ к db: откат внутри finish_tally
+        # истечёт его, и чтение round_row.id станет lazy load → MissingGreenlet.
+        loaded, closed_here = await lifecycle_mod.finish_tally(db, round_row)
+        assert closed_here is False
+        assert loaded is not None and loaded.id == round_row_id
+        assert loaded.status == RoundStatus.CLOSED
+    await _wipe([9951])
+
+
 async def test_close_voting_lost_claim_race(session) -> None:
     """Второй закрывающий молча уходит: UPDATE не захватил день (строки 329-330)."""
     round_row = _round(9980, RoundStatus.OPEN, voting_in_minutes=-30)

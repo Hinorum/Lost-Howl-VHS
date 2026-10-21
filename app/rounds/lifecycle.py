@@ -361,8 +361,13 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
     Условный UPDATE (status='tallying' → 'closed') защищает от гонки между
     планировщиком и /advance.
     """
+    # id снимаем ДО любых commit/rollback: откат истекает прикреплённые
+    # инстансы, и чтение round_row.id после отката — это lazy load вне
+    # greenlet-контекста (MissingGreenlet). Ветки отката обязаны знать id
+    # дня, не трогая истёкший объект.
+    round_id = round_row.id
     if round_row.status != RoundStatus.TALLYING:
-        loaded = await get_round(session, round_row.id)
+        loaded = await get_round(session, round_id)
         return (loaded or round_row), False
     counts = getattr(round_row, "_tally_counts", None)
     used_stakes = getattr(round_row, "_tally_used_stakes", None)
@@ -426,7 +431,7 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
                 f"голос стаи вывел сцену {_ROMAN[winner]}"
             )[:200]
     if not round_row.cards:
-        loaded = await get_round(session, round_row.id)
+        loaded = await get_round(session, round_id)
         if loaded is not None:
             round_row = loaded
     cards = {card.position: card for card in round_row.cards}
@@ -453,7 +458,7 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
     )
     if cast(CursorResult[Any], result).rowcount == 0:
         await session.rollback()
-        loaded = await get_round(session, round_row.id)
+        loaded = await get_round(session, round_id)
         return (loaded or round_row), False
     round_row.winner_card = winner
     round_row.vote_counts_json = counts_json
@@ -495,6 +500,6 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        loaded = await get_round(session, round_row.id)
+        loaded = await get_round(session, round_id)
         return (loaded or round_row), False
-    return await get_round(session, round_row.id), True  # type: ignore[return-value]
+    return await get_round(session, round_id), True  # type: ignore[return-value]
