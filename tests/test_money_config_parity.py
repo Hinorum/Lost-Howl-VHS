@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,17 @@ from app.config import Settings
 
 RENDER_YAML = Path(__file__).resolve().parents[1] / "render.yaml"
 ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
+
+# Ключи, которых нет в Settings, но которые нужны окружению:
+# - E2E_* — живой тестнет-прогон (scripts/e2e_testnet.py), читается скриптом;
+# - PYTHON_VERSION — переменная сборки Render, не настройка бота.
+NON_SETTING_KEYS = {
+    "E2E_PLAYER_ID",
+    "E2E_PLAYER_MNEMONIC",
+    "E2E_STAKE_TIMEOUT_SECONDS",
+    "E2E_TESTNET",
+    "PYTHON_VERSION",
+}
 
 # Рычаги, которые render.yaml объявляет «те же, что в app/config.py».
 MONEY_LEVERS = (
@@ -75,6 +87,23 @@ def _manifest_values() -> dict[str, str]:
             if key is not None and entry.get("value") is not None:
                 values[key] = str(entry["value"])
     return values
+
+
+def _manifest_keys() -> set[str]:
+    """ВСЕ ключи render.yaml — включая те, у которых нет значения (sync: false)."""
+    data = yaml.safe_load(RENDER_YAML.read_text(encoding="utf-8"))
+    keys: set[str] = set()
+    for service in data.get("services", []):
+        for entry in service.get("envVars", []) or []:
+            key = entry.get("key")
+            if key:
+                keys.add(str(key))
+    return keys
+
+
+def _env_example_keys() -> set[str]:
+    env = ENV_EXAMPLE.read_text(encoding="utf-8")
+    return set(re.findall(r"^([A-Z][A-Z0-9_]*)=", env, re.M))
 
 
 def _env_example_values() -> dict[str, str]:
@@ -125,6 +154,67 @@ def test_money_lever_matches_env_example(env_key: str, field: str) -> None:
     env = _env_example_values()
     assert env_key in env, f"{env_key} пропал из .env.example — рычаг стал невидимым при развороте"
     _assert_matches_default(env_key, field, env[env_key], "в .env.example")
+
+
+def test_every_setting_is_documented_in_env_example() -> None:
+    """Каждая настройка бота есть в .env.example — файл, который копируют.
+
+    Раньше паритет проверял только 16 «рычагов» денег, а остальные настройки
+    могли отсутствовать в файле годами: оператор копирует .env.example и
+    не знает, что настройка вообще существует (а потолок возвратов или
+    параметры проверки логов хостинга — это не «рычаг», а защита).
+
+    Исключения — ключи, которых в Settings нет по определению (E2E_* —
+    живой прогон, PYTHON_VERSION — переменная сборки Render).
+    """
+    settings_keys = {name.upper() for name in Settings.model_fields}
+    env_keys = _env_example_keys()
+    missing = sorted(settings_keys - env_keys)
+    assert not missing, f"настройки не описаны в .env.example: {missing}"
+
+
+def test_env_example_has_no_dead_keys() -> None:
+    """В .env.example нет ключей, которых бот не читает.
+
+    Мёртвый ключ — это опечатка (бота он не настроит) или секрет ради
+    ничего (в окружении лежит, а код его не смотрит). И то и другое —
+    источник расхождений: «я выставил LLM_API_KEY, а генерации не
+    изменились».
+    """
+    settings_keys = {name.upper() for name in Settings.model_fields}
+    env_keys = _env_example_keys()
+    unknown = sorted(env_keys - settings_keys - NON_SETTING_KEYS)
+    assert not unknown, f"в .env.example есть ключи, которых бот не читает: {unknown}"
+
+
+def test_manifest_has_no_unknown_keys() -> None:
+    """В render.yaml нет ключей, которых бот не читает.
+
+    Опечатка в манифесте (PAYOUT_FEE_GARM) молча оставляет дефолт, и
+    оператор думает, что выставил значение. Мёртвый ключ — секрет в
+    окружении ради ничего.
+    """
+    settings_keys = {name.upper() for name in Settings.model_fields}
+    manifest_keys = _manifest_keys()
+    unknown = sorted(manifest_keys - settings_keys - NON_SETTING_KEYS)
+    assert not unknown, f"в render.yaml есть ключи, которых бот не читает: {unknown}"
+
+
+def test_money_safety_knobs_are_declared_in_manifest() -> None:
+    """Рычаги безопасности денег объявлены в манифесте деплоя.
+
+    Потолок авто-возвратов и таймаут проверки баланса — не «рычаги» в
+    смысле распределения призов, а защита казны от сгоревшего газа. Если
+    их нет в render.yaml, прод работает на дефолтах кода, и оператор об
+    этом не знает.
+    """
+    manifest = _manifest_keys()
+    for key in (
+        "REFUND_MAX_PER_SENDER_DAY",
+        "REFUND_MAX_TOTAL_DAY",
+        "PAYOUT_BALANCE_PROBE_TIMEOUT_SECONDS",
+    ):
+        assert key in manifest, f"{key} не объявлен в render.yaml"
 
 
 def test_mainnet_liteserver_url_is_not_testnet() -> None:

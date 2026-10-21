@@ -42,18 +42,30 @@ services:
         value: "600"
       - key: PLAYER_DM
         value: "true"
-      - key: LLM_API_KEY
-        sync: false
       # Ключ Render API: бот сам проверяет свои логи на секреты (раньше это
       # требовало ручного grep по странице логов хостинга). Значение живёт
       # только в env Render, в репозитории его нет. Бот использует ключ
       # ТОЛЬКО на чтение (GET) и никогда не пишет его в логи.
       - key: RENDER_API_KEY
         sync: false
-      - key: LLM_BASE_URL
-        value: https://router.huggingface.co/v1/chat/completions
-      - key: GEMINI_API_KEY
+      # Каким сервисом проверять логи: без этих двух бот ищет единственный
+      # web-сервис аккаунта, а при нескольких — падает с понятной причиной
+      # (видно в /ops). Задай явно, если сервисов больше одного.
+      - key: RENDER_SERVICE_ID
         sync: false
+      - key: RENDER_SERVICE_NAME
+        sync: false
+      # Параметры прохода по логам: окно назад от «сейчас», потолок строк,
+      # потолок страниц и как часто проход нужен. Покрытие окна бот считает
+      # честно и показывает в /ops.
+      - key: RENDER_LOGS_LOOKBACK_HOURS
+        value: "24"
+      - key: RENDER_LOGS_LIMIT
+        value: "10000"
+      - key: RENDER_LOGS_MAX_PAGES
+        value: "100"
+      - key: RENDER_LOGS_CHECK_INTERVAL_HOURS
+        value: "3"
       - key: MEDIA_DIR
         value: ./media/generated
       - key: WEBHOOK_SECRET
@@ -186,6 +198,19 @@ services:
       # 0 = плоский PAYOUT_FEE_GRAM с возврата; >0 — комиссия долей от ставки.
       - key: REFUND_FEE_RATIO
         value: "0"
+      # Потолок авто-возвратов: каждый возврат — исходящий перевод за счёт
+      # казны, то есть сгоревший газ. Спам-бот может слать тысячи
+      # микропереводов, и без потолка казна платит газ за каждый. Сверх
+      # потолка переводы не возвращаются автоматически: они ждут ручного
+      # разбора (/incoming).
+      - key: REFUND_MAX_PER_SENDER_DAY
+        value: "5"
+      - key: REFUND_MAX_TOTAL_DAY
+        value: "50"
+      # Сколько ждать баланс казначея перед рассылкой: «не знаю, хватает ли
+      # на газ» держит очередь выплат до истечения таймаута.
+      - key: PAYOUT_BALANCE_PROBE_TIMEOUT_SECONDS
+        value: "20"
       # Доля (%) от подтверждённой ставки по реферальной ссылке, которая уходит
       # пригласившему и НЕ попадает в пул победителей.
       - key: REFERRAL_PCT
@@ -249,6 +274,19 @@ services:
         value: "72"
       - key: DISPUTES_ENABLED
         value: "true"
+      # Кассеты в базе (источник правды) с зеркалом в каталог: правка через
+      # /cassette видна всем инстансам сразу. false — кассеты только с диска.
+      - key: STORY_CASSETTES_DB
+        value: "true"
+      # Fail-closed по умолчанию: SQLite в проде ломает advisory-лок
+      # (два инстанса могут делить очередь выплат) и кладёт базу на
+      # эфемерный диск контейнера. Локально — вместе с ALLOW_SQLITE=true.
+      - key: ALLOW_SQLITE
+        value: "false"
+      # Дроп осиротевших колонок — разовая операция: включается на один
+      # деплой после удаления колонки из моделей, затем возвращается в false.
+      - key: DROP_ORPHAN_COLUMNS
+        value: "false"
       - key: LEADERBOARD_CORRECT_CAP
         value: "0"
       # Подпись токена реферальной ссылки (?start=ref_<id>_<токен>).
