@@ -332,6 +332,11 @@ async def snapshot() -> dict:
             "dead_letter_payouts": int(dead_count),
             "watcher_beat_age": None,
             "watcher_source": None,
+            # Счётчик сбоев краски секретов в логах (log_scrub): ненулевое
+            # значение означает, что запись лога не прошла через форматтер
+            # и могла унести мнемонику в текст записи. Ноль — единственное
+            # доказательство, доступное без доступа к логам Render.
+            "log_scrub_failures": 0,
             # Диагностика окружения: видно, что реально дошло до процесса.
             "ton_enabled": bool(settings.ton_enabled),
             "ton_network": "testnet" if settings.is_testnet else "mainnet",
@@ -353,6 +358,14 @@ async def snapshot() -> dict:
                 "status": latest.status.value if isinstance(latest.status, RoundStatus) else str(latest.status),
                 "voting_ends_at": latest.voting_ends_at.isoformat(),
             }
+        # Счётчик сбоев краски: локальный импорт, чтобы ops не тянул модуль
+        # логирования при старте (он ставит хендлеры на logging).
+        try:
+            from app.log_scrub import scrub_failures
+
+            payload["log_scrub_failures"] = int(scrub_failures())
+        except Exception:
+            payload["log_scrub_failures"] = 0
         # Аудитория рассылки — прямо в снимке. «Новости дня некому показать»
         # обязано быть видно в /health и /ops без доступа к прод-базе: раньше
         # единственный способ это узнать был SQL-запрос к чужому Postgres'у,

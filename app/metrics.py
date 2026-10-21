@@ -62,6 +62,10 @@ _HELP: dict[str, tuple[str, str]] = {
     ),
     "problems": ("gauge", "Текущих тревог по снимку check_anomalies"),
     "problems_age_seconds": ("gauge", "Возраст снимка тревог, секунды"),
+    "log_scrub_failures": (
+        "gauge",
+        "Сбоев краски секретов в логах (ненулевое значение — запись могла унести мнемонику)",
+    ),
 }
 
 # Счётчики монотонные: семейство -> {лейблы: значение}
@@ -182,6 +186,7 @@ def _db_gauges(snapshot: dict[str, Any] | None) -> dict[str, float | None]:
         "oldest_payout_age_seconds": snapshot.get("oldest_payout_age"),
         "problems": len(snapshot.get("problems") or []),
         "problems_age_seconds": snapshot.get("problems_age"),
+        "log_scrub_failures": snapshot.get("log_scrub_failures"),
     }
 
 

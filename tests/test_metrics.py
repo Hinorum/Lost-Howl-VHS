@@ -151,6 +151,7 @@ def test_operational_gauges_come_from_snapshot() -> None:
             "pending_stakes": 0,
             "problems": ["a", "b"],
             "problems_age": 3.0,
+            "log_scrub_failures": 0,
         }
     )
     assert "way_snapshot_up 1" in text
@@ -159,6 +160,8 @@ def test_operational_gauges_come_from_snapshot() -> None:
     assert "way_problems 2" in text
     assert "way_problems_age_seconds 3" in text
     assert "way_last_tick_age_seconds 1.5" in text
+    # Счётчик сбоев краски секретов: ноль — «краска ни разу не подвела».
+    assert "way_log_scrub_failures 0" in text
 
 
 def test_absent_values_are_skipped_not_zeroed() -> None:
