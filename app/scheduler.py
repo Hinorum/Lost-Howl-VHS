@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, time
-from time import monotonic
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
@@ -39,10 +38,14 @@ _bot: Bot | None = None
 # моргнула, PG перезапустился, pgbouncer переподключился. На сервере лок после
 # этого свободен, а процесс продолжает считать себя лидером — второй
 # инстанс берёт лок, и оба тикают: анонсы уходят дважды, выплаты могут
-# уйти дважды. Раз в пять минут — компромисс между «узнать быстро» и «не
-# дёргать базу каждый тик».
-_LOCK_CHECK_INTERVAL_SECONDS = 300
-_last_lock_check: float = 0.0
+# уйти дважды.
+#
+# Счётчик ТИКОВ, а не часы: монотонные часы в контейнере стартуют с нуля
+# (CLOCK_MONOTONIC там именованный), и троттлинг по времени в такой среде
+# молча отключал проверку навсегда — тик думал, что «проверял недавно».
+# Тик идёт раз в 15 секунд, поэтому 60 тиков — это 15 минут.
+_LOCK_CHECK_EVERY_TICKS = 60
+_lock_check_ticks = -1
 
 
 def set_bot(bot: Bot) -> None:
@@ -90,14 +93,13 @@ async def _ensure_scheduler_lock() -> bool:
     процесса будут вести один день), тик замирает, а админ получает тревогу
     «лок потерян».
 
-    Проверка идёт раз в пять минут, а после потери — на каждом тике: ждать
-    ещё пять минут, когда уже известно, что лок чужой, незачем.
+    Проверка идёт раз в 60 тиков (15 минут), а после потери — на каждом тике:
+    ждать ещё пятнадцать минут, когда уже известно, что лок чужой, незачем.
     """
-    global _last_lock_check
-    now = monotonic()
-    if now - _last_lock_check < _LOCK_CHECK_INTERVAL_SECONDS:
+    global _lock_check_ticks
+    _lock_check_ticks += 1
+    if _lock_check_ticks % _LOCK_CHECK_EVERY_TICKS:
         return True
-    _last_lock_check = now
     from app.scheduler_lock import acquire_scheduler_lock, verify_scheduler_lock
 
     if await verify_scheduler_lock():
@@ -120,7 +122,7 @@ async def _ensure_scheduler_lock() -> bool:
         "Лок планировщика потерян и не вернулся: этот инстанс больше не ведёт "
         "игру (лок у другого процесса). Тик замирает до следующей проверки."
     )
-    _last_lock_check = 0.0
+    _lock_check_ticks = -1
     await _mark_lock_lost()
     return False
 

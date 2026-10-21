@@ -29,7 +29,7 @@ from app.models import WatcherState
 def _clean_marker():
     """Метка «лок потерян» не должна пережить тест."""
     yield
-    sched._last_lock_check = 0.0
+    sched._lock_check_ticks = -1
 
 
 async def _clear_marker() -> None:
@@ -42,7 +42,7 @@ async def _clear_marker() -> None:
 
 async def test_lock_lost_and_not_regained_freezes_the_tick(monkeypatch) -> None:
     """Лок потерян и не вернулся — тик не трогает игру, метка оставлена."""
-    monkeypatch.setattr(sched, "_last_lock_check", 0.0)
+    monkeypatch.setattr(sched, "_lock_check_ticks", -1)
     monkeypatch.setattr(scheduler_lock, "verify_scheduler_lock", AsyncMock(return_value=False))
     monkeypatch.setattr(scheduler_lock, "acquire_scheduler_lock", AsyncMock(return_value=False))
     monkeypatch.setattr("app.ops.mark_tick", AsyncMock())
@@ -62,7 +62,7 @@ async def test_lock_lost_and_not_regained_freezes_the_tick(monkeypatch) -> None:
 
 async def test_regained_lock_clears_marker_and_lets_tick_work(monkeypatch) -> None:
     """Лок вернулся (умерло соединение, а лок был свободен) — игра едет дальше."""
-    monkeypatch.setattr(sched, "_last_lock_check", 0.0)
+    monkeypatch.setattr(sched, "_lock_check_ticks", -1)
     monkeypatch.setattr(scheduler_lock, "verify_scheduler_lock", AsyncMock(return_value=False))
     monkeypatch.setattr(scheduler_lock, "acquire_scheduler_lock", AsyncMock(return_value=True))
     monkeypatch.setattr("app.ops.mark_tick", AsyncMock())
@@ -83,8 +83,14 @@ async def test_regained_lock_clears_marker_and_lets_tick_work(monkeypatch) -> No
 
 
 async def test_lock_check_is_throttled_between_ticks(monkeypatch) -> None:
-    """Между проверками тик не дёргает базу: лок перепроверяется раз в 5 минут."""
-    monkeypatch.setattr(sched, "_last_lock_check", 0.0)
+    """Между проверками тик не дёргает базу: лок перепроверяется раз в 60 тиков.
+
+    Троттлинг сделан счётчиком тиков, а не часами: монотонные часы в
+    контейнере стартуют с нуля (CLOCK_MONOTONIC там именованный), и по
+    времени троттлинг молча отключал проверку навсегда — тик считал, что
+    «проверял недавно», и никогда не проверял лок.
+    """
+    monkeypatch.setattr(sched, "_lock_check_ticks", -1)
     verify = AsyncMock(return_value=True)
     monkeypatch.setattr(scheduler_lock, "verify_scheduler_lock", verify)
     monkeypatch.setattr(scheduler_lock, "acquire_scheduler_lock", AsyncMock(return_value=True))
@@ -93,6 +99,12 @@ async def test_lock_check_is_throttled_between_ticks(monkeypatch) -> None:
     # Второй вызов — внутри окна: проверки нет.
     assert await sched._ensure_scheduler_lock() is True
     assert verify.await_count == 1
+    # А на 60-м тике проверка снова идёт.
+    sched._lock_check_ticks = 58
+    assert await sched._ensure_scheduler_lock() is True
+    assert verify.await_count == 1
+    assert await sched._ensure_scheduler_lock() is True
+    assert verify.await_count == 2
 
 
 async def test_anomaly_alert_fires_when_lock_lost(monkeypatch) -> None:
