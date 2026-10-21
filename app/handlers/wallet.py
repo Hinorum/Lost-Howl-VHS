@@ -22,7 +22,16 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import LeaderboardPot, Player, Round, RoundStatus, Stake, WatcherState
 from app.rounds import get_active_round
-from app.style import hint_mark, money_mark, ok_mark, strip_html, warn_mark
+from app.style import (
+    hint_mark,
+    money_mark,
+    ok_mark,
+    strip_html,
+    warn_mark,
+)
+from app.style import (
+    pct_text as _pct_text,
+)
 from app.ton_utils import (
     address_network,
     friendly_address,
@@ -43,14 +52,6 @@ from .common import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _pct_text(value: float) -> str:
-    """Русская типографика процента: «0,5%» (дробь через запятую), «1%» (без ,0)."""
-    text = str(value)
-    if text.endswith(".0"):
-        text = text[:-2]
-    return text.replace(".", ",")
 
 
 def _days_word(count: int) -> str:

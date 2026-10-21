@@ -23,6 +23,14 @@ def strip_html(text: str) -> str:
     """
     return _HTML_TAG_RE.sub("", text)
 
+
+def pct_text(value: float) -> str:
+    """Процент для показа: <0,5%> (запятая — не точка, 1% — целое, 0)."""
+    text = str(value)
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text.replace(".", ",")
+
 # Обложка дня и заголовки канона.
 DAY_MARKS = [
     "🌑", "🌒", "🌓", "🌘", "🌙", "✨", "🌌", "🌀",

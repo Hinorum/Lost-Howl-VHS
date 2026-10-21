@@ -28,14 +28,12 @@ type = acyclic_siblings
 ancestors =
     app
 ignore_imports =
-    app.leaderboard -> app.handlers
     app.ops -> app.broadcast
     app.ops -> app.rounds
     app.ops -> app.ton_pay
     app.ops -> app.ton_watch
     app.rounds.lifecycle -> app.tally
     app.rounds.lifecycle -> app.ton_pay
-    app.stakes -> app.handlers.wallet
     app.stakes -> app.rounds.time
     app.ton_pay.treasury -> app.ton_watch
     app.ton_pay.wallet -> app.ton_pay.http_channel

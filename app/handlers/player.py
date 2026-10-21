@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import html
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
@@ -33,6 +33,7 @@ from app.style import (
 )
 from app.ton_utils import from_nano, to_nano
 from app.voting import cast_vote, change_vote, get_vote, upsert_player
+from app.weeks import human_claim_period
 
 from .common import _DYOR_TEXT, _ensure_round, _personal_keyboard, router
 
@@ -52,7 +53,7 @@ def _commands_help() -> list[str]:
         # В бесплатной версии /change безусловно отказывает (topup) — не рекламируем.
         lines.append("/change — перемотать кадр (⭐ или Gram)")
     if settings.ton_enabled:
-        from app.handlers.wallet import _pct_text
+        from app.style import pct_text as _pct_text
 
         lines.append("/wallet — кошелёк · /stake — поставить Gram на кадр")
         lines.append("/top — копилки и лидеры")
@@ -272,23 +273,6 @@ async def on_claim_month(callback: CallbackQuery) -> None:
     await _on_claim(callback, "month")
 
 
-_MONTH_NAMES_RU = (
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-)
-
-
-def _human_claim_period(kind: str, period: str) -> str:
-    """Человекочитаемый период заявки вместо служебного «2026-W35» / «2026-08»."""
-    if kind == "week":
-        from app.weeks import week_bounds
-
-        start, end = week_bounds(period)
-        return f"с {start:%d.%m} по {(end - timedelta(days=1)):%d.%m}"
-    year, month = map(int, period.split("-"))
-    return f"{_MONTH_NAMES_RU[month - 1]} {year}"
-
-
 async def _on_claim(callback: CallbackQuery, kind: str) -> None:
     """Претензия на место лидерборда: решает ничьи по времени Claim.
 
@@ -344,7 +328,7 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
                 "Сначала привяжи кошелёк — без него приз не уйдёт.", show_alert=True
             )
             return
-        human = _human_claim_period(kind, period)
+        human = human_claim_period(kind, period)
         confirm = (
             f"Заявка на копилку недели ({human}) принята: при равенстве верных "
             "путей и ставок Gram ты выше тех, кто заявился позже (или не заявился вовсе)."

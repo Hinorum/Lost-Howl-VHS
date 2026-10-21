@@ -77,6 +77,7 @@ from app.models import (
     WeeklyPot,
 )
 from app.ops import claim_once
+from app.style import pct_text as _pct_text
 from app.ton_utils import from_nano, to_nano
 from app.weeks import iso_week_key
 
@@ -669,8 +670,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             # строка-накопитель; деньги остаются на кошельке казначея и забираются
             # хранителем вручную (см. /panel, ручной вывод).
             if fund_cut > 0 and await _claim_pot(session, round_row.id, "fund"):
-                from app.handlers.wallet import _pct_text
-
+        
                 # Фонд Стаи — единственная строка-накопитель, уникального ключа
                 # для ON CONFLICT нет, поэтому: ряд-лок (на Postgres реальный,
                 # на SQLite no-op — там один процесс) + условная вставка первой

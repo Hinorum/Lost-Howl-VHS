@@ -65,7 +65,13 @@ from app.models import (
 )
 from app.stakes import split_equal
 from app.ton_utils import to_nano
-from app.weeks import iso_week_key, parse_prize_pcts, previous_week_key, week_bounds
+from app.weeks import (
+    human_claim_period,
+    iso_week_key,
+    parse_prize_pcts,
+    previous_week_key,
+    week_bounds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -386,9 +392,8 @@ async def _notify_tied_players(
     """Отправляет DM tied-игрокам с кнопкой Claim."""
     if bot is None or not tied_player_ids:
         return
-    from app.handlers import _human_claim_period
 
-    human = _human_claim_period(kind, period)
+    human = human_claim_period(kind, period)
     label = f"недели ({human})" if kind == "week" else f"месяца ({human})"
     text = (
         f"🏆 Ничья за призовые места leaderboard {label}!\n\n"

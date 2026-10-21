@@ -37,10 +37,31 @@ def previous_week_key(now: datetime | None = None) -> str:
 
 
 def parse_prize_pcts(spec: str) -> list[int]:
-    """«50,30,20» → [50, 30, 20]; мусор отбрасывается, пустой список → нет выплат."""
+    """«50,30,20» → [50, 30, 20]; нули и мусор пропускаются, лишнее отбрасывается."""
     pcts: list[int] = []
     for part in spec.split(","):
         part = part.strip()
         if part.isdigit() and int(part) > 0:
             pcts.append(int(part))
     return pcts[:3]
+
+
+MONTH_NAMES_RU = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+
+def human_claim_period(kind: str, period: str) -> str:
+    """Человекочитаемый период заявки вместо служебного «2026-W35» / «2026-08».
+
+    Живёт здесь, а не в хендлере: период лидерборда — это календарь игры, и
+    им пользуются и деньги (app/leaderboard.py), и Telegram. Деньги не должны
+    импортировать слой Telegram — на это стоит отдельная строка в
+    .importlinter, и она ослабляет контракт.
+    """
+    if kind == "week":
+        start, end = week_bounds(period)
+        return f"с {start:%d.%m} по {(end - timedelta(days=1)):%d.%m}"
+    year, month = map(int, period.split("-"))
+    return f"{MONTH_NAMES_RU[month - 1]} {year}"

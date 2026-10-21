@@ -123,6 +123,9 @@ __all__ = [
     "track_chat",
 ]
 
+from app.weeks import MONTH_NAMES_RU as _MONTH_NAMES_RU
+from app.weeks import human_claim_period as _human_claim_period
+
 from .admin import (
     _ACTIVE_STATUSES,
     _ADJ_CONFIRM_WINDOW,
@@ -189,9 +192,7 @@ from .payout import (
     cmd_treasury,
 )
 from .player import (
-    _MONTH_NAMES_RU,
     _commands_help,
-    _human_claim_period,
     _on_claim,
     _score_text,
     _start_keyboard,
