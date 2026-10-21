@@ -18,7 +18,7 @@ from app.log_scrub import install as install_log_scrub
 from app.profile import apply_profile
 from app.scheduler import set_bot, start_scheduler, tick
 from app.scheduler_lock import acquire_scheduler_lock, release_scheduler_lock
-from app.ton_utils import normalize_address
+from app.ton_utils import address_network, normalize_address
 
 
 def _same_address(left: str, right: str) -> bool:
@@ -285,6 +285,21 @@ def validate_config() -> list[str]:
                 "OWNER_WALLET_ADDRESS совпадает с адресом казначея — рейк хранителя "
                 "и доли копилки уйдут «сами себе». Укажи отдельный кошелёк владельца."
             )
+        # Адрес чужой сети молча ломает всё: переводы с него в сети бота не
+        # видны (ставки не засчитаются), выплаты уйдут в никуда. У v5-кошельков
+        # сеть зашита в аккаунт, поэтому «не тот адрес» — это не тот же адрес.
+        active_net = "testnet" if settings.is_testnet else "mainnet"
+        for label, value in (
+            ("TREASURY_ADDRESS", settings.active_treasury_address),
+            ("OWNER_WALLET_ADDRESS", settings.owner_wallet_address),
+        ):
+            address_net = address_network(value) if value else None
+            if address_net is not None and address_net != active_net:
+                problems.append(
+                    f"{label} — адрес сети {address_net}, а бот работает в сети "
+                    f"{active_net}. Адрес чужой сети здесь не существует: выплаты "
+                    "уйдут в никуда, а переводы с него не будут видны."
+                )
     return problems
 
 

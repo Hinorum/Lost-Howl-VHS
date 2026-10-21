@@ -24,6 +24,7 @@ from app.models import LeaderboardPot, Player, Round, RoundStatus, Stake, Watche
 from app.rounds import get_active_round
 from app.style import hint_mark, money_mark, ok_mark, strip_html, warn_mark
 from app.ton_utils import (
+    address_network,
     friendly_address,
     from_nano,
     is_valid_ton_address,
@@ -237,6 +238,20 @@ async def _bind_wallet(message: Message, address: str) -> bool:
             f"{warn_mark('badaddr')} Это не похоже на адрес Gram-кошелька (бывший TON).\n"
             "Адрес начинается с UQ или EQ — длинная строка вроде "
             "<code>UQD5…</code>. Пришли её целиком одним сообщением.",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+    # Адрес чужой сети. У v5-кошельков сеть зашита в аккаунт, поэтому
+    # тестнетовый адрес на mainnet — это просто несуществующий аккаунт: ставки
+    # с него не засчитались бы (переводов в сети бота не видно), кошелёк не
+    # подтвердился бы, а приз ждал бы в очереди выплат вечно.
+    address_net = address_network(address)
+    active_net = "testnet" if settings.is_testnet else "mainnet"
+    if address_net is not None and address_net != active_net:
+        await message.answer(
+            f"{warn_mark('badaddr')} Это адрес сети {address_net}, а игра идёт в сети "
+            f"{active_net}. Скопируй адрес из кошелька в той же сети, где идёт игра: "
+            "адрес другой сети здесь просто не существует.",
             parse_mode=ParseMode.HTML,
         )
         return False

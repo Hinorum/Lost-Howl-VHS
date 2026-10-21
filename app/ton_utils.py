@@ -6,6 +6,34 @@ import base64
 
 NANO = 1_000_000_000
 
+# Префиксы user-friendly адресов: бит сети в теге даёт 0Q/kQ (тестнет),
+# остальные — EQ/UQ (mainnet).
+_TESTNET_TAGS = ("kQ", "0Q")
+_MAINNET_TAGS = ("EQ", "UQ")
+
+
+def address_network(address: str) -> str | None:
+    """Сеть адреса по его user-friendly тегу: "mainnet"/"testnet"/None.
+
+    None — по адресу сеть не видна: raw-форма (wc:hex) несёт только
+    workchain, а неразбираемая строка — ничего.
+
+    Это важно для v5-кошельков: у них сеть зашита в data cell, то есть
+    тестнетовый и mainnet-овый адреса — РАЗНЫЕ аккаунты. Адрес чужой сети,
+    привязанный в базе, вёл бы себя тихо: переводы с него не видны в сети
+    бота, кошелёк не подтверждается, ставки не засчитываются, а приз ждёт
+    в очереди выплат.
+    """
+    candidate = address.strip()
+    if len(candidate) != 48:
+        return None
+    tag = candidate[:2]
+    if tag in _TESTNET_TAGS:
+        return "testnet"
+    if tag in _MAINNET_TAGS:
+        return "mainnet"
+    return None
+
 
 def is_valid_ton_address(address: str) -> bool:
     """Принимает user-friendly base64url (EQ/UQ/kQ/0Q, 48 символов) и raw hex."""
