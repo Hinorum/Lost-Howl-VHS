@@ -82,6 +82,20 @@ class Settings(BaseSettings):
     allow_sqlite: bool = False
     # Путь к PEM-файлу корневого CA для Postgres (Supabase пулер). Пусто — стандартные CA.
     database_ca: str = ""
+    # Пул соединений: сколько подключений держим постоянно (pool_size) и
+    # сколько сверх того разрешаем на пик (max_overflow). Значения по умолчанию
+    # рассчитаны на ТРАНЗАКЦИОННЫЙ пулер (Supabase, порт 6543): там клиентских
+    # соединений может быть много, серверных — мало.
+    #
+    # ВНИМАНИЕ: на СЕССИОННОМ пулере (порт 5432) каждое клиентское соединение
+    # — это отдельный серверный backend. Там 10+20 = 30 подключений выберут
+    # лимит Supabase («too many clients») на пике закрытия дня. Если в
+    # DATABASE_URL стоит порт 5432 — уменьшите DB_POOL_SIZE/DB_MAX_OVERFLOW
+    # (например 5 и 5) либо переходите на транзакционный пулер (6543).
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    # Сколько ждать свободный слот пула, прежде чем упасть с TimeoutError.
+    db_pool_timeout: int = 60
     timezone: str = "Europe/Moscow"
     media_dir: str = "./media/generated"
 

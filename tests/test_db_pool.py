@@ -1,0 +1,118 @@
+"""Пул соединений и advisory-лок: размер настраивается, лок не занимает слот.
+
+На СЕССИОННОМ пулере (Supabase, порт 5432) каждое клиентское соединение —
+отдельный серверный backend. Пул в 10+20 — это до 30 backend'ов на пике
+закрытия дня, и база может ответить «too many clients». Поэтому размер пула
+вынесен в настройки, а про слишком широкий пул бот предупреждает на старте.
+
+Второе: advisory-лок живёт на физическом соединении и намеренно не
+возвращается в пул (иначе лок уехал бы с чужой сессией). Но из основного
+пула он занимал СЛОТ на всё время жизни процесса и старел мимо
+pool_recycle. Теперь у лока свой движок с NullPool: слот основного пула не
+тронут, соединение одно.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from app.config import settings
+from app.db import engine
+
+
+def test_pool_size_comes_from_settings() -> None:
+    """Размер пула берётся из настроек, а не зашит в код."""
+    assert settings.db_pool_size >= 1
+    assert settings.db_max_overflow >= 0
+    assert settings.db_pool_timeout >= 1
+    if engine.dialect.name != "postgresql":
+        # SQLite (StaticPool) не принимает pool-параметры — там размер пула
+        # неприменим, проверка уходит в джобу test-postgres.
+        pytest.skip("размер пула применяется только к Postgres")
+    assert engine.pool.size() == settings.db_pool_size
+    assert engine.pool._max_overflow == settings.db_max_overflow
+
+
+def test_wide_pool_on_session_pooler_warns(monkeypatch) -> None:
+    """Сессионный пулер + широкий пул = предупреждение на старте."""
+    from app.main import _pool_size_warnings
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:5432/postgres",
+    )
+    monkeypatch.setattr(settings, "db_pool_size", 10)
+    monkeypatch.setattr(settings, "db_max_overflow", 20)
+    warnings = _pool_size_warnings()
+    assert warnings, "широкий пул на сессионном пулере должен быть замечен"
+    assert "too many clients" in warnings[0]
+
+
+def test_narrow_pool_on_session_pooler_is_silent(monkeypatch) -> None:
+    """Урезанный пул — не повод для предупреждения."""
+    from app.main import _pool_size_warnings
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:5432/postgres",
+    )
+    monkeypatch.setattr(settings, "db_pool_size", 5)
+    monkeypatch.setattr(settings, "db_max_overflow", 5)
+    assert _pool_size_warnings() == []
+
+
+def test_transaction_pooler_is_never_warned(monkeypatch) -> None:
+    """Транзакционный пулер (6543) держит сколько угодно клиентских соединений."""
+    from app.main import _pool_size_warnings
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:6543/postgres",
+    )
+    monkeypatch.setattr(settings, "db_pool_size", 10)
+    monkeypatch.setattr(settings, "db_max_overflow", 20)
+    assert _pool_size_warnings() == []
+
+
+async def test_lock_uses_its_own_engine(monkeypatch) -> None:
+    """Лок не занимает слот основного пула: у него свой движок.
+
+    Иначе соединение лока висело бы в пуле на всё время жизни процесса
+    (и старело мимо pool_recycle, который основной пул пересоздаёт).
+    """
+    from app import scheduler_lock as slock
+
+    class _FakeEngine:
+        dialect = type("d", (), {"name": "postgresql"})()
+
+        def __init__(self) -> None:
+            self.connected = 0
+
+        async def connect(self):
+            self.connected += 1
+            return _FakeConn()
+
+    class _FakeConn:
+        async def execute(self, stmt, params=None):
+            return _FakeResult()
+
+        async def close(self) -> None:
+            return None
+
+    class _FakeResult:
+        def scalar(self):
+            return True
+
+    fake = _FakeEngine()
+    monkeypatch.setattr(slock, "_lock_conn", None)
+    monkeypatch.setattr(slock, "_lock_engine_instance", lambda: fake)
+    monkeypatch.setattr("app.db.engine", fake)
+
+    assert await slock.acquire_scheduler_lock() is True
+    assert fake.connected == 1
+    assert slock.scheduler_lock_held() is True
+
+    await slock.release_scheduler_lock()

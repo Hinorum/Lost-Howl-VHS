@@ -26,13 +26,23 @@ engine = create_async_engine(
     settings.async_database_url,
     echo=False,
     pool_pre_ping=True,
-    # Пул 10+20 вместо дефолтных 5+10: параллельные задачи (тик, диспетчер,
-    # watch, бэкап, вебхук) держат соединения одновременно; 15 слотов
-    # исчерпывались на пике закрытия дня, и следующий checkout ждал молча.
-    # pool_timeout 60 с > 30 с дефолта: вместо тихого ожидания — внятный
-    # TimeoutError, который видно в логах и тревогах.
+    # Размер пула — из настроек: у транзакционного пулера (Supabase 6543)
+    # клиентских соединений может быть много, у сессионного (5432) каждое
+    # из них — отдельный серверный backend, и 10+20 выберут лимит Supabase
+    # на пике закрытия дня. Поэтому размер настраивается (DB_POOL_SIZE /
+    # DB_MAX_OVERFLOW), а дефолты рассчитаны на транзакционный пулер.
+    # pool_timeout — вместо тихого ожидания внятный TimeoutError, который
+    # видно в логах и тревогах.
     # SQLite (StaticPool) не принимает pool-параметры — только для Postgres.
-    **({} if _IS_SQLITE else {"pool_size": 10, "max_overflow": 20, "pool_timeout": 60}),
+    **(
+        {}
+        if _IS_SQLITE
+        else {
+            "pool_size": max(1, int(settings.db_pool_size)),
+            "max_overflow": max(0, int(settings.db_max_overflow)),
+            "pool_timeout": max(1, int(settings.db_pool_timeout)),
+        }
+    ),
     # Пулеры (Supabase/pgbouncer) закрывают простаивающие серверные соединения
     # по server_lifetime (~15 мин у Supabase; поверх этого копятся «Idle session
     # timeout»). Пересоздаём нашу сторону явно и раньше — 900 с < 15 мин — чтобы

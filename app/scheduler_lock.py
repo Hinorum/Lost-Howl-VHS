@@ -40,6 +40,34 @@ _LOCK_KEY = 0x54686557_31000000
 # соединение заберёт сборщик мусора и вернётся в пул вместе с локом.
 _lock_conn = None
 
+# Отдельный движок для лока. Лок живёт на физическом соединении и намеренно
+# НЕ возвращается в пул (иначе лок уехал бы с чужой сессией) — но из
+# основного пула он при этом занимал СЛОТ на всё время жизни процесса, да
+# ещё и старел мимо pool_recycle, который основной пул пересоздаёт. Свой
+# движок с NullPool решает оба: соединение одно, счётчик слотов основного
+# пула не тронут, и пересоздавать его не нужно.
+_lock_engine = None
+
+
+def _lock_engine_instance():
+    """Движок для advisory-лока: свой, без пула."""
+    global _lock_engine
+    if _lock_engine is None:
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        from app.config import postgres_connect_args, settings
+        from app.db import engine as app_engine
+
+        _lock_engine = create_async_engine(
+            app_engine.url,
+            poolclass=NullPool,
+            echo=False,
+            pool_pre_ping=True,
+            connect_args=postgres_connect_args(settings.database_url),
+        )
+    return _lock_engine
+
 
 async def acquire_scheduler_lock() -> bool:
     """Забрать право тикать. False — эту базу уже обслуживает другой процесс.
@@ -57,7 +85,7 @@ async def acquire_scheduler_lock() -> bool:
         # Один процесс на одну базу — предположение SQLite-окружения.
         return True
 
-    conn = await engine.connect()
+    conn = await _lock_engine_instance().connect()
     try:
         got = (await conn.execute(text("select pg_try_advisory_lock(:k)"), {"k": _LOCK_KEY})).scalar()
     except Exception:

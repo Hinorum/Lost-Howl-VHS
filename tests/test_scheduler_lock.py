@@ -120,6 +120,9 @@ async def test_second_instance_is_rejected(monkeypatch) -> None:
 
     monkeypatch.setattr(slock, "_lock_conn", None)
     monkeypatch.setattr("app.db.engine", _Engine())
+    # Лок живёт на СВОЕМ движке (без пула): иначе он занимал слот основного
+    # пула на всё время жизни процесса и старел мимо pool_recycle.
+    monkeypatch.setattr(slock, "_lock_engine_instance", lambda: _Engine())
 
     assert await slock.acquire_scheduler_lock() is True  # первый процесс забрал
     assert len(conns) == 1 and conns[0].closed is False, "лок держится на своём соединении"

@@ -309,7 +309,31 @@ def warn_config() -> list[str]:
     Держится отдельно от validate_config, потому что тот роняет старт, а
     подозрение на опечатку в имени переменной — не повод не подниматься.
     """
-    return _unknown_env_keys()
+    return [*_unknown_env_keys(), *_pool_size_warnings()]
+
+
+def _pool_size_warnings() -> list[str]:
+    """Пул соединений шире, чем терпит серверная сторона.
+
+    На СЕССИОННОМ пулере (Supabase, порт 5432) каждое клиентское соединение
+    — отдельный серверный backend. Пул в 10+20 — это до 30 backend'ов на
+    пике закрытия дня; если лимит провайдера ниже, база отдаст «too many
+    clients» и очередь выплат встанет. Не блокируем старт (провайдер и тариф
+    известны оператору), но говорим вслух.
+    """
+    url = settings.database_url or ""
+    if ":5432" not in url or "pooler.supabase.com" not in url:
+        return []
+    total = max(1, int(settings.db_pool_size)) + max(0, int(settings.db_max_overflow))
+    if total <= 12:
+        return []
+    return [
+        f"Пул соединений ({settings.db_pool_size}+{settings.db_max_overflow} = {total}) "
+        "шире, чем безопасно для СЕССИОННОГО пулера Supabase: каждое клиентское "
+        "соединение — отдельный серверный backend, и на пике закрытия дня база "
+        "может отдать «too many clients». Уменьши DB_POOL_SIZE/DB_MAX_OVERFLOW "
+        "или переходи на транзакционный пулер (порт 6543)."
+    ]
 
 
 def _unknown_env_keys() -> list[str]:
