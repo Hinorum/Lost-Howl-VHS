@@ -18,7 +18,7 @@ from app.db import SessionLocal
 from app.models import WatcherState
 from app.render_logs import (
     _mnemonic_fragments,
-    resolve_service_id,
+    resolve_service,
     scan_messages,
     verdict_line,
 )
@@ -125,15 +125,15 @@ def test_verdict_line_reports_clean_and_error() -> None:
     assert "не удалась" in failed
 
 
-async def test_resolve_service_id_requires_key(monkeypatch) -> None:
+async def test_resolve_service_requires_key(monkeypatch) -> None:
     """Без ключа проверка честно отказывает, а не молчит."""
     monkeypatch.setattr(settings, "render_api_key", "")
     with pytest.raises(RuntimeError):
-        await resolve_service_id()
+        await resolve_service()
 
 
-async def test_resolve_service_id_picks_single_web_service(monkeypatch) -> None:
-    """Единственный web-сервис определяется сам."""
+async def test_resolve_service_picks_single_web_service(monkeypatch) -> None:
+    """Единственный web-сервис определяется сам, вместе с ownerId."""
     monkeypatch.setattr(settings, "render_api_key", "KEY")
     monkeypatch.setattr(settings, "render_service_id", "")
     monkeypatch.setattr(settings, "render_service_name", "")
@@ -141,14 +141,21 @@ async def test_resolve_service_id_picks_single_web_service(monkeypatch) -> None:
     async def fake_get(path, params=None):
         return [
             {"service": {"id": "srv-1", "name": "worker", "type": "worker"}},
-            {"service": {"id": "srv-2", "name": "the-ways-bot", "type": "web"}},
+            {
+                "service": {
+                    "id": "srv-2",
+                    "name": "the-ways-bot",
+                    "type": "web",
+                    "ownerId": "own-1",
+                }
+            },
         ]
 
     monkeypatch.setattr("app.render_logs._api_get", fake_get)
-    assert await resolve_service_id() == "srv-2"
+    assert await resolve_service() == ("srv-2", "own-1")
 
 
-async def test_resolve_service_id_refuses_to_guess(monkeypatch) -> None:
+async def test_resolve_service_refuses_to_guess(monkeypatch) -> None:
     """Несколько web-сервисов — честный отказ, а не проверка чужого."""
     monkeypatch.setattr(settings, "render_api_key", "KEY")
     monkeypatch.setattr(settings, "render_service_id", "")
@@ -156,13 +163,27 @@ async def test_resolve_service_id_refuses_to_guess(monkeypatch) -> None:
 
     async def fake_get(path, params=None):
         return [
-            {"service": {"id": "srv-1", "name": "a", "type": "web"}},
-            {"service": {"id": "srv-2", "name": "b", "type": "web"}},
+            {"service": {"id": "srv-1", "name": "a", "type": "web", "ownerId": "o"}},
+            {"service": {"id": "srv-2", "name": "b", "type": "web", "ownerId": "o"}},
         ]
 
     monkeypatch.setattr("app.render_logs._api_get", fake_get)
     with pytest.raises(RuntimeError):
-        await resolve_service_id()
+        await resolve_service()
+
+
+async def test_resolve_service_requires_owner_id(monkeypatch) -> None:
+    """Сервис без ownerId — честная ошибка: запрос логов без него не пройдёт."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "")
+    monkeypatch.setattr(settings, "render_service_name", "")
+
+    async def fake_get(path, params=None):
+        return [{"service": {"id": "srv-2", "name": "bot", "type": "web"}}]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    with pytest.raises(RuntimeError):
+        await resolve_service()
 
 
 async def test_check_writes_verdict_without_secrets(monkeypatch, secrets) -> None:
@@ -172,11 +193,22 @@ async def test_check_writes_verdict_without_secrets(monkeypatch, secrets) -> Non
 
     async def fake_get(path, params=None):
         if path == "/logs":
+            assert params.get("resource") == "srv-1"
+            assert params.get("ownerId") == "own-1"
             return [
                 {"id": "1", "message": f"токен бота {settings.bot_token}", "timestamp": "2026-10-21T09:00:00Z"},
                 {"id": "2", "message": "День 8 открыт", "timestamp": "2026-10-21T09:00:01Z"},
             ]
-        return []
+        return [
+            {
+                "service": {
+                    "id": "srv-1",
+                    "name": "bot",
+                    "type": "web",
+                    "ownerId": "own-1",
+                }
+            }
+        ]
 
     monkeypatch.setattr("app.render_logs._api_get", fake_get)
     from app.render_logs import check_render_logs, last_verdict

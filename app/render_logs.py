@@ -154,37 +154,6 @@ async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
     return response.json()
 
 
-async def resolve_service_id() -> str:
-    """Определяет resource id своего сервиса Render.
-
-    Явный RENDER_SERVICE_ID выигрывает. Иначе — список сервисов: берём
-    единственный web-сервис (у бота он один), при нескольких — по имени
-    RENDER_SERVICE_NAME. Если определить нельзя — честная ошибка, а не
-    догадка: молча проверили бы чужой сервис.
-    """
-    explicit = (settings.render_service_id or "").strip()
-    if explicit:
-        return explicit
-    services = await _api_get("/services")
-    web: list[dict[str, Any]] = []
-    for item in services or []:
-        service = item.get("service") or item
-        if service.get("type") == "web":
-            web.append(service)
-    wanted = (settings.render_service_name or "").strip()
-    if wanted:
-        for service in web:
-            if service.get("name") == wanted:
-                return str(service.get("id"))
-    if len(web) == 1:
-        return str(web[0].get("id"))
-    if not web:
-        raise RuntimeError("у Render нет web-сервисов")
-    raise RuntimeError(
-        "у Render несколько web-сервисов — задай RENDER_SERVICE_ID (или RENDER_SERVICE_NAME)"
-    )
-
-
 def _log_query_shapes(since: datetime) -> list[dict[str, Any]]:
     """Формы запроса логов — от строгой к простой.
 
@@ -205,7 +174,58 @@ def _log_query_shapes(since: datetime) -> list[dict[str, Any]]:
     ]
 
 
-async def fetch_logs(service_id: str, since: datetime, limit: int) -> tuple[list[str], str]:
+async def resolve_service() -> tuple[str, str]:
+    """Определяет resource id и owner id своего сервиса Render.
+
+    Явный RENDER_SERVICE_ID выигрывает. Иначе — список сервисов: берём
+    единственный web-сервис (у бота он один), при нескольких — по имени
+    RENDER_SERVICE_NAME. Если определить нельзя — честная ошибка, а не
+    догадка: молча проверили бы чужой сервис.
+
+    ownerId нужен самому API: без него запрос логов отклоняется
+    («ownerId is required»).
+    """
+    explicit = (settings.render_service_id or "").strip()
+    services = await _api_get("/services")
+    web: list[dict[str, Any]] = []
+    for item in services or []:
+        service = item.get("service") or item
+        if service.get("type") == "web":
+            web.append(service)
+    wanted = (settings.render_service_name or "").strip()
+    chosen: dict[str, Any] | None = None
+    if explicit:
+        for service in services or []:
+            candidate = service.get("service") or service
+            if str(candidate.get("id")) == explicit:
+                chosen = candidate
+                break
+        if chosen is None:
+            raise RuntimeError(f"RENDER_SERVICE_ID={explicit} не найден среди сервисов")
+    elif wanted:
+        for service in web:
+            if service.get("name") == wanted:
+                chosen = service
+                break
+        if chosen is None:
+            raise RuntimeError(f"сервис с именем {wanted!r} не найден")
+    elif len(web) == 1:
+        chosen = web[0]
+    elif not web:
+        raise RuntimeError("у Render нет web-сервисов")
+    else:
+        raise RuntimeError(
+            "у Render несколько web-сервисов — задай RENDER_SERVICE_ID (или RENDER_SERVICE_NAME)"
+        )
+    owner_id = str(chosen.get("ownerId") or "").strip()
+    if not owner_id:
+        raise RuntimeError("у сервиса нет ownerId — запрос логов без него не пройдёт")
+    return str(chosen.get("id")), owner_id
+
+
+async def fetch_logs(
+    service_id: str, owner_id: str, since: datetime, limit: int
+) -> tuple[list[str], str]:
     """Забирает тексты логов сервиса за окно назад.
 
     Возвращает (тексты, использованная форма запроса). Формы перебираются по
@@ -214,8 +234,11 @@ async def fetch_logs(service_id: str, since: datetime, limit: int) -> tuple[list
     """
     last_error: Exception | None = None
     for shape in _log_query_shapes(since):
-        params: dict[str, Any] = {key: value for key, value in shape.items() if value is not None}
+        params: dict[str, Any] = {
+            key: value for key, value in shape.items() if value is not None
+        }
         params["resource"] = service_id
+        params["ownerId"] = owner_id
         if "limit" in params and int(params["limit"]) > limit:
             params["limit"] = limit
         try:
@@ -232,7 +255,9 @@ async def fetch_logs(service_id: str, since: datetime, limit: int) -> tuple[list
             if isinstance(message, str):
                 out.append(message)
         used = ",".join(
-            f"{key}={value}" for key, value in params.items() if key != "resource"
+            f"{key}={value}"
+            for key, value in params.items()
+            if key not in ("resource", "ownerId")
         )
         return out, used
     raise RuntimeError(f"ни одна форма запроса логов не подошла: {last_error}")
@@ -255,11 +280,11 @@ async def check_render_logs() -> dict[str, Any]:
         "error": None,
     }
     try:
-        service_id = await resolve_service_id()
+        service_id, owner_id = await resolve_service()
         verdict["service"] = service_id
         since = datetime.now(UTC) - timedelta(hours=verdict["window_hours"])
         messages, used = await fetch_logs(
-            service_id, since, int(settings.render_logs_limit)
+            service_id, owner_id, since, int(settings.render_logs_limit)
         )
         verdict["query"] = used
         verdict.update(scan_messages(messages))
