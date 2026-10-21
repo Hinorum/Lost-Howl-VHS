@@ -241,14 +241,22 @@ async def test_confirm_batch_shares_transaction_hash(monkeypatch) -> None:
         assert changed == 2
         async with SessionLocal() as session:
             rows = [await session.get(Payout, payout_id) for payout_id in ids]
-        stored = [row.tx_hash for row in rows]
+        stored = {row.id: row.tx_hash for row in rows}
         # Ровно одна строка хранит «чистый» хеш транзакции, вторая — с суффиксом.
-        assert stored.count(real) == 1, stored
-        suffixed = [value for value in stored if value != real]
+        plain = [payout_id for payout_id, value in stored.items() if value == real]
+        suffixed = {
+            payout_id: value for payout_id, value in stored.items() if value != real
+        }
+        assert len(plain) == 1, stored
         assert len(suffixed) == 1, stored
-        assert suffixed[0].startswith(real) and suffixed[0].endswith(f"#{ids[1]}"), suffixed
+        # Суффикс несёт id СВОЕЙ строки: порядок выборки строк базой не задан
+        # (SQLite и Postgres отдают его по-разному) — привязка к строке, а не
+        # к месту в выборке.
+        suffixed_id, suffixed_hash = next(iter(suffixed.items()))
+        assert suffixed_hash.startswith(real)
+        assert suffixed_hash.endswith(f"#{suffixed_id}")
         # Индекс (tx_hash, network) цел: хеши разные.
-        assert len(set(stored)) == 2
+        assert len(set(stored.values())) == 2
         # Обе строки подтверждены и выпадают из повторной сверки.
         assert all(row.status == "sent" for row in rows)
         assert all(row.tx_hash and not row.tx_hash.startswith("bcast:") for row in rows)
