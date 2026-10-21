@@ -17,10 +17,10 @@ from datetime import UTC, datetime, timedelta
 
 from app import ops
 from app.config import settings
+from app.core.registry import LOCAL_TIE_PREFIX
 from app.db import SessionLocal
 from app.models import Card, Player, Round, RoundStatus, Vote, WinRule
 from app.rounds import close_voting, finish_tally, pick_winner, tie_seed
-from app.rounds.voting import LOCAL_TIE_PREFIX
 
 
 def _round(day_index: int) -> Round:

@@ -27,10 +27,10 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 
 from app.config import settings
+from app.core.fees import fee_estimate_nano
 from app.db import SessionLocal
 from app.models import Payout, Round, RoundStatus
 from app.stakes import finalize_day_payouts
-from app.ton_utils import to_nano
 
 from .. import state as _state
 
@@ -356,7 +356,10 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     payout.last_error = reason[:200]
                 await session.commit()
                 return 0
-            fee_nano = to_nano(settings.payout_fee_gram)
+            # Комиссия — рабочая оценка (настроенная или фактическая, см.
+            # app/core/fees.py): при подорожавшей сети одной константы мало,
+            # и проверка баланса обещала бы больше, чем есть.
+            fee_nano = await fee_estimate_nano(session)
             needed = sum(p.amount_nanotons for p in sendable) + fee_nano * len(sendable)
             if balance < needed:
                 reason = (

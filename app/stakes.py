@@ -58,6 +58,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.fees import fee_estimate_nano
 from app.core.processed import KIND_STAKE, claim_transfer, transfer_claim_kind
 from app.models import (
     LeaderboardPot,
@@ -88,12 +89,18 @@ def current_network() -> str:
     return "testnet" if settings.is_testnet else "mainnet"
 
 
-def refund_net_amount(stake_amount_nanotons: int) -> int:
-    """Сумма возврата ИЗ СТАВКИ: с возвратов тоже удерживается газ сети.
+def refund_net_amount(
+    stake_amount_nanotons: int, fee_nanotons: int | None = None
+) -> int:
+    """Сумма возврата за вычетом комиссии сети.
 
-    По умолчанию с каждого возврата держится плоская комиссия payout_fee_gram
-    (казначей не финансирует чужие переводы из своего остатка). Если настроен
-    refund_fee_ratio > 0 — комиссия становится пропорциональной сумме ставки
+    fee_nanotons — комиссия за один возврат; по умолчанию настроенная
+    (PAYOUT_FEE_GRAM). Вызывающий, у которого есть сессия, может передать
+    рабочую оценку — с фактической комиссией сети (см. app/core/fees.py):
+    иначе при подорожавшей сети казна платит разницу, а возврату не хватает
+    на газ.
+
+    Если настроен refund_fee_ratio > 0 — комиссия становится пропорциональной сумме ставки
     (возврат = ставка × (1 − доля)), чтобы мелкие возвраты не теряли
     непропорционально много. Если газ больше самой ставки (экзотика:
     микро-отклонённые ставки), возвращать нечего — возвращаем 0, чтобы не
@@ -102,7 +109,8 @@ def refund_net_amount(stake_amount_nanotons: int) -> int:
     ratio = getattr(settings, "refund_fee_ratio", 0.0) or 0.0
     if ratio > 0:
         return max(0, int(stake_amount_nanotons * (1.0 - ratio)))
-    return max(0, stake_amount_nanotons - to_nano(settings.payout_fee_gram))
+    fee = to_nano(settings.payout_fee_gram) if fee_nanotons is None else fee_nanotons
+    return max(0, stake_amount_nanotons - fee)
 
 
 def split_pot(prize_pool_nanotons: int, entries: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -211,7 +219,9 @@ async def register_stake(
         # минимума, физически не поставил бы в этот день (вторая попытка ловила
         # already_staked и возвращалась). Пылевой остаток возвращается сразу
         # тем же расчётом, что и поток финализации (с вычетом газа).
-        refund = refund_net_amount(previous.amount_nanotons)
+        refund = refund_net_amount(
+            previous.amount_nanotons, fee_nanotons=await fee_estimate_nano(session)
+        )
         if refund > 0:
             session.add(
                 Payout(
@@ -507,6 +517,9 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
 
     created = 0
     pot = sum(stake.amount_nanotons for stake in confirmed)
+    # Рабочая комиссия за перевод: максимум из настроенной и средней
+    # фактической (сеть могла подорожать). Считается один раз на день.
+    fee_nano = await fee_estimate_nano(session)
 
     if not confirmed:
         round_row.pot_nanotons = 0
@@ -523,7 +536,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
 
         if not winning_stakes:
             for stake in confirmed:
-                refund = refund_net_amount(stake.amount_nanotons)
+                refund = refund_net_amount(stake.amount_nanotons, fee_nanotons=fee_nano)
                 if refund > 0:
                     created += add_payout(stake, "refund", refund)
                     # Ставка разобрана — обязана сменить статус. Иначе игрок
@@ -573,10 +586,8 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             round_row.referral_nanotons = referral_cut
             prize_pool = pot - house_cut - board_cut - weekly_cut - fund_cut - referral_cut
 
-            fee_nano = to_nano(settings.payout_fee_gram)
             min_payout_nano = to_nano(settings.min_payout_gram)
             net_pool = prize_pool - fee_nano * len(winning_stakes)
-
             dust_to_week = 0
             if net_pool < min_payout_nano:
                 dust_to_week = prize_pool
@@ -697,7 +708,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             round_row.rake_nanotons = house_cut + board_cut
 
     for stake in stuck:
-        refund = refund_net_amount(stake.amount_nanotons)
+        refund = refund_net_amount(stake.amount_nanotons, fee_nanotons=fee_nano)
         if refund <= 0:
             continue
         # Условный UPDATE-claim по ставке: ручной возврат (/return) берёт её
@@ -865,7 +876,9 @@ async def create_manual_refund(session, stake_id: int) -> str:
             "привязанный адрес ещё не доказан микро-переводом. Пусть игрок "
             "подтвердит кошелёк в /wallet."
         )
-    refund = refund_net_amount(stake.amount_nanotons)
+    refund = refund_net_amount(
+        stake.amount_nanotons, fee_nanotons=await fee_estimate_nano(session)
+    )
     if refund <= 0:
         return "сумма ставки не покрывает газ сети — возвращать нечего"
     # Атомарный UPDATE-claim по самой ставке — тот же приём, что в

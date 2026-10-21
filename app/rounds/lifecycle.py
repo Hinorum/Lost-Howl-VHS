@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.core.registry import LOCAL_TIE_PREFIX
 from app.models import (
     Card,
     Income,
@@ -35,7 +36,6 @@ from .rendering import plan_and_render
 from .time import _ROMAN, _now, utc_aware
 from .voting import (
     _TIE_THEATER,
-    LOCAL_TIE_PREFIX,
     _decisive_counts,
     _winner_and_tied,
     count_stakes_for_tally,

@@ -29,6 +29,7 @@ from app.core.registry import (
     ALERT_DELIVERY_KEY,
     ALERT_DELIVERY_MISSING_KEY,
     ALERT_ENTROPY_KEY,
+    ALERT_FEE_KEY,
     ALERT_LOCAL_TIE_KEY,
     ALERT_LOCK_LOST_KEY,
     ALERT_MIRROR_KEY,
@@ -44,6 +45,7 @@ from app.core.registry import (
     ANNOUNCE_EMPTY_DAY_KEY,
     BACKUP_LAST_OK_KEY,
     BEAT_KEY,
+    LOCAL_TIE_PREFIX,
     LOCK_LOST_KEY,
     MONEY_MODE_KEY,
     OPS_ALERT_DIGEST_KEY,
@@ -732,7 +734,6 @@ async def _local_tie_days(session, limit: int = 3) -> list[int]:
     «закон дня без энтропии»: там выбирался ЗАКОН, здесь — победитель.
     """
     from app.models import Round
-    from app.rounds.voting import LOCAL_TIE_PREFIX
 
     result = await session.execute(
         select(Round.day_index)
@@ -763,6 +764,48 @@ async def _check_local_tie(session, bot) -> None:
         "недоступен, и исход не проверяется по эксплореру (он честный — его "
         "никто не знал заранее, — но непроверяемый). Проверь доступ к "
         "TonAPI/Toncenter и TON_API_KEY/TONCENTER_API_KEY.",
+    )
+
+
+async def _fee_growth(session) -> tuple[int, int] | None:
+    """(настроенная, фактическая средняя) — если фактическая выше оценки.
+
+    None — либо данных зеркала ещё нет, либо сеть не подорожала.
+    """
+    from app.core.fees import configured_fee_nano, realized_fee_nano
+
+    configured = configured_fee_nano()
+    realized = await realized_fee_nano(session)
+    if realized is None or realized <= configured:
+        return None
+    return configured, realized
+
+
+async def _check_fee_growth(session, bot) -> None:
+    """Тревога: комиссия сети выросла, а оценка в настройках осталась прежней.
+
+    Пока оценка ниже фактической, казна платит разницу: из пула вычиталась
+    оценка, а сеть брала больше. Допуск сверки растёт вместе с числом
+    выплат, поэтому расхождение может копиться днями и не попасть в
+    сверку. Оператору поало обновить PAYOUT_FEE_GRAM.
+    """
+    from app.core.fees import FEE_ALERT_RATIO
+
+    growth = await _fee_growth(session)
+    if growth is None:
+        return
+    configured, realized = growth
+    if realized < configured * FEE_ALERT_RATIO:
+        return
+    await _raise(
+        session,
+        bot,
+        ALERT_FEE_KEY,
+        f"комиссия сети выше оценки (оценка {configured / 1e9:.5f} Gram, "
+        f"факт {realized / 1e9:.5f} Gram)",
+        f"⚠️ Комиссия сети выросла: фактическая {realized / 1e9:.5f} Gram против "
+        f"оценки {configured / 1e9:.5f} Gram (PAYOUT_FEE_GRAM). Казна платит "
+        "разницу из своего остатка — обнови PAYOUT_FEE_GRAM.",
     )
 
 
@@ -1459,6 +1502,8 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
         # Ничья, решённая локальной случайностью (сеть лежала в момент
         # закрытия голосов): исход не пересчитать по эксплореру.
         await _check_local_tie(session, bot)
+        # Комиссия сети выросла — оценка в настройках отстала.
+        await _check_fee_growth(session, bot)
     # 6. Свежесть бэкапа. Проверка вне условия ton_enabled: потеря базы означает
     #    потерю истории выплат и зеркала казны независимо от того, включены ли
     #    деньги сейчас, а сломанный pg_dump — это в первую очередь вопрос
