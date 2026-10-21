@@ -141,4 +141,13 @@ def test_bind_command_removed_and_autobind_registered() -> None:
     channels = [handler.callback.__name__ for handler in router.channel_post.handlers]
     assert "cmd_bind" not in messages and "cmd_bind" not in channels
     assert "auto_bind_chat" in messages and "auto_bind_chat" in channels
-    assert messages.index("auto_bind_chat") < messages.index("on_private_fallback")
+    # Catch-all живёт в отдельном роутере (app/handlers/fallback.py) и
+    # подключается последним — его позиция не зависит от порядка импортов
+    # модулей (isort умеет их переставлять, и такая перестановка однажды
+    # съела бы все команды).
+    from app.handlers.fallback import fallback_router
+
+    assert "on_private_fallback" not in messages
+    assert "on_private_fallback" in [
+        handler.callback.__name__ for handler in fallback_router.message.handlers
+    ]

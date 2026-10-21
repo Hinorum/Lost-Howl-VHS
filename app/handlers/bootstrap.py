@@ -47,6 +47,14 @@ async def _close_wallet_dialog_on_command(
 def build_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
+    # Catch-all ЛС подключается ПОСЛЕДНИМ: он перехватывает любую личку, и
+    # если окажется раньше команд — /start и прочие уйдут в диалог привязки
+    # молча. Порядок подключения задан здесь, а не порядком импортов модулей
+    # (isort умеет переставлять импорты, и такая перестановка однажды съела бы
+    # все команды).
+    from .fallback import fallback_router
+
+    dispatcher.include_router(fallback_router)
     _register_error_handler(dispatcher)
     return dispatcher
 

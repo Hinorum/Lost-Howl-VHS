@@ -110,6 +110,7 @@ __all__ = [
     "on_paystars",
     "on_payton",
     "on_pre_checkout",
+    "fallback_router",
     "on_private_fallback",
     "on_refunded_payment",
     "on_score_view",
@@ -163,7 +164,7 @@ from .common import (
     _set_paused_and_broadcast,
     router,
 )
-from .fallback import on_private_fallback, register_private_fallback
+from .fallback import fallback_router, on_private_fallback
 from .ops_diag import _ops_diag_text, cmd_alerts_clear, cmd_ops
 from .panel import (
     _admin_panel_text,
@@ -253,6 +254,6 @@ router.message.register(auto_bind_chat, F.chat.type != ChatType.PRIVATE)
 # В канал приходит channel_post, а не message; ЛС там не бывают — без фильтра.
 router.channel_post.register(auto_bind_chat)
 
-# Вызов после всех @router.message доменов. Сам import fallback isort
-# ставит раньше player/wallet — без декоратора там ничего не регистрируется.
-register_private_fallback()
+# Catch-all ЛС живёт в отдельном роутере (app/handlers/fallback.py) и
+# подключается последним в build_dispatcher: его позиция не зависит от
+# порядка импортов модулей пакета.
