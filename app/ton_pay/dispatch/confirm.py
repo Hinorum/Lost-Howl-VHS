@@ -46,7 +46,11 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
       • карта истории пуста (оба провайдера молчат) → НЕ трогаем строки:
         «не знаю» не имеет права ни подтверждать, ни возвращать в очередь;
       • скан окна усечён (payout_reconcile_max_pages) → «memo не найдено»
-        тоже «не знаю»: строки не трогаем, пока скан не станет полным.
+        тоже «не знаю»: строки не трогаем, пока скан не станет полным;
+      • пачка v5r1 (несколько выплат в одной транзакции) → хеш транзакции
+        достаётся ровно одной строке, остальные помечаются хешем с суффиксом
+        «#<id>»: индекс (tx_hash, network) не даёт двум строкам хранить один
+        хеш, а пачка — законный случай одной транзакции на несколько выплат.
     """
     # Локальный импорт: карта берётся через app.ton_pay, чтобы
     # monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", ...) доходил.
@@ -73,6 +77,31 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
             )
             if not rows:
                 return 0
+            # Хеши, уже занятые в этой сети: индекс uq_payout_tx_network (tx_hash,
+            # network) не даёт двум выплатам хранить один хеш транзакции. Пачка
+            # v5r1 кладёт НЕСКОЛЬКО выплат в ОДНУ транзакцию — у всех её memo
+            # один и тот же хеш (reconcile: tx_map[comment] = tx_hash). Раньше
+            # сверка писала этот хеш каждой строке пачки → IntegrityError на
+            # коммите: весь цикл откатывался, ни одна выплата не получала
+            # настоящий хеш, потерянные переводы не возвращались в очередь —
+            # и так каждый цикл. Теперь хеш транзакции занимает РОВНО одна
+            # строка, а остальные строки пачки получают хеш с суффиксом
+            # «#<id>»: он уникален в сети, остаётся прослеживаемым до своей
+            # транзакции и выпадает из повторной сверки (сканируются только
+            # tx_hash IS NULL / bcast:*).
+            taken_hashes = set(
+                (
+                    await session.execute(
+                        select(Payout.tx_hash).where(
+                            Payout.network == network,
+                            Payout.tx_hash.is_not(None),
+                            Payout.tx_hash.not_like("bcast:%"),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
             # Сверять нужно ТОЛЬКО эти memo (sent-без-реального-хеша): ищем их,
             # а не шерстим всю историю слепо. Как только все найдены — стоп:
             # запросов в квартал провайдера минимум, а «нет в истории» остаётся
@@ -115,7 +144,14 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
                     None,
                 )
                 if real_hash:
-                    payout.tx_hash = real_hash
+                    if real_hash in taken_hashes:
+                        # Пачка: хеш транзакции уже занят другой строкой.
+                        # Свой суффикс — иначе индекс уронил бы коммит.
+                        suffix = f"#{payout.id}"
+                        payout.tx_hash = f"{real_hash[: 80 - len(suffix)]}{suffix}"
+                    else:
+                        taken_hashes.add(real_hash)
+                        payout.tx_hash = real_hash
                     confirmed += 1
                     continue
                 sent_at = payout.sent_at.replace(tzinfo=None) if payout.sent_at is not None else None

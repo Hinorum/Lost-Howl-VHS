@@ -197,6 +197,131 @@ async def test_confirm_uses_comment_override(monkeypatch) -> None:
         await _cleanup(payout_id)
 
 
+async def test_confirm_batch_shares_transaction_hash(monkeypatch) -> None:
+    """Пачка v5r1: несколько выплат в ОДНОЙ транзакции → один хеш на всех.
+
+    Регресс: сверка писала реальный хеш каждой строке пачки, а индекс
+    (tx_hash, network) на это не даёт — коммит падал IntegrityError, ВЕСЬ цикл
+    сверки откатывался: ни одна выплата не получала настоящий хеш, потерянные
+    переводы не возвращались в очередь. Теперь хеш транзакции достаётся ровно
+    одной строке, остальные помечаются хешем с суффиксом «#<id>».
+    """
+    await ensure_round(65)
+    await ensure_player(43)
+    ids: list[int] = []
+    async with SessionLocal() as session:
+        for _ in range(2):
+            payout = Payout(
+                round_id=65,
+                player_id=43,
+                kind="prize",
+                amount_nanotons=500_000_000,
+                dest_address="0:" + os.urandom(32).hex(),
+                network="mainnet",
+                status="sent",
+                tx_hash="bcast:1789470019",
+                sent_at=datetime.now(UTC)
+                - timedelta(seconds=settings.payout_confirm_timeout_seconds + 60),
+            )
+            session.add(payout)
+            await session.flush()
+            ids.append(payout.id)
+        await session.commit()
+
+    real = "f" * 64
+
+    async def fake_tx_map(**kwargs) -> dict[str, str]:
+        # Одна транзакция пачки: у обоих memo ОДИН хеш (как в reconcile.py).
+        return {f"way:65:prize#{payout_id}": real for payout_id in ids}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+
+    try:
+        changed = await ton_pay.confirm_broadcast_payouts(bot=None)
+        assert changed == 2
+        async with SessionLocal() as session:
+            rows = [await session.get(Payout, payout_id) for payout_id in ids]
+        stored = [row.tx_hash for row in rows]
+        # Ровно одна строка хранит «чистый» хеш транзакции, вторая — с суффиксом.
+        assert stored.count(real) == 1, stored
+        suffixed = [value for value in stored if value != real]
+        assert len(suffixed) == 1, stored
+        assert suffixed[0].startswith(real) and suffixed[0].endswith(f"#{ids[1]}"), suffixed
+        # Индекс (tx_hash, network) цел: хеши разные.
+        assert len(set(stored)) == 2
+        # Обе строки подтверждены и выпадают из повторной сверки.
+        assert all(row.status == "sent" for row in rows)
+        assert all(row.tx_hash and not row.tx_hash.startswith("bcast:") for row in rows)
+    finally:
+        async with SessionLocal() as session:
+            for payout_id in ids:
+                row = await session.get(Payout, payout_id)
+                if row is not None:
+                    await session.delete(row)
+            await session.commit()
+
+
+async def test_confirm_keeps_existing_hash_owner(monkeypatch) -> None:
+    """Хеш, занятый чужой строкой раньше, не переписывается: суффикс и у неё.
+
+    Сверка не должна отбирать чужой хеш: индекс (tx_hash, network) — это
+    барьер от двойной оплаты, и подмена хеша ломала бы его смысл.
+    """
+    await ensure_round(66)
+    await ensure_player(44)
+    owner_hash = "e" * 64
+    async with SessionLocal() as session:
+        owner = Payout(
+            round_id=66,
+            player_id=44,
+            kind="prize",
+            amount_nanotons=500_000_000,
+            dest_address="0:" + os.urandom(32).hex(),
+            network="mainnet",
+            status="sent",
+            tx_hash=owner_hash,
+            sent_at=datetime.now(UTC),
+        )
+        session.add(owner)
+        await session.flush()
+        other = Payout(
+            round_id=66,
+            player_id=44,
+            kind="prize",
+            amount_nanotons=500_000_000,
+            dest_address="0:" + os.urandom(32).hex(),
+            network="mainnet",
+            status="sent",
+            tx_hash="bcast:1789470019",
+            sent_at=datetime.now(UTC)
+            - timedelta(seconds=settings.payout_confirm_timeout_seconds + 60),
+        )
+        session.add(other)
+        await session.flush()
+        owner_id, other_id = owner.id, other.id
+        await session.commit()
+
+    async def fake_tx_map(**kwargs) -> dict[str, str]:
+        return {f"way:66:prize#{other_id}": owner_hash}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+
+    try:
+        await ton_pay.confirm_broadcast_payouts(bot=None)
+        async with SessionLocal() as session:
+            owner = await session.get(Payout, owner_id)
+            other = await session.get(Payout, other_id)
+        assert owner.tx_hash == owner_hash
+        assert other.tx_hash == f"{owner_hash}#{other_id}"
+    finally:
+        async with SessionLocal() as session:
+            for payout_id in (owner_id, other_id):
+                row = await session.get(Payout, payout_id)
+                if row is not None:
+                    await session.delete(row)
+            await session.commit()
+
+
 async def test_confirm_ignores_other_networks(monkeypatch) -> None:
     """Сверка работает только по выплатам активной сети."""
     monkeypatch.setattr(settings, "ton_network", "mainnet")
