@@ -448,6 +448,16 @@ async def _ton_maintenance() -> None:
     from app.ton_pay import confirm_broadcast_payouts, settle_closed_rounds
 
     try:
+        # Сверка seqno после подъёма: кошелёк просят заранее (он же становится
+        # тёплым к первому платежу), и сверка случается в минуту после
+        # рестарта, а не к моменту первого выплата — когда непрочитанное
+        # окно уже миновало.
+        from app.ton_pay.wallet import ensure_cold_start_check
+
+        await ensure_cold_start_check()
+    except Exception:
+        logger.exception("Сверка seqno холодного старта упала (проверим позже)")
+    try:
         # Сверка «sent»-выплат с блокчейном: bcast-метка не гарантирует, что
         # перевод попал в блок (гонка двух быстрых переводов). Потерянные memo
         # возвращаются в очередь, подтверждённые получают реальный хеш.

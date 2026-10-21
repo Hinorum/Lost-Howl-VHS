@@ -299,16 +299,19 @@ def _cold_start_lines(raw: str | None) -> list[str]:
     Расхождение лайтсерверов и Toncenter после простоя — признак внешних
     переводов, прошедших мимо бота. Показываем и само расхождение, и когда
     проверка шла: событие случается раз в подъём, а логи живут недолго.
+    Неполная сверка (один из источников не ответил) — тоже строка: молчание
+    выглядело бы как «проверки не было».
     """
     if not raw:
         return []
     try:
         data = json.loads(raw)
-        lite = int(data["lite"])
-        http = int(data["http"])
-        delta = int(data.get("delta", lite - http))
+        lite = data.get("lite")
+        http = data.get("http")
+        delta = data.get("delta")
+        error = data.get("error")
         at = str(data.get("at") or "")
-    except (ValueError, TypeError, KeyError) as exc:
+    except (ValueError, TypeError, AttributeError) as exc:
         logger.debug("Метка холодного старта не разобрана (%r): %s", raw, exc)
         return []
     stamp = ""
@@ -320,10 +323,16 @@ def _cold_start_lines(raw: str | None) -> list[str]:
             stamp = f" · {moment:%d.%m %H:%M} UTC"
         except ValueError:
             stamp = ""
-    if abs(delta) > 1:
+    if lite is None or http is None:
+        read = f"лайтсерверы={lite if lite is not None else '—'}, toncenter={http if http is not None else '—'}"
+        reason = f" — {error}" if error else ""
+        return [f"  ⚠️ холодный старт: сверка неполная ({read}){reason}{stamp}"]
+    if delta is None:
+        return [f"  холодный старт: seqno прочитан ({read}){stamp}"]
+    if abs(int(delta)) > 1:
         return [
             f"  ⚠️ холодный старт: seqno лайтсерверов {lite}, toncenter {http} "
-            f"(расхождение {delta:+d}){stamp} — во время простоя прошли внешние переводы"
+            f"(расхождение {int(delta):+d}){stamp} — во время простоя прошли внешние переводы"
         ]
     return [f"  холодный старт: seqno совпал ({lite}){stamp}"]
 

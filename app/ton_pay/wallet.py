@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.config import settings
 from app.ton_utils import normalize_address
@@ -299,12 +299,42 @@ async def get_wallet():
         # всё равно читает свежий seqno, а расхождение может быть легитимным
         # (гонка фиксации блока). Проверка не должна ломать старт — поэтому
         # любой сбой молча уходит в предупреждение.
-        if network == "mainnet":
-            await _cold_start_seqno_check(state._wallet)
+        if network == "mainnet" and not state._cold_start_checked:
+            # Сверка — про подъём после простоя: ровно один раз на процесс
+            # (и снова, если кошелёк пересобрали — это новый «холодный старт»).
+            state._cold_start_checked = True
+            await cold_start_seqno_check(state._wallet)
         return state._wallet
 
 
-async def _cold_start_seqno_check(wallet) -> None:
+async def ensure_cold_start_check() -> None:
+    """Пробует выполнить сверку seqno холодного старта — без выплат.
+
+    Сверка по умолчанию случается при первом построении кошелька, а кошелёк
+    строится при первом выплате. Это слишком поздно: к моменту выплаты
+    непрочитанное окно уже миновало. Поэтому цикл обслуживания просит
+    кошелёк заранее (заодно он становится тёплым к первому платежу), и
+    сверка случается в минуту после подъёма.
+
+    Неудача (лайтсерверы мертвы — кошелёк не собрался) не считается
+    выполненной: попытка повторяется не чаще раза в 10 минут.
+    """
+    if state._cold_start_checked:
+        return
+    now = datetime.now(UTC)
+    if state._cold_start_next_attempt_at is not None and now < state._cold_start_next_attempt_at:
+        return
+    try:
+        await get_wallet()
+    except Exception as exc:
+        state._cold_start_next_attempt_at = now + timedelta(minutes=10)
+        logger.warning(
+            "Холодный старт: кошелёк не собрался (%s) — сверка seqno отложена",
+            exc,
+        )
+
+
+async def cold_start_seqno_check(wallet) -> None:
     """Сверка seqno на холодном старте: лайтсерверы против Toncenter.
 
     Пока бот лежал, казначей мог сделать внешние переводы (Tonkeeper, руками):
@@ -312,6 +342,13 @@ async def _cold_start_seqno_check(wallet) -> None:
     старым номером перевод уходит «в пустоту» (мемпул отбросит сообщение с
     неверным seqno). Тот же seqno через Toncenter (HTTP, всегда свежий)
     показывает правду.
+
+    ИСТОЧНИКИ ЧИТАЮТСЯ НЕЗАВИСИМО. Первая версия читала их одним
+    try-блоком, и мёртвые лайтсерверы (а они умирают отдельно от Toncenter)
+    уносили сверку целиком: живой Toncenter так и не спрашивался, метка не
+    писалась, и в /treasury было пусто — ровно то, что случилось на боевом
+    mainnet 2026-10-21. Теперь каждый источник читается своим try: что
+    прочиталось — то и пишется, а что не прочиталось — с причиной.
 
     Расхождение больше 1 — предупреждение в лог И запись в watcher_state:
     событие случается ровно один раз (при подъёме после простоя), логи живут
@@ -324,18 +361,31 @@ async def _cold_start_seqno_check(wallet) -> None:
     from app.db import SessionLocal
     from app.models import WatcherState
 
-    try:
-        from .http_channel import http_get_wallet_seqno
+    from .http_channel import http_get_wallet_seqno
 
-        lite_seqno = await wallet.get_seqno()
-        http_seqno = await http_get_wallet_seqno(wallet)
-    except Exception:
-        logger.warning("Cold-start сверка seqno не удалась", exc_info=True)
-        return
-    delta = lite_seqno - http_seqno
+    lite_seqno: int | None = None
+    http_seqno: int | None = None
+    problems: list[str] = []
+
+    try:
+        lite_seqno = int(await wallet.get_seqno())
+    except Exception as exc:
+        problems.append(f"лайтсерверы: {type(exc).__name__}: {exc}"[:200])
+    try:
+        http_seqno = int(await http_get_wallet_seqno(wallet))
+    except Exception as exc:
+        problems.append(f"toncenter: {type(exc).__name__}: {exc}"[:200])
+
+    delta = (lite_seqno - http_seqno) if lite_seqno is not None and http_seqno is not None else None
     stamp = datetime.now(UTC).isoformat()
     payload = json.dumps(
-        {"lite": lite_seqno, "http": http_seqno, "delta": delta, "at": stamp},
+        {
+            "lite": lite_seqno,
+            "http": http_seqno,
+            "delta": delta,
+            "at": stamp,
+            "error": "; ".join(problems) if problems else None,
+        },
         ensure_ascii=False,
     )
     try:
@@ -350,6 +400,15 @@ async def _cold_start_seqno_check(wallet) -> None:
         # Метка — удобство наблюдаемости, а не условие работы: её потеря
         # не должна превращаться в сбой старта.
         logger.warning("Cold-start сверка seqno: метку в watcher_state не сохранили", exc_info=True)
+    if problems:
+        logger.warning(
+            "Cold-start сверка seqno неполная: %s (прочитано: лайт=%s, http=%s)",
+            "; ".join(problems),
+            lite_seqno,
+            http_seqno,
+        )
+    if delta is None:
+        return
     if abs(delta) > 1:
         logger.warning(
             "Cold-start сверка seqno: лайтсерверы=%d, toncenter=%d (расхождение %d). "
