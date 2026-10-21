@@ -34,9 +34,9 @@ repos:
         pass_filenames: true
 
       - id: mypy-core
-        name: Mypy (ton_pay / ton_watch / rounds)
-        entry: python -m mypy app/ton_pay app/ton_watch app/rounds
+        name: "Mypy (весь app/)"
+        entry: python -m mypy
         language: system
         stages: [pre-commit]
-        files: ^(app/(ton_pay|ton_watch|rounds)/|mypy\.ini$)
+        files: ^(app/|mypy\.ini$)
         pass_filenames: false

@@ -209,7 +209,7 @@ async def _rank_window(
     until: datetime,
     by: str = "opens_at",
     limit: int = 50,
-) -> list[tuple[int, int, int, int]]:
+) -> list[tuple[int, ...]]:
     """Ранг окна [since, until): (player_id, верных, дней, вклад Gram).
 
     Порядок — ровно тот, что использует выплата: верные пути ↓, вклад Gram
@@ -747,13 +747,15 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                 payments.append((player_id, wallet, amount))
         else:
             # Прежнее поведение: победители, набравшие максимум, делят ровно.
-            winners = await _top_correct_voters(session, period_start, month_start)
+            correct_winners = await _top_correct_voters(
+                session, period_start, month_start
+            )
             staked = await _players_with_stake(
                 session, period_start, month_start, by="tally_ends_at"
             )
             payable_ids: list[int] = []
             wallets: dict[int, str] = {}
-            for player_id, _count in winners:
+            for player_id, _count in correct_winners:
                 player = await session.get(Player, player_id)
                 if (
                     player is not None
@@ -763,14 +765,14 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
                 ):
                     wallets[player_id] = player.wallet_address
                     payable_ids.append(player_id)
-            skipped = len(winners) - len(payable_ids)
+            skipped = len(correct_winners) - len(payable_ids)
             if not payable_ids:
                 # Платить некому: метку НЕ двигаем, копилка ждёт следующего цикла.
                 logger.warning(
                     "Копилка %d нанотонов ждёт: у лидеров (%s) нет подтверждённого кошелька "
                     "или ставки в этом месяце",
                     total,
-                    [pid for pid, _ in winners] or "нет голосов",
+                    [pid for pid, _ in correct_winners] or "нет голосов",
                 )
                 return False
             shares = split_equal(total, payable_ids)

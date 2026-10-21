@@ -53,8 +53,10 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from typing import Any, cast
 
 from sqlalchemy import select, text, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -292,7 +294,7 @@ async def confirm_stake(session: AsyncSession, tx_hash: str) -> bool:
         .where(Stake.id == stake.id, Stake.status == "pending")
         .values(status="confirmed", confirmed_at=datetime.now(UTC))
     )
-    if claimed.rowcount != 1:
+    if cast(CursorResult[Any], claimed).rowcount != 1:
         return False  # уже не pending (возврат/дубль) — не перезаписываем
     await session.commit()
     return True
@@ -408,7 +410,7 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
             .where(ReferralPot.id == pot.id, ReferralPot.nanotons == amount)
             .values(nanotons=0, updated_at=datetime.now(UTC))
         )
-        if claimed.rowcount == 0:
+        if cast(CursorResult[Any], claimed).rowcount == 0:
             continue  # другой процесс уже забрал — следующий цикл догонит
         session.add(
             Payout(
@@ -450,7 +452,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
         .where(Round.id == round_row.id, Round.payouts_finalized.is_(False))
         .values(payouts_finalized=True)
     )
-    if claim.rowcount == 0:
+    if cast(CursorResult[Any], claim).rowcount == 0:
         logger.info("finalize_day_payouts: round %s уже финализирован или claim не прошёл", round_row.id)
         return 0
     logger.info("finalize_day_payouts: round %s claim прошёл, ищу ставки (network=%s)", round_row.id, network)
@@ -486,7 +488,9 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                 Player.wallet_verified.is_(True),
             )
         )
-        wallet_map = {pid: addr for pid, addr in players_result.all()}
+        wallet_map = {
+            pid: addr for pid, addr in players_result.all() if addr
+        }
 
     def add_payout(stake: Stake, kind: str, amount: int) -> int:
         session.add(
@@ -722,7 +726,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             .where(Stake.id == stake.id, Stake.status.in_(["pending", "rejected"]))
             .values(status="refunded")
         )
-        if claimed.rowcount != 1:
+        if cast(CursorResult[Any], claimed).rowcount != 1:
             logger.info(
                 "finalize_day_payouts: ставка %s уже разобрана параллельной операцией — возврат не создаю",
                 stake.id,
@@ -894,7 +898,7 @@ async def create_manual_refund(session, stake_id: int) -> str:
         .where(Stake.id == stake.id, Stake.status.in_(["pending", "rejected"]))
         .values(status="refunded")
     )
-    if claimed.rowcount != 1:
+    if cast(CursorResult[Any], claimed).rowcount != 1:
         # Откат снимает и claim_once, и claim по ставке: «полу-меток» нет,
         # повторная попытка возможна — но статус уже не pending, так что
         # хендлер получит внятный отказ вместо второй выплаты.
@@ -944,7 +948,7 @@ async def record_fund_dispense(
             .where(PackFund.id == fund_row.id, PackFund.nanotons >= amount_nanotons)
             .values(nanotons=PackFund.nanotons - amount_nanotons)
         )
-        if not result.rowcount:
+        if not cast(CursorResult[Any], result).rowcount:
             fresh = (
                 await session.execute(select(PackFund).order_by(PackFund.id).limit(1))
             ).scalar_one_or_none()

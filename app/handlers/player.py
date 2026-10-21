@@ -322,7 +322,7 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
         # соперника. Битый opened_at окно чинит по-своему (settle перезапускает
         # таймер), поэтому здесь просто не считаем дедлайн прошедшим.
         try:
-            opened_at = datetime.fromisoformat(window.get("opened_at", ""))
+            opened_at = datetime.fromisoformat((window or {}).get("opened_at", ""))
             if opened_at.tzinfo is None:
                 opened_at = opened_at.replace(tzinfo=UTC)
         except (ValueError, TypeError):
@@ -421,6 +421,8 @@ async def _score_text(user) -> str:
         # Telegram отвергнет целиком. Экранируем здесь, у самой HTML-витрины
         # (scene_label экранирует так же, но эта локальная подпись добавляет
         # римскую позицию и раньше шла в обход общего хелпера).
+        if vote is None or round_row is None:
+            return "—"
         name = next((c.title for c in round_row.cards if c.position == vote.card_position), None)
         if name is None:
             return f"{POSITIONS[vote.card_position]}."
@@ -429,7 +431,7 @@ async def _score_text(user) -> str:
 
     if vote is None:
         choice = f"{hint_mark(str(user.id))} Сегодня ты ещё не сделал выбор дня."
-    elif round_row.status in (RoundStatus.OPEN, RoundStatus.TALLYING):
+    elif round_row is not None and round_row.status in (RoundStatus.OPEN, RoundStatus.TALLYING):
         choice = f"{path_mark('care', str(user.id))} Твой выбор: {_scene_label()}"
     else:
         choice = f"Вчера твой выбор: {_scene_label()}"
@@ -543,7 +545,8 @@ async def on_noop(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("menu:"))
 async def on_menu(callback: CallbackQuery) -> None:
     """Пульт LOST HOWL: сценарии кнопок, не покрытые готовыми колбэками."""
-    action = callback.data.split(":", 1)[1] if ":" in callback.data else ""
+    data = callback.data or ""
+    action = data.split(":", 1)[1] if ":" in data else ""
     handler = {
         "today": _menu_today,
         "wallet": _menu_wallet,
@@ -648,7 +651,7 @@ async def _menu_invite(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("vote:"))
 async def on_vote(callback: CallbackQuery) -> None:
-    parts = callback.data.split(":")
+    parts = (callback.data or "").split(":")
     if len(parts) != 3:
         await callback.answer("Некорректный выбор.", show_alert=True)
         return
@@ -743,7 +746,10 @@ async def on_vote(callback: CallbackQuery) -> None:
                             "откроет перевод с подставленным адресом, а «Скопировать "
                             "адрес» пригодится для любого другого кошелька."
                         )
-                    await callback.bot.send_message(
+                    bot = callback.bot
+                    if bot is None:
+                        return
+                    await bot.send_message(
                         callback.from_user.id,
                         text,
                         parse_mode=ParseMode.HTML,

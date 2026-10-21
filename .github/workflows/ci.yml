@@ -47,11 +47,10 @@ jobs:
         run: python -m scripts.dependency_hashes
       - name: Lint (runtime errors only)
         run: python -m ruff check .
-      # Постепенный mypy: пока только денежный контур и раунды. Ошибки в
-      # остальных пакетах не валят джобу (follow_imports=silent в mypy.ini),
-      # охват расширяется добавлением пакетов сюда и в pre-commit.
-      - name: "Type check (mypy: ton_pay/ton_watch/rounds)"
-        run: python -m mypy app/ton_pay app/ton_watch app/rounds
+      # Проверка типов: весь пакет приложения. Скооп — в mypy.ini (files=app),
+      # чтобы он не расходился с локальным pre-commit-хуком.
+      - name: "Type check (mypy)"
+        run: python -m mypy
       # Контракты импортной архитектуры: циклы и нарушения слоёв ловятся
       # здесь, а не в traceback'е на проде. Конфиг: .importlinter.
       - name: Import contracts

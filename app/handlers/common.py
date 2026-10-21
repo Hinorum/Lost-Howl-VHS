@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 from aiogram import Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -20,6 +20,30 @@ from app.rounds import ensure_current_round, get_active_round
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+def callback_message(callback: CallbackQuery) -> Message | None:
+    """Сообщение, к которому привязан колбэк, — если его ещё можно править.
+
+    У инлайн-кнопки сообщение бывает трёх видов: обычное Message, «недоступное»
+    (InaccessibleMessage — старое сообщение, которое Telegram больше не даёт
+    править: у него нет ни answer, ни edit_text) и вовсе отсутствует (колбэк
+    без сообщения). И то и другое — не ошибка, а обычное состояние: править и
+    отвечать тогда некуда, и хендлер должен сказать «кнопка устарела», а не
+    упасть.
+
+    Возвращаем ЛОКАЛЬНУЮ переменную, а не свойство callback.message: mypy не
+    держит сужение типа через await (свойство могло измениться), поэтому
+    проверка «if callback.message is not None» теряла смысл после любого
+    await — и падение «None has no attribute answer» было лишь вопросом
+    времени.
+    """
+    message = callback.message
+    if message is None:
+        return None
+    if not hasattr(message, "answer") and not hasattr(message, "edit_text"):
+        return None
+    return cast(Message, message)
 
 
 def require_admin(denial: str = "Команда только для хранителя игры.") -> Callable:

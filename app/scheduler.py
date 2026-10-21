@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, time
+from typing import Any, cast
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -285,7 +287,7 @@ async def _claim_results(session: AsyncSession, finished_id: int) -> bool:
         .where(Round.id == finished_id, Round.results_at.is_(None))
         .values(results_at=_now())
     )
-    return claimed.rowcount == 1
+    return cast(CursorResult[Any], claimed).rowcount == 1
 
 
 async def _announce_round(session: AsyncSession, round_row, bot: Bot | None) -> None:

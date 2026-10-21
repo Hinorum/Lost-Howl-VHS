@@ -80,7 +80,8 @@ def _alembic_head() -> str:
     from alembic.script import ScriptDirectory
 
     cfg = AlembicConfig(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
-    return ScriptDirectory.from_config(cfg).get_current_head()
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    return head or ""
 
 
 def _run_alembic(*args: str) -> subprocess.CompletedProcess:

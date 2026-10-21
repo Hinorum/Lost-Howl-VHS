@@ -15,10 +15,10 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 from aiogram import Bot
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 
 from app.config import settings
 from app.core.registry import (
@@ -192,7 +192,7 @@ async def mark_tick() -> None:
             # Успех стирает счётчик падений: иначе три разовые аварии за
             # месяц накопились бы до «падает» и кричали бы вхолостую.
             await session.execute(
-                WatcherState.__table__.delete().where(
+                delete(WatcherState).where(
                     WatcherState.key.in_([TICK_FAIL_KEY, TICK_FAIL_LAST_KEY])
                 )
             )
@@ -512,7 +512,7 @@ def _human_ts(utime: object) -> str:
     Нужен для дыры окна входящих: границы читает человек, а не код.
     """
     try:
-        moment = datetime.fromtimestamp(int(utime), tz=UTC)
+        moment = datetime.fromtimestamp(int(float(cast(float, utime))), tz=UTC)
     except (TypeError, ValueError, OSError):
         return "?"
     return moment.astimezone().strftime("%d.%m %H:%M")

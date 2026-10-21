@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatType
-from aiogram.types import ErrorEvent, Message
+from aiogram.types import ErrorEvent, Message, TelegramObject
 
 from app.config import settings
 
@@ -14,8 +16,12 @@ from .common import _dialog_close, router
 logger = logging.getLogger(__name__)
 
 
-@router.message.outer_middleware()
-async def _close_wallet_dialog_on_command(handler, event: Message, data: dict) -> None:
+@router.message.outer_middleware
+async def _close_wallet_dialog_on_command(
+    handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+    event: TelegramObject,
+    data: dict[str, Any],
+) -> Any:
     """Любая команда, кроме /wallet, закрывает открытый диалог привязки.
 
     Специфичные хендлеры команд перехватывают апдейт раньше, чем

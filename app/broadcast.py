@@ -1242,7 +1242,8 @@ async def _player_result_texts(finished: Round) -> list[tuple[int, str]]:
         for payout in (
             await session.execute(select(Payout).where(Payout.round_id == finished.id))
         ).scalars().all():
-            payouts.setdefault(payout.player_id, []).append(payout)
+            if payout.player_id is not None:
+                payouts.setdefault(payout.player_id, []).append(payout)
         return [
             (
                 player_id,

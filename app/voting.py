@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any, cast
 
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -126,7 +128,7 @@ async def change_vote(session: AsyncSession, round_row: Round, player_id: int, p
     # Атомарный захват старейшего гранта: условный UPDATE не даёт списать один
     # грант дважды при гонке параллельных вызовов.
     claim_result = await session.execute(_claim_grant_stmt(round_row.id, player_id))
-    if claim_result.rowcount != 1:
+    if cast(CursorResult[Any], claim_result).rowcount != 1:
         # Гранта нет (или его перехватил параллельный вызов). Пустой commit
         # закрывает транзакцию, не истекая объекты сессии (expire_on_commit=False).
         await session.commit()

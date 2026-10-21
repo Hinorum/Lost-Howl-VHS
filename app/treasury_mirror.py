@@ -895,7 +895,11 @@ async def sync_treasury_mirror() -> dict:
                 await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
                 await session.commit()
                 before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
-                if prev_head is not None and before_lt <= prev_head:
+                if (
+                    prev_head is not None
+                    and before_lt is not None
+                    and before_lt <= prev_head
+                ):
                     # Страница пересекла известную границу — хвост под меткой,
                     # новые транзакции выше головы все учтены.
                     break

@@ -410,6 +410,9 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
     )
     engaged_before = _tp.state._http_channel_engaged_at
     engaged_after = None
+    # Метка вещания: у каналов разный контракт (HTTP-ветка возвращает всегда
+    # строку, лайтсерверная — None, если отправки не было).
+    marker: str | None = None
     try:
         # Лок диспетчера обязателен: цикл очереди держит один seqno на пачку,
         # параллельный перевод с тем же seqno молча потерялся бы.
@@ -567,7 +570,7 @@ async def cmd_payout(message: Message) -> None:
 @require_admin()
 async def cmd_return(message: Message) -> None:
     """Ручной возврат «не засчитанной» ставки хранителем: /return <id>."""
-    parts = message.text.split()
+    parts = (message.text or "").split()
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer(
             "Формат: <code>/return &lt;id&gt;</code> — id ставки из «↩️ Вернуть ставку» в /panel."
@@ -612,7 +615,7 @@ async def cmd_fundout(message: Message) -> None:
     здесь фиксируется <сумма> и <зачем>, а баланс фонда уменьшается, чтобы
     прозрачный журнал и цифра фонда оставались честными. Только для хранителя.
     """
-    args = message.text.split()
+    args = (message.text or "").split()
     if len(args) < 3:
         await message.answer("Формат: /fundout <Gram> <причина. Что купили/разыграли>")
         return
@@ -800,7 +803,7 @@ async def cmd_mirror(message: Message) -> None:
     от головы к генезису и перепроверит тождество «Σ = баланс». Лекарство от
     глубокого рассинхрона (сбои индексаторов, реорги вглубь истории).
     """
-    if message.text.split()[1:] != ["reset", "confirm"]:
+    if (message.text or "").split()[1:] != ["reset", "confirm"]:
         await message.answer(
             "Пересборка зеркала казны: /mirror reset confirm\n"
             "После сброса зеркало пересканирует историю и сверку запускает "

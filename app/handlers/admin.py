@@ -342,7 +342,7 @@ async def cmd_dispute(message: Message) -> None:
     хранителю доступны open/resolve/reject/compensate."""
     from app import disputes as dispute_mod
 
-    parts = message.text.split()
+    parts = (message.text or "").split()
     verb = parts[1].lower() if len(parts) > 1 else ""
     if verb in ("resolve", "reject", "compensate", "open"):
         if message.from_user is None or message.from_user.id not in settings.admin_id_set:
@@ -398,7 +398,8 @@ async def cmd_dispute(message: Message) -> None:
     from app.models import Round as _Round
     from app.models import Vote as _Vote
 
-    reason = message.text.split(maxsplit=1)[1] if " " in message.text else ""
+    text = message.text or ""
+    reason = text.split(maxsplit=1)[1] if " " in text else ""
     async with SessionLocal() as session:
         player = await upsert_player(session, message.from_user)
         latest = (
@@ -604,7 +605,7 @@ async def on_adjust_action(callback: CallbackQuery) -> None:
     а не в памяти процесса: два инстанса бота видят один и тот же ожидающий
     тап, и второй тап подтверждает даже на другой реплике.
     """
-    action = callback.data.split(":", 1)[1]
+    action = (callback.data or "").split(":", 1)[1] if ":" in (callback.data or "") else ""
     if action not in {"out", "in", "loss"}:
         await callback.answer("Неизвестное действие.", show_alert=True)
         return
@@ -660,10 +661,10 @@ async def cmd_finalize(message: Message) -> None:
     # Сначала покажем состояние раунда(ов) для диагностики.
     async with SessionLocal() as session:
         if target_day is not None:
-            rnd = await session.execute(
+            rnd_result = await session.execute(
                 select(Round).where(Round.day_index == target_day).order_by(Round.id.desc()).limit(1)
             )
-            row = rnd.scalar_one_or_none()
+            row = rnd_result.scalar_one_or_none()
             if row is None:
                 await message.answer(f"День {target_day} не найден.")
                 return

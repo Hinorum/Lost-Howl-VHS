@@ -140,7 +140,7 @@ async def on_change_view(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("paystars:"))
 async def on_paystars(callback: CallbackQuery) -> None:
-    raw = callback.data.split(":")[1]
+    raw = (callback.data or "").split(":")[1] if ":" in (callback.data or "") else ""
     if not raw.isdigit() or callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
         await callback.answer("Оплата — только в личке у бота (/change).", show_alert=True)
         return
@@ -177,7 +177,11 @@ async def on_paystars(callback: CallbackQuery) -> None:
                     show_alert=True,
                 )
                 return
-    await callback.bot.send_invoice(
+    bot = callback.bot
+    if bot is None:
+        await callback.answer("Не удалось определить бота для выставления счёта.", show_alert=True)
+        return
+    await bot.send_invoice(
         chat_id=callback.message.chat.id,
         title="Перемотка кадра",
         description="Разовое право переписать выбор в сегодняшнем кадре. Действует до конца дня.",
@@ -313,7 +317,7 @@ async def on_refunded_payment(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("payton:"))
 async def on_payton(callback: CallbackQuery) -> None:
-    raw = callback.data.split(":")[1]
+    raw = (callback.data or "").split(":")[1] if ":" in (callback.data or "") else ""
     if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
         await callback.answer("Оплата — только в личке у бота (/change).", show_alert=True)
         return

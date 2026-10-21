@@ -54,7 +54,7 @@ from .admin import (
     _adjust_menu_text,
     cmd_advance,
 )
-from .common import _set_paused_and_broadcast, require_admin, router
+from .common import _set_paused_and_broadcast, callback_message, require_admin, router
 from .payout import (
     _payouts_text,
     _refunds_panel_text,
@@ -221,7 +221,7 @@ async def _build_panel_text(session) -> str:
     dead_by_kind = snap.get("payout_dead_by_kind") or {}
     p_refund = int(pending_by_kind.get("refund", 0))
     p_prize = int(pending_by_kind.get("prize", 0))
-    p_other = max(0, int(queue) - p_refund - p_prize)
+    p_other = max(0, int(queue or 0) - p_refund - p_prize)
     d_refund = int(dead_by_kind.get("refund", 0))
     parts = []
     if p_refund:
@@ -365,39 +365,45 @@ async def cmd_panel(message: Message) -> None:
 @require_admin("Пульт только для хранителя.")
 async def on_panel_action(callback: CallbackQuery) -> None:
     """Единая точка кнопок пульта: гейт хранителя + маршрутизация действий."""
-    action = callback.data.split(":", 1)[1]
+    data = callback.data or ""
+    action = data.split(":", 1)[1] if ":" in data else ""
+    message = callback_message(callback)
+    if message is None:
+        # Кнопка от старого (недоступного) сообщения: править и отвечать
+        # некуда. Это обычное состояние, а не ошибка.
+        await callback.answer("Кнопка устарела — открой панель заново.", show_alert=True)
+        return
     try:
         if action in {"view", "refresh"}:
             async with SessionLocal() as session:
                 text = await _admin_panel_text(session)
-            if callback.message is not None:
-                try:
-                    await callback.message.edit_text(
-                        text, parse_mode=ParseMode.HTML, reply_markup=await _panel_keyboard()
-                    )
-                except TelegramBadRequest as exc:
-                    # Двойной тап «Обновить» — нормальный жест, а не ошибка:
-                    # Telegram отклоняет правку без изменений содержимого.
-                    if "message is not modified" in str(exc).lower():
-                        await callback.answer("Без изменений.")
-                        return
-                    raise
+            try:
+                await message.edit_text(
+                    text, parse_mode=ParseMode.HTML, reply_markup=await _panel_keyboard()
+                )
+            except TelegramBadRequest as exc:
+                # Двойной тап «Обновить» — нормальный жест, а не ошибка:
+                # Telegram отклоняет правку без изменений содержимого.
+                if "message is not modified" in str(exc).lower():
+                    await callback.answer("Без изменений.")
+                    return
+                raise
             await callback.answer("Обновлено.")
             return
         if action == "payouts":
-            await callback.message.answer(await _payouts_text())
+            await message.answer(await _payouts_text())
             await callback.answer("Список ниже.")
             return
         if action == "stakes":
-            await callback.message.answer(await _stakes_panel_text())
+            await message.answer(await _stakes_panel_text())
             await callback.answer("Ставки ниже.")
             return
         if action == "refunds":
-            await callback.message.answer(await _refunds_panel_text())
+            await message.answer(await _refunds_panel_text())
             await callback.answer("Возвраты ниже.")
             return
         if action == "adjust":
-            await callback.message.answer(
+            await message.answer(
                 await _adjust_menu_text(),
                 parse_mode=ParseMode.HTML,
                 reply_markup=_adjust_keyboard(),
@@ -437,24 +443,23 @@ async def on_panel_action(callback: CallbackQuery) -> None:
                 )
                 return
             state_name = "со ставками и платной сменой выбора" if want_money else "без ставок"
-            if callback.message is not None:
-                async with SessionLocal() as session:
-                    text = await _admin_panel_text(session)
-                try:
-                    await callback.message.edit_text(
-                        f"💰 Версия «{state_name}» включена со СЛЕДУЮЩЕГО дня.\n"
-                        "Текущий день живёт по своему режиму.\n\n"
-                        + text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=await _panel_keyboard(),
-                    )
-                except TelegramBadRequest as exc:
-                    if "message is not modified" in str(exc).lower():
-                        # Повторное нажатие привело к тому же тексту: Telegram
-                        # отвечает ошибкой, а менять нечего. Молчание уместно.
-                        pass
-                    else:
-                        raise
+            async with SessionLocal() as session:
+                text = await _admin_panel_text(session)
+            try:
+                await message.edit_text(
+                    f"💰 Версия «{state_name}» включена со СЛЕДУЮЩЕГО дня.\n"
+                    "Текущий день живёт по своему режиму.\n\n"
+                    + text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=await _panel_keyboard(),
+                )
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    # Повторное нажатие привело к тому же тексту: Telegram
+                    # отвечает ошибкой, а менять нечего. Молчание уместно.
+                    pass
+                else:
+                    raise
             await callback.answer("Готово.")
             return
         if action in {"pause", "resume"}:
@@ -484,40 +489,39 @@ async def on_panel_action(callback: CallbackQuery) -> None:
                 return
             chats = f" Анонс в {delivered} чат(ах)." if delivered else ""
             status_msg = "⏸ Игра остановлена." if want_paused else "▶️ Игра возобновляется."
-            if callback.message is not None:
-                async with SessionLocal() as session:
-                    text = await _admin_panel_text(session)
-                try:
-                    await callback.message.edit_text(
-                        status_msg + chats + "\n\n" + text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=await _panel_keyboard(),
-                    )
-                except TelegramBadRequest as exc:
-                    if "message is not modified" in str(exc).lower():
-                        # Повторное нажатие привело к тому же тексту: Telegram
-                        # отвечает ошибкой, а менять нечего. Молчание уместно.
-                        pass
-                    else:
-                        raise
+            async with SessionLocal() as session:
+                text = await _admin_panel_text(session)
+            try:
+                await message.edit_text(
+                    status_msg + chats + "\n\n" + text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=await _panel_keyboard(),
+                )
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    # Повторное нажатие привело к тому же тексту: Telegram
+                    # отвечает ошибкой, а менять нечего. Молчание уместно.
+                    pass
+                else:
+                    raise
             await callback.answer("Готово.")
             return
         if action == "treasury":
             from app.ton_pay import treasury_diagnostics
 
-            await callback.message.answer(
+            await message.answer(
                 await treasury_diagnostics(), parse_mode=ParseMode.HTML
             )
             await callback.answer()
             return
         if action == "revenue":
-            await callback.message.answer(await _revenue_text())
+            await message.answer(await _revenue_text())
             await callback.answer()
             return
         if action == "cassettes":
             async with SessionLocal() as session:
                 text = await _cassette_menu_text(session)
-            await callback.message.answer(
+            await message.answer(
                 text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
             )
             await callback.answer()
@@ -553,22 +557,21 @@ async def on_panel_action(callback: CallbackQuery) -> None:
 
             await cmd_advance(_ShimMessage())
             summary = "\n".join(_answers)[:3500] or "Готово."
-            if callback.message is not None:
-                async with SessionLocal() as session:
-                    text = await _admin_panel_text(session)
-                try:
-                    await callback.message.edit_text(
-                        f"⏩ {summary}\n\n" + text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=await _panel_keyboard(),
-                    )
-                except TelegramBadRequest as exc:
-                    if "message is not modified" in str(exc).lower():
-                        # Повторное нажатие привело к тому же тексту: Telegram
-                        # отвечает ошибкой, а менять нечего. Молчание уместно.
-                        pass
-                    else:
-                        raise
+            async with SessionLocal() as session:
+                text = await _admin_panel_text(session)
+            try:
+                await message.edit_text(
+                    f"⏩ {summary}\n\n" + text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=await _panel_keyboard(),
+                )
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    # Повторное нажатие привело к тому же тексту: Telegram
+                    # отвечает ошибкой, а менять нечего. Молчание уместно.
+                    pass
+                else:
+                    raise
             await callback.answer("День переключён.")
             return
         await callback.answer("Неизвестное действие.", show_alert=True)
@@ -924,7 +927,8 @@ async def cmd_cassette(message: Message) -> None:
 @require_admin("Пульт только для хранителя.")
 async def on_cassette_action(callback: CallbackQuery) -> None:
     """Назначение «следующей», вход в «Редактор плёнки», скачивание и правки."""
-    parts = callback.data.split(":")
+    data = callback.data or ""
+    parts = data.split(":")
     op = parts[1] if len(parts) > 1 else ""
     file_name = parts[2] if len(parts) > 2 else ""
     # Всё, что дальше, работает с именем файла как с путём. Отсекаем выход за
@@ -934,6 +938,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
     if file_name and _safe_cassette_name(file_name) is None:
         await callback.answer("Некорректное имя кассеты.", show_alert=True)
         return
+    message = callback_message(callback)
     try:
         if op == "set":
             entry = _library_entry(file_name)
@@ -942,10 +947,20 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 return
             async with SessionLocal() as session:
                 await set_next_cassette(session, file_name)
-        elif op == "clear":
+            await callback.answer("Назначено следующей кассетой.")
+            return
+        if op == "clear":
             async with SessionLocal() as session:
                 await set_next_cassette(session, None)
-        elif op == "scene":
+            await callback.answer("Назначение снято.")
+            return
+        # Остальные действия правят сообщение панели или отвечают в него.
+        # Старое (недоступное) сообщение править нельзя — это обычное
+        # состояние, а не ошибка.
+        if message is None:
+            await callback.answer("Кнопка устарела — открой панель заново.", show_alert=True)
+            return
+        if op == "scene":
             entry = _library_entry(file_name)
             if entry is None or entry.cassette is None:
                 await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
@@ -953,7 +968,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
             async with SessionLocal() as session:
                 edit_file, _unused = await get_edit_intent(session)
             status = await _scene_status(entry)
-            await callback.message.edit_text(
+            await message.edit_text(
                 f"{_scene_text(entry, status)}{_scene_badge(edit_file == file_name)}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_scene_keyboard(
@@ -968,7 +983,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
                 return
             payload = scenario_yaml(entry.cassette).encode("utf-8")
-            await callback.message.answer_document(
+            await message.answer_document(
                 BufferedInputFile(payload, filename=Path(file_name).with_suffix(".yaml").name)
             )
         elif op in ("pick",):
@@ -978,7 +993,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
             if entry is None or entry.cassette is None:
                 await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
                 return
-            await callback.message.edit_text(
+            await message.edit_text(
                 (
                     f"🎞 {entry.cassette.title}"
                     f"{' · дорога ' + road if road != 'main' else ''} — день?"
@@ -1003,14 +1018,14 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 return
             if action == "dl":
                 payload = day_yaml(item, road=road).encode("utf-8")
-                await callback.message.answer_document(
+                await message.answer_document(
                     BufferedInputFile(
                         payload, filename=_day_doc_name(file_name, road, day_index)
                     )
                 )
             else:
                 for chunk in _chunk_message(day_view_text(entry.cassette, day_index, road)):
-                    await callback.message.answer(chunk)
+                    await message.answer(chunk)
         elif op == "edit":
             mode = parts[3] if len(parts) > 3 else "month"
             entry = _library_entry(file_name)
@@ -1024,7 +1039,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 "day": "фрагмент одного дня .yaml (скачай, измени, пришли файлом)",
             }.get(mode, "")
             status = await _scene_status(entry)
-            await callback.message.edit_text(
+            await message.edit_text(
                 f"{_scene_text(entry, status)}{_scene_badge(True, meaning)}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_scene_keyboard(
@@ -1044,7 +1059,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 "day": "проверю фрагмент дня без записи",
             }.get(mode, "проверю без записи")
             status = await _scene_status(entry)
-            await callback.message.edit_text(
+            await message.edit_text(
                 f"{_scene_text(entry, status)}{_scene_badge(True, meaning)}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_scene_keyboard(
@@ -1054,7 +1069,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
         elif op == "new":
             async with SessionLocal() as session:
                 await set_edit_intent(session, "<new>", "new")
-            await callback.message.edit_text(
+            await message.edit_text(
                 "➕ <b>НОВАЯ КАССЕТА</b>\n\n"
                 "Пришли документом YAML-сценарий нового месяца (контракт §1). "
                 "Шаблон — «Скачать месяц» любой существующей плёнки. Имя файла "
@@ -1066,8 +1081,11 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
             )
         elif op == "snapshot":
             safe = _safe_cassette_name(file_name)
-            path = default_cassettes_dir() / safe if safe else None
-            if path is None or not path.is_file():
+            if not safe:
+                await callback.answer("Некорректное имя кассеты.", show_alert=True)
+                return
+            path = default_cassettes_dir() / safe
+            if not path.is_file():
                 await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
                 return
             had_backup = _has_backup(file_name)  # до снятия слепка
@@ -1086,7 +1104,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 async with SessionLocal() as session:
                     edit_file, _unused = await get_edit_intent(session)
                 status = await _scene_status(entry)
-                await callback.message.edit_text(
+                await message.edit_text(
                     f"{_scene_text(entry, status)}{_scene_badge(edit_file == file_name)}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=_scene_keyboard(
@@ -1104,8 +1122,11 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
             return
         elif op == "restore":
             safe = _safe_cassette_name(file_name)
-            path = default_cassettes_dir() / safe if safe else None
-            if path is None or not path.is_file():
+            if not safe:
+                await callback.answer("Некорректное имя кассеты.", show_alert=True)
+                return
+            path = default_cassettes_dir() / safe
+            if not path.is_file():
                 await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
                 return
             ok, lines = restore_backup(safe, default_cassettes_dir())
@@ -1117,7 +1138,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
             persisted = await story_store.persist(safe, default_cassettes_dir())
             async with SessionLocal() as session:
                 text = await _cassette_menu_text(session)
-            await callback.message.edit_text(
+            await message.edit_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
             )
             await callback.answer(
@@ -1132,7 +1153,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
             if entry is None or entry.cassette is None:
                 await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
                 return
-            await callback.message.edit_text(
+            await message.edit_text(
                 _delete_text(entry),
                 parse_mode=ParseMode.HTML,
                 reply_markup=_delete_keyboard(file_name),
@@ -1154,7 +1175,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
                 if edit_file == file_name:
                     await clear_edit_intent(session)
                 text = await _cassette_menu_text(session)
-            await callback.message.edit_text(
+            await message.edit_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
             )
             if result.row_gone:
@@ -1169,7 +1190,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
         elif op == "stop":
             async with SessionLocal() as session:
                 await clear_edit_intent(session)
-            await callback.message.edit_text(
+            await message.edit_text(
                 "Загрузка отменена. Кассета не изменена: правки возвращались "
                 "документом.",
                 reply_markup=await _cassette_keyboard(),
@@ -1177,7 +1198,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
         elif op == "back":
             async with SessionLocal() as session:
                 text = await _cassette_menu_text(session)
-            await callback.message.edit_text(
+            await message.edit_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
             )
         else:
@@ -1218,11 +1239,17 @@ async def on_cassette_document(message: Message) -> None:
     if edit_file != "<new>" and _safe_cassette_name(edit_file) is None:
         await message.reply("❌ Имя кассеты некорректно — правка отклонена.")
         return
-    mode = edit_mode.split("-", 1)[0]
-    dry_run = edit_mode.endswith("-check")
+    # Режим правки лежит в БД: у легаси-строки он может быть пустым — тогда
+    # считаем его обычной правкой месяца (как при создании намерения).
+    mode = (edit_mode or "month").split("-", 1)[0]
+    dry_run = bool(edit_mode and edit_mode.endswith("-check"))
+    bot = message.bot
+    if bot is None:
+        await message.reply("❌ Не удалось определить бота для загрузки файла.")
+        return
     try:
         buffer = io.BytesIO()
-        await message.bot.download(file=message.document.file_id, destination=buffer)
+        await bot.download(file=message.document.file_id, destination=buffer)
         ok, lines, final_name = apply_cassette_file(
             buffer.getvalue(),
             edit_file,

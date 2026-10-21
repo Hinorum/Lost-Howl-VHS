@@ -38,6 +38,7 @@ from .common import (
     _dialog_close,
     _dialog_start,
     _personal_keyboard,
+    callback_message,
     router,
 )
 
@@ -415,6 +416,8 @@ async def _cmd_wallet_impl(message: Message) -> None:
     parts = (message.text or "").split()
     if len(parts) == 1:
         if message.chat.type == ChatType.PRIVATE:
+            if message.from_user is None:
+                return
             async with SessionLocal() as session:
                 player = await upsert_player(session, message.from_user)
             if not player.wallet_address:
@@ -600,8 +603,12 @@ async def on_stake_copy(callback: CallbackQuery) -> None:
     addr = friendly_address(
         settings.active_treasury_address, testnet=settings.is_testnet
     )
+    target = callback_message(callback)
+    if target is None:
+        await callback.answer("Кнопка устарела — открой /stake заново.", show_alert=True)
+        return
     try:
-        await callback.message.answer(
+        await target.answer(
             f"🏛 Адрес Фонда игры для перевода:\n<code>{addr}</code>\n\n"
             "Нажми на адрес — он скопируется. Переводи со СВОЕГО привязанного "
             "кошелька (/wallet), memo не нужен: перевод найдётся по отправителю.",

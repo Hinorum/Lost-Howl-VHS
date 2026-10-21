@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from typing import Any, cast
 
 from sqlalchemy import func, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -53,7 +55,7 @@ async def award_points(session: AsyncSession, round_row: Round) -> int:
         .where(Round.id == round_row.id, Round.awards_at.is_(None))
         .values(awards_at=datetime.now(UTC))
     )
-    if claim.rowcount == 0:
+    if cast(CursorResult[Any], claim).rowcount == 0:
         return 0  # уже начислено (повторный тик / админское переигрывание)
     voters = await session.execute(select(Vote.player_id).where(Vote.round_id == round_row.id))
     voter_ids = [row[0] for row in voters.all()]

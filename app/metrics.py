@@ -162,11 +162,11 @@ def render(snapshot: dict[str, Any] | None = None) -> str:
         lines.extend(_family(name))
         for labels, value in sorted(samples.items()):
             lines.append(f"{_PREFIX}{name}{_labels(labels)} {_number(value)}")
-    for name, value in sorted(_db_gauges(snapshot).items()):
-        if value is None:
+    for name, gauge in sorted(_db_gauges(snapshot).items()):
+        if gauge is None:
             continue
         lines.extend(_family(name))
-        lines.append(f"{_PREFIX}{name} {_number(value)}")
+        lines.append(f"{_PREFIX}{name} {_number(gauge)}")
     return "\n".join(lines) + "\n"
 
 

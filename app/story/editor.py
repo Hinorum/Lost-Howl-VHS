@@ -336,7 +336,7 @@ def apply_cassette_file(
     # требует той же гарантии, что и имя из callback_data.
     if not is_safe_cassette_name(final_name or ""):
         return False, ["Недопустимое имя файла по сценарию — запись отменена."], None
-    path = directory / final_name
+    path = directory / (final_name or "")
     if mode != "new":
         _backup(path)
     write_json(cassette, path)
