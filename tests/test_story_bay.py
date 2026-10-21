@@ -90,6 +90,35 @@ def _bay_off_after_each_test():
         uninstall_bay()
 
 
+@pytest.fixture(autouse=True)
+async def _run_anchor(session):
+    """Якорь забега: 5 мая 2026. День движения 7 → календарный 11 мая.
+
+    Дата дня кассеты считается от якоря (начало сезона), а не от «сегодня»:
+    после простоя движок догоняет пропущенные календарные дни, и «сегодня»
+    указало бы на уже показанный контент.
+
+    Якорь пишется ТОЙ ЖЕ сессией, что и тест: SQLite держит снимок
+    открытой транзакции, и запись из чужой сессии тест не увидит.
+    """
+    from app.core.registry import RUN_START_KEY
+    from app.models import WatcherState
+
+    payload = json.dumps(
+        {
+            "key": "2026-05",
+            "dom": 5,
+            "start_iso": "2026-05-05T00:00:00+00:00",
+        }
+    )
+    row = await session.get(WatcherState, RUN_START_KEY)
+    if row is None:
+        session.add(WatcherState(key=RUN_START_KEY, value=payload))
+    else:
+        row.value = payload
+    await session.commit()
+
+
 def test_install_registers_provider_and_uninstall_restores(tmp_path) -> None:
     _write_cassette(tmp_path, "may.json", "2026-05", 31, "may-kasseta")
     assert rendering_mod.get_plan_provider() is None
@@ -299,9 +328,11 @@ async def test_plan_day_prepends_echo_of_yesterday_winner(
     from app.models import Round, RoundStatus, StoryBeat, WinRule
 
     monkeypatch.setattr(bay, "datetime", _FakeDatetime)  # сегодня: 2026-05-11
+    # Эхо берётся у ПРЕДЫДУЩЕГО дня ДВИЖКА (day_index − 1): якорь даёт день 7
+    # = 11 мая, значит предыдущий день движка — 6-й (это 10 мая по календарю).
     session.add(
         Round(
-            day_index=10,
+            day_index=6,
             status=RoundStatus.CLOSED,
             win_rule=WinRule.MAJORITY,
             chapter_title="Глава 10",
@@ -314,7 +345,7 @@ async def test_plan_day_prepends_echo_of_yesterday_winner(
     )
     session.add(
         StoryBeat(
-            day_index=10,
+            day_index=6,
             winning_title="ход 10-1",
             winning_text="Вчера стая пошла на тень.",
             win_rule="majority",

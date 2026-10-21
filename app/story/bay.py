@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from app.config import settings
@@ -161,33 +161,85 @@ async def get_next_cassette(session) -> str | None:
     return row.value if row is not None else None
 
 
-async def _decision_day_winner(session, decision: date) -> int | None:
-    """Честный победитель движка за календарный день, или None.
+async def _anchor_info(session, day_index: int) -> tuple[date, int]:
+    """(календарная дата дня движения, день месяца якоря).
 
-    Перемотка решается только закрытым кадром: winner_card дня (at_day - 1)
-    из базы движка. Кассета ничего не выдумывает, а ищет раунд, открытый в
-    этот день (opens_at попадает в сутки). Победителя ещё нет / раунда нет —
-    перемотка не срабатывает (fail-open).
+    Кассета живёт календарными днями месяца, движок — своей
+    последовательностью дней. Дата берётся от ЯКОРЯ ЗАБЕГА (начала сезона):
+    день N — это якорь + N−1 дней.
+
+    Именно якорь, а не «сегодня»: после простоя движок догоняет
+    пропущенные календарные дни, и «сегодня» указало бы на контент, который
+    уже показан (или на тот, что покажут позже) — сюжет поехал бы
+    относительно канона. В нормальном ходе якорь и календарь совпадают, так
+    что поведение не меняется.
+
+    Без якоря (совсем свежий запуск) — сегодня: тогда день 1 и есть
+    сегодняшний день.
+    """
+    from app.rounds.anchor import get_run_anchor
+
+    try:
+        anchor = await get_run_anchor(session)
+    except Exception:
+        logger.debug("Якорь забега не прочитан — берём сегодняшний день", exc_info=True)
+        return datetime.now(UTC).date(), datetime.now(UTC).day
+    anchor = anchor or {}
+    start_iso = anchor.get("start_iso")
+    dom = anchor.get("dom")
+    if not isinstance(dom, int) or dom < 1 or dom > 31:
+        dom = 1
+    if isinstance(start_iso, str) and len(start_iso) >= 10:
+        try:
+            # Только дата: время суток якоря не влияет на календарь кассеты.
+            start = date.fromisoformat(start_iso[:10])
+        except ValueError:
+            start = None
+        if start is not None:
+            return start + timedelta(days=max(0, day_index - 1)), dom
+    today = datetime.now(UTC).date()
+    return today, today.day
+
+
+def _engine_day_for(anchor_dom: int, cassette_day: int) -> int:
+    """Номер дня движка, соответствующий дню кассеты.
+
+    Смещение одно на весь забег: день движения N открывается на дате
+    (якорь + N − 1 дней), то есть кассетный день D соответствует дню
+    движка D − (якорь − 1).
+
+    Через смещение, а не через поиск раунда по дате: в догоняющих днях на
+    одну дату приходится несколько раундов, и поиск по дате брал бы не тот
+    (победителя чужого дня — то есть перемотка включалась бы по чужому
+    решению).
+    """
+    return cassette_day - (anchor_dom - 1)
+
+
+async def _decision_day_winner(session, engine_day: int) -> int | None:
+    """Честный победитель движка за день с указанным номером, или None.
+
+    Перемотка решается только закрытым кадром: winner_card дня из базы
+    движка. Кассета ничего не выдумывает, а ищет раунд по НОМЕРУ дня
+    движка (он уникален) — по дате искать нельзя: в догоняющих днях на
+    одну дату приходится несколько раундов, и дата выбрала бы не тот.
+    Победителя ещё нет / раунда нет — перемотка не срабатывает
+    (fail-open).
     """
     from sqlalchemy import select
 
     from app.models import Round
 
-    start = datetime.combine(decision, time.min, tzinfo=UTC)
-    end = start + timedelta(days=1)
     row = await session.scalar(
-        select(Round)
-        .where(
-            Round.opens_at >= start,
-            Round.opens_at < end,
+        select(Round).where(
+            Round.day_index == engine_day,
             Round.winner_card.is_not(None),
         )
-        .order_by(Round.id.desc())
     )
     return int(row.winner_card) if row is not None else None
 
 
-async def _prev_echo(session, today: date) -> str:
+async def _prev_echo(session, engine_day: int) -> str:
     """Эхо вчерашнего выбора: канон победившей карты дня N−1.
 
     При рендере дня N берём вчерашний закрытый кадр движка, а из него — его
@@ -195,21 +247,17 @@ async def _prev_echo(session, today: date) -> str:
     победившей карты. Победителя нет / канона нет / день первый — пусто
     (fail-open).
     """
-    if today.day <= 1:
+    if engine_day <= 1:
         return ""
     from sqlalchemy import select
 
     from app.models import Round, StoryBeat
 
-    yesterday = today - timedelta(days=1)
     row = await session.scalar(
-        select(Round)
-        .where(
-            Round.opens_at >= yesterday,
-            Round.opens_at < today,
+        select(Round).where(
+            Round.day_index == engine_day - 1,
             Round.winner_card.is_not(None),
         )
-        .order_by(Round.id.desc())
     )
     if row is None:
         return ""
@@ -231,12 +279,18 @@ async def day_diary(session, round_row) -> str:
         item_day = getattr(round_row, "day_index", None)
         if opens is None or not item_day:
             return ""
+        from app.rounds.anchor import get_run_anchor
+
         day = opens.date() if getattr(opens, "tzinfo", None) else opens.replace(tzinfo=UTC).date()
         selected = await get_next_cassette(session)
         cassette = active_cassette(day, selected=selected, directory=_library_dir)
         if cassette is None:
             return ""
-        road, _ = await _resolution(session, cassette, day)
+        anchor = await get_run_anchor(session)
+        dom = (anchor or {}).get("dom")
+        road, _ = await _resolution(
+            session, cassette, day, dom if isinstance(dom, int) else None
+        )
         item = cassette.day_for(day.day, road)
         return (item.diary or "").strip() if item else ""
     except Exception:
@@ -245,12 +299,15 @@ async def day_diary(session, round_row) -> str:
 
 
 async def _resolution(
-    session, cassette: Cassette, today: date
+    session, cassette: Cassette, today: date, anchor_dom: int | None = None
 ) -> tuple[str, list[date]]:
     """Дорога дня и календарные даты решений, по которым она считается.
 
     Отдельный шаг с чистыми аргументами, чтобы тест мог проверить выбор
     дороги без базы: winners кассета получает от движка, а не сама.
+
+    anchor_dom — день месяца якоря забега: по нему дни кассеты переводятся
+    в дни движка (см. _engine_day_for).
     """
     decision_days = {
         fork.at_day - 1 for fork in cassette.switch if fork.at_day <= today.day
@@ -259,7 +316,14 @@ async def _resolution(
     decision_dates: list[date] = []
     for n in sorted(decision_days):
         decision_date = date(today.year, today.month, n)
-        winner = await _decision_day_winner(session, decision_date)
+        engine_day = (
+            _engine_day_for(anchor_dom, n) if anchor_dom is not None else None
+        )
+        winner = (
+            await _decision_day_winner(session, engine_day)
+            if engine_day is not None
+            else None
+        )
         if winner is not None:
             winners[n] = winner
             decision_dates.append(decision_date)
@@ -271,11 +335,17 @@ async def today_road(
 ) -> tuple[str, list[date]]:
     """Дорога, по которой сегодня идёт кассета (для контекста редактора).
 
-    Читает только честные прошлые решения движка (закрытые раунды по opens_at);
-    сбоя нет — main. Дата по умолчанию — сегодня.
+    Читает только честные прошлые решения движка (закрытые раунды по
+    номеру дня); сбоя нет — main. Дата по умолчанию — сегодня.
     """
+    from app.rounds.anchor import get_run_anchor
+
     today = today or datetime.now(UTC).date()
-    return await _resolution(session, cassette, today)
+    anchor = await get_run_anchor(session)
+    dom = (anchor or {}).get("dom")
+    return await _resolution(
+        session, cassette, today, dom if isinstance(dom, int) else None
+    )
 
 
 async def set_next_cassette(session, file_name: str | None) -> None:
@@ -350,14 +420,14 @@ async def _plan_and_render(
         selected = await get_next_cassette(session)
     except Exception:
         selected = None
-    today = datetime.now(UTC).date()
+    today, anchor_dom = await _anchor_info(session, day_index)
     cassette = active_cassette(
         today, selected=selected, directory=_library_dir
     )
     if cassette is None:
         return payload
     try:
-        road, decision_dates = await _resolution(session, cassette, today)
+        road, decision_dates = await _resolution(session, cassette, today, anchor_dom)
         day = cassette.day_for(today.day, road)
     except Exception:
         logger.warning(
@@ -381,7 +451,7 @@ async def _plan_and_render(
     )
     chapter_text = day.chapter_text
     try:
-        echo = await _prev_echo(session, today)
+        echo = await _prev_echo(session, day_index)
         if echo:
             chapter_text = f"{echo}\n\n{chapter_text}"
     except Exception:

@@ -9,7 +9,7 @@ opens_at. Сбой дороги = fail-open: играем главную.
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -200,6 +200,35 @@ def _bay_off_after_each_test():
         uninstall_bay()
 
 
+@pytest.fixture(autouse=True)
+async def _run_anchor(session):
+    """Якорь забега: 5 мая 2026. День движения 7 → календарный 11 мая.
+
+    Дата дня кассеты считается от якоря (начало сезона), а не от «сегодня»:
+    после простоя движок догоняет пропущенные календарные дни, и «сегодня»
+    указало бы на уже показанный контент.
+
+    Якорь пишется ТОЙ ЖЕ сессией, что и тест: SQLite держит снимок
+    открытой транзакции, и запись из чужой сессии тест не увидит.
+    """
+    from app.core.registry import RUN_START_KEY
+    from app.models import WatcherState
+
+    payload = json.dumps(
+        {
+            "key": "2026-05",
+            "dom": 5,
+            "start_iso": "2026-05-05T00:00:00+00:00",
+        }
+    )
+    row = await session.get(WatcherState, RUN_START_KEY)
+    if row is None:
+        session.add(WatcherState(key=RUN_START_KEY, value=payload))
+    else:
+        row.value = payload
+    await session.commit()
+
+
 async def _plan(monkeypatch, session, tmp_path, winners: dict[int, int]):
     """Прогон _plan_and_render с фикс-датой 2026-05-11 и заданными победителями."""
     payload = _fork_payload()
@@ -214,8 +243,14 @@ async def _plan(monkeypatch, session, tmp_path, winners: dict[int, int]):
     ]
     payload["days"] = [_day(i) for i in range(1, 32)]
 
-    async def fake_winner(session_arg, decision: date) -> int | None:
-        return winners.get(decision.day)
+    # Смещение между днём кассеты и днём движка: якорь 5 мая, день движения 7 —
+    # это 11 мая, значит кассетный день N соответствует дню движка N − 4.
+    offset = 11 - 7
+
+    async def fake_winner(session_arg, engine_day: int) -> int | None:
+        # Победитель ищется у дня ДВИЖКА (номер уникален), а не по дате:
+        # в догоняющих днях на одну дату приходится несколько раундов.
+        return winners.get(engine_day + offset)
 
     monkeypatch.setattr(bay, "datetime", _FakeDatetime)
     monkeypatch.setattr(bay, "_decision_day_winner", fake_winner)

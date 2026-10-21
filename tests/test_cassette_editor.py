@@ -10,6 +10,7 @@
 """
 
 import calendar
+import json
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -373,6 +374,35 @@ async def test_today_road_main_without_engine_decisions(session) -> None:
     road, dates = await today_road(session, cassette, today)
     assert road == "main"
     assert dates == []
+
+
+@pytest.fixture(autouse=True)
+async def _run_anchor(session):
+    """Якорь забега: 1 июня 2026 — день движения N открывается N-го числа.
+
+    Дни кассеты переводятся в дни движка через смещение от якоря, а не через
+    поиск раунда по дате (в догоняющих днях на одну дату приходится несколько
+    раундов, и дата выбрала бы не тот).
+
+    Якорь пишется ТОЙ ЖЕ сессией, что и тест: SQLite держит снимок
+    открытой транзакции, и запись из чужой сессии тест не увидит.
+    """
+    from app.core.registry import RUN_START_KEY
+    from app.models import WatcherState
+
+    payload = json.dumps(
+        {
+            "key": "2026-06",
+            "dom": 1,
+            "start_iso": "2026-06-01T00:00:00+00:00",
+        }
+    )
+    row = await session.get(WatcherState, RUN_START_KEY)
+    if row is None:
+        session.add(WatcherState(key=RUN_START_KEY, value=payload))
+    else:
+        row.value = payload
+    await session.commit()
 
 
 async def test_today_road_resolves_fork_with_engine_winner(session) -> None:
