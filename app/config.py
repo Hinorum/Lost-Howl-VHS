@@ -510,5 +510,37 @@ class Settings(BaseSettings):
     def active_toncenter_api_base(self) -> str:
         return self.toncenter_api_base_testnet if self.is_testnet else self.toncenter_api_base
 
+    @property
+    def active_network(self) -> str:
+        """Сеть, в которой живёт бот: «mainnet» или «testnet».
+
+        Одно место вместо двух десятков литералов по коду. Колонка network у
+        ставок и выплат — денежная граница: строки mainnet и testnet не
+        должны смешиваться (тестовый контур с реальными деньгами несовместим).
+        Опечатка в сетевом литерале уводила бы выплату в чужую сеть молча.
+        """
+        return "testnet" if self.is_testnet else "mainnet"
+
+    @property
+    def rake_total_pct(self) -> float:
+        """Суммарный рейк (доли казны) в процентах."""
+        return (
+            self.owner_rake_pct
+            + self.leaderboard_rake_pct
+            + self.weekly_pot_pct
+            + self.pack_fund_pct
+            + self.referral_pct
+        )
+
+    @property
+    def prize_pool_pct(self) -> float:
+        """Доля призового пула: 100 % минус рейк.
+
+        Одно место и одно округление. Копии формулы в /start, /wallet и
+        /win_calc округлялись по-разному, и игрок видел разные проценты в
+        разных экранах — а по ним он понимает, куда уйдёт его ставка.
+        """
+        return round(100.0 - self.rake_total_pct, 2)
+
 
 settings = Settings()

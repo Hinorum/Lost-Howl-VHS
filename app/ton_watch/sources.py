@@ -616,7 +616,7 @@ async def _collect_transfers(
         logger.error(
             "ОБА индексатора (%s) недоступны: переводы не читаются! "
             "Проверь TonAPI/Toncenter или перезапусти сервис.",
-            "testnet" if settings.is_testnet else "mainnet",
+            settings.active_network,
         )
         return merged, False, "none", None, primary.parse_fail_count + fallback.parse_fail_count
     # Хотя бы один проход надёжен — цикл успешен, но окно прочитано не целиком.

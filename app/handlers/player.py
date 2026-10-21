@@ -58,15 +58,7 @@ def _commands_help() -> list[str]:
         lines.append("/wallet — кошелёк · /stake — поставить Gram на кадр")
         lines.append("/top — копилки и лидеры")
         lines.append("/fund — Фонд Стаи: баланс и журнал")
-        pool_pct = round(
-            100
-            - settings.owner_rake_pct
-            - settings.leaderboard_rake_pct
-            - settings.weekly_pot_pct
-            - settings.pack_fund_pct
-            - settings.referral_pct,
-            2,
-        )
+        pool_pct = settings.prize_pool_pct
         lines.append(
             f"\n💰 Фонд дня: {_pct_text(pool_pct)}% — угадавшим кадр. Детали — /stake; "
             "копилки и награды за приглашённых — /top и /invite."

@@ -89,7 +89,7 @@ logger = logging.getLogger(__name__)
 
 
 def current_network() -> str:
-    return "testnet" if settings.is_testnet else "mainnet"
+    return settings.active_network
 
 
 def refund_net_amount(

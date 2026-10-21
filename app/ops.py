@@ -360,7 +360,7 @@ async def snapshot() -> dict:
             "log_scrub_failures": 0,
             # Диагностика окружения: видно, что реально дошло до процесса.
             "ton_enabled": bool(settings.ton_enabled),
-            "ton_network": "testnet" if settings.is_testnet else "mainnet",
+            "ton_network": settings.active_network,
             # Кто ведёт игру: лок планировщика держит этот процесс или нет.
             # Раньше состояние лока было видно только в коде: оператор видел
             # «всё хорошо», а игру вёл второй инстанс.
@@ -1558,7 +1558,7 @@ async def treasury_expected_state(session) -> TreasuryDrift | None:
         return None
     if balance is None:
         return None
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     unpaid = int(
         (
             await session.execute(
@@ -1717,7 +1717,7 @@ async def record_manual_adjustment(
         amount_nanotons=amount,
         player_id=None,
         round_id=None,
-        network="testnet" if settings.is_testnet else "mainnet",
+        network=settings.active_network,
         unit_ref=f"manual:{uuid.uuid4().hex}",
         note=(note or "")[:200],
     )

@@ -432,7 +432,7 @@ async def _fetch_page(
     """
     if not settings.ton_enabled or not settings.active_treasury_address:
         return [], "none", False
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     treasury = settings.active_treasury_address
     client = get_http_client()
     candidates = (
@@ -645,7 +645,7 @@ async def _apply_page(
 
 
 def _active_network() -> str:
-    return "testnet" if settings.is_testnet else "mainnet"
+    return settings.active_network
 
 
 async def _purge_moves_missing_from_chain(

@@ -214,7 +214,7 @@ async def get_wallet():
     notify_liteserver_down) исполняется здесь: старый провайдер закрывается,
     при следующем обращении поднимается свежий.
     """
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     async with state._wallet_lock:
         if state._provider_reset_requested:
             # Фолбэк-путь заметил серию сбоев лайтсерверов: больной узел
@@ -511,7 +511,7 @@ def build_offline_treasury_wallet():
     публичный ключ онлайн-путь берут у liteclient, здесь их читаем по HTTP.
     Возвращает (wallet, version).
     """
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     requested = settings.treasury_wallet_version.strip().lower() if settings.treasury_wallet_version else ""
     forced = requested if requested in WALLET_VERSIONS else None
     return build_offline_wallet(

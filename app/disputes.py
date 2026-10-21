@@ -30,7 +30,7 @@ def _now() -> datetime:
 
 
 def _network() -> str:
-    return "testnet" if settings.is_testnet else "mainnet"
+    return settings.active_network
 
 
 def _enabled() -> bool:

@@ -45,7 +45,7 @@ async def realized_fee_nano(session, limit: int = REALIZED_FEE_SAMPLE) -> int | 
     None — данных нет (зеркало ещё не набрало истории, или это первый
     перевод). Тогда рабочая оценка остаётся настроенной.
     """
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     result = await session.execute(
         select(TreasuryMove.fee_nanotons)
         .where(

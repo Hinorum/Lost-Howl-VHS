@@ -287,7 +287,7 @@ async def _test_preflight(amount: Decimal, force_http: bool, batch_count: int) -
     """
     import app.ton_pay as _tp
 
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     lines = [f"🧪 Холостой перевод · {network} · потолок {_TEST_MAX_GRAM} Gram"]
     wallet = None
     version: str | None = None

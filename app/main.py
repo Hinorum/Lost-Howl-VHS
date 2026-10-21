@@ -215,13 +215,7 @@ def validate_config() -> list[str]:
             "ADMIN_IDS не заполнены — административные команды (/advance, "
             "/resetgame, /panel, /disputes) будут недоступны никому."
         )
-    rake = (
-        settings.owner_rake_pct
-        + settings.leaderboard_rake_pct
-        + settings.weekly_pot_pct
-        + settings.pack_fund_pct
-        + settings.referral_pct
-    )
+    rake = settings.rake_total_pct
     if rake > 100:
         problems.append(
             f"Суммарный рейк {rake:.2f}% превышает 100% (owner {settings.owner_rake_pct}%"
@@ -288,7 +282,7 @@ def validate_config() -> list[str]:
         # Адрес чужой сети молча ломает всё: переводы с него в сети бота не
         # видны (ставки не засчитаются), выплаты уйдут в никуда. У v5-кошельков
         # сеть зашита в аккаунт, поэтому «не тот адрес» — это не тот же адрес.
-        active_net = "testnet" if settings.is_testnet else "mainnet"
+        active_net = settings.active_network
         for label, value in (
             ("TREASURY_ADDRESS", settings.active_treasury_address),
             ("OWNER_WALLET_ADDRESS", settings.owner_wallet_address),

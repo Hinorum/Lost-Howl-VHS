@@ -177,7 +177,7 @@ async def _top_correct_voters(session, since: datetime, until: datetime) -> list
 
 def _active_network() -> str:
     """Контур казны: вклад Gram учитывается только в живом контуре."""
-    return "testnet" if settings.is_testnet else "mainnet"
+    return settings.active_network
 
 
 async def _gram_contributions(
@@ -823,7 +823,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             else:
                 pot_row.nanotons += recarry
 
-        network = "testnet" if settings.is_testnet else "mainnet"
+        network = settings.active_network
         for player_id, wallet, amount in payments:
             session.add(
                 Payout(

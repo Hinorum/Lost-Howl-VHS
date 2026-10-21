@@ -71,15 +71,7 @@ def _economy_text() -> str:
     m_pcts = "/".join(
         part.strip() for part in settings.monthly_prize_weights.split(",") if part.strip()
     )
-    pool_pct = round(
-        100
-        - settings.owner_rake_pct
-        - settings.leaderboard_rake_pct
-        - settings.weekly_pot_pct
-        - settings.pack_fund_pct
-        - settings.referral_pct,
-        2,
-    )
+    pool_pct = settings.prize_pool_pct
 
     return (
         "\n\nРаспределение фонда дня:\n"
@@ -164,14 +156,7 @@ def _win_calc_text() -> str:
 
     Примеры считаются после вычета газа — как в реальной выплате.
     """
-    pool_pct = (
-        100
-        - settings.owner_rake_pct
-        - settings.leaderboard_rake_pct
-        - settings.weekly_pot_pct
-        - settings.pack_fund_pct
-        - settings.referral_pct
-    )
+    pool_pct = settings.prize_pool_pct
     fee = settings.payout_fee_gram
     # Пример 1: банк 10 G, на верную сцену 6 G двумя игроками (4 G и 2 G).
     pool1 = 10 * pool_pct / 100 - fee * 2
@@ -248,7 +233,7 @@ async def _bind_wallet(message: Message, address: str) -> bool:
     # с него не засчитались бы (переводов в сети бота не видно), кошелёк не
     # подтвердился бы, а приз ждал бы в очереди выплат вечно.
     address_net = address_network(address)
-    active_net = "testnet" if settings.is_testnet else "mainnet"
+    active_net = settings.active_network
     if address_net is not None and address_net != active_net:
         await message.answer(
             f"{warn_mark('badaddr')} Это адрес сети {address_net}, а игра идёт в сети "

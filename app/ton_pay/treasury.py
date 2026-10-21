@@ -111,7 +111,7 @@ def treasury_pair_check_text() -> str:
     except Exception:
         return "мнемоника невалидна ⚠️"
     public_key = private_key_to_public_key(private_key)
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     version, _candidates = _wallet_pkg.detect_wallet_version(
         public_key, settings.active_treasury_address, _wallet_pkg.NETWORK_GLOBAL_IDS[network]
     )
@@ -125,7 +125,7 @@ def treasury_pair_check_text() -> str:
 
 async def treasury_diagnostics() -> str:
     """Полный отчёт по казначею одной строкой-текстом для /treasury."""
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     lines = [f"🏛 Казначей ({network})"]
     if not settings.ton_enabled:
         lines.append("TON выключен (TON_ENABLED=false): ставки и выплаты не работают.")
@@ -346,7 +346,7 @@ async def blockchain_diagnostics() -> str:
     доступности в последнем цикле. Поиск «куда делось» начинается здесь,
     без перебора логов и запросов к индексаторам руками.
     """
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     lines = [f"⛓ Блокчейн-контур ({network})"]
     if not settings.ton_enabled:
         lines.append("TON выключен (TON_ENABLED=false): ставки и выплаты не работают.")
