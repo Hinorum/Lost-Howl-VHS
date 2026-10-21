@@ -237,12 +237,13 @@ async def resolve_service() -> tuple[str, str]:
 async def fetch_logs(
     service_id: str, owner_id: str, since: datetime, limit: int
 ) -> tuple[list[str], dict[str, Any]]:
-    """Забирает тексты логов сервиса за окно назад — постранично.
+    """Забирает тексты логов сервиса за окно назад — постранично НАЗАД.
 
-    Логи Render листаются временем (курсора у списка нет), поэтому страницы
-    идут ОТ САМОГО СТАРОГО к новому: утечка при старте процесса (главный
-    кандидат — мнемоника в первых же строках) живёт в начале окна, а в хвосте
-    лежит шум тиков. Направление — forward.
+    Логи Render листаются временем (курсора у списка нет): запрос с
+    startTime/endTime отдаёт страницу записей, а следующая страница идёт
+    от границы предыдущей. Направление — backward, от «сейчас» к началу
+    окна: проверять надо СВЕЖИЕ логи (утечка в первых строках только что
+    поднявшегося процесса), а не вчерашнее утро.
 
     Возвращает (тексты, сводка): сколько строк, какое окно реально покрыто
     и доводилось ли окно до конца. Если страницы кончились, а окно — нет,
@@ -256,19 +257,22 @@ async def fetch_logs(
         }
         params["resource"] = service_id
         params["ownerId"] = owner_id
-        params["direction"] = "forward"
+        params["direction"] = "backward"
         page_limit = int(params.get("limit") or 100)
         max_pages = max(1, int(settings.render_logs_max_pages))
         total_limit = max(page_limit, int(settings.render_logs_limit))
         messages: list[str] = []
         stamps: list[datetime] = []
         seen_ids: set[str] = set()
-        cursor = since
+        upper = datetime.now(UTC)
         pages = 0
         try:
             while pages < max_pages and len(messages) < total_limit:
                 params["startTime"] = (
-                    cursor.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    since.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                )
+                params["endTime"] = (
+                    upper.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
                 )
                 payload = await _api_get("/logs", params)
                 entries = (
@@ -278,35 +282,28 @@ async def fetch_logs(
                 if not entries:
                     break
                 page_stamps: list[datetime] = []
+                fresh = 0
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
+                    entry_id = str(entry.get("id") or "")
+                    if entry_id and entry_id in seen_ids:
+                        continue
+                    if entry_id:
+                        seen_ids.add(entry_id)
+                        fresh += 1
                     message = entry.get("message")
                     if isinstance(message, str):
                         messages.append(message)
                     stamp = _entry_time(entry.get("timestamp"))
                     if stamp is not None:
                         page_stamps.append(stamp)
-                if not page_stamps:
+                if not page_stamps or not fresh:
+                    # Страница не двинулась или повторилась — дальше бессмысленно.
                     break
-                fresh = [
-                    entry
-                    for entry in entries
-                    if isinstance(entry, dict)
-                    and str(entry.get("id") or "") not in seen_ids
-                ]
-                if not fresh:
-                    # Страница повторилась — дальше идти бессмысленно.
-                    break
-                for entry in fresh:
-                    seen_ids.add(str(entry.get("id") or ""))
-                    stamp = _entry_time(entry.get("timestamp"))
-                    if stamp is not None:
-                        stamps.append(stamp)
-                # Дальше идём ЗА самой свежей записью страницы: фильтр startTime
-                # отсекает всё, что раньше, поэтому следующая страница — это
-                # продолжение окна, а не повтор той же порции.
-                cursor = max(page_stamps) + timedelta(seconds=1)
+                stamps.extend(page_stamps)
+                # Следующая страница — всё, что СТАРШЕ самой ранней записи этой.
+                upper = min(page_stamps) - timedelta(seconds=1)
                 if len(entries) < page_limit:
                     break
         except Exception as exc:
@@ -318,7 +315,7 @@ async def fetch_logs(
             oldest = min(stamps)
             newest = max(stamps)
             span = (now - since).total_seconds() or 1
-            share = min(1.0, max(0.0, (newest - oldest).total_seconds() / span))
+            share = min(1.0, max(0.0, (now - oldest).total_seconds() / span))
             summary = {
                 "pages": pages,
                 "oldest": oldest.isoformat(),
@@ -337,7 +334,7 @@ async def fetch_logs(
         summary["query"] = ",".join(
             f"{key}={value}"
             for key, value in params.items()
-            if key not in ("resource", "ownerId", "startTime")
+            if key not in ("resource", "ownerId", "startTime", "endTime")
         )
         return messages, summary
     raise RuntimeError(f"ни одна форма запроса логов не подошла: {last_error}")

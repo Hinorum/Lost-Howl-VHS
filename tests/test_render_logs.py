@@ -242,8 +242,13 @@ async def test_check_records_error_without_raising(monkeypatch) -> None:
     assert stored is not None and stored["error"]
 
 
-async def test_fetch_logs_walks_window_by_time(monkeypatch) -> None:
-    """Страницы идут от самого старого к новому: утечка при старте — в начале."""
+async def test_fetch_logs_walks_window_backwards(monkeypatch) -> None:
+    """Страницы идут НАЗАД от «сейчас»: проверять надо свежие логи.
+
+    Утечка в первых строках только что поднявшегося процесса — в хвосте
+    окна, а не в начале: обход назад от текущего момента доходит до них
+    первыми.
+    """
     monkeypatch.setattr(settings, "render_api_key", "KEY")
     monkeypatch.setattr(settings, "render_service_id", "srv-1")
     monkeypatch.setattr(settings, "render_logs_max_pages", 5)
@@ -255,22 +260,22 @@ async def test_fetch_logs_walks_window_by_time(monkeypatch) -> None:
 
     pages = [
         [
-            {"id": "1", "message": "старт", "timestamp": "2026-10-21T09:00:00Z"},
-            {"id": "2", "message": "старт2", "timestamp": "2026-10-21T09:00:01Z"},
+            {"id": "1", "message": "свежее", "timestamp": "2026-10-21T09:10:00Z"},
+            {"id": "2", "message": "свежее2", "timestamp": "2026-10-21T09:00:00Z"},
         ],
         [
-            {"id": "3", "message": "хвост", "timestamp": "2026-10-21T09:10:00Z"},
+            {"id": "3", "message": "старое", "timestamp": "2026-10-21T08:30:00Z"},
         ],
     ]
-    seen_starts: list[str] = []
+    seen: list[dict] = []
 
     async def fake_get(path, params=None):
         if path != "/logs":
             return [
                 {"service": {"id": "srv-1", "name": "bot", "type": "web", "ownerId": "own-1"}}
             ]
-        seen_starts.append(str(params.get("startTime")))
-        index = min(len(seen_starts) - 1, len(pages) - 1)
+        seen.append(dict(params or {}))
+        index = min(len(seen) - 1, len(pages) - 1)
         return pages[index]
 
     monkeypatch.setattr("app.render_logs._api_get", fake_get)
@@ -279,14 +284,14 @@ async def test_fetch_logs_walks_window_by_time(monkeypatch) -> None:
     since = datetime(2026, 10, 21, 8, 0, 0, tzinfo=UTC)
     messages, summary = await fetch_logs("srv-1", "own-1", since, 2000)
 
-    assert messages == ["старт", "старт2", "хвост"]
+    assert messages == ["свежее", "свежее2", "старое"]
     assert summary["pages"] == 2
-    assert summary["oldest"].startswith("2026-10-21T09:00:00")
+    assert summary["oldest"].startswith("2026-10-21T08:30:00")
     assert summary["newest"].startswith("2026-10-21T09:10:00")
-    # Первая страница — от начала окна; вторая — сразу ЗА самой свежей записью
-    # первой (фильтр startTime отсекает всё, что раньше).
-    assert seen_starts[0].startswith("2026-10-21T08:00:00")
-    assert seen_starts[1].startswith("2026-10-21T09:00:02")
+    # Первая страница — от начала окна; вторая — всё, что СТАРШЕ самой ранней
+    # записи первой (endTime отсекает хвост).
+    assert seen[0]["startTime"].startswith("2026-10-21T08:00:00")
+    assert seen[1]["endTime"].startswith("2026-10-21T08:59:59")
 
 
 async def test_check_reports_uncovered_window(monkeypatch, secrets) -> None:
