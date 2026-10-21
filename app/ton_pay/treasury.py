@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from sqlalchemy import func, or_, select
 
 from app.config import settings
+from app.core.registry import COLD_START_SEQNO_KEY
 from app.db import SessionLocal
 from app.models import Income, Payout, Player, WatcherState
 from app.ton_codec import api_headers, tonapi_headers
@@ -237,15 +238,23 @@ async def treasury_diagnostics() -> str:
         beat_iso = None
         watcher_source = None
         cursor_raw = None
-        for key, slot in ((BEAT_KEY, "b"), (SOURCE_KEY, "s"), (CURSOR_KEY, "c")):
+        cold_start_raw = None
+        for key, slot in (
+            (BEAT_KEY, "b"),
+            (SOURCE_KEY, "s"),
+            (CURSOR_KEY, "c"),
+            (COLD_START_SEQNO_KEY, "k"),
+        ):
             row = await session.get(WatcherState, key)
             if row is not None:
                 if slot == "b":
                     beat_iso = row.value
                 elif slot == "s":
                     watcher_source = row.value
-                else:
+                elif slot == "c":
                     cursor_raw = row.value
+                else:
+                    cold_start_raw = row.value
     lines.append(f"Очередь выплат: ожидает {waiting} · failed {dead}")
     if waiting or dead:
         lines.append("Разбор: /payouts — причина видна у каждой строки.")
@@ -280,7 +289,43 @@ async def treasury_diagnostics() -> str:
             lines.append("  ⚠️ курсор В БУДУЩЕМ: новые переводы отсекаются как «старые» — обнули ключ ton_watch_cursor_utime в watcher_state")
     elif settings.ton_enabled:
         lines.append("  курсора нет — стартует с отката 12 ч")
+    lines.extend(_cold_start_lines(cold_start_raw))
     return "\n".join(lines)
+
+
+def _cold_start_lines(raw: str | None) -> list[str]:
+    """Строка о сверке seqno на холодном старте (результат последней попытки).
+
+    Расхождение лайтсерверов и Toncenter после простоя — признак внешних
+    переводов, прошедших мимо бота. Показываем и само расхождение, и когда
+    проверка шла: событие случается раз в подъём, а логи живут недолго.
+    """
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        lite = int(data["lite"])
+        http = int(data["http"])
+        delta = int(data.get("delta", lite - http))
+        at = str(data.get("at") or "")
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.debug("Метка холодного старта не разобрана (%r): %s", raw, exc)
+        return []
+    stamp = ""
+    if at:
+        try:
+            moment = datetime.fromisoformat(at)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=UTC)
+            stamp = f" · {moment:%d.%m %H:%M} UTC"
+        except ValueError:
+            stamp = ""
+    if abs(delta) > 1:
+        return [
+            f"  ⚠️ холодный старт: seqno лайтсерверов {lite}, toncenter {http} "
+            f"(расхождение {delta:+d}){stamp} — во время простоя прошли внешние переводы"
+        ]
+    return [f"  холодный старт: seqno совпал ({lite}){stamp}"]
 
 
 async def blockchain_diagnostics() -> str:

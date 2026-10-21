@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -291,7 +292,74 @@ async def get_wallet():
             state._wallet = await WalletV4R2.from_private_key(state._provider, private_key, wc=0)
         state._wallet_network = network
         logger.info("Кошелёк казначея готов (%s, контракт %s)", network, version)
+        # Холодный старт: сверяем seqno, который отдают лайтсерверы, с тем же
+        # номером из Toncenter (HTTP). Расхождение — признак того, что во время
+        # простоя казначей успел сделать внешние переводы, а лайтсерверы отдают
+        # устаревший номер. Проверка НЕ блокирует работу: настоящая отправка
+        # всё равно читает свежий seqno, а расхождение может быть легитимным
+        # (гонка фиксации блока). Проверка не должна ломать старт — поэтому
+        # любой сбой молча уходит в предупреждение.
+        if network == "mainnet":
+            await _cold_start_seqno_check(state._wallet)
         return state._wallet
+
+
+async def _cold_start_seqno_check(wallet) -> None:
+    """Сверка seqno на холодном старте: лайтсерверы против Toncenter.
+
+    Пока бот лежал, казначей мог сделать внешние переводы (Tonkeeper, руками):
+    лайтсерверы отстают от цепочки и отдают устаревший seqno — а подписанный
+    старым номером перевод уходит «в пустоту» (мемпул отбросит сообщение с
+    неверным seqno). Тот же seqno через Toncenter (HTTP, всегда свежий)
+    показывает правду.
+
+    Расхождение больше 1 — предупреждение в лог И запись в watcher_state:
+    событие случается ровно один раз (при подъёме после простоя), логи живут
+    недолго, а расхождение должно быть видно в /treasury.
+
+    Ничего не блокирует: сбой проверки (мёртвые лайтсерверы, молчащий
+    Toncenter) — предупреждение, кошелёк остаётся рабочим.
+    """
+    from app.core.registry import COLD_START_SEQNO_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    try:
+        from .http_channel import http_get_wallet_seqno
+
+        lite_seqno = await wallet.get_seqno()
+        http_seqno = await http_get_wallet_seqno(wallet)
+    except Exception:
+        logger.warning("Cold-start сверка seqno не удалась", exc_info=True)
+        return
+    delta = lite_seqno - http_seqno
+    stamp = datetime.now(UTC).isoformat()
+    payload = json.dumps(
+        {"lite": lite_seqno, "http": http_seqno, "delta": delta, "at": stamp},
+        ensure_ascii=False,
+    )
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, COLD_START_SEQNO_KEY)
+            if row is None:
+                session.add(WatcherState(key=COLD_START_SEQNO_KEY, value=payload))
+            else:
+                row.value = payload
+            await session.commit()
+    except Exception:
+        # Метка — удобство наблюдаемости, а не условие работы: её потеря
+        # не должна превращаться в сбой старта.
+        logger.warning("Cold-start сверка seqno: метку в watcher_state не сохранили", exc_info=True)
+    if abs(delta) > 1:
+        logger.warning(
+            "Cold-start сверка seqno: лайтсерверы=%d, toncenter=%d (расхождение %d). "
+            "Пока бот лежал, возможно, прошли внешние переводы — стоит свериться с /treasury",
+            lite_seqno,
+            http_seqno,
+            delta,
+        )
+    else:
+        logger.info("Cold-start сверка seqno: лайт=%d, http=%d — совпадает", lite_seqno, http_seqno)
 
 
 def build_offline_wallet(
