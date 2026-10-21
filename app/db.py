@@ -68,6 +68,11 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 #     идемпотентную ревизию legacy_convergence (см. _migrate).
 _LEGACY_RECONCILE_ANCHOR = "a7b8c9d0e1f2"
 
+# Потолок одной alembic-команды при подъёме. Миграция идёт в процессе бота, и
+# зависшая (блокировка таблицы, которую держит старый инстанс) держала бы
+# контейнер на старте вечно. Десять минут — с запасом на большой дамп.
+_ALEMBIC_TIMEOUT_SECONDS = 600
+
 
 def _alembic_head() -> str:
     """Ревизия head из alembic-скриптов без подключения к БД."""
@@ -84,17 +89,30 @@ def _run_alembic(*args: str) -> subprocess.CompletedProcess:
     migrations/env.py сам подхватывает настройки приложения (URL, CA),
     поэтому аргументов достаточно. CWD — корень репозитория (alembic.ini
     рядом). DATABASE_URL подставляется из окружения или settings.database_url.
+
+    Потолок по времени обязателен: миграция выполняется при подъёме бота, и
+    зависшая (чаще всего — на блокировке таблицы, которую держит старый
+    инстанс) держала бы контейнер на старте вечно, без внятной причины.
     """
     root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
     env.setdefault("DATABASE_URL", settings.database_url)
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        capture_output=True,
-        text=True,
-        cwd=root,
-        env=env,
-    )
+    try:
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", *args],
+            capture_output=True,
+            text=True,
+            cwd=root,
+            env=env,
+            timeout=_ALEMBIC_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"alembic {' '.join(args)} не уложился в {_ALEMBIC_TIMEOUT_SECONDS} с — "
+            "миграция зависла (чаще всего: блокировка таблицы, которую держит "
+            "другой процесс). Проверь блокировки в СУБД и прогони "
+            "'alembic upgrade head' вручную."
+        ) from exc
 
 
 def _tables(sync_conn) -> set[str]:
