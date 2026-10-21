@@ -29,6 +29,7 @@ from app.core.registry import (
     ALERT_DELIVERY_KEY,
     ALERT_DELIVERY_MISSING_KEY,
     ALERT_ENTROPY_KEY,
+    ALERT_LOCK_LOST_KEY,
     ALERT_MIRROR_KEY,
     ALERT_PARSE_FAIL_KEY,
     ALERT_QUEUE_KEY,
@@ -42,6 +43,7 @@ from app.core.registry import (
     ANNOUNCE_EMPTY_DAY_KEY,
     BACKUP_LAST_OK_KEY,
     BEAT_KEY,
+    LOCK_LOST_KEY,
     MONEY_MODE_KEY,
     OPS_ALERT_DIGEST_KEY,
     OPS_ALERT_TRACK_KEY,
@@ -235,6 +237,22 @@ async def mark_tick_failed(exc: BaseException | str, bot: Bot | None = None) -> 
     return count
 
 
+def _scheduler_lock_held() -> bool:
+    """Держит ли этот процесс лок планировщика.
+
+    Лок нужен только на Postgres: на SQLite предполагается один процесс, и
+    guard отдаёт True. Ошибка чтения не должна ронять снимок /health — в
+    худшем случае поле покажет «lost», что видно и безопасно.
+    """
+    try:
+        from app.scheduler_lock import scheduler_lock_held
+
+        return scheduler_lock_held()
+    except Exception:
+        logger.debug("Не удалось прочитать состояние лока планировщика", exc_info=True)
+        return False
+
+
 async def snapshot() -> dict:
     """Состояние игры одним словарём для /health (мониторинг Render/UptimeRobot)."""
     async with SessionLocal() as session:
@@ -340,6 +358,10 @@ async def snapshot() -> dict:
             # Диагностика окружения: видно, что реально дошло до процесса.
             "ton_enabled": bool(settings.ton_enabled),
             "ton_network": "testnet" if settings.is_testnet else "mainnet",
+            # Кто ведёт игру: лок планировщика держит этот процесс или нет.
+            # Раньше состояние лока было видно только в коде: оператор видел
+            # «всё хорошо», а игру вёл второй инстанс.
+            "scheduler_lock": "held" if _scheduler_lock_held() else "lost",
         }
         if oldest_pending is not None:
             moment = oldest_pending if oldest_pending.tzinfo else oldest_pending.replace(tzinfo=UTC)
@@ -981,6 +1003,25 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                 ALERT_TICK_KEY,
                 note,
                 f"⚠️ {note.capitalize()}. Дни не переключаются, смотрите логи сервиса.",
+            )
+        # 0b. Лок планировщика потерян — этот инстанс больше не ведёт игру.
+        # Лок живёт на физическом соединении с Postgres и может умереть сам
+        # (сбой сети, рестарт PG, pgbouncer): на сервере он освобождается
+        # сразу, и второй инстанс берёт его. Тик это замечает и замирает
+        # (иначе два процесса вели бы один день), а метку оставляет нам —
+        # поднять тревогу отсюда, с кулдауном и сводкой.
+        lock_lost_at = await _get_state(session, LOCK_LOST_KEY)
+        if lock_lost_at:
+            note = "лок планировщика потерян — игру ведёт другой процесс"
+            await _raise(
+                session,
+                bot,
+                ALERT_LOCK_LOST_KEY,
+                note,
+                "⚠️ Лок планировщика потерян: этот инстанс больше не ведёт игру — "
+                "лок у другого процесса (старый билд или зомби после деплоя). "
+                "Проверьте, сколько инстансов на этой базе, и остановите лишние: "
+                "два тикающих процесса ведут один день (двойные анонсы и выплаты).",
             )
         # 1. Watcher не завершает успешные циклы — ставки перестают находиться.
         # Сердцебиение ставит каждый цикл с живым TonAPI, даже если переводов

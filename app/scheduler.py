@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, time
+from time import monotonic
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
@@ -14,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.async_utils import spawn
 from app.broadcast import announce_audience_size, announce_day_diary, announce_new_day
 from app.config import settings
+from app.core.registry import LOCK_LOST_KEY
 from app.db import SessionLocal
 from app.models import RoundStatus, WatcherState
 from app.rounds import (
@@ -32,10 +34,95 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 _bot: Bot | None = None
 
+# Как часто тик перепроверяет, что лок планировщика ещё наш. Проверка — лёгкий
+# ping соединения (select 1), но лок может умереть в любой момент: сеть
+# моргнула, PG перезапустился, pgbouncer переподключился. На сервере лок после
+# этого свободен, а процесс продолжает считать себя лидером — второй
+# инстанс берёт лок, и оба тикают: анонсы уходят дважды, выплаты могут
+# уйти дважды. Раз в пять минут — компромисс между «узнать быстро» и «не
+# дёргать базу каждый тик».
+_LOCK_CHECK_INTERVAL_SECONDS = 300
+_last_lock_check: float = 0.0
+
 
 def set_bot(bot: Bot) -> None:
     global _bot
     _bot = bot
+
+
+async def _mark_lock_lost() -> None:
+    """Метка «лок потерян» — её поднимет аномаль-скан тревогой.
+
+    Тревогу поднимает не тик, а аномаль-скан: у него есть кулдаун, сводка и
+    сообщение «проблема закрыта». Тик только пишет факт.
+    """
+    async with SessionLocal() as session:
+        row = await session.get(WatcherState, LOCK_LOST_KEY)
+        stamp = _now().isoformat()
+        if row is None:
+            session.add(WatcherState(key=LOCK_LOST_KEY, value=stamp))
+        else:
+            row.value = stamp
+        await session.commit()
+
+
+async def _clear_lock_lost() -> None:
+    """Лок снова наш (или лок не нужен) — метка снимается, тревога закроется."""
+    async with SessionLocal() as session:
+        row = await session.get(WatcherState, LOCK_LOST_KEY)
+        if row is None:
+            return
+        await session.delete(row)
+        await session.commit()
+
+
+async def _ensure_scheduler_lock() -> bool:
+    """True — тику можно работать. False — лок потерян, тик обязан остановиться.
+
+    Лок — сессионный advisory lock на ОТДЕЛЬНОМ соединении с Postgres. Соединение
+    может умереть (сбой сети, рестарт PG, pgbouncer): на сервере лок освобождается
+    сразу, а процесс продолжает считать, что он лидер. Второй инстанс берёт лок —
+    и оба тикают: анонсы дня уходят дважды, выплаты могут уйти дважды.
+
+    Поэтому тик перепроверяет лок и, если тот пропал, пытается вернуть его
+    (чаще всего это просто умершее соединение, а лок свободен). Если вернуть
+    не удалось — лок у другого процесса: трогать игру нельзя (иначе два
+    процесса будут вести один день), тик замирает, а админ получает тревогу
+    «лок потерян».
+
+    Проверка идёт раз в пять минут, а после потери — на каждом тике: ждать
+    ещё пять минут, когда уже известно, что лок чужой, незачем.
+    """
+    global _last_lock_check
+    now = monotonic()
+    if now - _last_lock_check < _LOCK_CHECK_INTERVAL_SECONDS:
+        return True
+    _last_lock_check = now
+    from app.scheduler_lock import acquire_scheduler_lock, verify_scheduler_lock
+
+    if await verify_scheduler_lock():
+        await _clear_lock_lost()
+        return True
+    # Соединение-держатель умерло: лок на сервере свободен. Пробуем вернуть.
+    try:
+        regained = await acquire_scheduler_lock()
+    except Exception:
+        logger.exception("Не удалось вернуть лок планировщика")
+        regained = False
+    if regained:
+        logger.warning(
+            "Лок планировщика был потерян (соединение умерло) — вернули его, "
+            "продолжаем тикать"
+        )
+        await _clear_lock_lost()
+        return True
+    logger.error(
+        "Лок планировщика потерян и не вернулся: этот инстанс больше не ведёт "
+        "игру (лок у другого процесса). Тик замирает до следующей проверки."
+    )
+    _last_lock_check = 0.0
+    await _mark_lock_lost()
+    return False
 
 
 async def tick(bot: Bot | None = None) -> None:
@@ -52,6 +139,16 @@ async def _tick_body(bot: Bot | None, span) -> None:
     """Одно тело тика. Вынесено из tick(), чтобы обернуть его учётом времени."""
     from app.ops import is_game_paused, mark_tick, mark_tick_failed
 
+    # Лок планировщика — не формальность: второй инстанс, взяв лок, тикает
+    # параллельно (двойные анонсы, двойные выплаты). Пока лок наш — работаем;
+    # потерян — замираем, оставив игру тому, кто лок держит.
+    if not await _ensure_scheduler_lock():
+        # Сердцебиение обновляем: процесс жив и ведёт себя правильно (стоит
+        # на стороне, уступая игру лидеру). Тревога «лок потерян» идёт из
+        # аномаль-скана по метке, а не отсюда.
+        async with SessionLocal() as session:
+            await mark_tick()
+        return
     # Стоп-кран: дни не открываются и не закрываются, анонсы молчат.
     # Watcher (отдельная джоба) продолжает возвращать входящие переводы,
     # а очередь выплат — разгребаться: чужие деньги зависнуть не должны.
