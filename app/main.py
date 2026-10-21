@@ -309,7 +309,43 @@ def warn_config() -> list[str]:
     Держится отдельно от validate_config, потому что тот роняет старт, а
     подозрение на опечатку в имени переменной — не повод не подниматься.
     """
-    return [*_unknown_env_keys(), *_pool_size_warnings()]
+    return [*_unknown_env_keys(), *_pool_size_warnings(), *_self_healing_warnings()]
+
+
+def _self_healing_warnings() -> list[str]:
+    """Выключенные пути самолечения и потолок ставок — говорим вслух.
+
+    Тумблеры (TON_PROVIDER_REBUILD, HTTP_TONAPI_FALLBACK) в бою включаются
+    вручную, а в манифесте render.yaml стоят нейтральными: Blueprint Sync
+    перезапишет ими живое состояние вслепую. После такого синка канал
+    остаётся без второго вещателя и без пересборки пула — и это видно
+    только по симптомам (выплаты встали на 429 от Toncenter).
+
+    Потолок одной ставки (STAKE_MAX_TON=0) — про деньги: одна ставка может
+    унести весь фонд дня. Не ошибка, но о ней стоит сказать.
+    """
+    if not settings.ton_enabled:
+        return []
+    warnings: list[str] = []
+    off: list[str] = []
+    if not settings.http_tonapi_fallback:
+        off.append("HTTP_TONAPI_FALLBACK (второй вещатель: отказ Toncenter не отработает)")
+    if not settings.ton_provider_rebuild:
+        off.append("TON_PROVIDER_REBUILD (пересборка пула лайтсерверов при серии сбоев)")
+    if off:
+        warnings.append(
+            "Выключены пути самолечения: "
+            + "; ".join(off)
+            + ". Если это не замысел — тумблеры включаются в дашборде Render, а "
+            "Blueprint Sync перезапишет их значениями из render.yaml (там они "
+            "нейтральные)."
+        )
+    if settings.stake_max_ton <= 0:
+        warnings.append(
+            "STAKE_MAX_TON=0 — потолка одной ставки нет: одна ставка может "
+            "унести весь фонд дня вместе с копилками."
+        )
+    return warnings
 
 
 def _pool_size_warnings() -> list[str]:

@@ -11,6 +11,13 @@ services:
     # и requirements-critical-hashes.txt.
     buildCommand: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg && echo "deb http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg && apt-get update && apt-get install -y --no-install-recommends postgresql-client-17 && pip install -r requirements.txt && python -m scripts.dependency_hashes
     startCommand: python -m app.main
+    # autoDeploy здесь НЕ объявлен — намеренно: Blueprint Sync перезаписывает
+    # только объявленные поля, а autoDeploy живёт в настройках сервиса Render
+    # (там решает владелец: ждать зелёного CI или деплоить по пушу). Если
+    # объявить его здесь, синк переписал бы решение владельца на деплой по
+    # пушу — мимо зелёного CI. Политика деплоя и процедура ручного деплоя с
+    # autoDeploy=false — в docs/MAINNET_READINESS.md.
+    #
     # Проба Render — GET без заголовков, поэтому она ходит на /alive: там нет
     # ни снимка, ни секрета, и HEALTH_TOKEN не приходится держать в репозитории.
     # Значение живёт в env Render (HEALTH_TOKEN ниже) и защищает /health + /metrics.
@@ -132,8 +139,14 @@ services:
         value: https://ton.org/global.config.json
       # Пересборка пула лайтсерверов после серии сбоев: больной узел остаётся
       # «живым» и приоритетным для pytoniq (высокий кэш seqno), ретраи снова
-      # попадают в него — свежий пул даёт шанс сменить набор пиров. false —
-      # прежнее поведение (ретраи в тот же пул).
+      # попадают в него — свежий пул даёт шанс сменить набор пиров.
+      #
+      # Здесь false, и это НЕ значит «выключено в бою»: живое состояние
+      # тумблеров — в дашборде Render, а манифест держит значения
+      # нейтральными (деплой поведенчески нейтрален, пока тумблер не включён).
+      # ОПАСНО: Blueprint Sync перезапишет живое состояние этим false —
+      # выключит самолечение вслепую. Включай в дашборде (и тогда держи в
+      # бою включённым), а в манифесте — по своему усмотрению.
       - key: TON_PROVIDER_REBUILD
         value: "false"
       # Цикл наблюдателя входящих (сек) = скорость подтверждения ставок.
@@ -158,15 +171,22 @@ services:
       - key: TONCENTER_API_KEY
         sync: false
       # Второй вещатель HTTP-канала: отказ Toncenter (429-лимит, 5xx, сеть) —
-      # тот же подписанный BoC повторяется через TonAPI. false — прежнее
-      # поведение: отказ Toncenter уходит наружу как есть.
+      # тот же подписанный BoC повторяется через TonAPI.
+      #
+      # Здесь false, и это НЕ значит «выключено в бою»: живое состояние
+      # тумблеров — в дашборде Render, манифест держит значения нейтральными.
+      # ОПАСНО: Blueprint Sync перезапишет живое состояние этим false.
       - key: HTTP_TONAPI_FALLBACK
         value: "false"
       - key: STAKE_MIN_TON
         value: "0.5"
       # Потолок одной ставки (Gram): перевод выше отклоняется и возвращается
-      # после итогов дня. 0 = потолка нет (прежнее поведение). Боевое значение
-      # ставится в панели Render — здесь дефолт для Blueprint Sync.
+      # после итогов дня. 0 = потолка нет: одна ставка может унести весь фонд
+      # дня (а вместе с ним и копилки).
+      #
+      # Боевое значение держится в дашборде Render; здесь 0 — дефолт для
+      # Blueprint Sync. ОПАСНО: синк перезапишет живое значение этим нулём
+      # и потолка не станет вовсе. Если потолок нужен — поставь его и здесь.
       - key: STAKE_MAX_TON
         value: "0"
       - key: OWNER_RAKE_PCT
