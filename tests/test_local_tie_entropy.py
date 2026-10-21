@@ -112,19 +112,25 @@ async def test_local_tie_raises_alert(monkeypatch) -> None:
 
     monkeypatch.setattr(settings, "ton_enabled", True)
     bot = SimpleNamespace(send_message=AsyncMock())
+    round_id = 0
     try:
         async with SessionLocal() as db:
             round_row = _round(853)
             round_row.tie_entropy = f"{LOCAL_TIE_PREFIX}deadbeef"
             db.add(round_row)
             await db.commit()
+            round_id = round_row.id
 
         problems = await ops.check_anomalies(bot=bot)
         assert any("жребий ничьей без сети" in problem for problem in problems), problems
         assert bot.send_message.await_count >= 1
     finally:
         async with SessionLocal() as db:
-            await db.execute(Round.__table__.delete().where(Round.day_index == 853))
+            # Карточки дня удаляем первыми: у дня они есть по умолчанию, и
+            # Postgres не даст снести раунд с живыми карточками (SQLite
+            # внешние ключи не проверяет, поэтому локально это проходило).
+            await db.execute(Card.__table__.delete().where(Card.round_id == round_id))
+            await db.execute(Round.__table__.delete().where(Round.id == round_id))
             await db.commit()
 
 
