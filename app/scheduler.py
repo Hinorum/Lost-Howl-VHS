@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import time
+from datetime import UTC, datetime, time
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
@@ -493,6 +493,35 @@ async def _ops_sweep() -> None:
     problems = await check_anomalies(_bot)
     if problems:
         logger.warning("Аномалии: %s", "; ".join(problems))
+    # Проверка собственных логов Render на секреты: раз в N часов, чтобы
+    # бот сам следил за тем, что раньше требовало ручного grep по странице
+    # логов хостинга.
+    await _render_logs_check_due()
+
+
+async def _render_logs_check_due() -> None:
+    """Проверка логов Render, если подошло время (не чаще раза в N часов)."""
+    from app.config import settings
+
+    if not (settings.render_api_key or "").strip():
+        return
+    from app.render_logs import check_render_logs, last_verdict
+
+    interval_hours = max(1, int(settings.render_logs_check_interval_hours))
+    verdict = await last_verdict()
+    if verdict:
+        try:
+            checked = datetime.fromisoformat(str(verdict.get("checked_at") or ""))
+            if checked.tzinfo is None:
+                checked = checked.replace(tzinfo=UTC)
+            age_hours = (_now() - checked).total_seconds() / 3600
+            if age_hours < interval_hours:
+                return
+        except ValueError:
+            # Битая метка времени = «не знаю, когда проверяли» — считаем, что
+            # пора, и проверяем заново (проверка безопасна и повторяема).
+            pass
+    await check_render_logs()
 
 
 async def _ops_sweep_guarded() -> None:

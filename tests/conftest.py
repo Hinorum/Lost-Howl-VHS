@@ -42,6 +42,11 @@ os.environ.setdefault("HEALTH_TOKEN", "")
 # Postgres-хосту (settings.database_ca приоритетнее автоматики pooler-суффикса),
 # и тесты connect-args, ожидающие ssl=True, падали при зелёном CI.
 os.environ.setdefault("DATABASE_CA", "")
+# Ключ Render API в боевом .env — тестам он не нужен, а его попадание в
+# repr настроек (падающий тест печатает Settings целиком) означало бы утечку
+# ключа в вывод прогона. Пустая переменная перекрывает .env: приоритет у
+# переменных окружения выше.
+os.environ.setdefault("RENDER_API_KEY", "")
 
 import asyncio
 import datetime as _dt

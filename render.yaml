@@ -44,6 +44,12 @@ services:
         value: "true"
       - key: LLM_API_KEY
         sync: false
+      # Ключ Render API: бот сам проверяет свои логи на секреты (раньше это
+      # требовало ручного grep по странице логов хостинга). Значение живёт
+      # только в env Render, в репозитории его нет. Бот использует ключ
+      # ТОЛЬКО на чтение (GET) и никогда не пишет его в логи.
+      - key: RENDER_API_KEY
+        sync: false
       - key: LLM_BASE_URL
         value: https://router.huggingface.co/v1/chat/completions
       - key: GEMINI_API_KEY

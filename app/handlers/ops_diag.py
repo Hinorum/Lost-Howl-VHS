@@ -116,6 +116,11 @@ async def _ops_diag_text() -> str:
     lines.append(
         f"Раунд: {_round_line(data)} · аптайм {_age_phrase(data.get('uptime_seconds'))}"
     )
+    # Проверка собственных логов Render на секреты: то, что раньше требовало
+    # ручного grep по странице логов хостинга, теперь видно в пульте.
+    from app.render_logs import last_verdict, verdict_line
+
+    lines.append(verdict_line(await last_verdict()))
     lines.append("Разбор: /treasury · /payouts · /stakes · /blockchain · /mirror")
     return "\n".join(lines)
 

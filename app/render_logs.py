@@ -1,0 +1,280 @@
+"""Проверка собственных логов Render на секреты.
+
+Зачем: пункт чек-листа mainnet «мнемоника mainnet-кошелька НЕ появляется
+в логах» требовал ручного `grep -ri mnemonic logs/` по странице логов
+Render. Бот умеет ходить в свой же хостинг по API (RENDER_API_KEY) и
+проверять это сам — регулярно и без участия человека.
+
+Что проверяем: в тексте логов не должно встречаться НИ ОДНОГО секрета
+из окружения — мнемоника казначея (главной и тестнет), токен бота, токен
+/health, webhook-секрет, реферальный секрет, ключи API и пароль бэкапа.
+Краска секретов в логах (app/log_scrub.py) — основная защита; эта проверка —
+второй рубеж, который замечает, если краску отключили или она не справилась.
+
+Чего проверка НЕ делает:
+- не печатает и не хранит сами секреты: в вердикте только СЧЁТ строк по
+  каждой категории и номер строки-примера (без содержимого);
+- не пишет ничего в лог, кроме счётчиков: проверяемый секрет не должен
+  попасть в проверяющие логи.
+
+Ключ RENDER_API_KEY — учётные данные всего аккаунта Render, поэтому бот
+пользуется им ТОЛЬКО на чтение (GET) и никогда не пишет им в логи.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from app.config import settings
+from app.core.registry import RENDER_LOGS_CHECK_KEY
+from app.http_utils import get_http_client, http_get_with_retry
+
+logger = logging.getLogger(__name__)
+
+_RENDER_API_BASE = "https://api.render.com/v1"
+
+# Секреты окружения: имя категории → (где лежит, имя поля).
+# Часть секретов живёт в Settings, часть — просто переменные окружения Render
+# (LLM/картинки/бэкап): бот получает их в процессе целиком, и утечка в лог
+# equally возможна. Секрет Render API — тоже: им бот ходит в свой хостинг.
+_SECRET_SETTINGS = (
+    ("treasury_mnemonic", "treasury_mnemonic"),
+    ("treasury_testnet_mnemonic", "treasury_testnet_mnemonic"),
+    ("bot_token", "bot_token"),
+    ("health_token", "health_token"),
+    ("webhook_secret", "webhook_secret"),
+    ("referral_secret", "referral_secret"),
+    ("ton_api_key", "ton_api_key"),
+    ("toncenter_api_key", "toncenter_api_key"),
+)
+_SECRET_ENV = (
+    ("render_api_key", "RENDER_API_KEY"),
+    ("llm_api_key", "LLM_API_KEY"),
+    ("gemini_api_key", "GEMINI_API_KEY"),
+    ("imgbb_api_key", "IMGBB_API_KEY"),
+    ("pollinations_token", "POLLINATIONS_TOKEN"),
+    ("backup_passphrase", "BACKUP_PASSPHRASE"),
+)
+
+
+def _secrets() -> list[tuple[str, str]]:
+    """Секреты окружения, которые ищем в логах (непустые, длиной от 8)."""
+    out: list[tuple[str, str]] = []
+    for label, field in _SECRET_SETTINGS:
+        value = str(getattr(settings, field, "") or "").strip()
+        if len(value) >= 8:
+            out.append((label, value))
+    for label, env_name in _SECRET_ENV:
+        value = str(os.environ.get(env_name, "") or "").strip()
+        if len(value) >= 8:
+            out.append((label, value))
+    return out
+
+
+def _mnemonic_fragments(mnemonic: str, words: int = 3) -> list[str]:
+    """Кусочки мнемоники: три подряд идущих слова.
+
+    Точное совпадение всей фразы почти невозможно (лог обычно печатает часть
+    строки), а вот три слова подряд — уже надёжный признак утечки.
+    """
+    parts = [word for word in mnemonic.replace("\n", " ").split(" ") if word]
+    if len(parts) < words:
+        return []
+    return [" ".join(parts[index : index + words]) for index in range(len(parts) - words + 1)]
+
+
+def scan_messages(messages: list[str]) -> dict[str, Any]:
+    """Ищет секреты в текстах логов. Возвращает только СЧЁТЧИКИ.
+
+    Секреты в вердикт не попадают: в него идёт имя категории, число строк и
+    номер первой найденной строки (без содержимого) — иначе проверка сама
+    стала бы утечкой.
+    """
+    hits: dict[str, int] = {}
+    samples: dict[str, int] = {}
+    haystacks = [message.lower() for message in messages]
+    for label, secret in _secrets():
+        needle = secret.lower()
+        count = 0
+        first = 0
+        for index, text in enumerate(haystacks, 1):
+            if needle in text:
+                count += 1
+                if not first:
+                    first = index
+        if count:
+            hits[label] = count
+            samples[label] = first
+    # Мнемоника: кроме всей фразы — три слова подряд (частая утечка).
+    for label, field in (("treasury_mnemonic", "treasury_mnemonic"), ("treasury_testnet_mnemonic", "treasury_testnet_mnemonic")):
+        secret = str(getattr(settings, field, "") or "")
+        fragments = _mnemonic_fragments(secret)
+        if not fragments:
+            continue
+        count = 0
+        first = 0
+        for index, text in enumerate(haystacks, 1):
+            if any(fragment.lower() in text for fragment in fragments):
+                count += 1
+                if not first:
+                    first = index
+        if count:
+            # Считаем отдельно: полная фраза входит в подсчёт фрагментов.
+            hits[label] = hits.get(label, 0) + count
+            samples.setdefault(label, first)
+    return {"hits": hits, "samples": samples, "scanned": len(messages)}
+
+
+async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    """GET к Render API. Только чтение — ключ никогда не уходит на запись."""
+    key = (settings.render_api_key or "").strip()
+    if not key:
+        raise RuntimeError("RENDER_API_KEY не задан")
+    client = get_http_client()
+    response = await http_get_with_retry(
+        client,
+        f"{_RENDER_API_BASE}{path}",
+        params=params,
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        timeout=30.0,
+        max_retries=1,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+async def resolve_service_id() -> str:
+    """Определяет resource id своего сервиса Render.
+
+    Явный RENDER_SERVICE_ID выигрывает. Иначе — список сервисов: берём
+    единственный web-сервис (у бота он один), при нескольких — по имени
+    RENDER_SERVICE_NAME. Если определить нельзя — честная ошибка, а не
+    догадка: молча проверили бы чужой сервис.
+    """
+    explicit = (settings.render_service_id or "").strip()
+    if explicit:
+        return explicit
+    services = await _api_get("/services")
+    web: list[dict[str, Any]] = []
+    for item in services or []:
+        service = item.get("service") or item
+        if service.get("type") == "web":
+            web.append(service)
+    wanted = (settings.render_service_name or "").strip()
+    if wanted:
+        for service in web:
+            if service.get("name") == wanted:
+                return str(service.get("id"))
+    if len(web) == 1:
+        return str(web[0].get("id"))
+    if not web:
+        raise RuntimeError("у Render нет web-сервисов")
+    raise RuntimeError(
+        "у Render несколько web-сервисов — задай RENDER_SERVICE_ID (или RENDER_SERVICE_NAME)"
+    )
+
+
+async def fetch_logs(service_id: str, since: datetime, limit: int) -> list[str]:
+    """Забирает тексты логов сервиса за окно назад."""
+    params: dict[str, Any] = {
+        "resources": service_id,
+        "start": since.astimezone(UTC).isoformat(),
+        "limit": limit,
+        "direction": "backward",
+    }
+    payload = await _api_get("/logs", params)
+    entries = payload if isinstance(payload, list) else (payload or {}).get("logs") or []
+    out: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        message = entry.get("message")
+        if isinstance(message, str):
+            out.append(message)
+    return out
+
+
+async def check_render_logs() -> dict[str, Any]:
+    """Проверяет логи Render на секреты и пишет вердикт в watcher_state.
+
+    Вердикт: {checked_at, scanned, hits, samples, service, window_hours,
+    error}. Значений секретов в нём нет — только счётчики.
+    """
+    verdict: dict[str, Any] = {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "scanned": 0,
+        "hits": {},
+        "samples": {},
+        "service": None,
+        "window_hours": int(settings.render_logs_lookback_hours),
+        "error": None,
+    }
+    try:
+        service_id = await resolve_service_id()
+        verdict["service"] = service_id
+        since = datetime.now(UTC) - timedelta(hours=verdict["window_hours"])
+        messages = await fetch_logs(service_id, since, int(settings.render_logs_limit))
+        verdict.update(scan_messages(messages))
+    except Exception as exc:
+        verdict["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        logger.warning("Проверка логов Render не удалась: %s", verdict["error"])
+    await _save_verdict(verdict)
+    if not verdict["error"]:
+        logger.info(
+            "Проверка логов Render: строк %d, утечек %d",
+            verdict["scanned"],
+            len(verdict["hits"]),
+        )
+    return verdict
+
+
+async def _save_verdict(verdict: dict[str, Any]) -> None:
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, RENDER_LOGS_CHECK_KEY)
+            payload = json.dumps(verdict, ensure_ascii=False)
+            if row is None:
+                session.add(WatcherState(key=RENDER_LOGS_CHECK_KEY, value=payload))
+            else:
+                row.value = payload
+            await session.commit()
+    except Exception:
+        logger.warning("Вердикт проверки логов не сохранился", exc_info=True)
+
+
+async def last_verdict() -> dict[str, Any] | None:
+    """Последний вердикт проверки логов (для /ops)."""
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, RENDER_LOGS_CHECK_KEY)
+            if row is None:
+                return None
+            data = json.loads(row.value)
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def verdict_line(verdict: dict[str, Any] | None) -> str:
+    """Строка о проверке логов для /ops — без секретов, только счётчики."""
+    if not verdict:
+        return "Логи Render: проверка ещё не выполнялась"
+    if verdict.get("error"):
+        return f"⚠️ Логи Render: проверка не удалась — {verdict['error']}"
+    hits = verdict.get("hits") or {}
+    scanned = int(verdict.get("scanned") or 0)
+    checked = str(verdict.get("checked_at") or "")[:16].replace("T", " ")
+    if hits:
+        names = ", ".join(f"{name} ×{count}" for name, count in sorted(hits.items()))
+        return f"⚠️ Логи Render: утечки секретов! {names} (строк {scanned}, проверено {checked})"
+    return f"Логи Render: секретов в логах нет (строк {scanned}, окно {verdict.get('window_hours')} ч, проверено {checked})"

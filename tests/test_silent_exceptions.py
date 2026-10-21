@@ -6,9 +6,10 @@
 не в коде, а в том, написал ли автор почему здесь тихо.
 
 Проверка требует у каждого `pass` в обработчике исключения либо записи в лог,
-либо пояснения рядом. Все оставшиеся молчания (6 штук) перечислены в
+либо пояснения рядом. Все оставшиеся молчания (7 штук) перечислены в
 DOCUMENTED: main.py — Ctrl+C и неподдерживаемый Windows-сигнал, ton_codec.py —
-проверка формата адреса, panel.py — повторное нажатие в пульте.
+проверка формата адреса, panel.py — повторное нажатие в пульте, scheduler.py —
+битая метка времени проверки логов.
 """
 
 from __future__ import annotations
@@ -25,12 +26,13 @@ DOCUMENTED = (
     "main.py: NotImplementedError у add_signal_handler (Windows/песочница)",
     "ton_codec.py: «не hex» — ответ проверки формата, а не сбой",
     "panel.py: «message is not modified» — повторное нажатие без правки",
+    "scheduler.py: битая метка времени проверки логов — «пора проверять заново»",
 )
 
 # Сколько молчаний с пояснением должно остаться. Число, а не номера строк:
 # нумерация сдвигается от каждой правки, а решение — нет. И добавление
 # молчания, и его тихое удаление должны заставлять пересмотреть этот список.
-EXPECTED_DOCUMENTED = 6
+EXPECTED_DOCUMENTED = 7
 
 
 def _handlers(path: Path) -> list[ast.ExceptHandler]:
@@ -115,5 +117,5 @@ def test_documented_silences_match_the_audit() -> None:
 def test_audit_notes_stay_readable() -> None:
     """Причины перечислены словами: тест, который их проверяет, должен быть
     понятен человеку, а не только машине."""
-    assert len(DOCUMENTED) == 4
+    assert len(DOCUMENTED) == 5
     assert all(":" in note and len(note) > 20 for note in DOCUMENTED)

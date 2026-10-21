@@ -142,7 +142,6 @@ PARSE_FAIL_COUNT_KEY = "ton_watch_parse_fail_count"
 # Деталь для /blockchain и оператора, отдельный от счётчика — позволяет понять
 # «что именно сломалось» без подъёма логов.
 PARSE_FAIL_LAST_KEY = "ton_watch_parse_fail_last"
-
 # --- Холодный старт кошелька (app/ton_pay/wallet.py) ---
 
 # Результат последней сверки seqno казначея на холодном старте (JSON: lite,
@@ -152,6 +151,15 @@ PARSE_FAIL_LAST_KEY = "ton_watch_parse_fail_last"
 # рестарт и было видно в /treasury: логи живут недолго, а событие случается
 # ровно один раз — при подъёме после простоя.
 COLD_START_SEQNO_KEY = "cold_start_seqno"
+
+# --- Логи Render (app/render_logs.py) ---
+
+# Вердикт последней проверки собственных логов Render на секреты (JSON:
+# checked_at, scanned, hits, samples, service, window_hours, error). Значений
+# секретов в нём нет — только счётчики: проверка не должна стать утечкой.
+# Ключ нужен, чтобы бот сам проверял то, что раньше требовало ручного grep
+# по странице логов хостинга.
+RENDER_LOGS_CHECK_KEY = "render_logs_check"
 
 # --- Зеркало казны (app/treasury_mirror.py) ---
 # Голова зеркала: lt самой свежей учтённой транзакции. Пока бутстрап не
