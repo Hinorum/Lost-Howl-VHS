@@ -14,29 +14,33 @@ from .common import _dialog_close, router
 logger = logging.getLogger(__name__)
 
 
+@router.message.outer_middleware()
+async def _close_wallet_dialog_on_command(handler, event: Message, data: dict) -> None:
+    """Любая команда, кроме /wallet, закрывает открытый диалог привязки.
+
+    Специфичные хендлеры команд перехватывают апдейт раньше, чем
+    on_private_fallback, поэтому там закрыть диалог невозможно — делаем
+    это на уровне маршрутизатора: прошёл команду — значит ожидание адреса
+    прервано. /wallet не трогаем: он сам продолжает/открывает привязку.
+
+    Middleware регистрируется на уровне модуля, а не внутри build_dispatcher:
+    роутер общий на процесс, и регистрация при каждой сборке диспетчера
+    вешала бы на каждое обновление по два одинаковых закрытия диалога.
+    """
+    if isinstance(event, Message) and event.chat.type == ChatType.PRIVATE:
+        text = (event.text or "").strip()
+        if text.startswith("/") and not text.startswith("/wallet"):
+            uid = event.from_user.id if event.from_user else 0
+            try:
+                await _dialog_close(uid)
+            except Exception:
+                logger.exception("Не удалось закрыть диалог кошелька (uid=%s)", uid)
+    return await handler(event, data)
+
+
 def build_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
-
-    @router.message.outer_middleware()
-    async def _close_wallet_dialog_on_command(handler, event: Message, data: dict) -> None:
-        """Любая команда, кроме /wallet, закрывает открытый диалог привязки.
-
-        Специфичные хендлеры команд перехватывают апдейт раньше, чем
-        on_private_fallback, поэтому там закрыть диалог невозможно — делаем
-        это на уровне маршрутизатора: прошёл команду — значит ожидание адреса
-        прервано. /wallet не трогаем: он сам продолжает/открывает привязку.
-        """
-        if isinstance(event, Message) and event.chat.type == ChatType.PRIVATE:
-            text = (event.text or "").strip()
-            if text.startswith("/") and not text.startswith("/wallet"):
-                uid = event.from_user.id if event.from_user else 0
-                try:
-                    await _dialog_close(uid)
-                except Exception:
-                    logger.exception("Не удалось закрыть диалог кошелька (uid=%s)", uid)
-        return await handler(event, data)
-
     _register_error_handler(dispatcher)
     return dispatcher
 
