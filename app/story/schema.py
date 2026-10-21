@@ -157,6 +157,20 @@ class SwitchModel(BaseModel):
     winner: int
     days: list[DayModel]
 
+    @field_validator("to")
+    @classmethod
+    def _road_is_not_main(cls, value: str) -> str:
+        # Имя «main» занято главной дорогой: day_for() отдаёт главную дорогу
+        # ДО поиска по форку, а road() вернул бы «main» — перемотка с таким
+        # именем молча не отыгрывалась бы, без единой ошибки. Дешёвая защита
+        # в контракте лучше «сюжет сломался, а кассета валидна».
+        if value.strip().lower() == "main":
+            raise ValueError(
+                "дорога перемотки не может называться «main»: главная дорога "
+                "играется всегда, и перемотка с таким именем молча не отыграется"
+            )
+        return value
+
     @field_validator("winner")
     @classmethod
     def _winner_in_range(cls, value: int) -> int:

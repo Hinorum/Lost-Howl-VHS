@@ -295,6 +295,21 @@ def test_fork_duplicate_at_day_winner_rejected() -> None:
     assert any("at_day=28" in error and "winner=1" in error for error in result.errors)
 
 
+def test_fork_road_named_main_rejected() -> None:
+    """Дорога перемотки не может называться «main»: она бы молча не отыгралась.
+
+    day_for() отдаёт главную дорогу ДО поиска по форку, а road() вернул бы
+    «main» — перемотка с таким именем не отыгралась бы, без единой ошибки.
+    """
+    payload = _fork_payload()
+    payload["switch"].append(
+        {"to": "main", "at_day": 28, "winner": 0, "days": [_day(i) for i in range(28, 31)]}
+    )
+    result = validate_payload(payload)
+    assert result.cassette is None
+    assert any("main" in error for error in result.errors), result.errors
+
+
 def test_real_cassettes_have_no_hard_errors() -> None:
     """Вся библиотека проходит жёсткий контракт (мягкие замечания — не ошибки)."""
     library = Path(__file__).resolve().parents[1] / "app" / "story" / "cassettes"
