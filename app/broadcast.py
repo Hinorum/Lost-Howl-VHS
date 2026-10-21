@@ -6,7 +6,9 @@ import asyncio
 import html
 import logging
 from collections import Counter
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
@@ -281,45 +283,13 @@ async def _dm_send_all(
         # каждый час вечно — ровно так застрял delivery:dm:vote-reminder.
         await clear_delivery_marker(f"dm:{label}")
         return 0
-    semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
-    reasons: Counter[str] = Counter()
-
-    async def worker(player_id: int) -> bool:
-        async with semaphore:
-            try:
-                await deliver(player_id)
-                return True
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 1)
-                try:
-                    await deliver(player_id)
-                    return True
-                except Exception as exc2:
-                    logger.warning("Игроку %s сообщение не доставлено (после ретрая): %s", player_id, exc2)
-                    reasons[failure_reason(exc2)] += 1
-                    return False
-            except TelegramForbiddenError:
-                # Бот заблокирован или аккаунт удалён: писать сюда больше некуда.
-                await deactivate_player(player_id)
-                reasons["игрок заблокировал бота или аккаунт недоступен"] += 1
-                return False
-            except TelegramBadRequest as exc:
-                if "USER_BOT_TO_BOT_DISABLED" in str(exc):
-                    # Аккаунт-бот: Telegram запрещает боту писать боту в ЛС.
-                    # Деактивируем — доставка невозможна в принципе.
-                    await deactivate_player(player_id)
-                    reasons["аккаунт-бот (нельзя писать боту)"] += 1
-                    return False
-                logger.warning("Игроку %s сообщение не доставлено: %s", player_id, exc)
-                reasons[failure_reason(exc)] += 1
-                return False
-            except Exception as exc:
-                logger.warning("Игроку %s сообщение не доставлено: %s", player_id, exc)
-                reasons[failure_reason(exc)] += 1
-                return False
-
-    outcomes = await asyncio.gather(*(worker(pid) for pid in player_ids))
-    delivered = sum(1 for ok in outcomes if ok)
+    delivered, reasons = await _fanout(
+        player_ids,
+        deliver,
+        on_forbidden=deactivate_player,
+        forbidden_reason="игрок заблокировал бота или аккаунт недоступен",
+        label=f"Личное сообщение «{label}»",
+    )
     logger.info("%s: доставлено %d из %d игроков", label, delivered, len(player_ids))
     await record_delivery(f"dm:{label}", delivered, len(player_ids), reasons)
     return delivered
@@ -435,6 +405,119 @@ def failure_reason(exc: Exception) -> str:
         return "флуд-контроль: ретрай не помог"
     text = " ".join(str(exc).split())[:80]
     return f"{type(exc).__name__}: {text}".rstrip(": ")
+
+
+async def _fanout(
+    targets: Sequence[int],
+    deliver: Callable[[int], Awaitable[Any]],
+    *,
+    on_forbidden: Callable[[int], Awaitable[Any]] | None = None,
+    on_failed: Callable[[int, Exception], Awaitable[Any]] | None = None,
+    forbidden_reason: str = "доступ закрыт (kicked/бот заблокирован)",
+    label: str = "рассылка",
+) -> tuple[int, Counter[str]]:
+    """Рассылка по получателям: параллельно, с одним ретраем по флуд-контролю.
+
+    Возвращает (доставлено, причины отказов).
+
+    Общий помощник для всех рассылок. Копии этого кода разъехались, и в двух
+    из них ретрай после флуд-контроля глушил TelegramForbiddenError в общем
+    except: получатель, заблокировавший бота МЕЖДУ ретраем, оставался в базе
+    навсегда — его пробовали доставить в каждой рассылке. В личных итогах
+    запрета не было вовсе: там заблокировавший игрок оставался подписчиком и
+    получал попытки каждый день.
+    """
+    semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
+    reasons: Counter[str] = Counter()
+
+    async def _deactivate(target: int) -> None:
+        """Отключить получателя. Сбой хука не должен ронять рассылку.
+
+        Отключение — это запись в БД; если она падает (БД качнулась, таймаут),
+        получатель просто останется в списке и получит попытку в следующей
+        рассылке. Но если бы исключение вылетело из хука, asyncio.gather
+        прервал бы ВСЮ рассылку: один непрописанный чат отозвал бы отправку
+        всем остальным.
+        """
+        if on_forbidden is None:
+            return
+        try:
+            await on_forbidden(target)
+        except Exception:
+            logger.warning(
+                "%s: получатель %s не отключён (сбой записи) — вернёмся к нему "
+                "в следующей рассылке",
+                label,
+                target,
+                exc_info=True,
+            )
+
+    async def worker(target: int) -> bool:
+        async with semaphore:
+            try:
+                await deliver(target)
+                return True
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 1)
+                try:
+                    await deliver(target)
+                    return True
+                except TelegramForbiddenError:
+                    # Заблокировали МЕЖДУ флуд-ретраем: раньше этот случай
+                    # тонул в общем except, и получатель оставался в базе
+                    # навсегда.
+                    reasons[forbidden_reason] += 1
+                    await _deactivate(target)
+                    return False
+                except Exception as exc2:
+                    logger.warning(
+                        "%s не доставлен %s (после ретрая): %s: %s",
+                        label,
+                        target,
+                        type(exc2).__name__,
+                        exc2,
+                    )
+                    reasons[failure_reason(exc2)] += 1
+                    if on_failed is not None:
+                        await on_failed(target, exc2)
+                    return False
+            except TelegramForbiddenError:
+                reasons[forbidden_reason] += 1
+                await _deactivate(target)
+                return False
+            except TelegramBadRequest as exc:
+                if "USER_BOT_TO_BOT_DISABLED" in str(exc):
+                    # Аккаунт-бот: Telegram запрещает боту писать боту в ЛС.
+                    # Деактивируем — доставка невозможна в принципе.
+                    reasons["аккаунт-бот (нельзя писать боту)"] += 1
+                    await _deactivate(target)
+                    return False
+                logger.warning(
+                    "%s не доставлен %s: %s: %s",
+                    label,
+                    target,
+                    type(exc).__name__,
+                    exc,
+                )
+                reasons[failure_reason(exc)] += 1
+                if on_failed is not None:
+                    await on_failed(target, exc)
+                return False
+            except Exception as exc:
+                logger.warning(
+                    "%s не доставлен %s: %s: %s",
+                    label,
+                    target,
+                    type(exc).__name__,
+                    exc,
+                )
+                reasons[failure_reason(exc)] += 1
+                if on_failed is not None:
+                    await on_failed(target, exc)
+                return False
+
+    outcomes = await asyncio.gather(*(worker(target) for target in targets))
+    return sum(1 for ok in outcomes if ok), reasons
 
 
 def _reasons_text(reasons: dict[str, int], limit: int = 3) -> str:
@@ -1021,40 +1104,18 @@ async def _broadcast_text(
     if not chat_ids:
         logger.warning("_broadcast_text: нет активных чатов для рассылки (все деактивированы?)")
     if chat_ids:
-        semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
-        reasons: Counter[str] = Counter()
-
-        async def worker(chat_id: int) -> int | None:
-            async with semaphore:
-                try:
-                    await bot.send_message(chat_id, text, parse_mode=parse_mode)
-                    return chat_id
-                except TelegramRetryAfter as exc:
-                    logger.warning("Флуд-контроль в чате %s: пауза %d с", chat_id, exc.retry_after)
-                    await asyncio.sleep(exc.retry_after + 1)
-                    try:
-                        await bot.send_message(chat_id, text, parse_mode=parse_mode)
-                        return chat_id
-                    except Exception as exc2:
-                        logger.warning("Текст не доставлен в чат %s (после ретрая): %s", chat_id, exc2)
-                        reasons[failure_reason(exc2)] += 1
-                        return None
-                except TelegramForbiddenError:
-                    reasons["доступ к чату закрыт (kicked/бот заблокирован)"] += 1
-                    await deactivate_chat(chat_id)
-                    return None
-                except Exception as exc:
-                    logger.warning("Текст не доставлен в чат %s: %s", chat_id, exc)
-                    reasons[failure_reason(exc)] += 1
-                    if any(mark in str(exc).lower() for mark in _FORGET_MARKS):
-                        await deactivate_chat(chat_id)
-                    return None
-
-        outcomes = await asyncio.gather(*(worker(chat_id) for chat_id in chat_ids))
-        delivered = len([c for c in outcomes if c is not None])
-        await record_delivery(kind, delivered, len(chat_ids), reasons)
+        delivered, reasons = await _fanout(
+            chat_ids,
+            lambda chat_id: bot.send_message(chat_id, text, parse_mode=parse_mode),
+            on_forbidden=deactivate_chat,
+            on_failed=_forget_if_gone,
+            label="Текст в чат",
+        )
     else:
         delivered = 0
+        reasons = Counter()
+    if chat_ids:
+        await record_delivery(kind, delivered, len(chat_ids), reasons)
     # Личные дубликаты подписчикам — даже если живых чатов нет.
     delivered_dm = await _dm_send_all(
         bot,
@@ -1278,31 +1339,19 @@ async def announce_player_results(bot: Bot | None, finished: Round) -> int:
         return 0
     if not texts:
         return 0
-    semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
-
-    async def worker(player_id: int, text: str) -> bool:
-        async with semaphore:
-            try:
-                await bot.send_message(player_id, text, parse_mode=ParseMode.HTML)
-                return True
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 1)
-                try:
-                    await bot.send_message(player_id, text, parse_mode=ParseMode.HTML)
-                    return True
-                except Exception as exc2:
-                    logger.warning(
-                        "Личный итог дня не доставлен игроку %s (после ретрая): %s",
-                        player_id,
-                        exc2,
-                    )
-                    return False
-            except Exception as exc:
-                logger.warning("Личный итог дня не доставлен игроку %s: %s", player_id, exc)
-                return False
-
-    outcomes = await asyncio.gather(*(worker(pid, text) for pid, text in texts))
-    delivered = sum(1 for ok in outcomes if ok)
+    texts_map = {player_id: text for player_id, text in texts}
+    # Личные итоги: раньше здесь вообще не было обработки запрета — игрок,
+    # заблокировавший бота, оставался подписчиком и получал попытки каждый
+    # день. Теперь запрет обрабатывает общий помощник рассылки.
+    delivered, _reasons = await _fanout(
+        list(texts_map),
+        lambda player_id: bot.send_message(
+            player_id, texts_map[player_id], parse_mode=ParseMode.HTML
+        ),
+        on_forbidden=deactivate_player,
+        forbidden_reason="игрок заблокировал бота или аккаунт недоступен",
+        label=f"Личный итог дня {getattr(finished, 'day_index', '?')}",
+    )
     logger.info(
         "Личные итоги дня %s: доставлено %d из %d игроков",
         getattr(finished, "day_index", "?"),
@@ -1323,47 +1372,13 @@ async def whisper_to_chats(
     if bot is None or not text:
         return 0
     chat_ids = await active_chat_ids()
-    semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
-    reasons: Counter[str] = Counter()
-
-    async def worker(chat_id: int) -> bool:
-        async with semaphore:
-            try:
-                await bot.send_message(chat_id, text, parse_mode=parse_mode)
-                return True
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 1)
-                try:
-                    await bot.send_message(chat_id, text, parse_mode=parse_mode)
-                    return True
-                except Exception as exc2:
-                    logger.warning("Шёпот дня не доставлен в чат %s (после ретрая): %s", chat_id, exc2)
-                    reasons[failure_reason(exc2)] += 1
-                    return False
-            except TelegramForbiddenError:
-                reasons["доступ к чату закрыт (kicked/бот заблокирован)"] += 1
-                await deactivate_chat(chat_id)
-                return False
-            except Exception as exc:
-                lowered = str(exc).lower()
-                reasons[failure_reason(exc)] += 1
-                if any(mark in lowered for mark in _FORGET_MARKS):
-                    await deactivate_chat(chat_id)
-                else:
-                    # Раньше здесь был просто return False — единственный
-                    # except в проекте вообще без лога. Потеря паузы, разворота
-                    # или церемонии не была видна нигде: ни в логах, ни в
-                    # тревогах, ни в счётчике доставки.
-                    logger.warning(
-                        "Шёпот дня не доставлен в чат %s: %s: %s",
-                        chat_id,
-                        type(exc).__name__,
-                        exc,
-                    )
-                return False
-
-    outcomes = await asyncio.gather(*(worker(c) for c in chat_ids))
-    delivered = sum(1 for ok in outcomes if ok)
+    delivered, reasons = await _fanout(
+        chat_ids,
+        lambda chat_id: bot.send_message(chat_id, text, parse_mode=parse_mode),
+        on_forbidden=deactivate_chat,
+        on_failed=_forget_if_gone,
+        label="Шёпот дня",
+    )
     failed = len(chat_ids) - delivered
     await record_delivery("whisper", delivered, len(chat_ids), reasons)
     logger.info(
