@@ -66,6 +66,21 @@ def _mnemonic_patterns() -> list[re.Pattern[str]]:
     return _mnemonic_cache
 
 
+def _database_password() -> str:
+    """Пароль из DATABASE_URL — тоже секрет.
+
+    Он не лежит отдельным полем в настройках (только внутри URL), поэтому
+    вытаскивается оттуда. Пустой результат — не ошибка: без пароля (например
+    в SQLite-режиме) и красить нечего.
+    """
+    raw = (settings.database_url or "").strip()
+    if "@" not in raw or "/" not in raw.split("@", 1)[0]:
+        return ""
+    credentials = raw.split("@", 1)[0]
+    _, _, password = credentials.partition(":")
+    return password.strip()
+
+
 def _secret_values() -> tuple[str, ...]:
     return (
         settings.bot_token,
@@ -74,6 +89,14 @@ def _secret_values() -> tuple[str, ...]:
         settings.ton_api_key,
         settings.toncenter_api_key,
         settings.referral_secret,
+        # Ключ Render API — учётные данные ВСЕГО аккаунта: он открывает все
+        # сервисы, все деплои и все логи. Раньше он не красился, хотя лежит
+        # в том же процессе, что и мнемоника казначея, а утечь может
+        # вместе с исключением httpx (в нём целый заголовок Authorization).
+        settings.render_api_key,
+        # Пароль от базы: DATABASE_URL — единственное место, где он есть, и
+        # строка подключения в тексте ошибки — обычное дело.
+        _database_password(),
     )
 
 

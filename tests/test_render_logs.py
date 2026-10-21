@@ -261,6 +261,34 @@ async def test_check_records_error_without_raising(monkeypatch) -> None:
     assert stored is not None and stored["error"]
 
 
+async def test_check_times_out_and_leaves_a_trace(monkeypatch) -> None:
+    """Проход, который не уложился, оставляет след.
+
+    Раньше проверка жила внутри ops-sweep — единственного детектора аномалий:
+    зависший запрос к API хостинга держал его десятки минут, и тревоги админу
+    не уходили. Теперь у проверки своя джоба и потолок по времени; но и при
+    таймауте вердикт обязан сохраниться — иначе след сбоя исчезает, и
+    следующий проход выглядит как первый.
+    """
+    import asyncio
+
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr("app.render_logs._SCAN_TIMEOUT_SECONDS", 0.05)
+
+    async def hang(path, params=None):
+        await asyncio.sleep(5)
+        return []
+
+    monkeypatch.setattr("app.render_logs._api_get", hang)
+    from app.render_logs import check_render_logs, last_verdict
+
+    verdict = await check_render_logs()
+    assert "TimeoutError" in verdict["error"]
+    stored = await last_verdict()
+    assert stored is not None and "TimeoutError" in stored["error"]
+
+
 async def test_fetch_logs_walks_window_backwards(monkeypatch) -> None:
     """Страницы идут НАЗАД от «сейчас»: проверять надо свежие логи.
 

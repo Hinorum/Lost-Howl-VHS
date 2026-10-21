@@ -125,6 +125,46 @@ def test_ton_api_key_is_redacted(monkeypatch) -> None:
     assert log_scrub.REDACTED_SECRET in text
 
 
+def test_render_api_key_is_redacted(monkeypatch) -> None:
+    """Ключ Render API — учётные данные всего аккаунта.
+
+    Он лежит в том же процессе, что и мнемоника казначея, а утечь может
+    вместе с исключением httpx: в нём целый заголовок Authorization.
+    """
+    key = "rnd_key_abcdef123456"
+    monkeypatch.setattr(settings, "render_api_key", key)
+
+    text = log_scrub.redact(f"Authorization: Bearer {key}")
+
+    assert key not in text
+    assert log_scrub.REDACTED_SECRET in text
+
+
+def test_database_password_is_redacted(monkeypatch) -> None:
+    """Пароль от базы — тоже секрет, и он живёт только внутри URL."""
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://way_user:sup3r-secret-pw@db.host:5432/way_db",
+    )
+
+    text = log_scrub.redact(
+        "не удалось подключиться: postgresql://way_user:sup3r-secret-pw@db.host:5432/way_db"
+    )
+
+    assert "sup3r-secret-pw" not in text
+    assert log_scrub.REDACTED_SECRET in text
+
+
+def test_database_password_absent_is_not_an_error(monkeypatch) -> None:
+    """Без пароля (SQLite-режим) красить нечего — и это не ошибка."""
+    monkeypatch.setattr(settings, "database_url", "sqlite+aiosqlite:///./data/app.db")
+
+    text = log_scrub.redact("обычная строка лога")
+
+    assert "обычная строка лога" in text
+
+
 def test_short_secret_is_not_redacted(monkeypatch) -> None:
     """Короче 8 символов — пустяк: красить «true» сломал бы лог без пользы."""
     monkeypatch.setattr(settings, "bot_token", "true")

@@ -306,6 +306,47 @@ async def test_start_scheduler_registers_only_zero_arg_jobs(monkeypatch) -> None
             raise AssertionError(f"джоба {job_id} требует аргументы: {exc}") from exc
 
 
+async def test_ops_sweep_does_not_scan_render_logs(monkeypatch) -> None:
+    """Проверка логов Render — отдельной джобой, а не внутри ops-sweep.
+
+    ops-sweep — единственный детектор аномалий: если он занят проходом по
+    логам хостинга (десятки страниц к API Render), тревоги админу не уходят
+    именно тогда, когда всё плохо. Проход по логам живёт в своей джобе.
+    """
+    from app import scheduler as sched
+
+    async def bomb(*_args, **_kwargs):
+        raise AssertionError("ops-sweep не должен сканировать логи Render")
+
+    monkeypatch.setattr(sched, "_render_logs_check_due", bomb)
+    monkeypatch.setattr("app.ops.check_anomalies", AsyncMock(return_value=[]))
+
+    await sched._ops_sweep()
+
+
+async def test_render_logs_scan_is_registered_as_own_job(monkeypatch) -> None:
+    """У проверки логов свой таймер: полчаса, а не «внутри аномалий»."""
+    from app import scheduler as scheduler_mod
+
+    registered: list[tuple[str, object, str, int | None]] = []
+
+    def fake_add_job(func, trigger, *, id, **kwargs):
+        registered.append((id, func, trigger, kwargs.get("seconds")))
+
+    monkeypatch.setattr(scheduler_mod.scheduler, "add_job", fake_add_job)
+    monkeypatch.setattr(scheduler_mod.scheduler, "start", lambda: None)
+    monkeypatch.setattr(settings, "ton_enabled", False)
+
+    scheduler_mod.start_scheduler()
+
+    ids = [job_id for job_id, _func, _trigger, _sec in registered]
+    assert "render-log-scan" in ids
+    scan = next(
+        (seconds for job_id, _fn, _trigger, seconds in registered if job_id == "render-log-scan")
+    )
+    assert scan == 1800
+
+
 async def test_story_sync_job_never_raises(monkeypatch) -> None:
     """Джоба зеркала кассет fail-open: и сбой базы, и успех — без исключений.
 

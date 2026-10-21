@@ -23,6 +23,7 @@ Render. Бот умеет ходить в свой же хостинг по API 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -36,6 +37,13 @@ from app.http_utils import get_http_client, http_get_with_retry
 logger = logging.getLogger(__name__)
 
 _RENDER_API_BASE = "https://api.render.com/v1"
+
+# Потолок одного прохода по логам. Проход — это до 100 страниц к API Render
+# (render_logs_max_pages), и на медленном API он занимал десятки минут:
+# проверка жила внутри ops-sweep, и всё это время единственный детектор
+# аномалий молчал. Теперь у проверки своя джоба, но потолок по времени нужен
+# всё равно: зависший HTTP-запрос не должен держать джобу вечно.
+_SCAN_TIMEOUT_SECONDS = 300
 
 # Секреты окружения: имя категории → (где лежит, имя поля).
 # Часть секретов живёт в Settings, часть — просто переменные окружения Render
@@ -362,14 +370,23 @@ async def check_render_logs() -> dict[str, Any]:
         "error": None,
     }
     try:
-        service_id, owner_id = await resolve_service()
-        verdict["service"] = service_id
-        since = datetime.now(UTC) - timedelta(hours=verdict["window_hours"])
-        messages, summary = await fetch_logs(
-            service_id, owner_id, since, int(settings.render_logs_limit)
+        async with asyncio.timeout(_SCAN_TIMEOUT_SECONDS):
+            service_id, owner_id = await resolve_service()
+            verdict["service"] = service_id
+            since = datetime.now(UTC) - timedelta(hours=verdict["window_hours"])
+            messages, summary = await fetch_logs(
+                service_id, owner_id, since, int(settings.render_logs_limit)
+            )
+            verdict.update(summary)
+            verdict.update(scan_messages(messages))
+    except TimeoutError:
+        # Проход не уложился: вердикт с ошибкой всё равно пишется (проверка
+        # должна оставлять след, а не исчезать молча), и следующий проход
+        # повторит её — по расписанию, а не по сбою.
+        verdict["error"] = (
+            f"TimeoutError: проверка не уложилась в {_SCAN_TIMEOUT_SECONDS} с"
         )
-        verdict.update(summary)
-        verdict.update(scan_messages(messages))
+        logger.warning("Проверка логов Render: %s", verdict["error"])
     except Exception as exc:
         verdict["error"] = f"{type(exc).__name__}: {exc}"[:300]
         logger.warning("Проверка логов Render не удалась: %s", verdict["error"])
