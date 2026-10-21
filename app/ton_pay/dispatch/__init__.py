@@ -29,6 +29,7 @@ from sqlalchemy.engine import CursorResult
 from app.config import settings
 from app.core.fees import fee_estimate_nano
 from app.db import SessionLocal
+from app.log_scrub import redact
 from app.models import Payout, Round, RoundStatus
 from app.stakes import finalize_day_payouts
 
@@ -353,7 +354,7 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     "Диспетчер: %s (выплат в очереди: %d)", reason, len(sendable)
                 )
                 for payout in sendable:
-                    payout.last_error = reason[:200]
+                    payout.last_error = redact(reason)[:200]
                 await session.commit()
                 return 0
             # Комиссия — рабочая оценка (настроенная или фактическая, см.
@@ -368,7 +369,7 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                 )
                 logger.warning("Диспетчер: %s", reason)
                 for payout in sendable:
-                    payout.last_error = reason[:200]
+                    payout.last_error = redact(reason)[:200]
                 await session.commit()
                 return 0
         # Атомарный клейм «взятых в работу» ДО вещания. Условный UPDATE по
@@ -637,7 +638,7 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
                     # (тот при неуспехе падает текстом провайдера — он и виден).
                     reason = str(exc)
                     logger.warning("Выплата %s не ушла: %s", payout.id, exc)
-                    payout.last_error = reason[:200]
+                    payout.last_error = redact(reason)[:200]
                     tx_hash = None
                 if tx_hash is None and payout.last_error is None:
                     # Единственный путь сюда — guard выключенного TON/мнемоники.

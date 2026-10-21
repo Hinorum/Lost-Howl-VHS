@@ -26,6 +26,7 @@ from app.broadcast import (
 )
 from app.config import settings
 from app.db import SessionLocal
+from app.log_scrub import redact
 from app.models import Chat, Payout, Round, RoundStatus, Stake, Vote, WatcherState
 from app.rounds import (
     _now,
@@ -641,7 +642,7 @@ async def on_adjust_action(callback: CallbackQuery) -> None:
         result = await _apply_adjustment(callback.bot, action, None)
     except Exception as exc:
         logger.exception("Корректировка казны %s не удалась", action)
-        await callback.answer(f"Не получилось: {exc}", show_alert=True)
+        await callback.answer(f"Не получилось: {redact(str(exc))}", show_alert=True)
         return
     if callback.message is not None:
         await callback.message.answer(result, parse_mode=ParseMode.HTML, reply_markup=None)
@@ -745,13 +746,13 @@ async def cmd_finalize(message: Message) -> None:
                 created = await finalize_day_payouts(session, row)
                 results.append(f"День {row.day_index} (Round#{row.id}): создано выплат {created}")
         except Exception as exc:
-            results.append(f"День {rnd.day_index} (Round#{rnd.id}): ОШИБКА — {exc!r}")
+            results.append(f"День {rnd.day_index} (Round#{rnd.id}): ОШИБКА — {redact(repr(exc))}")
     # Отправляем
     try:
         sent = await dispatch_pending_payouts(bot=message.bot)
         results.append(f"Отправлено: {sent}")
     except Exception as exc:
-        results.append(f"Ошибка отправки: {exc!r}")
+        results.append(f"Ошибка отправки: {redact(repr(exc))}")
     await message.answer("\n".join(results))
 
 
@@ -845,14 +846,14 @@ async def cmd_refinalize(message: Message) -> None:
             created = await finalize_day_payouts(session, row)
             await message.answer(f"Создано выплат: {created}")
     except Exception as exc:
-        await message.answer(f"Ошибка финализации: {exc!r}")
+        await message.answer(f"Ошибка финализации: {redact(repr(exc))}")
         return
 
     try:
         sent = await dispatch_pending_payouts(bot=message.bot)
         await message.answer(f"Отправлено выплат: {sent}")
     except Exception as exc:
-        await message.answer(f"Ошибка отправки: {exc!r}")
+        await message.answer(f"Ошибка отправки: {redact(repr(exc))}")
 
 
 @router.message(Command("pause"), F.chat.type == ChatType.PRIVATE)

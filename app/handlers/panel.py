@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import SessionLocal
+from app.log_scrub import redact
 from app.models import Payout, Round, RoundStatus, WatcherState
 from app.story import store as story_store
 from app.story.bay import (
@@ -577,7 +578,7 @@ async def on_panel_action(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестное действие.", show_alert=True)
     except Exception as exc:
         logger.exception("Действие пульта %s не удалось", action)
-        await callback.answer(f"Не получилось: {exc}", show_alert=True)
+        await callback.answer(f"Не получилось: {redact(str(exc))}", show_alert=True)
 
 
 async def _cassette_menu_text(session) -> str:
@@ -1207,7 +1208,7 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
         await callback.answer("Готово.")
     except Exception as exc:
         logger.exception("Действие кассеты %s не удалось", callback.data)
-        await callback.answer(f"Не получилось: {exc}", show_alert=True)
+        await callback.answer(f"Не получилось: {redact(str(exc))}", show_alert=True)
 
 
 @router.message(F.document, F.chat.type == ChatType.PRIVATE)
@@ -1259,7 +1260,7 @@ async def on_cassette_document(message: Message) -> None:
         )
     except Exception as exc:
         logger.exception("Загрузка правки кассеты %s не удалась", edit_file)
-        ok, lines, final_name = False, [f"Не получилось: {exc}"], None
+        ok, lines, final_name = False, [f"Не получилось: {redact(str(exc))}"], None
     async with SessionLocal() as session:
         await clear_edit_intent(session)
     # Долговечность: файл уже на диске — переносим правку в базу (см.

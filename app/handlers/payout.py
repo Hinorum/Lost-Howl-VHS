@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import SessionLocal
+from app.log_scrub import redact
 from app.models import Income, Payout, Player, Round, Stake
 from app.style import money_mark, ok_mark, warn_mark
 from app.ton_utils import friendly_address, from_nano, normalize_address
@@ -295,7 +296,7 @@ async def _test_preflight(amount: Decimal, force_http: bool, batch_count: int) -
         wallet, version = _tp.build_offline_treasury_wallet()
         lines.append(f"Пара мнемоник/адрес: {version} ✓ · BoC собирается")
     except Exception as exc:
-        lines.append(f"Пара мнемоник/адрес: {html_escape(str(exc))} ⚠️")
+        lines.append(f"Пара мнемоник/адрес: {html_escape(redact(str(exc)))} ⚠️")
     if batch_count and version != "v5r1":
         # Пачка — механизм v5r1 (out_list). На v4r2 предполёт обязан отказать
         # ДО движения денег: pytoniq упакует что-то своё, и репетиция проверит
@@ -307,7 +308,7 @@ async def _test_preflight(amount: Decimal, force_http: bool, batch_count: int) -
     try:
         balance, status, source = await _tp.fetch_account_state()
     except Exception as exc:
-        balance, status, source = None, None, f"ошибка: {exc}"
+        balance, status, source = None, None, f"ошибка: {redact(str(exc))}"
     if balance is None:
         lines.append(f"Баланс: недоступен ⚠️ · источник {html_escape(str(source))}")
     else:
@@ -317,7 +318,7 @@ async def _test_preflight(amount: Decimal, force_http: bool, batch_count: int) -
         seqno = await _tp.http_get_wallet_seqno(wallet)
         lines.append(f"seqno (runGetMethod по HTTP): {seqno} ✓")
     except Exception as exc:
-        lines.append(f"seqno не прочитан: {html_escape(str(exc))} ⚠️")
+        lines.append(f"seqno не прочитан: {html_escape(redact(str(exc)))} ⚠️")
     dest = settings.active_treasury_address
     shown = (
         friendly_address(normalize_address(dest), testnet=settings.is_testnet) if dest else "—"
@@ -371,7 +372,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
     except ValueError as exc:
         await message.answer(
             f"{warn_mark('nopay')} Формат: <code>{html_escape(_TEST_USAGE)}</code>\n"
-            f"Причина: {html_escape(str(exc))}",
+            f"Причина: {html_escape(redact(str(exc)))}",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -379,7 +380,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
         report = await _test_preflight(amount, force_http, batch_count)
     except Exception as exc:
         await message.answer(
-            f"{warn_mark('nopay')} Предполёт не прошёл: {html_escape(str(exc))}",
+            f"{warn_mark('nopay')} Предполёт не прошёл: {html_escape(redact(str(exc)))}",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -430,7 +431,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
         engaged_after = _tp.state._http_channel_engaged_at
     except Exception as exc:
         await message.answer(
-            f"{warn_mark('nopay')} Отправка не удалась: {html_escape(str(exc))}",
+            f"{warn_mark('nopay')} Отправка не удалась: {html_escape(redact(str(exc)))}",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -553,7 +554,7 @@ async def cmd_payout(message: Message) -> None:
         try:
             new_status = await resolve_dead_payout(session, payout_id, action)
         except ValueError as exc:
-            await message.answer(f"{warn_mark('nopay')} {exc}")
+            await message.answer(f"{warn_mark('nopay')} {redact(str(exc))}")
             return
     if new_status == "dismissed":
         await message.answer(f"{ok_mark(str(payout_id))} Выплата #{payout_id} помечена как спам: из очереди ушла, сбросу больше не мешает.")
@@ -603,7 +604,7 @@ async def cmd_treasury(message: Message) -> None:
         await message.answer(await treasury_diagnostics(), parse_mode=ParseMode.HTML)
     except Exception as exc:
         logger.exception("Отчёт /treasury не собран")
-        await message.answer(f"Отчёт не собрался: {exc}")
+        await message.answer(f"Отчёт не собрался: {redact(str(exc))}")
 
 
 @router.message(Command("fundout"), F.chat.type == ChatType.PRIVATE)
@@ -791,7 +792,7 @@ async def cmd_blockchain(message: Message) -> None:
         await message.answer(await blockchain_diagnostics())
     except Exception as exc:
         logger.exception("Отчёт /blockchain не собран")
-        await message.answer(f"Не собрал отчёт: {exc}")
+        await message.answer(f"Не собрал отчёт: {redact(str(exc))}")
 
 
 @router.message(Command("mirror"), F.chat.type == ChatType.PRIVATE)
@@ -816,4 +817,4 @@ async def cmd_mirror(message: Message) -> None:
         await message.answer(await reset_treasury_mirror())
     except Exception as exc:
         logger.exception("Сброс зеркала казны не выполнен")
-        await message.answer(f"Не сбросил зеркало: {exc}")
+        await message.answer(f"Не сбросил зеркало: {redact(str(exc))}")
