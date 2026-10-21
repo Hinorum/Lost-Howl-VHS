@@ -29,6 +29,7 @@ from app.core.registry import (
     ALERT_DELIVERY_KEY,
     ALERT_DELIVERY_MISSING_KEY,
     ALERT_ENTROPY_KEY,
+    ALERT_LOCAL_TIE_KEY,
     ALERT_LOCK_LOST_KEY,
     ALERT_MIRROR_KEY,
     ALERT_PARSE_FAIL_KEY,
@@ -723,6 +724,48 @@ async def _check_entropy_fallback(session, bot) -> None:
     )
 
 
+async def _local_tie_days(session, limit: int = 3) -> list[int]:
+    """Дни, ничья в которых решена локальной случайностью (сеть была недоступна).
+
+    Такие дни не проверяются по блоку TON: исход честный (никто не знал его
+    заранее), но непроверяемый. Для хранителя это важно знать отдельно от
+    «закон дня без энтропии»: там выбирался ЗАКОН, здесь — победитель.
+    """
+    from app.models import Round
+    from app.rounds.voting import LOCAL_TIE_PREFIX
+
+    result = await session.execute(
+        select(Round.day_index)
+        .where(Round.tie_entropy.like(f"{LOCAL_TIE_PREFIX}%"))
+        .order_by(Round.day_index.desc())
+        .limit(limit)
+    )
+    return [int(day_index) for day_index in result.scalars().all() if day_index is not None]
+
+
+async def _check_local_tie(session, bot) -> None:
+    """Тревога: ничью последних дней решили без сети.
+
+    Исход не воспроизводится по эксплореру — в отличие от жребия по блоку.
+    Значит, оператор должен знать, что такой день был, и почему сеть была
+    недоступна в тот момент.
+    """
+    days = await _local_tie_days(session)
+    if not days:
+        return
+    listed = ", ".join(str(day) for day in days)
+    await _raise(
+        session,
+        bot,
+        ALERT_LOCAL_TIE_KEY,
+        f"жребий ничьей без сети (дни {listed})",
+        f"⚠️ Ничью в днях {listed} решила локальная случайность: блок TON был "
+        "недоступен, и исход не проверяется по эксплореру (он честный — его "
+        "никто не знал заранее, — но непроверяемый). Проверь доступ к "
+        "TonAPI/Toncenter и TON_API_KEY/TONCENTER_API_KEY.",
+    )
+
+
 async def _check_backup_freshness(session, bot) -> None:
     """Тревога: успешного бэкапа не было слишком долго.
 
@@ -1413,6 +1456,9 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
     #    фактически — исход перестал быть проверяемым, и в этом надо жить.
     if settings.ton_enabled:
         await _check_entropy_fallback(session, bot)
+        # Ничья, решённая локальной случайностью (сеть лежала в момент
+        # закрытия голосов): исход не пересчитать по эксплореру.
+        await _check_local_tie(session, bot)
     # 6. Свежесть бэкапа. Проверка вне условия ton_enabled: потеря базы означает
     #    потерю истории выплат и зеркала казны независимо от того, включены ли
     #    деньги сейчас, а сломанный pg_dump — это в первую очередь вопрос

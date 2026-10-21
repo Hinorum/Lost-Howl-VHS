@@ -51,6 +51,9 @@ ALERT_STUCK_KEY = "alert_stuck_ts"
 # счётчик не обнулит чистый parse-цикл. Связан с watcher_state:parse_fail_count.
 ALERT_PARSE_FAIL_KEY = "alert_parse_fail_ts"
 ALERT_ENTROPY_KEY = "alert_entropy_ts"
+# Тревога «жребий ничьей решили без сети»: такие дни не проверяются по блоку
+# TON — исход честный (его никто не знал заранее), но непроверяемый.
+ALERT_LOCAL_TIE_KEY = "alert_local_tie_ts"
 ALERT_BACKUP_KEY = "alert_backup_ts"
 # Тревога «рассылка не дошла». До появления меток delivery:* успешный проход
 # рассылки и доставка всем были одним и тем же утверждением, а на деле нет:

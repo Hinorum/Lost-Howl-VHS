@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -34,6 +35,7 @@ from .rendering import plan_and_render
 from .time import _ROMAN, _now, utc_aware
 from .voting import (
     _TIE_THEATER,
+    LOCAL_TIE_PREFIX,
     _decisive_counts,
     _winner_and_tied,
     count_stakes_for_tally,
@@ -336,6 +338,18 @@ async def close_voting(session: AsyncSession, round_row: Round) -> Round:
         from app.ton_pay import fetch_masterchain_entropy
 
         round_row.tie_entropy = await fetch_masterchain_entropy()
+        if not round_row.tie_entropy and settings.ton_enabled:
+            # Сеть недоступна — берём ЛОКАЛЬНУЮ случайность. Прежний
+            # детерминированный жребий (сид «день+закон») был виден любому:
+            # исход дня можно было вычислить заранее и поставить на него —
+            # ровно тогда, когда день решался деньгами. Локальная энтропия
+            # никому не известна заранее, но сохраняется в дне, поэтому
+            # пересчёт (heal, finish_tally) даёт тот же исход.
+            round_row.tie_entropy = f"{LOCAL_TIE_PREFIX}{secrets.token_hex(16)}"
+            logger.warning(
+                "День %s: сеть недоступна, ничья решена локальной случайностью",
+                round_row.day_index,
+            )
     seed = tie_seed(round_row)
     round_row.winner_card, _ = await _winner_and_tied(session, round_row, counts, seed, votes)
     await session.commit()
