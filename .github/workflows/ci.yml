@@ -170,6 +170,11 @@ jobs:
     env:
       # Локальный хост -> postgres_connect_args не включает SSL (см. config.py).
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/the_way_ci
+      # Тесты НЕ наследуют DATABASE_URL: модульная фикстура чистит все
+      # таблицы, и унаследованная переменная приложения указывала бы на
+      # боевую базу (wipe прода). Тестовая база объявляется явно; здесь —
+      # тот же Postgres 16.
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/the_way_ci
       # Тот же URL для flow-тестов миграций: без него они молча уходят в
       # SQLite-файлы, и цепочка на боевом диалекте снова остаётся непроверенной.
       TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/the_way_ci

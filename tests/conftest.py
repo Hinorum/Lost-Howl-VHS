@@ -1,16 +1,43 @@
 import os
 import tempfile
 
-# Отдельная БД для тестов хендлеров: переменная окружения сильнее .env,
-# задаём ДО первых импортов app.*. Файл пересоздаём при каждом прогоне,
-# чтобы схема всегда соответствовала текущим моделям.
-_DB_PATH = os.path.join(tempfile.gettempdir(), "the_ways_handlers_test.db")
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///" + _DB_PATH)
-for _suffix in ("", "-journal", "-wal", "-shm"):
-    try:
-        os.remove(_DB_PATH + _suffix)
-    except FileNotFoundError:
-        pass
+# Тестовая БД — отдельная и ЯВНАЯ.
+#
+# Раньше здесь стоял setdefault("DATABASE_URL", ...): унаследованная
+# переменная побеждала, а DATABASE_URL в любой машине с .env указывает на
+# БОЕВУЮ базу. Модульная фикстура чистит все таблицы перед каждым модулем —
+# то есть `pytest` в шелле с экспортированным DATABASE_URL стирал прода.
+#
+# Теперь:
+# - TEST_DATABASE_URL — осознанный выбор БД прогона (CI: Postgres 16);
+# - иначе — временный SQLite-файл (имя уникально на процесс: два
+#   одновременных прогона не делят одну базу и не портят её друг другу);
+# - DATABASE_URL перекрывается БЕЗУСЛОВНО: переменная приложения не должна
+#   указывать тестами на боевой контур.
+# Живой e2e-прогон (E2E_TESTNET=1) — единственное исключение: там нужен
+# тестнетовый контур целиком, и очистка таблиц отключается (см.
+# _clean_global_db_per_module).
+_LIVE_E2E = os.environ.get("E2E_TESTNET") == "1"
+_TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "").strip()
+_DB_PATH = ""
+if not _LIVE_E2E:
+    if not _TEST_DB_URL:
+        _DB_PATH = os.path.join(
+            tempfile.gettempdir(), f"the_ways_handlers_test_{os.getpid()}.db"
+        )
+        _TEST_DB_URL = "sqlite+aiosqlite:///" + _DB_PATH
+    os.environ["DATABASE_URL"] = _TEST_DB_URL
+    # Файл пересоздаём при каждом прогоне, чтобы схема всегда соответствовала
+    # текущим моделям.
+    for _suffix in ("", "-journal", "-wal", "-shm"):
+        try:
+            os.remove(_DB_PATH + _suffix)
+        except OSError:
+            # Файл может быть занят (Windows держит его открытым, пока держит
+            # другой процесс) — ловим любую ошибку, а не только FileNotFoundError:
+            # раньше PermissionError на коллекции ронял ВЕСЬ прогон. У каждого
+            # прогона своё имя файла, поэтому занятость ему не мешает.
+            pass
 
 # Герметичность к пользовательскому .env: pydantic (app.config) читает .env из
 # CWD, и файл с контуром (TON_NETWORK=testnet, TON_ENABLED=true) молча ломал
@@ -52,6 +79,7 @@ import asyncio
 import datetime as _dt
 import sqlite3
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 # Python 3.12 объявил устаревшим встроенный адаптер datetime/date в sqlite3, и
 # pytest.ini гоняет DeprecationWarning как ошибку — любой raw text() с параметром
@@ -66,6 +94,15 @@ sqlite3.register_adapter(_dt.date, lambda v: v.isoformat())
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler as _AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+
+class _TestDbGuard(NamedTuple):
+    """Доступ к гарду тестовой БД из теста (см. фикстуру test_db_guard)."""
+
+    assert_database: object
+    truncate_all: object
+    db_path: str
+    test_db_url: str
 
 # Хранилище кассет в базе (app/story/store.py) по умолчанию ВЫКЛЮЧЕНО в тестах:
 # его включают только тесты самого хранилища — им нужны свой каталог и свои
@@ -131,6 +168,23 @@ def scheduler_guard() -> tuple[list, object]:
     return _started_schedulers, _stop_started_schedulers
 
 
+@pytest.fixture(scope="session")
+def test_db_guard():
+    """Гард тестовой БД: отдаётся тесту, чтобы он проверил сам себя.
+
+    Смысл гарда — тот же, что у scheduler_guard: страховка, которую никто не
+    проверяет, однажды оказывается неработающей. Тест получает и проверку
+    БД, и саму очистку, и путь к временной базе — импорт conftest вторым
+    модулем исполнял бы его верхний код ещё раз (и снёс бы файл базы).
+    """
+    return _TestDbGuard(
+        assert_database=_assert_test_database,
+        truncate_all=truncate_all,
+        db_path=_DB_PATH,
+        test_db_url=_TEST_DB_URL,
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 async def _global_db_schema():
     """Глобальная БД (SessionLocal) пересоздаётся по текущим моделям каждый прогон."""
@@ -138,6 +192,14 @@ async def _global_db_schema():
 
     await init_db()
     yield
+    # Временная база прогона — на диске её оставать незачем: файл в темпе
+    # копится от прогона к прогону и ничего не объясняет.
+    if _DB_PATH:
+        for _suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                os.remove(_DB_PATH + _suffix)
+            except OSError:
+                pass
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -152,13 +214,49 @@ async def _clean_global_db_per_module():
     DELETE по таблицам упирается в внешние ключи, которые SQLite по
     умолчанию не проверяет, и модуль падал бы на чужом сиде. TRUNCATE с
     CASCADE не зависит от порядка таблиц и обнуляет счётчики.
+
+    В живом e2e-режиме (E2E_TESTNET=1) очистка НЕ выполняется: там база —
+    тестнетовый контур, и снос таблиц уничтожил бы его состояние.
     """
     from app.db import SessionLocal
 
+    if _LIVE_E2E:
+        yield
+        return
     async with SessionLocal() as db:
         await truncate_all(db)
         await db.commit()
     yield
+
+
+def _assert_test_database(db) -> None:
+    """Очистка таблиц — только в той БД, которую прогон объявил тестовой.
+
+    Фикстура выше чистит ВСЕ таблицы перед каждым модулем. На боевой базе
+    это означало бы wipe прода, поэтому прогон обязан убедиться, что цель —
+    именно та БД, которую он объявил тестовой (TEST_DATABASE_URL или
+    временный SQLite-файл). Всё остальное — отказ, а не предупреждение:
+    ошибочно вычищенная чужая база не восстанавливается.
+    """
+    from sqlalchemy.engine import make_url
+
+    if _LIVE_E2E:
+        return
+    bind = db.get_bind()
+    url = bind.url
+    expected = make_url(_TEST_DB_URL)
+    same_backend = url.get_backend_name() == expected.get_backend_name()
+    same_name = (url.database or "") == (expected.database or "")
+    same_host = (url.host or "") == (expected.host or "")
+    if not (same_backend and same_name and same_host):
+        raise RuntimeError(
+            "тесты отказываются чистить не-тестовую БД: "
+            f"подключено {url.get_backend_name()}://{url.host or ''}/"
+            f"{url.database or ''}, а прогон объявил тестовой "
+            f"{expected.get_backend_name()}://{expected.host or ''}/"
+            f"{expected.database or ''}. Проверь TEST_DATABASE_URL: тесты "
+            "перекрывают DATABASE_URL принудительно и не наследуют её."
+        )
 
 
 async def truncate_all(db) -> None:
@@ -172,6 +270,7 @@ async def truncate_all(db) -> None:
     """
     from sqlalchemy import delete, text
 
+    _assert_test_database(db)
     tables = Base.metadata.sorted_tables
     if db.bind is not None and db.bind.dialect.name == "postgresql":
         names = ", ".join(f'"{table.name}"' for table in tables)
