@@ -449,6 +449,11 @@ async def test_run_webhook_lifecycle(monkeypatch) -> None:
     client = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(status_code=200)))
     monkeypatch.setattr(main_module, "get_http_client", Mock(return_value=client))
 
+    import app.db as db_module
+
+    dispose_engine = AsyncMock()
+    monkeypatch.setattr(db_module, "dispose_engine", dispose_engine)
+
     bot = SimpleNamespace(
         set_webhook=AsyncMock(),
         session=SimpleNamespace(close=AsyncMock()),
@@ -465,6 +470,10 @@ async def test_run_webhook_lifecycle(monkeypatch) -> None:
     scheduler.shutdown_scheduler.assert_called_once()
     bot.session.close.assert_awaited_once()
     main_module.close_http_client.assert_awaited_once()
+    # Пул БД закрывается явно: иначе соединения умирающего процеста остаются
+    # на пулере сиротами (idle / idle in transaction) до их таймаута, и каждый
+    # такой backend занимает слот лимита проекта.
+    dispose_engine.assert_awaited_once()
     # Старт игры планируется отдельной задачей, а не блокирует подъём сервера.
     main_module.boot_game.assert_called_once_with(bot)
 

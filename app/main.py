@@ -634,6 +634,14 @@ async def run_webhook(bot, dispatcher) -> None:
     await runner.cleanup()
     await bot.session.close()
     await close_http_client()
+    # Пул БД закрываем явно: иначе соединения умирающего процесса остаются
+    # на пулере сиротами до таймаута и занимают слот лимита проекта.
+    try:
+        from app.db import dispose_engine
+
+        await dispose_engine()
+    except Exception:
+        log.warning("Пул соединений БД не закрыт — освободится по таймауту", exc_info=True)
 
 
 def ensure_webhook_secret() -> None:
