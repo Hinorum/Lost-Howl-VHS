@@ -19,7 +19,7 @@ from app import ops
 from app.config import settings
 from app.core.registry import LOCAL_TIE_PREFIX
 from app.db import SessionLocal
-from app.models import Card, Player, Round, RoundStatus, Vote, WinRule
+from app.models import Card, Player, Round, RoundStatus, Stake, Vote, WinRule
 from app.rounds import close_voting, finish_tally, pick_winner, tie_seed
 
 
@@ -149,5 +149,45 @@ async def test_tie_entropy_from_chain_stays_verifiable(session, monkeypatch) -> 
         loaded = await session.get(Round, round_row.id)
         assert loaded.tie_entropy == "93123949:abcdef"
         assert not loaded.tie_entropy.startswith(LOCAL_TIE_PREFIX)
+    finally:
+        await session.rollback()
+
+
+async def test_money_day_stays_unpredictable_after_global_switch_off(
+    session, monkeypatch
+) -> None:
+    """День решён банком ставок — даже если глобальный TON_ENABLED выключили.
+
+    Ставки принимаются, пока watcher жив. Глобальный переключатель можно
+    выключить деплоем уже после открытия дня — и тогда день остаётся
+    денежным (его решает банк), а жребий ничьей при недоступной сети стал
+    бы детерминированным: исход вычисляется заранее, и на него можно
+    поставить.
+    """
+    monkeypatch.setattr(settings, "ton_enabled", False)
+
+    async def no_entropy() -> str | None:
+        return None
+
+    monkeypatch.setattr("app.ton_pay.fetch_masterchain_entropy", no_entropy)
+
+    round_row = await _seed_tied_day(session, 855)
+    round_row.money_mode = True  # день открыт со ставками
+    session.add(
+        Stake(
+            round_id=round_row.id,
+            player_id=900_031,
+            amount_nanotons=500_000_000,
+            network="mainnet",
+            status="confirmed",
+            tx_hash="tie-stake-855",
+        )
+    )
+    await session.commit()
+    try:
+        await close_voting(session, round_row)
+        loaded = await session.get(Round, round_row.id)
+        assert loaded.tie_entropy is not None
+        assert loaded.tie_entropy.startswith(LOCAL_TIE_PREFIX), loaded.tie_entropy
     finally:
         await session.rollback()

@@ -31,6 +31,7 @@ from app.models import (
 )
 
 from .materialization import _materialize_round, _stamp_day_money_mode
+from .pot import round_pot
 from .queries import get_active_round, get_latest_round, get_round
 from .rendering import plan_and_render
 from .time import _ROMAN, _now, utc_aware
@@ -307,6 +308,28 @@ def public_round_view(round_row: Round) -> dict:
     return view
 
 
+async def _day_decided_by_money(session: AsyncSession, round_row: Round) -> bool:
+    """Жребий ничьей не должен быть предсказуемым там, где на исход ставили.
+
+    Признака два, достаточно любого:
+
+    - денежный контур включён (ton_enabled): в игре с деньгами предсказуемый
+      жребий — риск по определению (так и задумано: «без денег поведение
+      прежнее»);
+    - у дня были ставки: день открыт со ставками (watcher работал), а
+      контур выключили позже — деплоем. Глобальный флаг этого уже не
+      покажет, и без второго признака исход снова стал бы вычислимым
+      заранее.
+
+    Ставки — единственный точный след того, что на исход ставили: снимок
+    money_mode отвечает на другое («рубильник разрешил»).
+    """
+    if settings.ton_enabled:
+        return True
+    _pot_nano, stake_count = await round_pot(session, round_row.id)
+    return stake_count > 0
+
+
 async def close_voting(session: AsyncSession, round_row: Round) -> Round:
     if round_row.status != RoundStatus.OPEN:
         return round_row
@@ -338,7 +361,7 @@ async def close_voting(session: AsyncSession, round_row: Round) -> Round:
         from app.ton_pay import fetch_masterchain_entropy
 
         round_row.tie_entropy = await fetch_masterchain_entropy()
-        if not round_row.tie_entropy and settings.ton_enabled:
+        if not round_row.tie_entropy and await _day_decided_by_money(session, round_row):
             # Сеть недоступна — берём ЛОКАЛЬНУЮ случайность. Прежний
             # детерминированный жребий (сид «день+закон») был виден любому:
             # исход дня можно было вычислить заранее и поставить на него —
