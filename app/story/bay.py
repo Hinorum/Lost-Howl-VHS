@@ -130,6 +130,36 @@ def active_cassette(
     return candidates[0][1]
 
 
+def missing_cassette_months(
+    today: date | None = None,
+    directory: Path | None = None,
+) -> list[str]:
+    """Месяцы без валидной кассеты: текущий и следующий.
+
+    Кассета месяца — это весь сюжет месяца. Если её нет (или она отвергнута
+    валидатором), движок тихо играет шаблоном: «День N, сцена I/II/III» —
+    и месяц сюжета просто исчезает, без единого сигнала. Оператор узнаёт
+    об этом от игроков («а где сюжет?»), а не из /ops.
+
+    Возвращает список месяцев-ключей («2026-11»), которых не хватает.
+    """
+    today = today or datetime.now(UTC).date()
+    months: list[str] = []
+    year, month = today.year, today.month
+    for offset in (0, 1):
+        if offset:
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        key = f"{year:04d}-{month:02d}"
+        if not any(
+            cassette.month == key for cassette in _read_library(directory).values()
+        ):
+            months.append(key)
+    return months
+
+
 def list_cassettes(directory: Path | None = None) -> list[LibraryEntry]:
     """Снимок библиотеки для пульта как есть (без кэша — правки файлов видны).
 

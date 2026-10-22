@@ -25,6 +25,7 @@ from app.core.registry import (
     ALERT_ANNOUNCE_EMPTY_KEY,
     ALERT_BACKUP_KEY,
     ALERT_BALANCE_KEY,
+    ALERT_CASSETTE_KEY,
     ALERT_DEAD_KEY,
     ALERT_DELIVERY_KEY,
     ALERT_DELIVERY_MISSING_KEY,
@@ -723,6 +724,34 @@ async def _check_entropy_fallback(session, bot) -> None:
         f"⚠️ Жребий дня без блока TON: дни {listed} выпали на локальный жребий — "
         "игроки не могут пересчитать исход по эксплореру. Проверь доступ к "
         "TonAPI/Toncenter и TON_API_KEY/TONCENTER_API_KEY: /ton и логи TON.",
+    )
+
+
+async def _check_missing_cassette(session, bot) -> None:
+    """Тревога: на текущий или следующий месяц нет валидной кассеты.
+
+    Кассета месяца — это весь сюжет месяца. Если её нет, движок тихо играет
+    шаблоном («День N, сцена I/II/III»), и месяц сюжета просто исчезает без
+    единого сигнала: узнать об этом можно от игроков или вообще никак.
+    """
+    from app.story.bay import missing_cassette_months
+
+    try:
+        months = missing_cassette_months()
+    except Exception:
+        logger.debug("Библиотека кассет не прочитана", exc_info=True)
+        return
+    if not months:
+        return
+    listed = ", ".join(months)
+    await _raise(
+        session,
+        bot,
+        ALERT_CASSETTE_KEY,
+        f"нет кассеты на месяц {listed}",
+        f"⚠️ На месяц {listed} нет валидной кассеты: месяц сюжета исчезнет "
+        "целиком, движок будет играть шаблоном. Положи кассету в библиотеку "
+        "(app/story/cassettes/) или назначь её через /panel.",
     )
 
 
@@ -1504,6 +1533,8 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
         await _check_local_tie(session, bot)
         # Комиссия сети выросла — оценка в настройках отстала.
         await _check_fee_growth(session, bot)
+    # Сюжет: месяц без кассеты — это месяц без сюжета (движок играет шаблон).
+    await _check_missing_cassette(session, bot)
     # 6. Свежесть бэкапа. Проверка вне условия ton_enabled: потеря базы означает
     #    потерю истории выплат и зеркала казны независимо от того, включены ли
     #    деньги сейчас, а сломанный pg_dump — это в первую очередь вопрос
