@@ -32,6 +32,13 @@ ignore_imports =
     app.ops -> app.rounds
     app.ops -> app.ton_pay
     app.ops -> app.ton_watch
+    # app.ops -> app.story.bay: та же ленивая развязка, что и у соседних
+    # строк ops (ops -> broadcast/rounds/ton_pay/ton_watch): ops —
+    # наблюдательный слой, он читает все слои, но только изнутри функций.
+    # Без этой строки петля: story -> rounds -> ops -> story (ops читает
+    # сюжетный слой за недостающей кассетой, а сюжетный слой берёт у движка
+    # якорь забега и шаблонный день).
+    app.ops -> app.story.bay
     app.rounds.lifecycle -> app.tally
     app.rounds.lifecycle -> app.ton_pay
     app.stakes -> app.rounds.time
