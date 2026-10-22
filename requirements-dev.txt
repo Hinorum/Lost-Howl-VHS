@@ -2,6 +2,11 @@
 pytest==9.1.1
 pytest-asyncio==1.4.0
 pytest-cov==7.1.0
+# Потолок на один тест (pytest.ini: timeout = 180). Без него зависший тест
+# съедал бы шестичасовой бюджет воркера целиком, и виноват был бы
+# непонятно где. Метод — signal (работает в CI на Linux); на Windows
+# pytest-timeout его пропускает, там страхует потолок джобы (timeout-minutes).
+pytest-timeout==2.4.0
 # ruff держим здесь, а не отдельной строкой `pip install ... ruff` в CI:
 # коммит 8b616a1 заменил такой install на requirements-dev.txt, но ruff в
 # списке не значился — и шаг «Lint» на каждом прогоне падал с «No module

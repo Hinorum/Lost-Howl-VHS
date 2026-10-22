@@ -1,4 +1,5 @@
 import os
+import signal
 import tempfile
 
 # Тестовая БД — отдельная и ЯВНАЯ.
@@ -94,6 +95,23 @@ sqlite3.register_adapter(_dt.date, lambda v: v.isoformat())
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler as _AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+
+def pytest_configure(config) -> None:
+    """Потолок на один тест — только там, где он умеет срабатывать.
+
+    pytest-timeout умеет два метода: signal (SIGALRM — только POSIX) и thread
+    (убивает весь прогон целиком). На Windows нет ни того, ни другого: signal
+    падает на импорте, thread уносит с собой всю сессию. Поэтому потолок
+    включается на POSIX, а на Windows его страхует потолок джобы в CI
+    (timeout-minutes) — там видна причина, а не «тест умер без следа».
+    """
+    if not hasattr(signal, "SIGALRM"):
+        return
+    if not config.pluginmanager.hasplugin("timeout"):
+        return
+    config.option.timeout = 180
+    config.option.timeout_method = "signal"
 
 
 class _TestDbGuard(NamedTuple):
