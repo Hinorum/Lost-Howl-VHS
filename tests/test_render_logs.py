@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import delete
@@ -342,11 +342,22 @@ async def test_fetch_logs_walks_window_backwards(monkeypatch) -> None:
 
 
 async def test_check_reports_uncovered_window(monkeypatch, secrets) -> None:
-    """Если окно не покрыто целиком — вердикт говорит об этом прямо."""
+    """Если окно не покрыто целиком — вердикт говорит об этом прямо.
+
+    Метка записи строится от «сейчас», а не пишется константой: покрытие
+    считается как (now − oldest) / (now − since), где since = now − окно.
+    Захардкоженная метка делает тест бомбой — он валиден ровно 24 часа
+    после момента написания, потом метка проваливается за since, числитель
+    перерастает знаменатель, min(1.0, …) зажимает долю в 1.0, и тест падает
+    на ровном месте. Отсчёт от now не даёт такой границы: запись на 12 ч
+    назад при окне 24 ч всегда даёт долю 0.5 и сохраняет смысл проверки —
+    одна страница окно не покрывает.
+    """
     monkeypatch.setattr(settings, "render_api_key", "KEY")
     monkeypatch.setattr(settings, "render_service_id", "srv-1")
     monkeypatch.setattr(settings, "render_logs_max_pages", 1)
     monkeypatch.setattr(settings, "render_logs_lookback_hours", 24)
+    halfway = (datetime.now(UTC) - timedelta(hours=12)).isoformat()
 
     async def fake_get(path, params=None):
         if path != "/logs":
@@ -354,7 +365,7 @@ async def test_check_reports_uncovered_window(monkeypatch, secrets) -> None:
                 {"service": {"id": "srv-1", "name": "bot", "type": "web", "ownerId": "own-1"}}
             ]
         return [
-            {"id": "1", "message": "строка", "timestamp": "2026-10-21T09:00:00Z"},
+            {"id": "1", "message": "строка", "timestamp": halfway},
         ]
 
     monkeypatch.setattr("app.render_logs._api_get", fake_get)
