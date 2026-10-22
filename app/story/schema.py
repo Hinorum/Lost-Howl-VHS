@@ -27,7 +27,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 # Лимиты из движка (см. docs/Lost Howl VHS.md, раздел 9 «Контракт кассеты»).
 # Схема не выпускает текст, который рендер поста не сможет показать целиком:
@@ -93,6 +100,9 @@ def days_in_month(month: str) -> int:
 class CardModel(BaseModel):
     """Одна карта пути (Position 0, 1 или 2) внутри дня."""
 
+    # Неизвестные поля сохраняются: правка не должна их стирать.
+    model_config = ConfigDict(extra="allow")
+
     position: int
     title: str = Field(min_length=1, max_length=FIELD_LIMITS["card_title"])
     consequence: str = Field(
@@ -114,6 +124,9 @@ class CardModel(BaseModel):
 
 class DayModel(BaseModel):
     """Один день пути: глава и ровно три карты голосования."""
+
+    # Неизвестные поля сохраняются: правка не должна их стирать.
+    model_config = ConfigDict(extra="allow")
 
     day_index: int = Field(ge=1)
     chapter_title: str = Field(min_length=1, max_length=FIELD_LIMITS["chapter_title"])
@@ -152,6 +165,9 @@ class SwitchModel(BaseModel):
     раньше, чем движок объявил победителя предыдущего дня.
     """
 
+    # Неизвестные поля сохраняются: правка не должна их стирать.
+    model_config = ConfigDict(extra="allow")
+
     to: str = Field(min_length=1, max_length=FIELD_LIMITS["track_name"])
     at_day: int = Field(ge=2)
     winner: int
@@ -179,14 +195,41 @@ class SwitchModel(BaseModel):
         return value
 
 
+def _collect_unknown(model: BaseModel, prefix: str, found: list[str]) -> None:
+    """Собрать пути полей, которых нет в схеме (для предупреждения)."""
+    for name in model.model_extra or {}:
+        found.append(f"{prefix}{name}")
+    for field_name in ("days", "switch", "cards"):
+        children = getattr(model, field_name, None)
+        if not isinstance(children, list):
+            continue
+        for index, child in enumerate(children):
+            if isinstance(child, BaseModel):
+                _collect_unknown(child, f"{prefix}{field_name}[{index}].", found)
+
+
 class Cassette(BaseModel):
     """Валидированная кассета месяца: месяц «YYYY-MM» + ровно N дней месяца.
 
     `days` — главная дорога (main) на весь месяц. `switch` — перемотки:
     альтернативные дороги, которые включаются, только если по итогам дня
     до развилки движок отдал нужную карту.
+
+    `version` — версия формата. Без неё формат нельзя было бы менять:
+    старое поле в файле молча пропадало бы при первом же round-trip (редактор
+    переписывает файл через model_dump, то есть только известными полями) —
+    и правка сюжета исчезала бы без единого следа.
+
+    `extra="allow"` — поля, которых схема ещё не знает, СОХРАНЯЮТСЯ при
+    пересохранении (в отличие от обычного игнорирования, при котором они
+    тихо удалялись бы). Старый бот при этом такой файл всё равно прочитает:
+    лишние поля ему безразличны. Валидатор отдельно предупреждает о таких
+    полях — «сохранится, но бот его не читает».
     """
 
+    model_config = ConfigDict(extra="allow")
+
+    version: int = Field(default=1, ge=1)
     cassette_id: str = Field(min_length=1)
     month: str
     title: str = Field(min_length=1)
@@ -246,6 +289,21 @@ class Cassette(BaseModel):
                     "без пропусков и дублей"
                 )
         return self
+
+    def unknown_field_warnings(self) -> list[str]:
+        """Поля, которых нет в схеме: они сохранятся, но бот их не читает.
+
+        Такое поле появляется, когда формат кассеты расширяют, а бот ещё
+        не знает про расширение. Оно не ломает файл (старый бот прочитает и
+        его), но и смысла не несёт, пока схема его не заведёт.
+        """
+        found: list[str] = []
+        _collect_unknown(self, "", found)
+        return [
+            f"поле «{name}» схеме неизвестно — оно сохранится при правке, "
+            "но бот его не читает"
+            for name in found
+        ]
 
     def road(self, today_day: int, winners: dict[int, int]) -> str:
         """Активная дорога на календарный день месяца.
@@ -362,6 +420,7 @@ def validate_payload(payload: dict) -> ValidationResult:
             errors=[f"стоп-слова: {', '.join(taboo)}"],
         )
     warnings.extend(cassette.style_warnings())
+    warnings.extend(cassette.unknown_field_warnings())
     return ValidationResult(cassette=cassette, errors=[], warnings=warnings)
 
 

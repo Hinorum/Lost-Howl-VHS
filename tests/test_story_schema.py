@@ -158,15 +158,25 @@ def test_taboo_word_rejected() -> None:
     assert any("стоп-слова" in error for error in result.errors)
 
 
-def test_unknown_fields_are_ignored() -> None:
-    """Лишние ключи JSON валидатор игнорирует (промпт §9)."""
+def test_unknown_fields_are_kept_and_reported() -> None:
+    """Лишние ключи JSON не ломают файл, но о них говорят.
+
+    Раньше они просто игнорировались — и при правке (round-trip через
+    model_dump) ТИХО УДАЛЯЛИСЬ: поле, которого схема ещё не знает, исчезало
+    из файла без следа. Теперь такое поле сохраняется, а валидатор
+    предупреждает: «сохранится, но бот его не читает».
+    """
     payload = _payload("2026-04", 30)
     payload["attribution"] = "старое поле"
     payload["days"][0]["station"] = "старая станция"
     result = validate_payload(payload)
     assert result.cassette is not None
-    assert not hasattr(result.cassette, "attribution")
-    assert not hasattr(result.cassette.days[0], "station")
+    # Поле сохранено — правка его не снесёт.
+    assert result.cassette.attribution == "старое поле"
+    assert result.cassette.days[0].station == "старая станция"
+    # И о нём сказано.
+    assert any("attribution" in warning for warning in result.warnings), result.warnings
+    assert any("station" in warning for warning in result.warnings), result.warnings
 
 
 def test_field_limits_tighten_to_display() -> None:

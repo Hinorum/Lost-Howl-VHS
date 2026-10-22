@@ -475,7 +475,9 @@ async def test_scene_opens_editor(monkeypatch, tmp_path) -> None:
     assert not callback.answer.called
     await panel_mod.on_cassette_action(callback)
     text = callback.message.edit_text.call_args.args[0]
-    assert "ПЛЁНКА" in text
+    # Заголовок экрана — «Кассета: <название>». Раньше здесь стояло «ПЛЁНКА:» —
+    # слово из тестовой фикстуры, попавшее в прод-текст.
+    assert "Кассета: " in text
     assert "mel.json" in text
     assert "morning" in text  # дороги из switch
     labels = _flat(callback.message.edit_text.call_args.kwargs["reply_markup"])

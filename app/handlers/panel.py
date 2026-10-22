@@ -5,6 +5,7 @@ import io
 import json
 import logging
 from datetime import UTC, datetime
+from html import escape as html_escape
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -606,7 +607,7 @@ async def _cassette_menu_text(session) -> str:
             marks.append("▶ играется")
         flags = " · " + " · ".join(marks) if marks else ""
         lines.append(
-            f"📖 {entry.file_name} · {cassette.title} · {cassette.month} "
+            f"📖 {entry.file_name} · {html_escape(cassette.title)} · {cassette.month} "
             f"({len(cassette.days)} дней){flags}"
         )
         if entry.warnings:
@@ -677,9 +678,9 @@ def _scene_text(entry: LibraryEntry, status: str = "") -> str:
     assert cassette is not None
     roads = " · ".join(["main"] + [fork.to for fork in cassette.switch])
     lines = [
-        f"🎞 <b>ПЛЁНКА: {cassette.title}</b>",
+        f"🎞 <b>Кассета: {html_escape(cassette.title)}</b>",
         f"Файл: {entry.file_name} · {cassette.month} · {len(cassette.days)} дней",
-        f"Дороги: {roads}",
+        f"Дороги: {html_escape(roads)}",
     ]
     if status:
         lines.append(status)
