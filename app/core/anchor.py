@@ -1,13 +1,25 @@
+"""Якорь забега: общий словарь слоёв.
+
+Забег — это «с какого дня считается день 1». Якорь нужен и движку (номер
+дня забега, короткая стартовая неделя лидерборда), и сюжетному слою
+(кассетный день считается от якоря, а не от «сегодня»).
+
+Раньше якорь жил в app/rounds/anchor.py, и сюжетный слой тянул движок
+ради него — вместе с регистрацией провайдера это давало петлю
+story -> rounds -> ops -> story. Якорь — общий словарь, ему место в core.
+
+Запись якоря: watcher_state по ключу RUN_START_KEY (app.core.registry).
+"""
+
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.registry import RUN_START_KEY
 from app.models import WatcherState
-
-from .time import _now
 
 
 def parse_anchor(value: str | None) -> dict | None:
@@ -48,7 +60,7 @@ async def get_run_anchor(session: AsyncSession) -> dict:
     row = await session.get(WatcherState, RUN_START_KEY)
     anchor = parse_anchor(row.value if row is not None else None)
     if anchor is None:
-        anchor = default_anchor(_now())
+        anchor = default_anchor(datetime.now(UTC))
         payload = json.dumps(anchor, ensure_ascii=False)
         if row is None:
             session.add(WatcherState(key=RUN_START_KEY, value=payload))

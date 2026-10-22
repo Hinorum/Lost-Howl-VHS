@@ -28,6 +28,18 @@ from app.story.bay import (
 )
 
 
+async def _plan_day(session, day_index: int, entropy: str | None = None) -> dict:
+    """День кассеты через провайдера — как это делает движок.
+
+    Провайдер получает готовую базу (шаблонный день) от движка и дополняет
+    её сюжетом: сюжетный слой не строит шаблон сам.
+    """
+    from app.rounds.rendering import render_template_day
+
+    base = await render_template_day(session, day_index, entropy=entropy)
+    return await bay._plan_and_render(session, day_index, base, entropy=entropy)
+
+
 def _day(index: int) -> dict:
     return {
         "day_index": index,
@@ -210,7 +222,7 @@ async def test_plan_day_uses_active_cassette(
     await set_next_cassette(session, "may.json")
     assert install_bay(tmp_path) is True
     try:
-        payload = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        payload = await _plan_day(session, 7, entropy="100:deadbeef")
         # Контент кассеты поверх честного payload движка:
         assert payload["day_index"] == 7
         assert payload["rule_entropy"] == "100:deadbeef"
@@ -245,7 +257,7 @@ async def test_dilemma_reaches_round_column(session, tmp_path, monkeypatch) -> N
     await set_next_cassette(session, "may-dilemma.json")
     assert install_bay(tmp_path) is True
     try:
-        rendered = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        rendered = await _plan_day(session, 7, entropy="100:deadbeef")
         assert rendered["dilemma"] == "К воде или за топливом?"
         round_row = await _materialize_round(session, rendered, latest=None)
         assert round_row.dilemma == "К воде или за топливом?"
@@ -261,7 +273,7 @@ async def test_plan_day_falls_back_to_engine(
     _write_cassette(tmp_path, "jun.json", "2026-06", 30, "jun-kasseta")
     install_bay(tmp_path)
     try:
-        payload = await bay._plan_and_render(session, 7)
+        payload = await _plan_day(session, 7)
         assert payload["chapter_title"] == "День 7"
         assert len(payload["cards"]) == 3
     finally:
@@ -297,7 +309,7 @@ async def test_editor_edit_picked_up_on_next_render(
     await set_next_cassette(session, "may.json")
     assert install_bay(tmp_path) is True
     try:
-        before = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        before = await _plan_day(session, 7, entropy="100:deadbeef")
         assert before["chapter_title"] == "Глава 11"
 
         cassette = active_cassette(date(2026, 5, 11), directory=tmp_path)
@@ -310,7 +322,7 @@ async def test_editor_edit_picked_up_on_next_render(
         )
         assert ok, lines
 
-        after = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        after = await _plan_day(session, 7, entropy="100:deadbeef")
         assert after["chapter_title"] == "Глава 11 (правка хранителя)"
     finally:
         uninstall_bay()
@@ -366,7 +378,7 @@ async def test_plan_day_prepends_echo_of_yesterday_winner(
     await set_next_cassette(session, "may-echo.json")
     assert install_bay(tmp_path) is True
     try:
-        rendered = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        rendered = await _plan_day(session, 7, entropy="100:deadbeef")
         assert rendered["day_index"] == 7
         assert rendered["rule_entropy"] == "100:deadbeef"
         assert rendered["chapter_text"].startswith("Вчера стая пошла на тень.")
@@ -393,7 +405,7 @@ async def test_plan_day_echo_absent_without_yesterday_winner(
     await set_next_cassette(session, "may-echo.json")
     assert install_bay(tmp_path) is True
     try:
-        rendered = await bay._plan_and_render(session, 7, entropy="100:deadbeef")
+        rendered = await _plan_day(session, 7, entropy="100:deadbeef")
         assert rendered["chapter_text"].startswith("Стая собирается у котла")
     finally:
         uninstall_bay()

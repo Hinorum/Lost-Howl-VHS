@@ -32,13 +32,6 @@ ignore_imports =
     app.ops -> app.rounds
     app.ops -> app.ton_pay
     app.ops -> app.ton_watch
-    # app.ops -> app.story.bay: та же ленивая развязка, что и у соседних
-    # строк ops (ops -> broadcast/rounds/ton_pay/ton_watch): ops —
-    # наблюдательный слой, он читает все слои, но только изнутри функций.
-    # Без этой строки петля: story -> rounds -> ops -> story (ops читает
-    # сюжетный слой за недостающей кассетой, а сюжетный слой берёт у движка
-    # якорь забега и шаблонный день).
-    app.ops -> app.story.bay
     app.rounds.lifecycle -> app.tally
     app.rounds.lifecycle -> app.ton_pay
     app.stakes -> app.rounds.time
@@ -66,7 +59,7 @@ forbidden_modules =
 # Контракт 3: сюжетный слой — пассивные данные: ни Telegram, ни денег.
 # Только прямые импорты — как в контракте 2.
 [importlinter:contract:3]
-name = Сюжет (story) не импортирует handlers/ton_pay/broadcast/scheduler
+name = Сюжет (story) не импортирует handlers/ton_pay/broadcast/scheduler/rounds
 type = forbidden
 allow_indirect_imports = True
 source_modules =
@@ -76,3 +69,4 @@ forbidden_modules =
     app.ton_pay
     app.broadcast
     app.scheduler
+    app.rounds

@@ -3,49 +3,18 @@ from __future__ import annotations
 import logging
 import secrets
 from datetime import datetime
-from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.day_provider import (  # noqa: F401 — публичная поверхность движка
+    PlanProvider,
+    get_plan_provider,
+    register_plan_provider,
+    unregister_plan_provider,
+)
 from app.models import WinRule
 
 logger = logging.getLogger(__name__)
-
-
-class PlanProvider(Protocol):
-    """Источник дня поверх шаблона (кассеты, будущие сюжетные слои).
-
-    Провайдер обязан вернуть полный payload, но закон дня (rule/rule_entropy)
-    остаётся за движком: шаблонный рендер вызывается провайдером как основа.
-    """
-
-    async def __call__(
-        self,
-        session: AsyncSession,
-        day_index: int,
-        opens_hint: datetime | None = None,
-        entropy: str | None = None,
-    ) -> dict: ...
-
-
-_plan_provider: PlanProvider | None = None
-
-
-def register_plan_provider(provider: PlanProvider) -> None:
-    """Регистрирует источник дня. Контракт явный: без monkeypatch атрибутов."""
-    global _plan_provider
-    _plan_provider = provider
-
-
-def unregister_plan_provider(provider: PlanProvider | None = None) -> None:
-    """Снимает провайдер; с аргументом — только если зарегистрирован он же."""
-    global _plan_provider
-    if provider is None or _plan_provider is provider:
-        _plan_provider = None
-
-
-def get_plan_provider() -> PlanProvider | None:
-    return _plan_provider
 
 # Формат payload дня. v5: инлайн-день — глава, дилемма и карты рендерятся
 # сразу целиком (dilemma обязателен: структура поста одна). После удаления
@@ -88,14 +57,20 @@ async def plan_and_render(
 
     Провайдер ищется в момент вызова, поэтому `lifecycle` может импортировать
     эту функцию по значению — регистрация кассет всё равно видна.
+
+    Шаблонный день собирается ДО вызова провайдера и передаётся ему базой:
+    сюжетный слой дополняет готовый payload (глава, три пути), а не строит
+    шаблон сам. Так сюжетный слой не знает про шаблонный рендер — иначе он
+    тянул бы движок и получалась бы петля story -> rounds -> ops -> story.
     """
-    provider = _plan_provider
-    if provider is None:
-        return await render_template_day(
-            session, day_index, opens_hint=opens_hint, entropy=entropy
-        )
-    return await provider(
+    base = await render_template_day(
         session, day_index, opens_hint=opens_hint, entropy=entropy
+    )
+    provider = get_plan_provider()
+    if provider is None:
+        return base
+    return await provider(
+        session, day_index, base, opens_hint=opens_hint, entropy=entropy
     )
 
 

@@ -18,6 +18,18 @@ from app.story.bay import install_bay, set_next_cassette, uninstall_bay
 from app.story.schema import validate_payload
 
 
+async def _plan_day(session, day_index: int, entropy: str | None = None) -> dict:
+    """День кассеты через провайдера — как это делает движок.
+
+    Провайдер получает готовую базу (шаблонный день) от движка и дополняет
+    её сюжетом: сюжетный слой не строит шаблон сам.
+    """
+    from app.rounds.rendering import render_template_day
+
+    base = await render_template_day(session, day_index, entropy=entropy)
+    return await bay._plan_and_render(session, day_index, base, entropy=entropy)
+
+
 def _day(index: int, chapter: str | None = None) -> dict:
     chapter = chapter or f"Глава {index}"
     return {
@@ -258,7 +270,7 @@ async def _plan(monkeypatch, session, tmp_path, winners: dict[int, int]):
     await set_next_cassette(session, "may-fork.json")
     assert install_bay(tmp_path) is True
     try:
-        return await bay._plan_and_render(session, 7, entropy="200:feed")
+        return await _plan_day(session, 7, entropy="200:feed")
     finally:
         uninstall_bay()
 

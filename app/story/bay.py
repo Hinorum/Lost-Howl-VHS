@@ -1,12 +1,18 @@
 """Проигрыватель кассет (VCR).
 
 Модуль-обработчик между движком и библиотекой кассет. install_bay()
-регистрирует провайдера дня в app.rounds.rendering (register_plan_provider):
+регистрирует провайдера дня в app.core.day_provider (register_plan_provider):
 сперва спрашивает активную кассету (месяц кассеты == текущему календарному
 месяцу), есть день — подставляет его главу и три пути поверх честного payload
 движка (закон дня rule/rule_entropy неизменно считает движок из энтропии TON)
-и возвращает результат; нет — вызывает шаблонный рендер, движок живёт
+и возвращает результат; нет — возвращает базу как есть, движок живёт
 шаблоном.
+
+Слой НЕ знает про движок: реестр провайдера, якорь забега и базовый
+шаблонный день приходят из app.core и от самого движка (провайдеру
+передаётся готовая база). Раньше сюжетный слой тянул app.rounds.rendering
+(реестр провайдера) и app.rounds.anchor (якорь забега) — вместе с новой
+зависимостью ops -> story это давало петлю story -> rounds -> ops -> story.
 
 Контракт явный: rendering.plan_and_render ищет провайдера в момент вызова,
 поэтому lifecycle импортирует функцию по значению без monkeypatch-патчей.
@@ -207,7 +213,7 @@ async def _anchor_info(session, day_index: int) -> tuple[date, int]:
     Без якоря (совсем свежий запуск) — сегодня: тогда день 1 и есть
     сегодняшний день.
     """
-    from app.rounds.anchor import get_run_anchor
+    from app.core.anchor import get_run_anchor
 
     try:
         anchor = await get_run_anchor(session)
@@ -309,7 +315,7 @@ async def day_diary(session, round_row) -> str:
         item_day = getattr(round_row, "day_index", None)
         if opens is None or not item_day:
             return ""
-        from app.rounds.anchor import get_run_anchor
+        from app.core.anchor import get_run_anchor
 
         day = opens.date() if getattr(opens, "tzinfo", None) else opens.replace(tzinfo=UTC).date()
         selected = await get_next_cassette(session)
@@ -368,7 +374,7 @@ async def today_road(
     Читает только честные прошлые решения движка (закрытые раунды по
     номеру дня); сбоя нет — main. Дата по умолчанию — сегодня.
     """
-    from app.rounds.anchor import get_run_anchor
+    from app.core.anchor import get_run_anchor
 
     today = today or datetime.now(UTC).date()
     anchor = await get_run_anchor(session)
@@ -432,20 +438,20 @@ async def clear_edit_intent(session) -> None:
 
 
 async def _plan_and_render(
-    session, day_index: int, opens_hint=None, entropy: str | None = None
+    session, day_index: int, base: dict, opens_hint=None, entropy: str | None = None
 ) -> dict:
-    """Обёртка-патч: день кассеты поверх честного payload движка.
+    """День кассеты поверх честного payload движка.
 
     Закон дня (rule/rule_entropy) приходит от оригинала — кассета его не
     трогает. Подставляются только глава и три пути. Перемотки (switch)
     кассеты включаются победителем движка за день до развилки; сбой расчёта
     дороги не роняет кадр — играем главную дорогу (fail-open).
-    """
-    from app.rounds.rendering import render_template_day
 
-    payload = await render_template_day(
-        session, day_index, opens_hint=opens_hint, entropy=entropy
-    )
+    base — шаблонный день, собранный движком: сюжетный слой его дополняет,
+    а не строит шаблон сам (иначе он тянул бы движок — и получалась бы
+    петля story -> rounds -> ops -> story).
+    """
+    payload = base
     try:
         selected = await get_next_cassette(session)
     except Exception:
@@ -510,10 +516,10 @@ def install_bay(directory: Path | None = None) -> bool:
             "Кассетная библиотека %s не найдена — движок без сюжета", library_dir
         )
         return False
-    from app.rounds import rendering as rendering_mod
+    from app.core.day_provider import register_plan_provider
 
     _library_dir = library_dir
-    rendering_mod.register_plan_provider(_plan_and_render)
+    register_plan_provider(_plan_and_render)
     _patched = True
     found = _read_library(directory)
     if found:
@@ -533,8 +539,8 @@ def uninstall_bay() -> None:
     global _patched
     if not _patched:
         return
-    from app.rounds import rendering as rendering_mod
+    from app.core.day_provider import unregister_plan_provider
 
-    rendering_mod.unregister_plan_provider(_plan_and_render)
+    unregister_plan_provider(_plan_and_render)
     _patched = False
     logger.info("Проигрыватель кассет выключен — движок играет шаблон")

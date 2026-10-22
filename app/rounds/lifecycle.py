@@ -168,7 +168,7 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
     await session.execute(update(Player).values(score=0, correct_picks=0))
     # Новый забег: якорь стартует сегодня — месяц и день месяца
     # лежат в watcher_state RUN_START_KEY (совместимо с leaderboard).
-    from app.rounds.anchor import default_anchor
+    from app.core.anchor import default_anchor
 
     fresh_anchor = default_anchor(_now())
     payload = json.dumps(fresh_anchor, ensure_ascii=False)

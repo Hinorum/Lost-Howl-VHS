@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, settings
+from app.core.anchor import default_anchor
 from app.core.registry import RUN_START_KEY, WEEK_CLAIM_WINDOW_KEY
 from app.db import SessionLocal
 from app.leaderboard import (
@@ -40,7 +41,6 @@ from app.models import (
     WeeklyPot,
     WinRule,
 )
-from app.rounds.anchor import default_anchor
 from app.ton_utils import to_nano
 from app.weeks import iso_week_key, parse_prize_pcts, previous_week_key, week_bounds
 

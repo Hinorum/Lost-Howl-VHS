@@ -971,8 +971,8 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         # дать шанс, а копилка не должна висеть вечно.
         relaxed = False
         try:
+            from app.core.anchor import parse_anchor
             from app.core.registry import RUN_START_KEY
-            from app.rounds.anchor import parse_anchor
 
             anchor_row = await session.get(WatcherState, RUN_START_KEY)
             anchor = parse_anchor(anchor_row.value if anchor_row is not None else None)

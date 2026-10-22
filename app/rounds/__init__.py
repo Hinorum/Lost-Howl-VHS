@@ -11,7 +11,8 @@
 """
 from __future__ import annotations
 
-from .anchor import default_anchor, get_run_anchor, parse_anchor
+from app.core.anchor import default_anchor, get_run_anchor, parse_anchor
+
 from .lifecycle import (
     claim_announcement,
     close_voting,
