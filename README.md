@@ -297,7 +297,7 @@ python -m app.main
 ```powershell
 python -m pytest -q                              # тесты без сети и Telegram
 python -m ruff check .                           # линтер
-python -m mypy app/ton_pay app/ton_watch app/rounds  # типы (постепенный охват)
+python -m mypy                                   # типы (весь пакет app/)
 python -m scripts.cassette_tool lint <файл.json> # кассета перед коммитом (по одному файлу)
 lint-imports                                     # контракты импортной архитектуры
 ```
@@ -310,33 +310,17 @@ lint-imports                                     # контракты импор
 ### Покрытие тестами
 
 CI enforced `--cov-fail-under=88` по всему пакету `app/` (джоба `test`). Факт
-на последнем замере — **92 %**: 1577 passed, 11 skipped, полный прогон ≈3 минуты
+на последнем замере — **92 %**: 1821 passed, 14 skipped, полный прогон ≈4.5 минуты
 (`python -m pytest -q --cov=app --cov-report=term`). Покрытие — это floor, не цель:
 качественные тесты (инварианты экономики, property-тесты, конкурентные сценарии)
 важнее числа; конкретные сценарии описаны в `docs/architecture.md`, раздел
 «Главные инварианты».
 
-По модулям пакета `ton_pay`:
-
-| Подмодуль          | Покрытие |
-|--------------------|----------|
-| `state.py`         | 100 %    |
-| `__init__.py` (фасад) | 100 % |
-| `dispatch/memo.py` | 100 %    |
-| `dispatch/confirm.py` | 100 % |
-| `dispatch/send.py` | 98 %     |
-| `dispatch/queue.py` | 94 %    |
-| `dispatch/alerts.py` | 89 %   |
-| `dispatch/__init__.py` (цикл) | 92 % |
-| `http_channel.py`  | 90 %     |
-| `reconcile.py`     | 93 %     |
-| `treasury.py`      | 89 %     |
-| `wallet.py`        | 85 %     |
-
-`wallet.py` — самое низкое покрытие: часть функций вызывается админ-хендлерами
-под `ADMIN_IDS` и e2e-тестом на тестнете, в SQLite-прогоне они не исполняются.
-Это известное узкое место; поднять его можно через `test_admin_panel.py`-фикстуры,
-если потребуется.
+По модулям смотреть в выводе джобы `test` (шаг Tests): таблица покрытия в
+README устаревала бы после каждого коммита и молча расходилась с реальностью
+(так и случилось: в ней стояли цифры полуторамесячной давности). Сверить
+своё: `python -m pytest -q --cov=app --cov-report=term-missing` — строки с
+покрытием ниже 90 % и есть узкие места.
 
 ### Сквозной прогон на тестнете
 
