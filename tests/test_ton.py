@@ -1069,8 +1069,10 @@ async def test_auto_grant_by_amount_when_memo_missing(
 
     from sqlalchemy import select
 
+    from app.core.processed import KIND_REVOTE, transfer_claim_kind
     from app.db import SessionLocal
-    from app.models import RevoteGrant
+    from app.models import ProcessedTransfer, RevoteGrant
+    from app.stakes import current_network
     from app.ton_watch import Transfer, process_transfer
     from app.voting import cast_vote
 
@@ -1097,6 +1099,13 @@ async def test_auto_grant_by_amount_when_memo_missing(
             )
             assert len(grants) == 1 and grants[0].status == "granted"
             assert grants[0].round_id == round_row.id
+            # Плата за смену пути — такая же обработка перевода, как ставка
+            # или возврат: журнал должен знать её хеш, иначе инвариант
+            # «один перевод — одна обработка» остаётся дырявым.
+            assert (
+                await transfer_claim_kind(db, tx_hash, current_network())
+                == KIND_REVOTE
+            )
             refunds = (
                 (await db.execute(Payout.__table__.select().where(Payout.tx_hash == tx_hash)))
                 .all()
@@ -1105,6 +1114,11 @@ async def test_auto_grant_by_amount_when_memo_missing(
         finally:
             # Журнал входящих ссылается на раунд и игрока — сначала он,
             # иначе Postgres не отдаст удаление родителя (SQLite молчит).
+            await db.execute(
+                ProcessedTransfer.__table__.delete().where(
+                    ProcessedTransfer.tx_hash == tx_hash
+                )
+            )
             await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
             await db.execute(Income.__table__.delete().where(Income.round_id == round_row.id))
             await db.execute(RevoteGrant.__table__.delete().where(RevoteGrant.unit_ref == tx_hash))

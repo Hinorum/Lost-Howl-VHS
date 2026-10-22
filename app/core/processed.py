@@ -28,9 +28,11 @@ from __future__ import annotations
 from sqlalchemy import text
 
 # Виды обработки. Значение кладётся в колонку kind и читается обратно, чтобы
-# отличать «перевод уже возвращён» от «перевод уже учтён как ставка».
+# отличать «перевод уже возвращён» от «перевод уже учтён как ставка» или как
+# плата за смену пути.
 KIND_STAKE = "stake"
 KIND_REFUND = "refund"
+KIND_REVOTE = "revote"
 
 
 async def claim_transfer(

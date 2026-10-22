@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 
 from app.config import settings
+from app.core.processed import KIND_REVOTE, claim_transfer
 from app.db import SessionLocal
 from app.models import Income, Player, RevoteGrant, Round, RoundStatus, Stake
 from app.stakes import current_network
@@ -77,6 +78,16 @@ async def _grant_revote(session, transfer: Transfer, player: Player, round_row: 
         select(RevoteGrant.id).where(RevoteGrant.unit_ref == transfer.tx_hash)
     )
     if duplicate.scalar_one_or_none() is not None:
+        return "duplicate_tx"
+    # Метка в общем журнале — в той же транзакции, что грант и доход. Проверка
+    # выше неатомарна, а журнал закрывает гонку: один хеш не даст двух грантов.
+    if not await claim_transfer(
+        session,
+        transfer.tx_hash,
+        current_network(),
+        KIND_REVOTE,
+        transfer.value_nanotons,
+    ):
         return "duplicate_tx"
     session.add(
         RevoteGrant(
