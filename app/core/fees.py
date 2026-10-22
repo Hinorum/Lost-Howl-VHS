@@ -87,20 +87,25 @@ async def realized_fee_nano(session, limit: int = REALIZED_FEE_SAMPLE) -> int | 
     (app.stakes), из возвратов и из проверки баланса диспетчера. Завышение
     здесь — не безопасная сторона: у казны остаётся разница, а игроки
     недополучают (в пределе весь пул уходит в копилку недели).
+
+    Смотрим только текущий адрес казны: после ротации строки прежнего
+    адреса остаются в зеркале (чистка трёт лишь текущий), но их газ уже
+    не про этот контур и не должен размывать среднее.
     """
     network = settings.active_network
+    query = select(
+        TreasuryMove.balance_delta_nanotons,
+        TreasuryMove.value_nanotons,
+        TreasuryMove.out_msgs_count,
+    ).where(
+        TreasuryMove.network == network,
+        TreasuryMove.direction == "out",
+    )
+    treasury_address = settings.active_treasury_address
+    if treasury_address:
+        query = query.where(TreasuryMove.address == treasury_address)
     result = await session.execute(
-        select(
-            TreasuryMove.balance_delta_nanotons,
-            TreasuryMove.value_nanotons,
-            TreasuryMove.out_msgs_count,
-        )
-        .where(
-            TreasuryMove.network == network,
-            TreasuryMove.direction == "out",
-        )
-        .order_by(TreasuryMove.id.desc())
-        .limit(limit)
+        query.order_by(TreasuryMove.id.desc()).limit(limit)
     )
     costs: list[int] = []
     for delta, value, count in result.all():

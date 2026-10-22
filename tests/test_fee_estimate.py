@@ -29,8 +29,18 @@ from app.models import TreasuryMove
 from app.ton_utils import to_nano
 
 
+def _treasury_address() -> str:
+    return settings.active_treasury_address or "0:" + "ab" * 32
+
+
 async def _seed_outgoing_fee(
-    session, fee_nanotons: int, count: int = 5, out_msgs_count: int = 1
+    session,
+    fee_nanotons: int,
+    count: int = 5,
+    out_msgs_count: int = 1,
+    *,
+    address: str | None = None,
+    tag: str = "fee-seed",
 ) -> None:
     """Несколько исходящих переводов с фактической стоимостью сети.
 
@@ -39,14 +49,16 @@ async def _seed_outgoing_fee(
     (−balance_delta − value). Именно её и меряет app/core/fees.py.
 
     out_msgs_count > 1 — пачка: стоимость транзакции общая на все сообщения.
+    address/tag — чтобы один тест мог положить строки двух адресов казны.
     """
     value = 1_000_000
+    address = address or _treasury_address()
     for index in range(count):
         session.add(
             TreasuryMove(
-                tx_hash=f"fee-seed-{index}",
+                tx_hash=f"{tag}-{index}",
                 network="mainnet",
-                address="0:" + "ab" * 32,
+                address=address,
                 utime=1_700_000_000 + index,
                 lt=1_700_000_000 + index,
                 direction="out",
@@ -106,6 +118,29 @@ async def test_estimate_never_drops_below_configured(monkeypatch) -> None:
         await _wipe_moves()
 
 
+async def test_realized_fee_ignores_old_treasury_address(monkeypatch) -> None:
+    """После ротации казны газ прежнего адреса не размывает среднее.
+
+    Зеркало хранит строки и старого адреса, а чистка удаляет только текущий.
+    Без фильтра дорогой старый перевод задирал бы оценку и зря уменьшал пул.
+    """
+    monkeypatch.setattr(settings, "ton_network", "mainnet")
+    current = "0:" + "11" * 32
+    old = "0:" + "22" * 32
+    monkeypatch.setattr(settings, "treasury_address", current)
+    try:
+        async with SessionLocal() as session:
+            await _seed_outgoing_fee(
+                session, to_nano(0.01), count=1, address=old, tag="fee-seed-old"
+            )
+            await _seed_outgoing_fee(
+                session, to_nano(0.0005), count=1, address=current, tag="fee-seed-current"
+            )
+            assert await realized_fee_nano(session) == to_nano(0.0005)
+    finally:
+        await _wipe_moves()
+
+
 async def test_fee_growth_raises_alert(monkeypatch) -> None:
     """Комиссия выросла заметно — хранитель узнаёт и обновит оценку."""
     monkeypatch.setattr(settings, "ton_network", "mainnet")
@@ -161,7 +196,7 @@ async def test_realized_cost_includes_forward_fee(monkeypatch) -> None:
                 TreasuryMove(
                     tx_hash="fee-seed-forward",
                     network="mainnet",
-                    address="0:" + "ab" * 32,
+                    address=_treasury_address(),
                     utime=1_700_000_000,
                     lt=1_700_000_000,
                     direction="out",
@@ -199,7 +234,7 @@ async def test_realized_cost_of_batch_is_per_message(monkeypatch) -> None:
                 TreasuryMove(
                     tx_hash="fee-seed-batch",
                     network="mainnet",
-                    address="0:" + "ab" * 32,
+                    address=_treasury_address(),
                     utime=1_700_000_000,
                     lt=1_700_000_000,
                     direction="out",
@@ -235,7 +270,7 @@ async def test_batch_does_not_raise_false_fee_alert(monkeypatch) -> None:
                 TreasuryMove(
                     tx_hash="fee-seed-batch-alert",
                     network="mainnet",
-                    address="0:" + "ab" * 32,
+                    address=_treasury_address(),
                     utime=1_700_000_000,
                     lt=1_700_000_000,
                     direction="out",
@@ -267,7 +302,7 @@ async def test_realized_cost_ignores_failed_transfer(monkeypatch) -> None:
                 TreasuryMove(
                     tx_hash="fee-seed-failed",
                     network="mainnet",
-                    address="0:" + "ab" * 32,
+                    address=_treasury_address(),
                     utime=1_700_000_000,
                     lt=1_700_000_000,
                     direction="out",
