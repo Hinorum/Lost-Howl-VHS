@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import httpx
@@ -49,6 +50,83 @@ async def close_http_client() -> None:
         _HTTP_CLIENT = None
 
 
+async def _request_with_retry(
+    send: Callable[..., Awaitable[httpx.Response]],
+    url: str,
+    *,
+    timeout: float | None = None,
+    max_retries: int = 1,
+    retry_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    max_delay: float = 30.0,
+) -> httpx.Response:
+    """Запрос с ретраями на 429/5xx и транзиентные таймауты.
+
+    Общая реализация для GET и POST: правила ретрая, backoff и уважение
+    Retry-After должны быть одинаковыми, а раньше это были две копии, и они
+    разъехались — в POST потолка на паузу из Retry-After не было вовсе.
+
+    send — уже связанный с адресом и телом вызов клиента (get или post):
+    так правила ретрая живут в одном месте, а способ отправки — в своём.
+
+    Пауза между попытками растёт экспоненциально: retry_delay,
+    retry_delay × backoff_factor, ×backoff_factor²… — не выше max_delay.
+    Прежняя постоянная задержка долбила молчащий индексатор с одинаковой
+    частотой и не давала ему оправиться. timeout — пер-запросный таймаут
+    (None = по умолчанию клиента): для «не смеющего тормозить тик» вызовов
+    (энтропия мастерчейна).
+
+    429 (квота провайдера — реальность free tier TonAPI/Toncenter): респект
+    заголовка Retry-After (сек до абсолютной даты), иначе обычный backoff —
+    долбить в отказ после ответа «подожди» значит ловить бан ключа.
+    """
+    last_exc: Exception | None = None
+    host = _host_of(url)
+    for attempt in range(1 + max_retries):
+        try:
+            request_kwargs: dict = {}
+            if timeout is not None:
+                request_kwargs["timeout"] = timeout
+            response = await send(**request_kwargs)
+            inc("http_requests_total", {"host": host, "status": str(response.status_code)})
+            if response.status_code == 429 and attempt < max_retries:
+                inc("http_retries_total", {"host": host, "reason": "429"})
+                delay = _retry_after_delay(response)
+                if delay is None:
+                    delay = min(max_delay, retry_delay * (backoff_factor**attempt))
+                # Потолок удерживаем и для Retry-After: провайдер может
+                # попросить подождать час — минуточный цикл так не живёт.
+                delay = min(delay, max_delay)
+                logger.warning(
+                    "HTTP 429 от %s (попытка %d/%d), повтор через %.1fs",
+                    url, attempt + 1, 1 + max_retries, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code < 500 or attempt == max_retries:
+                return response
+            inc("http_retries_total", {"host": host, "reason": str(response.status_code)})
+            delay = min(max_delay, retry_delay * (backoff_factor**attempt))
+            logger.warning(
+                "HTTP %d от %s (попытка %d/%d), повтор через %.1fs",
+                response.status_code, url, attempt + 1, 1 + max_retries, delay,
+            )
+            await asyncio.sleep(delay)
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            inc("http_requests_total", {"host": host, "status": "error"})
+            inc("http_retries_total", {"host": host, "reason": "transport"})
+            last_exc = exc
+            if attempt == max_retries:
+                raise
+            delay = min(max_delay, retry_delay * (backoff_factor**attempt))
+            logger.warning(
+                "HTTP ошибка %s от %s (попытка %d/%d), повтор через %.1fs",
+                exc, url, attempt + 1, 1 + max_retries, delay,
+            )
+            await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
 async def http_get_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -63,61 +141,21 @@ async def http_get_with_retry(
 ) -> httpx.Response:
     """HTTP GET с retry для 429/5xx ошибок и транзиентных таймаутов.
 
-    Пауза между попытками растёт экспоненциально: retry_delay, retry_delay ×
-    backoff_factor, ×backoff_factor²… — не выше max_delay. Прежняя постоянная
-    задержка долбила молчащий индексатор с одинаковой частотой и не давала
-    ему оправиться. timeout — пер-запросный таймаут (None = по умолчанию
-    клиента): для «не смеющего тормозить тик» вызовов (энтропия мастерчейна).
-
-    429 (квота провайдера — реальность free tier TonAPI/Toncenter): респект
-    заголовка Retry-After (сек до абсолютной даты), иначе обычный backoff —
-    долбить в отказ после ответа «подожди» значит ловить бан ключа.
+    Общие правила ретрая — в _request_with_retry.
     """
-    last_exc = None
-    host = _host_of(url)
-    for attempt in range(1 + max_retries):
-        try:
-            request_kwargs: dict = {}
-            if timeout is not None:
-                request_kwargs["timeout"] = timeout
-            response = await client.get(url, params=params, headers=headers, **request_kwargs)
-            inc("http_requests_total", {"host": host, "status": str(response.status_code)})
-            if response.status_code == 429 and attempt < max_retries:
-                inc("http_retries_total", {"host": host, "reason": "429"})
-                delay = _retry_after_delay(response)
-                if delay is None:
-                    delay = min(max_delay, retry_delay * (backoff_factor**attempt))
-                # Потолок удерживаем и для Retry-After: провайдер может
-                # попросить подождать час — минуточный цикл так не живёт.
-                delay = min(delay, max_delay) if delay > 0 else max(0.0, delay)
-                logger.warning(
-                    "HTTP 429 от %s (попытка %d/%d), повтор через %.1fs",
-                    url, attempt + 1, 1 + max_retries, delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-            if response.status_code < 500 or attempt == max_retries:
-                return response
-            inc("http_retries_total", {"host": host, "reason": str(response.status_code)})
-            delay = min(max_delay, retry_delay * (backoff_factor**attempt))
-            logger.warning(
-                "HTTP %d от %s (попытка %d/%d), повтор через %.1fs",
-                response.status_code, url, attempt + 1, 1 + max_retries, delay,
-            )
-            await asyncio.sleep(delay)
-        except (httpx.TransportError, httpx.TimeoutException) as exc:
-            inc("http_requests_total", {"host": host, "status": "error"})
-            inc("http_retries_total", {"host": host, "reason": "transport"})
-            last_exc = exc
-            if attempt == max_retries:
-                raise
-            delay = min(max_delay, retry_delay * (backoff_factor**attempt))
-            logger.warning(
-                "HTTP ошибка %s от %s (попытка %d/%d), повтор через %.1fs",
-                exc, url, attempt + 1, 1 + max_retries, delay,
-            )
-            await asyncio.sleep(delay)
-    raise last_exc  # type: ignore[misc]
+
+    async def send(**kwargs) -> httpx.Response:
+        return await client.get(url, params=params, headers=headers, **kwargs)
+
+    return await _request_with_retry(
+        send,
+        url,
+        timeout=timeout,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        backoff_factor=backoff_factor,
+        max_delay=max_delay,
+    )
 
 
 async def http_post_with_retry(
@@ -132,57 +170,27 @@ async def http_post_with_retry(
     backoff_factor: float = 2.0,
     max_delay: float = 30.0,
 ) -> httpx.Response:
-    """HTTP POST с теми же правилами ретрая, что GET (см. http_get_with_retry).
+    """HTTP POST с теми же правилами ретрая, что GET (см. _request_with_retry).
 
     Нужен HTTP-каналу отправки (ton_pay): подписанное внешнее сообщение
     казначея вещается через Toncenter v2 jsonRPC sendBoc, когда ADNL/TCP до
     лайтсерверов закрыт окружением. Тот же backoff на 429/5xx и транзиентные
     сбои — «отправить и забыть» тут недопустимо: потерянный ответ равноценен
-    двойной отправке, if сообщение уже ушло штатно.
+    двойной отправке, если сообщение уже ушло штатно.
     """
-    last_exc = None
-    host = _host_of(url)
-    for attempt in range(1 + max_retries):
-        try:
-            request_kwargs: dict = {}
-            if timeout is not None:
-                request_kwargs["timeout"] = timeout
-            response = await client.post(url, json=json, headers=headers, **request_kwargs)
-            inc("http_requests_total", {"host": host, "status": str(response.status_code)})
-            if response.status_code == 429 and attempt < max_retries:
-                inc("http_retries_total", {"host": host, "reason": "429"})
-                delay = _retry_after_delay(response)
-                if delay is None:
-                    delay = min(max_delay, retry_delay * (backoff_factor**attempt))
-                delay = min(delay, max_delay) if delay > 0 else max(0.0, delay)
-                logger.warning(
-                    "HTTP 429 от %s (попытка %d/%d), повтор через %.1fs",
-                    url, attempt + 1, 1 + max_retries, delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-            if response.status_code < 500 or attempt == max_retries:
-                return response
-            inc("http_retries_total", {"host": host, "reason": str(response.status_code)})
-            delay = min(max_delay, retry_delay * (backoff_factor**attempt))
-            logger.warning(
-                "HTTP %d от %s (попытка %d/%d), повтор через %.1fs",
-                response.status_code, url, attempt + 1, 1 + max_retries, delay,
-            )
-            await asyncio.sleep(delay)
-        except (httpx.TransportError, httpx.TimeoutException) as exc:
-            inc("http_requests_total", {"host": host, "status": "error"})
-            inc("http_retries_total", {"host": host, "reason": "transport"})
-            last_exc = exc
-            if attempt == max_retries:
-                raise
-            delay = min(max_delay, retry_delay * (backoff_factor**attempt))
-            logger.warning(
-                "HTTP ошибка %s от %s (попытка %d/%d), повтор через %.1fs",
-                exc, url, attempt + 1, 1 + max_retries, delay,
-            )
-            await asyncio.sleep(delay)
-    raise last_exc  # type: ignore[misc]
+
+    async def send(**kwargs) -> httpx.Response:
+        return await client.post(url, json=json, headers=headers, **kwargs)
+
+    return await _request_with_retry(
+        send,
+        url,
+        timeout=timeout,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        backoff_factor=backoff_factor,
+        max_delay=max_delay,
+    )
 
 
 def _host_of(url: str) -> str:
