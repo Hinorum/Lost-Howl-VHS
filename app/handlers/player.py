@@ -59,9 +59,11 @@ def _commands_help() -> list[str]:
         lines.append("/top — копилки и лидеры")
         lines.append("/fund — Фонд Стаи: баланс и журнал")
         pool_pct = settings.prize_pool_pct
+        pool_high_pct = pool_pct + settings.referral_pct
         lines.append(
-            f"\n💰 Фонд дня: {_pct_text(pool_pct)}% — угадавшим кадр. Детали — /stake; "
-            "копилки и награды за приглашённых — /top и /invite."
+            f"\n💰 Фонд дня: {_pct_text(pool_pct)}–{_pct_text(pool_high_pct)}% — "
+            "угадавшим кадр. Детали — /stake; копилки и награды за приглашённых — "
+            "/top и /invite."
         )
     lines.append("/invite — позвать в стаю: ссылка и награда за приведённых")
     return lines

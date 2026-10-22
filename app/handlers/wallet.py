@@ -72,18 +72,21 @@ def _economy_text() -> str:
         part.strip() for part in settings.monthly_prize_weights.split(",") if part.strip()
     )
     pool_pct = settings.prize_pool_pct
+    pool_high_pct = pool_pct + settings.referral_pct
 
     return (
         "\n\nРаспределение фонда дня:\n"
-        f"• {_pct_text(pool_pct)}% — поставившим на верную сцену, пропорционально ставкам "
-        f"(газ сети ~{settings.payout_fee_gram:g} Gram за перевод — из пула заранее)\n"
+        f"• {_pct_text(pool_pct)}–{_pct_text(pool_high_pct)}% — поставившим на верную сцену, "
+        f"пропорционально ставкам (газ сети ~{settings.payout_fee_gram:g} Gram за перевод — "
+        "из пула заранее)\n"
         f"• {_pct_text(settings.pack_fund_pct)}% — Фонд Стаи: копится, разыгрывает хранитель\n"
         f"• {_pct_text(settings.weekly_pot_pct)}% — копилка недели: топ-3 ({pcts}%) — кошелёк, "
         f"{settings.weekly_min_days}+ {_days_word(settings.weekly_min_days)} голосования и "
         "ставка за неделю; ничья — вклад Gram, затем кто раньше заявил\n"
         f"• {_pct_text(settings.leaderboard_rake_pct)}% — копилка месяца: топ-3 /top ({m_pcts}%) — "
         "кошелёк и ставка в месяце\n"
-        f"• {_pct_text(settings.referral_pct)}% — пригласившим (см. /invite)\n"
+        f"• до {_pct_text(settings.referral_pct)}% — пригласившим: только со ставок приведённых; "
+        "без них доля остаётся в пуле (см. /invite)\n"
         f"• {_pct_text(settings.owner_rake_pct)}% — налог «Децентрализованному Богу»\n"
         "\nЕсли на верную сцену не поставил никто — все ставки возвращаются (минус газ сети)."
     )
@@ -157,6 +160,7 @@ def _win_calc_text() -> str:
     Примеры считаются после вычета газа — как в реальной выплате.
     """
     pool_pct = settings.prize_pool_pct
+    pool_high_pct = pool_pct + settings.referral_pct
     fee = settings.payout_fee_gram
     # Пример 1: банк 10 G, на верную сцену 6 G двумя игроками (4 G и 2 G).
     pool1 = 10 * pool_pct / 100 - fee * 2
@@ -165,8 +169,10 @@ def _win_calc_text() -> str:
     coef2 = pool2 / 0.5
     return (
         "\n\n🧮 Как считается выигрыш\n"
-        f"Пул призов = {pool_pct:g}% фонда дня минус газ сети (~{fee:g} G за перевод); "
-        "делится между поставившими на верную сцену пропорционально ставкам.\n"
+        f"Пул призов = {pool_pct:g}–{pool_high_pct:g}% фонда дня минус газ сети "
+        f"(~{fee:g} G за перевод); делится между поставившими на верную сцену "
+        "пропорционально ставкам. В примерах ниже — минимальный пул: без приведённых "
+        "ставок он выше.\n"
         f"Пример: банк 10 G, на верную сцену поставили 4 G и 2 G → пул {pool1:.2f} G "
         f"делится как {pool1 * 4 / 6:.2f} G и {pool1 * 2 / 6:.2f} G.\n"
         f"Одинокая ставка 0.5 G при банке 5 G забирает весь пул: {pool2:.2f} G (×{coef2:.1f}). "
