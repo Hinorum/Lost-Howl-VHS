@@ -21,16 +21,61 @@ from app.db import engine
 
 
 def test_pool_size_comes_from_settings() -> None:
-    """Размер пула берётся из настроек, а не зашит в код."""
-    assert settings.db_pool_size >= 1
-    assert settings.db_max_overflow >= 0
+    """Размер пула — из настроек, а если он нулевой, подбирается сам."""
+    from app.db import pool_limits
+
+    size, overflow = pool_limits()
+    assert size >= 1
+    assert overflow >= 0
     assert settings.db_pool_timeout >= 1
     if engine.dialect.name != "postgresql":
         # SQLite (StaticPool) не принимает pool-параметры — там размер пула
         # неприменим, проверка уходит в джобу test-postgres.
         pytest.skip("размер пула применяется только к Postgres")
-    assert engine.pool.size() == settings.db_pool_size
-    assert engine.pool._max_overflow == settings.db_max_overflow
+    assert engine.pool.size() == size
+    assert engine.pool._max_overflow == overflow
+
+
+def test_pool_auto_sizing_follows_pooler_type(monkeypatch) -> None:
+    """Пул подбирается по типу пулера: сессионный — узкий, остальные — широкий.
+
+    Сессионный пулер Supabase (5432): каждое клиентское соединение —
+    отдельный серверный backend. Пул 10+20 — это до 30 backend'ов на пике
+    закрытия дня, и база отдаёт «too many clients» ровно тогда, когда игра
+    busiest. Транзакционный пулер (6543) мультиплексирует — там широкий пул
+    безопасен.
+    """
+    from app.db import pool_limits
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:5432/postgres",
+    )
+    monkeypatch.setattr(settings, "db_pool_size", 0)
+    monkeypatch.setattr(settings, "db_max_overflow", 0)
+    assert pool_limits() == (5, 2)
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:6543/postgres",
+    )
+    assert pool_limits() == (10, 20)
+
+
+def test_pool_auto_sizing_yields_to_explicit_settings(monkeypatch) -> None:
+    """Явные настройки выигрывают: оператор может знать про тариф лучше нас."""
+    from app.db import pool_limits
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:5432/postgres",
+    )
+    monkeypatch.setattr(settings, "db_pool_size", 8)
+    monkeypatch.setattr(settings, "db_max_overflow", 4)
+    assert pool_limits() == (8, 4)
 
 
 def test_wide_pool_on_session_pooler_warns(monkeypatch) -> None:

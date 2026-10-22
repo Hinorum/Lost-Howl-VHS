@@ -92,8 +92,13 @@ class Settings(BaseSettings):
     # лимит Supabase («too many clients») на пике закрытия дня. Если в
     # DATABASE_URL стоит порт 5432 — уменьшите DB_POOL_SIZE/DB_MAX_OVERFLOW
     # (например 5 и 5) либо переходите на транзакционный пулер (6543).
-    db_pool_size: int = 10
-    db_max_overflow: int = 20
+    # Ноль = подобрать автоматически по типу пулера (app/db.py::pool_limits):
+    # на СЕССИОННОМ пулере Supabase (5432) каждое клиентское соединение —
+    # отдельный серверный backend, и широкий пул выбирает лимит проекта
+    # («too many clients») на пике закрытия дня. Там по умолчанию 5+2.
+    # Явные значения всегда выигрывают: оператор может знать про тариф лучше.
+    db_pool_size: int = 0
+    db_max_overflow: int = 0
     # Сколько ждать свободный слот пула, прежде чем упасть с TimeoutError.
     db_pool_timeout: int = 60
     timezone: str = "Europe/Moscow"

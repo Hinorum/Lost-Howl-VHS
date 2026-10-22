@@ -22,6 +22,32 @@ def _sqlite_connect_args() -> dict:
 
 _IS_SQLITE = settings.async_database_url.startswith("sqlite")
 
+
+def pool_limits() -> tuple[int, int]:
+    """Размер пула соединений: из настроек, иначе подбирается сам.
+
+    Ноль в настройке означает «подобрать». Подбор — по типу пулера:
+
+    - СЕССИОННЫЙ пулер Supabase (порт 5432): каждое клиентское соединение —
+      отдельный серверный backend. Широкий пул выбирает лимит проекта
+      («too many clients») ровно в тот момент, когда бот закрывает день и
+      открывает следующий, — поэтому здесь пул узкий (5+2).
+    - транзакционный пулер (6543) и обычный Postgres: соединения
+      мультиплексируются, широкий пул безопасен.
+
+    Явные значения настроек всегда выигрывают: оператор может знать про
+    тариф лучше нас.
+    """
+    size = max(0, int(settings.db_pool_size))
+    overflow = max(0, int(settings.db_max_overflow))
+    if size > 0:
+        return size, overflow
+    url = settings.async_database_url or ""
+    if "pooler.supabase.com" in url and ":5432" in url:
+        return 5, 2
+    return 10, 20
+
+
 engine = create_async_engine(
     settings.async_database_url,
     echo=False,
@@ -38,8 +64,8 @@ engine = create_async_engine(
         {}
         if _IS_SQLITE
         else {
-            "pool_size": max(1, int(settings.db_pool_size)),
-            "max_overflow": max(0, int(settings.db_max_overflow)),
+            "pool_size": pool_limits()[0],
+            "max_overflow": pool_limits()[1],
             "pool_timeout": max(1, int(settings.db_pool_timeout)),
         }
     ),

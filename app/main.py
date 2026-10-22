@@ -354,11 +354,16 @@ def _pool_size_warnings() -> list[str]:
     url = settings.database_url or ""
     if ":5432" not in url or "pooler.supabase.com" not in url:
         return []
-    total = max(1, int(settings.db_pool_size)) + max(0, int(settings.db_max_overflow))
+    # Итоговый размер — с учётом автоподбора: при нулевых настройках пул на
+    # сессионном пулере уже узкий (5+2), и предупреждать не о чем.
+    from app.db import pool_limits
+
+    size, overflow = pool_limits()
+    total = size + overflow
     if total <= 12:
         return []
     return [
-        f"Пул соединений ({settings.db_pool_size}+{settings.db_max_overflow} = {total}) "
+        f"Пул соединений ({size}+{overflow} = {total}) "
         "шире, чем безопасно для СЕССИОННОГО пулера Supabase: каждое клиентское "
         "соединение — отдельный серверный backend, и на пике закрытия дня база "
         "может отдать «too many clients». Уменьши DB_POOL_SIZE/DB_MAX_OVERFLOW "
