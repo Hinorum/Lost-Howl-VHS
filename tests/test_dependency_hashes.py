@@ -35,6 +35,16 @@ GOOD = {
         "pytoniq_core-0.1.46-py3-none-any.whl": "c" * 64,
         "pytoniq_core-0.1.46.tar.gz": "d" * 64,
     },
+    # Прямые зависимости без ключевых пакетов тоже обязаны быть в
+    # пин-файле: иначе сверка артефактов их не покрывает.
+    "aiohttp": {
+        "__version__": "3.12.15",
+        "aiohttp-3.12.15-py3-none-any.whl": "e" * 64,
+    },
+    "alembic": {
+        "__version__": "1.20.0",
+        "alembic-1.20.0-py3-none-any.whl": "f" * 64,
+    },
 }
 
 
@@ -221,6 +231,26 @@ def test_repo_pin_file_is_consistent_with_requirements() -> None:
     for name, artifacts in dh.parse_pin_file(pin).items():
         assert artifacts["__version__"] == versions.get(name), name
         assert [k for k in artifacts if k != "__version__"], f"{name}: нет артефактов"
+
+
+def test_repo_pin_file_covers_every_direct_dependency() -> None:
+    """Каждая прямая зависимость покрыта пин-файлом.
+
+    Без этого новый пакет, добавленный в requirements.txt и забытый при
+    обновлении пин-файла, уехал бы в прод без сверки артефактов с PyPI —
+    шаг отвечал бы «всё совпало» и молчал.
+    """
+    requirements = Path("requirements.txt")
+    pin = Path("requirements-critical-hashes.txt")
+    if not (requirements.is_file() and pin.is_file()):
+        pytest.skip("файлы зависимостей не найдены")
+    versions = dh.pinned_versions(requirements)
+    covered = set(dh.parse_pin_file(pin))
+    missing = sorted(set(versions) - covered)
+    assert not missing, (
+        f"прямые зависимости без пин-файла: {missing} — "
+        "python -m scripts.dependency_hashes --write"
+    )
 
 
 def test_json_fixture_shape_matches_pypi_api() -> None:

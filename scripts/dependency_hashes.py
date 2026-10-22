@@ -251,6 +251,18 @@ def verify(requirements: Path = REQUIREMENTS, pin_path: Path = PIN_FILE) -> int:
                 "его нет в пин-файле"
             )
 
+    # Каждый ПРЯМОЙ пакет из requirements.txt обязан быть в пин-файле.
+    # Раньше проверка шла по пин-файлу, и новый прямой зависимость, забытый
+    # при обновлении, уезжала бы в прод БЕЗ сверки артефактов с PyPI:
+    # шаг отвечает «всё совпало» и молчит.
+    for name in sorted(versions):
+        if name not in expected:
+            problems.append(
+                f"{name}: есть в requirements.txt, но нет в пин-файле — "
+                "прямая зависимость без сверки артефактов. Обнови пин-файл: "
+                "python -m scripts.dependency_hashes --write"
+            )
+
     for problem in problems:
         print(f"✗ {problem}", file=sys.stderr)
     if problems:
@@ -258,7 +270,6 @@ def verify(requirements: Path = REQUIREMENTS, pin_path: Path = PIN_FILE) -> int:
         return 1
     print(f"✓ критичные зависимости совпадают с пин-файлом ({', '.join(sorted(expected))})")
     return 0
-
 
 def main(argv: list[str] | None = None) -> int:
     _safe_console()
