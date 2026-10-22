@@ -127,7 +127,7 @@ WEEK_READY_KEY = "week_leaderboard_ready"
 WEEK_CLAIM_WINDOW_KEY = "claim_window:week"
 MONTH_CLAIM_WINDOW_KEY = "claim_window:month"
 
-# --- Сезон / сюжет (якорь забега — app/rounds/anchor.py, кассеты — app/story/bay.py,
+# --- Сезон / сюжет (якорь забега — app/core/anchor.py, кассеты — app/story/bay.py,
 # назначение — app/handlers/panel.py) ---
 
 RUN_START_KEY = "run_season_anchor"
