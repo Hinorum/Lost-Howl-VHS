@@ -35,17 +35,25 @@ def pool_limits() -> tuple[int, int]:
     - транзакционный пулер (6543) и обычный Postgres: соединения
       мультиплексируются, широкий пул безопасен.
 
-    Явные значения настроек всегда выигрывают: оператор может знать про
-    тариф лучше нас.
+    Явные значения настроек выигрывают — но ПО КАЖДОЙ ОСИ ОТДЕЛЬНО.
+    Раньше проверка была `if size > 0: return size, overflow`, то есть
+    DB_MAX_OVERFLOW молча выбрасывался, если оператор задал только его, а
+    DB_POOL_SIZE оставил нулевым («подобрать»). Оператор видел в конфиге
+    явное число, а в пуле оказывался автоподбор — расхождение конфигурации
+    и поведения без единого предупреждения. Теперь нулевая ось означает
+    «подбери», ненулевая — «уважай», и смешивать их можно свободно.
     """
     size = max(0, int(settings.db_pool_size))
     overflow = max(0, int(settings.db_max_overflow))
-    if size > 0:
-        return size, overflow
     url = settings.async_database_url or ""
     if "pooler.supabase.com" in url and ":5432" in url:
-        return 5, 2
-    return 10, 20
+        auto_size, auto_overflow = 5, 2
+    else:
+        auto_size, auto_overflow = 10, 20
+    return (
+        size if size > 0 else auto_size,
+        overflow if overflow > 0 else auto_overflow,
+    )
 
 
 engine = create_async_engine(

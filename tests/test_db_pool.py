@@ -78,6 +78,57 @@ def test_pool_auto_sizing_yields_to_explicit_settings(monkeypatch) -> None:
     assert pool_limits() == (8, 4)
 
 
+def test_pool_explicit_overflow_survives_auto_size(monkeypatch) -> None:
+    """Явный DB_MAX_OVERFLOW не выбрасывается, когда DB_POOL_SIZE = 0.
+
+    Регресс: условие было `if size > 0: return size, overflow`, поэтому
+    оператор, задавший ТОЛЬКО переполнение (size оставил нулевым —
+    «подбери сам»), получал автоподбор целиком. Своего числа он в пуле не
+    видел, и конфиг молча расходился с поведением. Теперь каждая ось
+    решается отдельно: нулевая — подбор, ненулевая — уважение.
+    """
+    from app.db import pool_limits
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:6543/postgres",
+    )
+    # Транзакционный пулер: автоподбор дал бы 10+20. Оператор оставил size
+    # нулевым и попросил переполнение 5 — должно выйти 10+5, а не 10+20.
+    monkeypatch.setattr(settings, "db_pool_size", 0)
+    monkeypatch.setattr(settings, "db_max_overflow", 5)
+    assert pool_limits() == (10, 5)
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:5432/postgres",
+    )
+    # Сессионный: автоподбор дал бы 5+2. Явное переполнение 5 → 5+5.
+    monkeypatch.setattr(settings, "db_pool_size", 0)
+    monkeypatch.setattr(settings, "db_max_overflow", 5)
+    assert pool_limits() == (5, 5)
+
+
+def test_pool_explicit_size_survives_auto_overflow(monkeypatch) -> None:
+    """Обратная сторона: явный DB_POOL_SIZE при нулевом переполнении.
+
+    Симметрия предыдущего теста: подставлять автоподбор в пустое место нужно
+    на обеих осях, а не только на первой.
+    """
+    from app.db import pool_limits
+
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        "postgresql://u:p@aws-0-eu-central-1.pooler.supabase.com:6543/postgres",
+    )
+    monkeypatch.setattr(settings, "db_pool_size", 3)
+    monkeypatch.setattr(settings, "db_max_overflow", 0)
+    assert pool_limits() == (3, 20)
+
+
 def test_wide_pool_on_session_pooler_warns(monkeypatch) -> None:
     """Сессионный пулер + широкий пул = предупреждение на старте."""
     from app.main import _pool_size_warnings
