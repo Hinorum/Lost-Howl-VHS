@@ -262,7 +262,7 @@ async def dispatch_pending_payouts(limit: int = 50, bot: Bot | None = None) -> i
 
 async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
     sent = 0
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     async with SessionLocal() as session:
         # Kill switch хранителя (/halt-payouts) — самая первая проверка цикла,
         # до клейма строк и до возврата зависших. Деньги не уходят, но очередь

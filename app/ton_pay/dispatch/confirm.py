@@ -56,7 +56,7 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
     # monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", ...) доходил.
     import app.ton_pay as _tp
 
-    network = "testnet" if settings.is_testnet else "mainnet"
+    network = settings.active_network
     async with _state._DISPATCH_LOCK:
         async with SessionLocal() as session:
             rows = (
