@@ -24,11 +24,15 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _PREFIX = "way_"
+
+# Время старта процесса — для метрики сборки.
+PROCESS_STARTED_AT = datetime.now(UTC).isoformat(timespec="seconds")
 
 # семейство -> ("counter"|"gauge", описание)
 _HELP: dict[str, tuple[str, str]] = {
@@ -38,6 +42,26 @@ _HELP: dict[str, tuple[str, str]] = {
         "gauge",
         "Длительность последнего запуска фоновой задачи, секунды",
     ),
+    "job_duration_seconds_sum": (
+        "counter",
+        "Сумма длительностей запусков фоновых задач, секунды",
+    ),
+    "job_duration_seconds_count": (
+        "counter",
+        "Сколько запусков фоновых задач учтено в сумме длительностей",
+    ),
+    "http_requests_total": (
+        "counter",
+        "Обращения к внешним API по хосту и коду ответа",
+    ),
+    "http_retries_total": (
+        "counter",
+        "Повторы обращений к внешним API по хосту и причине",
+    ),
+    "db_pool_checkedout": ("gauge", "Соединений БД, взятых из пула"),
+    "db_pool_size": ("gauge", "Размер пула соединений БД"),
+    "db_pool_overflow": ("gauge", "Разрешено соединений БД сверх пула"),
+    "build_info": ("gauge", "Сборка процесса: коммит и время старта"),
     "update_errors_total": ("counter", "Сбои обработки апдейтов по типу"),
     "announce_no_audience_total": (
         "counter",
@@ -121,8 +145,50 @@ async def timed(job: str):
 
 
 def _record_job(job: str, result: str, started: float) -> None:
+    elapsed = time.monotonic() - started
     inc("job_runs_total", {"job": job, "result": result})
-    set_gauge("job_duration_seconds", {"job": job}, time.monotonic() - started)
+    set_gauge("job_duration_seconds", {"job": job}, elapsed)
+    # Сумма и счётчик рядом с «длительностью последнего запуска»: по одному
+    # последнему значению нельзя посчитать среднее и увидеть «джоба стала в
+    # десять раз медленнее» — а это ровно тот сигнал, ради которого нужны
+    # метрики.
+    inc("job_duration_seconds_sum", {"job": job}, elapsed)
+    inc("job_duration_seconds_count", {"job": job})
+
+
+def _build_commit() -> str:
+    """Коммит работающей сборки (Render отдаёт RENDER_GIT_COMMIT)."""
+    import os
+
+    return (os.environ.get("RENDER_GIT_COMMIT") or "unknown").strip() or "unknown"
+
+
+def _db_pool_gauges() -> dict[str, float | None]:
+    """Состояние пула соединений БД.
+
+    Раньше его не было видно, а именно он объясняет «too many clients»:
+    занятые слоты пула и лимит — первое, что нужно знать при разборе.
+    """
+    try:
+        from app.db import engine
+
+        pool = engine.pool
+        checkedout = getattr(pool, "checkedout", None)
+        size = getattr(pool, "size", None)
+        overflow = getattr(pool, "overflow", None)
+        overflow_value = overflow() if callable(overflow) else None
+        return {
+            "db_pool_checkedout": float(checkedout()) if callable(checkedout) else None,
+            "db_pool_size": float(size()) if callable(size) else None,
+            # Отрицательное значение — «лимита нет» (так отдаёт StaticPool).
+            "db_pool_overflow": (
+                float(overflow_value)
+                if isinstance(overflow_value, (int, float)) and overflow_value >= 0
+                else None
+            ),
+        }
+    except Exception:
+        return {"db_pool_checkedout": None, "db_pool_size": None, "db_pool_overflow": None}
 
 
 def _escape(value: str) -> str:
@@ -167,6 +233,19 @@ def render(snapshot: dict[str, Any] | None = None) -> str:
             continue
         lines.extend(_family(name))
         lines.append(f"{_PREFIX}{name} {_number(gauge)}")
+    for name, gauge in sorted(_db_pool_gauges().items()):
+        if gauge is None:
+            continue
+        lines.extend(_family(name))
+        lines.append(f"{_PREFIX}{name} {_number(gauge)}")
+    # Сборка: какой коммит работает и с какого момента. Без этого по метрикам
+    # нельзя понять, что за деплой сейчас стоит.
+    lines.extend(_family("build_info"))
+    build_labels = (
+        f'commit="{_escape(_build_commit())}",'
+        f'started_at="{_escape(PROCESS_STARTED_AT)}"'
+    )
+    lines.append(f"{_PREFIX}build_info{{{build_labels}}} 1")
     return "\n".join(lines) + "\n"
 
 

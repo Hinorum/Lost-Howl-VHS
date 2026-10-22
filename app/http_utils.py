@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 
 import httpx
 
+from app.metrics import inc
+
 logger = logging.getLogger(__name__)
 
 _HTTP_CLIENT: httpx.AsyncClient | None = None
@@ -72,13 +74,16 @@ async def http_get_with_retry(
     долбить в отказ после ответа «подожди» значит ловить бан ключа.
     """
     last_exc = None
+    host = _host_of(url)
     for attempt in range(1 + max_retries):
         try:
             request_kwargs: dict = {}
             if timeout is not None:
                 request_kwargs["timeout"] = timeout
             response = await client.get(url, params=params, headers=headers, **request_kwargs)
+            inc("http_requests_total", {"host": host, "status": str(response.status_code)})
             if response.status_code == 429 and attempt < max_retries:
+                inc("http_retries_total", {"host": host, "reason": "429"})
                 delay = _retry_after_delay(response)
                 if delay is None:
                     delay = min(max_delay, retry_delay * (backoff_factor**attempt))
@@ -93,6 +98,7 @@ async def http_get_with_retry(
                 continue
             if response.status_code < 500 or attempt == max_retries:
                 return response
+            inc("http_retries_total", {"host": host, "reason": str(response.status_code)})
             delay = min(max_delay, retry_delay * (backoff_factor**attempt))
             logger.warning(
                 "HTTP %d от %s (попытка %d/%d), повтор через %.1fs",
@@ -100,6 +106,8 @@ async def http_get_with_retry(
             )
             await asyncio.sleep(delay)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
+            inc("http_requests_total", {"host": host, "status": "error"})
+            inc("http_retries_total", {"host": host, "reason": "transport"})
             last_exc = exc
             if attempt == max_retries:
                 raise
@@ -133,13 +141,16 @@ async def http_post_with_retry(
     двойной отправке, if сообщение уже ушло штатно.
     """
     last_exc = None
+    host = _host_of(url)
     for attempt in range(1 + max_retries):
         try:
             request_kwargs: dict = {}
             if timeout is not None:
                 request_kwargs["timeout"] = timeout
             response = await client.post(url, json=json, headers=headers, **request_kwargs)
+            inc("http_requests_total", {"host": host, "status": str(response.status_code)})
             if response.status_code == 429 and attempt < max_retries:
+                inc("http_retries_total", {"host": host, "reason": "429"})
                 delay = _retry_after_delay(response)
                 if delay is None:
                     delay = min(max_delay, retry_delay * (backoff_factor**attempt))
@@ -152,6 +163,7 @@ async def http_post_with_retry(
                 continue
             if response.status_code < 500 or attempt == max_retries:
                 return response
+            inc("http_retries_total", {"host": host, "reason": str(response.status_code)})
             delay = min(max_delay, retry_delay * (backoff_factor**attempt))
             logger.warning(
                 "HTTP %d от %s (попытка %d/%d), повтор через %.1fs",
@@ -159,6 +171,8 @@ async def http_post_with_retry(
             )
             await asyncio.sleep(delay)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
+            inc("http_requests_total", {"host": host, "status": "error"})
+            inc("http_retries_total", {"host": host, "reason": "transport"})
             last_exc = exc
             if attempt == max_retries:
                 raise
@@ -169,6 +183,13 @@ async def http_post_with_retry(
             )
             await asyncio.sleep(delay)
     raise last_exc  # type: ignore[misc]
+
+
+def _host_of(url: str) -> str:
+    """Хост URL для лейбла метрики (без пути и query: там может быть ключ)."""
+    if "//" in url:
+        return url.split("//", 1)[1].split("/", 1)[0].split("?", 1)[0][:64]
+    return url[:64]
 
 
 def _retry_after_delay(response: httpx.Response) -> float | None:
