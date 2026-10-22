@@ -115,6 +115,21 @@ async def test_claim_rolls_back_with_effect() -> None:
             await session.commit()
 
 
+async def test_claim_clips_hash_to_column_length(session) -> None:
+    """Слишком длинный tx_hash не должен ронять обработку на Postgres.
+
+    Колонка — String(80), а Payout.tx_hash уже обрезается. Журнал обязан
+    вести себя так же: иначе мусорный идентификатор от источника валит
+    перевод ошибкой длины вместо штатной обработки.
+    """
+    long_hash = "a" * 120
+    assert await claim_transfer(session, long_hash, "mainnet", KIND_STAKE, 1)
+    await session.commit()
+    stored = (await session.execute(select(ProcessedTransfer.tx_hash))).scalar_one()
+    assert len(stored) == 80
+    assert await transfer_claim_kind(session, long_hash, "mainnet") == KIND_STAKE
+
+
 async def test_stake_is_processed_once(ton_on: None) -> None:
     """Один перевод — одна ставка: журнал держит второй проход."""
     round_id = await _open_round()

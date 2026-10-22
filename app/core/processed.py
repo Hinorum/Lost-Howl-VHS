@@ -34,6 +34,15 @@ KIND_STAKE = "stake"
 KIND_REFUND = "refund"
 KIND_REVOTE = "revote"
 
+# Длина колонки processed_transfers.tx_hash. Хеши TON — 64 hex, но источник
+# может отдать мусорный или склеенный идентификатор; Payout.tx_hash уже
+# обрезается, и журнал должен вести себя так же, а не падать на Postgres.
+_TX_HASH_MAX = 80
+
+
+def _tx_key(tx_hash: str) -> str:
+    return (tx_hash or "")[:_TX_HASH_MAX]
+
 
 async def claim_transfer(
     session,
@@ -56,7 +65,7 @@ async def claim_transfer(
             "ON CONFLICT (tx_hash, network) DO NOTHING"
         ),
         {
-            "tx": tx_hash,
+            "tx": _tx_key(tx_hash),
             "network": network,
             "kind": kind,
             "amount": amount_nanotons,
@@ -72,6 +81,6 @@ async def transfer_claim_kind(session, tx_hash: str, network: str) -> str | None
             "SELECT kind FROM processed_transfers "
             "WHERE tx_hash = :tx AND network = :network"
         ),
-        {"tx": tx_hash, "network": network},
+        {"tx": _tx_key(tx_hash), "network": network},
     )
     return result.scalar_one_or_none()
