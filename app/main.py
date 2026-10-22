@@ -576,6 +576,20 @@ async def boot_game(bot) -> None:
     await _boot_after_lock(bot)
 
 
+async def _dispose_db_pool() -> None:
+    """Закрыть пул БД, не роняя штатную остановку из-за сбоя очистки.
+
+    Явное закрытие нужно обоим режимам: соединения умирающего процесса иначе
+    остаются на пулере сиротами до таймаута и занимают слот лимита проекта.
+    """
+    try:
+        from app.db import dispose_engine
+
+        await dispose_engine()
+    except Exception:
+        log.warning("Пул соединений БД не закрыт — освободится по таймауту", exc_info=True)
+
+
 async def run_webhook(bot, dispatcher) -> None:
     path = "/webhook"
     secret = settings.webhook_secret or None
@@ -636,12 +650,7 @@ async def run_webhook(bot, dispatcher) -> None:
     await close_http_client()
     # Пул БД закрываем явно: иначе соединения умирающего процесса остаются
     # на пулере сиротами до таймаута и занимают слот лимита проекта.
-    try:
-        from app.db import dispose_engine
-
-        await dispose_engine()
-    except Exception:
-        log.warning("Пул соединений БД не закрыт — освободится по таймауту", exc_info=True)
+    await _dispose_db_pool()
 
 
 def ensure_webhook_secret() -> None:
@@ -681,7 +690,12 @@ async def main() -> None:
         return
     await bot.delete_webhook(drop_pending_updates=False)
     await boot_game(bot)
-    await dispatcher.start_polling(bot)
+    try:
+        await dispatcher.start_polling(bot)
+    finally:
+        # Long polling тоже завершается штатно (Ctrl+C, SIGTERM): пул надо
+        # закрыть, а не оставлять соединения пулеру до таймаута.
+        await _dispose_db_pool()
 
 
 if __name__ == "__main__":

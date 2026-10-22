@@ -711,12 +711,20 @@ async def test_main_runs_polling_mode(monkeypatch) -> None:
     monkeypatch.setattr(settings, "webhook_base_url", "")
     run_webhook = AsyncMock()
     monkeypatch.setattr(main_module, "run_webhook", run_webhook)
+
+    import app.db as db_module
+
+    dispose_engine = AsyncMock()
+    monkeypatch.setattr(db_module, "dispose_engine", dispose_engine)
+
     await main_module.main()
     run_webhook.assert_not_awaited()
     # drop_pending_updates=False: накопленные за сон голоса должны дойти.
     assert bot.delete_webhook.await_args.kwargs["drop_pending_updates"] is False
     main_module.boot_game.assert_awaited_once_with(bot)
     dispatcher.start_polling.assert_awaited_once_with(bot)
+    # Long polling тоже обязан закрыть пул, а не оставить соединения пулеру.
+    dispose_engine.assert_awaited_once()
 
 
 def test_entrypoint_swallows_keyboard_interrupt(monkeypatch) -> None:
