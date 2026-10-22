@@ -9,7 +9,10 @@
 
 Что НЕ ловит (намеренно):
   - открытые адреса (0:abc..., UQ...) — они безопасны;
-  - примеры мнемоник в тестах/доках — для них есть .secrets-allowlist.
+  - примеры мнемоник в тестах/доках — для них есть .secrets-allowlist:
+    файл в корне репозитория, по одной подстроке на допустимое совпадение
+    (строки с # — комментарии). Пустой или отсутствующий файл не разрешает
+    ничего.
 
 Запуск:
     python scripts/hooks/check_secrets.py [--staged] [--all]
@@ -201,6 +204,11 @@ _BIP39_SET = frozenset(_BIP39_HEAD)
 # так же реальна, как и классические 24, — ловим все размеры.
 _BIP39_LENGTHS = frozenset({12, 15, 18, 21, 24})
 
+# Allow-list: файл в корне репозитория, по одной подстроке на допустимое
+# совпадение. Секреты сюда НЕ кладут — только то, что безобидно (тестовые
+# примеры мнемоник, публичные ключи).
+_ALLOWLIST_FILE = ".secrets-allowlist"
+
 
 # 64-символьная hex-строка, в строке сама по себе (не часть большего слова).
 _HEX_PRIVATE_KEY = re.compile(r"(?<![\w])[0-9a-fA-F]{64}(?![\w])")
@@ -256,7 +264,28 @@ def _is_base64_private_key(line: str) -> bool:
     return True
 
 
-def _scan_file(path: Path) -> list[tuple[int, str, str]]:
+def _allowlist() -> list[str]:
+    """Разрешённые совпадения из .secrets-allowlist (подстроки).
+
+    Файл обещан в тексте сканера — значит, он должен работать: ложное
+    срабатывание (например, на 24-словном примере мнемоники в тесте) иначе
+    нечем разблокировать, и разработчик обходит сканер флагом --no-verify.
+    """
+    path = Path(_ALLOWLIST_FILE)
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _scan_file(path: Path, allowlist: list[str] | None = None) -> list[tuple[int, str, str]]:
     """Вернуть список (номер_строки, фрагмент, вид_секрета) для файла."""
     # Собственный файл сканера несёт публичный словарь BIP-39 (2048 слов),
     # разложенный по строкам ровно по 12–15 слов: «подозрительных» строк тут
@@ -267,9 +296,12 @@ def _scan_file(path: Path) -> list[tuple[int, str, str]]:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except (OSError, UnicodeDecodeError):
         return []
+    allowed = allowlist or []
     out: list[tuple[int, str, str]] = []
     for n, raw in enumerate(text.splitlines(), 1):
         line = raw.rstrip("\n")
+        if allowed and any(entry in line for entry in allowed):
+            continue
         for kind in _scan_line(line):
             out.append((n, line[:120] + ("…" if len(line) > 120 else ""), kind))
         if _is_base64_private_key(line):
@@ -321,6 +353,7 @@ def main() -> int:
     args = parser.parse_args()
 
     paths = _iter_paths(args.staged)
+    allowlist = _allowlist()
     bad: list[tuple[Path, int, str, str]] = []
     for p in paths:
         if not p.exists() or p.is_dir():
@@ -331,7 +364,7 @@ def main() -> int:
                 fh.read(8192)
         except (OSError, UnicodeDecodeError):
             continue
-        findings = _scan_file(p)
+        findings = _scan_file(p, allowlist)
         for line_no, snippet, kind in findings:
             bad.append((p, line_no, snippet, kind))
 
