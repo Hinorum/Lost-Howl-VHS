@@ -30,7 +30,13 @@ from app.ton_utils import to_nano
 
 
 async def _seed_outgoing_fee(session, fee_nanotons: int, count: int = 5) -> None:
-    """Несколько исходящих переводов с фактической комиссией."""
+    """Несколько исходящих переводов с фактической стоимостью сети.
+
+    Геометрия — как в зеркале: за исходящий перевод баланс казны упал на
+    (сумма перевода + стоимость сети), поэтому стоимость выводится из дельты
+    (−balance_delta − value). Именно её и меряет app/core/fees.py.
+    """
+    value = 1_000_000
     for index in range(count):
         session.add(
             TreasuryMove(
@@ -41,9 +47,9 @@ async def _seed_outgoing_fee(session, fee_nanotons: int, count: int = 5) -> None
                 lt=1_700_000_000 + index,
                 direction="out",
                 kind="payout:prize",
-                value_nanotons=1_000_000,
+                value_nanotons=value,
                 fee_nanotons=fee_nanotons,
-                balance_delta_nanotons=-1_000_000,
+                balance_delta_nanotons=-(value + fee_nanotons),
                 counterparty="0:" + "cd" * 32,
                 comment="",
                 success=True,
@@ -124,5 +130,76 @@ async def test_small_fee_growth_stays_silent(monkeypatch) -> None:
 
         problems = await ops.check_anomalies(bot=bot)
         assert not any("комиссия сети выше оценки" in problem for problem in problems), problems
+    finally:
+        await _wipe_moves()
+
+
+async def test_realized_cost_includes_forward_fee(monkeypatch) -> None:
+    """Стоимость перевода — полная: и комиссия получателя, и forward fee.
+
+    Сеть берёт с отправителя две части, и в total_fees (fee_nanotons зеркала)
+    forward fee не входит. Если мерять только им, стоимость занижена
+    примерно на 11% (замерено по живым переводам казны 2026-10-21), и тревога
+    «сеть подорожала» срабатывает поздно, а её значение предлагает хранителю
+    заниженную константу.
+
+    Здесь forward fee сидит в дельте баланса: баланс казны упал на сумму
+    перевода ПЛЮС обе части комиссии.
+    """
+    monkeypatch.setattr(settings, "ton_network", "mainnet")
+    total_fees = 478_820  # комиссия получателя (total_fees в цепочке)
+    forward_fee = 44_446  # forward fee сообщения — платит отправитель сверху
+    value = 499_300_000
+    try:
+        async with SessionLocal() as session:
+            session.add(
+                TreasuryMove(
+                    tx_hash="fee-seed-forward",
+                    network="mainnet",
+                    address="0:" + "ab" * 32,
+                    utime=1_700_000_000,
+                    lt=1_700_000_000,
+                    direction="out",
+                    kind="payout:prize",
+                    value_nanotons=value,
+                    fee_nanotons=total_fees,
+                    balance_delta_nanotons=-(value + total_fees + forward_fee),
+                    counterparty="0:" + "cd" * 32,
+                    comment="",
+                    success=True,
+                )
+            )
+            await session.commit()
+            realized = await realized_fee_nano(session)
+            assert realized == total_fees + forward_fee
+    finally:
+        await _wipe_moves()
+
+
+async def test_realized_cost_ignores_failed_transfer(monkeypatch) -> None:
+    """Неудавшийся перевод (баланс не изменился) в выборку не попадает."""
+    monkeypatch.setattr(settings, "ton_network", "mainnet")
+    value = 1_000_000
+    try:
+        async with SessionLocal() as session:
+            session.add(
+                TreasuryMove(
+                    tx_hash="fee-seed-failed",
+                    network="mainnet",
+                    address="0:" + "ab" * 32,
+                    utime=1_700_000_000,
+                    lt=1_700_000_000,
+                    direction="out",
+                    kind="payout:prize",
+                    value_nanotons=value,
+                    fee_nanotons=0,
+                    balance_delta_nanotons=0,
+                    counterparty="0:" + "cd" * 32,
+                    comment="",
+                    success=False,
+                )
+            )
+            await session.commit()
+            assert await realized_fee_nano(session) is None
     finally:
         await _wipe_moves()
