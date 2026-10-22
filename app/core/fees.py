@@ -24,6 +24,11 @@ fee_nanotons стоимость перевода занижена примерн
 казны уменьшился на (сумма перевода + стоимость сети) → стоимость =
 −balance_delta − value. Сходится с цепочкой до нанотона.
 
+Строка зеркала — транзакция, а пачка v5r1 кладёт в неё все выплаты цикла.
+Поэтому средняя фактическая стоимость делится на число исходящих сообщений
+(out_msgs_count): иначе «оценка за перевод» была бы оценкой за всю пачку, и
+каждый получатель оплатил бы газ всех остальных.
+
 Модуль — в app/core, потому что его зовут и денежный контур
 (app.stakes), и диспетчер выплат (app.ton_pay.dispatch), а из app.core не
 тянется ничего, что тянуло бы их обратно: иначе появился бы цикл импортов.
@@ -70,19 +75,26 @@ def network_cost_nano(
 
 
 async def realized_fee_nano(session, limit: int = REALIZED_FEE_SAMPLE) -> int | None:
-    """Средняя ФАКТИЧЕСКАЯ стоимость исходящего перевода (для отправителя).
+    """Средняя ФАКТИЧЕСКАЯ стоимость ОДНОГО исходящего перевода.
 
     None — данных нет (зеркало ещё не набрало истории, или это первый
     перевод). Тогда рабочая оценка остаётся настроенной.
 
-    Считаем по ТРАНЗАКЦИЯМ, а не по сообщениям: пачка (несколько выплат в
-    одном внешнем сообщении) стоит дешевле на перевод — при включённой
-    пачке оценка получается завышенной, а это безопасная сторона (казна не
-    платит разницу из своего остатка).
+    Стоимость транзакции из зеркала делится на число её исходящих сообщений:
+    одна строка зеркала — одна транзакция, а пачка v5r1 кладёт в неё до 50
+    выплат. Без деления «стоимость перевода» была бы стоимостью всей пачки,
+    и вызывающий код вычитал бы газ за N переводов N раз: из призового пула
+    (app.stakes), из возвратов и из проверки баланса диспетчера. Завышение
+    здесь — не безопасная сторона: у казны остаётся разница, а игроки
+    недополучают (в пределе весь пул уходит в копилку недели).
     """
     network = settings.active_network
     result = await session.execute(
-        select(TreasuryMove.balance_delta_nanotons, TreasuryMove.value_nanotons)
+        select(
+            TreasuryMove.balance_delta_nanotons,
+            TreasuryMove.value_nanotons,
+            TreasuryMove.out_msgs_count,
+        )
         .where(
             TreasuryMove.network == network,
             TreasuryMove.direction == "out",
@@ -90,13 +102,15 @@ async def realized_fee_nano(session, limit: int = REALIZED_FEE_SAMPLE) -> int | 
         .order_by(TreasuryMove.id.desc())
         .limit(limit)
     )
-    costs = [
-        cost
-        for cost in (
-            network_cost_nano(delta, value) for delta, value in result.all()
-        )
-        if cost is not None
-    ]
+    costs: list[int] = []
+    for delta, value, count in result.all():
+        cost = network_cost_nano(delta, value)
+        if cost is None:
+            continue
+        # ceil, а не floor: сумма оценок по сообщениям не ниже фактической
+        # стоимости транзакции. При count=1 результат прежний, до нанотона.
+        messages = max(1, int(count or 0))
+        costs.append((cost + messages - 1) // messages)
     if not costs:
         return None
     return sum(costs) // len(costs)

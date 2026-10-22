@@ -665,6 +665,11 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                     ),
                     {"w": week, "amount": week_total_cut},
                 )
+                # Запись внутри claim — не забывчивость: claim=False значит,
+                # что копилку уже начислила транзакция-победитель, и она же
+                # записала weekly_nanotons. /refinalize сбрасывает только
+                # payouts_finalized, а это поле не обнуляет, поэтому «0 при
+                # уже зачисленной копилке» достижим лишь искусственно.
                 round_row.weekly_nanotons = week_total_cut
             # Фонд Стаи: неубывающее накопление без периода раздачи. Единственная
             # строка-накопитель; деньги остаются на кошельке казначея и забираются

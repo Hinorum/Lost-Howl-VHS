@@ -136,6 +136,35 @@ async def test_dust_shares_roll_to_weekly_pot(session: AsyncSession, monkeypatch
     assert fund.nanotons == pot * round(settings.pack_fund_pct * 100) // 10_000
 
 
+async def test_week_claim_loser_keeps_recorded_weekly_amount(
+    session: AsyncSession, monkeypatch
+) -> None:
+    """Claim=False значит «копилку уже начислили»: чужую запись не перезаписываем.
+
+    Второй претендент на claim (повторная финализация/refinalize) не должен
+    трогать round.weekly_nanotons: сумму записала транзакция-победитель. Ветку
+    нельзя построить реальным вторым вызовом (его отсекает payouts_finalized),
+    поэтому подменяем claim напрямую — проверяем именно инвариант поля.
+    """
+    session.add(Player(id=41, wallet_address="wallet-41", wallet_verified=True))
+    round_row = await make_closed_round(session, winner_card=0, day_index=44)
+    session.add_all(
+        [
+            Vote(round_id=round_row.id, player_id=41, card_position=0),
+            Stake(round_id=round_row.id, player_id=41, amount_nanotons=to_nano(1), tx_hash="a", status="confirmed"),
+        ]
+    )
+    round_row.weekly_nanotons = 12_345
+    await session.commit()
+
+    async def _claim_lost(_session, _round_id, _pot_kind) -> bool:
+        return False
+
+    monkeypatch.setattr(stakes_mod, "_claim_pot", _claim_lost)
+    await stakes_mod.finalize_day_payouts(session, round_row)
+    assert round_row.weekly_nanotons == 12_345
+
+
 async def test_gas_eaten_pool_goes_to_week_and_is_not_refund(
     session: AsyncSession, monkeypatch
 ) -> None:

@@ -67,6 +67,9 @@ class MirrorMove:
     counterparty: str
     comment: str
     success: bool
+    # Число исходящих сообщений транзакции: знаменатель для газа перевода.
+    # 1 — исторические строки и одиночные переводы; 0 — входящие без out_msgs.
+    out_msgs_count: int = 1
     provider: str = ""  # tonapi | toncenter
 
     @property
@@ -135,6 +138,16 @@ def _out_value(item: dict) -> tuple[int, str, str]:
             dest = _address_of(msg.get("destination"))
             comment = extract_comment(msg)
     return total, dest, comment
+
+
+def _out_count(item: dict) -> int:
+    """Сколько исходящих сообщений в транзакции.
+
+    Это знаменатель для стоимости одного перевода: одна строка зеркала —
+    одна транзакция, а пачка v5r1 кладёт в неё все выплаты цикла. Считаем
+    только разобранные сообщения (dict), как и _out_value/_out_forward_fees.
+    """
+    return sum(1 for msg in item.get("out_msgs") or [] if isinstance(msg, dict))
 
 
 def _out_forward_fees(item: dict) -> int:
@@ -207,6 +220,7 @@ def parse_tonapi_move(item: dict, network: str, treasury: str = "") -> MirrorMov
         counterparty=counterparty,
         comment=comment,
         success=success,
+        out_msgs_count=_out_count(item),
         provider="tonapi",
     )
 
@@ -260,6 +274,7 @@ def parse_toncenter_move(item: dict, network: str, treasury: str = "") -> Mirror
         counterparty=counterparty,
         comment=comment,
         success=True,
+        out_msgs_count=_out_count(item),
         provider="toncenter",
     )
 
@@ -605,6 +620,7 @@ async def _apply_page(
                     direction=move.direction,
                     kind=kind,
                     value_nanotons=move.value_nanotons,
+                    out_msgs_count=move.out_msgs_count,
                     fee_nanotons=move.fee_nanotons,
                     balance_delta_nanotons=move.balance_delta_nanotons,
                     counterparty=move.counterparty,
@@ -621,12 +637,14 @@ async def _apply_page(
             or row.balance_delta_nanotons != move.balance_delta_nanotons
             or row.direction != move.direction
             or row.address != address
+            or row.out_msgs_count != move.out_msgs_count
         )
         row.lt = move.lt
         row.utime = move.utime
         row.address = address
         row.balance_delta_nanotons = move.balance_delta_nanotons
         row.direction = move.direction
+        row.out_msgs_count = move.out_msgs_count
         row.kind = kind
         row.linked_id = linked
         row.counterparty = move.counterparty or row.counterparty

@@ -642,6 +642,14 @@ class TreasuryMove(Base):
     kind: Mapped[str] = mapped_column(String(32), default="unknown", index=True)
     # Абсолютная сумма перевода (для чтения); знак несёт balance_delta.
     value_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Сколько исходящих сообщений было в транзакции. Строка зеркала — это
+    # транзакция, а пачка v5r1 кладёт в неё до 50 выплат. Без этого числа
+    # стоимость транзакции в app/core/fees.py выдавала бы себя за стоимость
+    # одного перевода и вычитала бы газ за всю пачку на каждого получателя.
+    # 1 — исторические строки и одиночные переводы; 0 — входящие без out_msgs.
+    out_msgs_count: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1")
+    )
     # Реальная комиссия транзакции из цепочки (total_fees) — не оценка.
     fee_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     # Сальдо аккаунта от этой транзакции (со знаком): Σ по генезису = баланс.

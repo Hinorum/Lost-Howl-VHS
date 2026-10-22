@@ -102,6 +102,7 @@ def test_tonapi_parse_incoming_move() -> None:
     assert move.balance_delta_nanotons == 995_000_000
     assert move.counterparty == PLAYER
     assert move.provider == "tonapi"
+    assert move.out_msgs_count == 0
     assert move.is_money_move
 
 
@@ -111,6 +112,22 @@ def test_tonapi_parse_outgoing_with_memo() -> None:
     assert move.value_nanotons == 1_000_000_000
     assert move.balance_delta_nanotons == -(1_000_000_000 + 5_000_000)
     assert move.comment == "way:7:prize#42"
+    assert move.out_msgs_count == 1
+
+
+def test_tonapi_parse_counts_batch_out_messages() -> None:
+    """Пачка: одна транзакция — несколько исходящих, счётчик нужен для газа."""
+    item = _tonapi_item("batch-1", outgoing=True, value=300_000_000)
+    item["out_msgs"] = [
+        {"value": 100_000_000, "destination": {"address": PLAYER}, "msg_data": {}},
+        {"value": 150_000_000, "destination": {"address": PLAYER}, "msg_data": {}},
+        {"value": 50_000_000, "destination": {"address": PLAYER}, "msg_data": {}},
+    ]
+    move = _to_move(item)
+    assert move is not None
+    assert move.direction == "out"
+    assert move.out_msgs_count == 3
+    assert move.value_nanotons == 300_000_000
 
 
 def test_tonapi_parse_outgoing_without_provider_delta_counts_forward_fee() -> None:
@@ -189,6 +206,7 @@ def test_toncenter_parse_outgoing_with_fee() -> None:
     assert move is not None and move.direction == "out"
     assert move.balance_delta_nanotons == -(300_000_000 + 5_000_000)
     assert move.comment == "way:3:refund#9"
+    assert move.out_msgs_count == 1
 
 
 def test_hash_normalization_handles_base64url() -> None:
@@ -740,6 +758,32 @@ async def test_reorg_rewrites_moved_tx_in_place(ton_mirror, monkeypatch) -> None
                 select(TreasuryMove).where(TreasuryMove.tx_hash == _h64("org")))).scalar_one()
         assert after.lt == 50_500
         assert after.balance_delta_nanotons == 1_195_000_000
+    finally:
+        await _wipe_mirror()
+
+
+async def test_sync_persists_out_msgs_count(ton_mirror, monkeypatch) -> None:
+    """Число сообщений пачки переживает запись: по нему делится газ перевода."""
+    item = _tonapi_item("batch-row", outgoing=True, value=300_000_000, fee=5_000_000)
+    item["out_msgs"] = [
+        {"value": 100_000_000, "destination": {"address": PLAYER}, "msg_data": {}},
+        {"value": 150_000_000, "destination": {"address": PLAYER}, "msg_data": {}},
+        {"value": 50_000_000, "destination": {"address": PLAYER}, "msg_data": {}},
+    ]
+    ledger = [item]
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state",
+                        _fake_chain_balance_async(_fake_chain_balance(ledger)))
+    try:
+        result = await treasury_mirror.sync_treasury_mirror()
+        assert result["added"] == 1
+        async with SessionLocal() as db:
+            row = (await db.execute(
+                select(TreasuryMove).where(TreasuryMove.tx_hash == _h64("batch-row")))).scalar_one()
+        assert row.out_msgs_count == 3
+        assert row.value_nanotons == 300_000_000
     finally:
         await _wipe_mirror()
 

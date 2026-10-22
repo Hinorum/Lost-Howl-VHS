@@ -29,12 +29,16 @@ from app.models import TreasuryMove
 from app.ton_utils import to_nano
 
 
-async def _seed_outgoing_fee(session, fee_nanotons: int, count: int = 5) -> None:
+async def _seed_outgoing_fee(
+    session, fee_nanotons: int, count: int = 5, out_msgs_count: int = 1
+) -> None:
     """Несколько исходящих переводов с фактической стоимостью сети.
 
     Геометрия — как в зеркале: за исходящий перевод баланс казны упал на
     (сумма перевода + стоимость сети), поэтому стоимость выводится из дельты
     (−balance_delta − value). Именно её и меряет app/core/fees.py.
+
+    out_msgs_count > 1 — пачка: стоимость транзакции общая на все сообщения.
     """
     value = 1_000_000
     for index in range(count):
@@ -48,6 +52,7 @@ async def _seed_outgoing_fee(session, fee_nanotons: int, count: int = 5) -> None
                 direction="out",
                 kind="payout:prize",
                 value_nanotons=value,
+                out_msgs_count=out_msgs_count,
                 fee_nanotons=fee_nanotons,
                 balance_delta_nanotons=-(value + fee_nanotons),
                 counterparty="0:" + "cd" * 32,
@@ -172,6 +177,82 @@ async def test_realized_cost_includes_forward_fee(monkeypatch) -> None:
             await session.commit()
             realized = await realized_fee_nano(session)
             assert realized == total_fees + forward_fee
+    finally:
+        await _wipe_moves()
+
+
+async def test_realized_cost_of_batch_is_per_message(monkeypatch) -> None:
+    """Пачка v5r1: стоимость транзакции делится на все её сообщения.
+
+    Одна строка зеркала — одна транзакция, а в пачке до 50 выплат. Если
+    делить не на out_msgs_count, «стоимость перевода» становится стоимостью
+    всей пачки, и app.stakes вычитает газ за 50 переводов 50 раз.
+    """
+    monkeypatch.setattr(settings, "ton_network", "mainnet")
+    per_message = to_nano(0.002)
+    messages = 50
+    value = 100_000_000 * messages
+    total_cost = per_message * messages
+    try:
+        async with SessionLocal() as session:
+            session.add(
+                TreasuryMove(
+                    tx_hash="fee-seed-batch",
+                    network="mainnet",
+                    address="0:" + "ab" * 32,
+                    utime=1_700_000_000,
+                    lt=1_700_000_000,
+                    direction="out",
+                    kind="payout:prize",
+                    value_nanotons=value,
+                    out_msgs_count=messages,
+                    fee_nanotons=total_cost,
+                    balance_delta_nanotons=-(value + total_cost),
+                    counterparty="0:" + "cd" * 32,
+                    comment="",
+                    success=True,
+                )
+            )
+            await session.commit()
+            assert await realized_fee_nano(session) == per_message
+            assert await fee_estimate_nano(session) == per_message
+    finally:
+        await _wipe_moves()
+
+
+async def test_batch_does_not_raise_false_fee_alert(monkeypatch) -> None:
+    """Пачка не выглядит как подорожание сети: тревога меряется за перевод."""
+    monkeypatch.setattr(settings, "ton_network", "mainnet")
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    bot = SimpleNamespace(send_message=AsyncMock())
+    per_message = int(configured_fee_nano() * (1 + (FEE_ALERT_RATIO - 1) / 2))
+    messages = 20
+    total_cost = per_message * messages
+    value = 10_000_000 * messages
+    try:
+        async with SessionLocal() as session:
+            session.add(
+                TreasuryMove(
+                    tx_hash="fee-seed-batch-alert",
+                    network="mainnet",
+                    address="0:" + "ab" * 32,
+                    utime=1_700_000_000,
+                    lt=1_700_000_000,
+                    direction="out",
+                    kind="payout:prize",
+                    value_nanotons=value,
+                    out_msgs_count=messages,
+                    fee_nanotons=total_cost,
+                    balance_delta_nanotons=-(value + total_cost),
+                    counterparty="0:" + "cd" * 32,
+                    comment="",
+                    success=True,
+                )
+            )
+            await session.commit()
+
+        problems = await ops.check_anomalies(bot=bot)
+        assert not any("комиссия сети выше оценки" in problem for problem in problems), problems
     finally:
         await _wipe_moves()
 
