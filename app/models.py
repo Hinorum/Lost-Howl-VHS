@@ -508,30 +508,6 @@ class PackFundLedger(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class Dispute(Base):
-    """Формальная жалоба игрока на итог дня, рассматриваемая хранителем.
-
-    Каркас разрешения споров без авто-эскроу: сам исход дня НЕ отменяется
-    и не переворачивается задним числом (выплаты победителям не трогаются),
-    а рассматривается как претензия — результат фиксируется резолюцией
-    (resolved/rejected). Компенсация при подтверждённой претензии — это
-    обычная выплата kind="dispute" в общей очереди выплат, сделанная вручную
-    хранителем после ревью. Так реальные деньги двигаются только по
-    выстраданному пути, а спор остаётся подконтрольным аудитом.
-    """
-
-    __tablename__ = "disputes"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    round_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    player_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    reason: Mapped[str] = mapped_column(String(500), default="")
-    status: Mapped[str] = mapped_column(String(16), default="open")  # open|resolved|rejected
-    keeper_note: Mapped[str] = mapped_column(String(300), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
 class RevoteGrant(Base):
     """Оплаченное право изменить свой выбор в дне (Stars или TON).
 

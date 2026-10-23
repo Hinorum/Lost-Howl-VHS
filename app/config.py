@@ -222,7 +222,6 @@ class Settings(BaseSettings):
     # остаётся жребий мастерчейна, как прежде. false = прежнее поведение
     # (любую ничью решает жребий); включается по указу хранителя.
     tie_break_by_votes: bool = False
-    disputes_enabled: bool = True
     owner_wallet_address: str = ""
     stake_confirm_seconds: int = 40
     # Столько раз зависшая выплата ретраится, прежде чем окончательно встать в failed.

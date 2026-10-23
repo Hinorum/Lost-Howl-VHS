@@ -20,13 +20,10 @@ from aiogram.types import Chat
 from aiogram.types import Message as AiogramMessage
 
 import app.handlers.panel as panel_mod
-from app.handlers import admin as admin_mod
 from app.handlers.admin import (
     cmd_adjust,
     cmd_advance,
     cmd_backup,
-    cmd_dispute,
-    cmd_disputes,
     cmd_finalize,
     cmd_pause,
     cmd_refinalize,
@@ -66,8 +63,6 @@ COMMAND_GUARDS = [
     (cmd_advance, "/advance"),
     (cmd_backup, "/backup"),
     (cmd_resetgame, "/resetgame"),
-    (cmd_dispute, "/dispute open 3 1 x"),  # admin-глагол open: отказ в теле, до доступа к БД
-    (cmd_disputes, "/disputes"),
     (cmd_adjust, "/adjust"),
     (cmd_finalize, "/finalize"),
     (cmd_refinalize, "/refinalize"),
@@ -138,53 +133,6 @@ async def test_admin_callbacks_reject_outsider(monkeypatch, handler, data) -> No
     args, kwargs = callback.answer.call_args
     assert ADMIN_TEXT in args[0].lower()
     assert kwargs.get("show_alert") is True
-
-
-async def test_dispute_self_filing_reachable_for_outsider(monkeypatch) -> None:
-    """Регрессия 73fde3d: публичная само-подача /dispute не должна гейтиться.
-
-    Жалобу на свой последний сыгранный день подаёт сам игрок: без
-    admin-глагола хендлер обязан дойти до disputes.open_dispute, а не
-    ответить отказом хранителя. БД-слой подменён — тест про доступность
-    пути, а не про хранение.
-    """
-    from app import disputes as dispute_mod
-
-    calls: list[tuple] = []
-
-    async def fake_open(session, round_id, player_id, reason):
-        calls.append((round_id, player_id, reason))
-        return "жалоба принята в разбор"
-
-    class _FakeResult:
-        def scalar_one_or_none(self):
-            return None
-
-    class _FakeSession:
-        async def execute(self, *args, **kwargs):
-            return _FakeResult()
-
-    class _FakeSessionCtx:
-        async def __aenter__(self):
-            return _FakeSession()
-
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(panel_mod.settings, "admin_ids", "4242")
-    monkeypatch.setattr(admin_mod, "SessionLocal", _FakeSessionCtx)
-    monkeypatch.setattr(
-        admin_mod, "upsert_player", AsyncMock(return_value=SimpleNamespace(id=OUTSIDER_ID))
-    )
-    monkeypatch.setattr(dispute_mod, "open_dispute", fake_open)
-
-    msg = make_message("/dispute ставка ушла, а день закрылся мимо")
-    await cmd_dispute(msg)
-
-    reply = msg.answer.call_args.args[0]
-    assert reply == "жалоба принята в разбор"
-    assert ADMIN_TEXT not in reply.lower()
-    assert calls == [(None, OUTSIDER_ID, "ставка ушла, а день закрылся мимо")]
 
 
 def _registered_filters(handler) -> list:

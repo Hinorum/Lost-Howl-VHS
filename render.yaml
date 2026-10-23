@@ -309,8 +309,6 @@ services:
         value: "50,30,20"
       - key: CATCHUP_WINDOW_HOURS
         value: "72"
-      - key: DISPUTES_ENABLED
-        value: "true"
       # Кассеты в базе (источник правды) с зеркалом в каталог: правка через
       # /cassette видна всем инстансам сразу. false — кассеты только с диска.
       - key: STORY_CASSETTES_DB

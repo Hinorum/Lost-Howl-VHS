@@ -213,7 +213,7 @@ def validate_config() -> list[str]:
     if not settings.admin_ids.strip():
         problems.append(
             "ADMIN_IDS не заполнены — административные команды (/advance, "
-            "/resetgame, /panel, /disputes) будут недоступны никому."
+            "/resetgame, /panel) будут недоступны никому."
         )
     rake = settings.rake_total_pct
     if rake > 100:

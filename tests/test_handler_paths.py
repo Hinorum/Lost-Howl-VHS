@@ -1,8 +1,7 @@
-"""Слепые зоны хендлеров: /finalize, /dispute, сценарии пульта, тексты кошелька.
+"""Слепые зоны хендлеров: /finalize, сценарии пульта, тексты кошелька.
 
 Раньше эти ветки не выполнялись ни одним тестом: полная диагностика /finalize,
-админ-глаголы /dispute (включая краш «resolve без id»), кнопки пульта
-(▶️ Сегодня / 💰 Кошелёк / 🏆 Копилки / 🏦 Фонд), сборщики
+кнопки пульта (▶️ Сегодня / 💰 Кошелёк / 🏆 Копилки / 🏦 Фонд), сборщики
 текстов фонда/копилок и внутренности пульта Хранителя (версия игры,
 пауза/возобновление, кассеты, двойные тапы подтверждения).
 Фейки сообщений — по образцу test_admin_guard.
@@ -13,22 +12,20 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest
-from conftest import ensure_player, ensure_round
-from sqlalchemy import delete, select
+from conftest import ensure_player
+from sqlalchemy import delete
 
 import app.handlers.panel as panel_mod
 import app.handlers.player as player_mod
 import app.ton_pay as ton_pay_mod
 from app.config import settings
 from app.db import SessionLocal
-from app.disputes import open_dispute
-from app.handlers.admin import cmd_dispute, cmd_finalize
+from app.handlers.admin import cmd_finalize
 from app.handlers.panel import _cassette_menu_text, cmd_panel, on_panel_action
 from app.handlers.player import on_menu
 from app.handlers.wallet import _fund_text, _top_text, cmd_fund
 from app.models import (
     Card,
-    Dispute,
     LeaderboardPot,
     PackFund,
     PackFundLedger,
@@ -175,133 +172,6 @@ async def test_finalize_says_nothing_when_already_finalized(monkeypatch) -> None
     await cmd_finalize(msg)
     text = "\n".join(_answers(msg))
     assert "Незавершённых дней нет" in text
-
-
-# ---------------------------------------------------------------- /dispute
-
-
-async def test_dispute_open_validates_arguments(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "admin_ids", str(ADMIN_ID))
-    await ensure_player(88001)
-
-    msg = _admin_message("/dispute open 779999")
-    await cmd_dispute(msg)
-    assert any("Формат: /dispute open" in text for text in _answers(msg))
-
-    msg = _admin_message("/dispute open abc 88001 опоздал")
-    await cmd_dispute(msg)
-    assert any("Номер дня должен быть целым числом." in text for text in _answers(msg))
-
-    msg = _admin_message("/dispute open 779999 @netakogo нет-такого")
-    await cmd_dispute(msg)
-    assert any("Игрок не найден (id или @ник)." in text for text in _answers(msg))
-
-
-async def test_dispute_open_creates_record(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "admin_ids", str(ADMIN_ID))
-    await ensure_player(88001)
-
-    msg = _admin_message("/dispute open 779999 88001 ставка не дошла")
-    await cmd_dispute(msg)
-    assert any("спор открыт и ждёт рассмотрения хранителем" in text for text in _answers(msg))
-    async with SessionLocal() as db:
-        row = (
-            await db.execute(select(Dispute).where(Dispute.player_id == 88001))
-        ).scalar_one_or_none()
-    assert row is not None and row.status == "open"
-    assert row.reason == "ставка не дошла"
-
-
-async def test_dispute_resolve_without_id_shows_format(monkeypatch) -> None:
-    """Без id раньше команда падала IndexError: guard пропускал parts[2]."""
-    monkeypatch.setattr(settings, "admin_ids", str(ADMIN_ID))
-
-    msg = _admin_message("/dispute resolve")
-    await cmd_dispute(msg)
-    assert any("Формат: /dispute resolve <id> [примечание]" in text for text in _answers(msg))
-
-    msg = _admin_message("/dispute resolve abc")
-    await cmd_dispute(msg)
-    assert any("Номер спора должен быть целым числом." in text for text in _answers(msg))
-
-    msg = _admin_message("/dispute resolve 999999")
-    await cmd_dispute(msg)
-    assert any("нет такого спора" in text for text in _answers(msg))
-
-
-async def test_dispute_resolve_and_reject_settle(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "admin_ids", str(ADMIN_ID))
-    await ensure_player(88002)
-    async with SessionLocal() as db:
-        await open_dispute(db, 779999, 88002, "первый спор")
-        dispute_id = (
-            await db.execute(select(Dispute.id).where(Dispute.player_id == 88002))
-        ).scalar_one()
-
-    msg = _admin_message(f"/dispute resolve {dispute_id} разобрано")
-    await cmd_dispute(msg)
-    assert any(f"спор #{dispute_id} resolved" in text for text in _answers(msg))
-
-    # Повторный resolve — спор уже закрыт.
-    msg = _admin_message(f"/dispute resolve {dispute_id}")
-    await cmd_dispute(msg)
-    assert any("уже закрыт" in text for text in _answers(msg))
-
-
-async def test_dispute_compensate_requires_verified_wallet(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "admin_ids", str(ADMIN_ID))
-    await ensure_player(88003)
-    async with SessionLocal() as db:
-        await open_dispute(db, 779999, 88003, "без кошелька")
-        dispute_id = (
-            await db.execute(select(Dispute.id).where(Dispute.player_id == 88003))
-        ).scalar_one()
-
-    msg = _admin_message(f"/dispute compensate {dispute_id}")
-    await cmd_dispute(msg)
-    assert any("Формат: /dispute compensate" in text for text in _answers(msg))
-
-    msg = _admin_message("/dispute compensate abc 1.5")
-    await cmd_dispute(msg)
-    assert any("Номер спора должен быть целым числом." in text for text in _answers(msg))
-
-    msg = _admin_message(f"/dispute compensate {dispute_id} 1.5")
-    await cmd_dispute(msg)
-    assert any("у игрока не привязан кошелёк" in text for text in _answers(msg))
-
-
-async def test_dispute_compensate_pays_out(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "admin_ids", str(ADMIN_ID))
-    await ensure_player(88004)
-    # Компенсация создаёт Payout с round_id=779999 — день обязан существовать.
-    await ensure_round(779999)
-    async with SessionLocal() as db:
-        player = await db.get(Player, 88004)
-        player.wallet_address = "UQ_test_wallet"
-        player.wallet_verified = True
-        await open_dispute(db, 779999, 88004, "с кошельком")
-        dispute_id = (
-            await db.execute(select(Dispute.id).where(Dispute.player_id == 88004))
-        ).scalar_one()
-        await db.commit()
-
-    # Нечисловая сумма при живом кошельке: спор остаётся открытым.
-    msg = _admin_message(f"/dispute compensate {dispute_id} abc")
-    await cmd_dispute(msg)
-    assert any("сумма должна быть числом в Gram" in text for text in _answers(msg))
-
-    msg = _admin_message(f"/dispute compensate {dispute_id} 1.5 за хвост")
-    await cmd_dispute(msg)
-    assert any(
-        f"компенсация 1.5 Gram поставлена в очередь (спор #{dispute_id})" in text
-        for text in _answers(msg)
-    )
-    async with SessionLocal() as db:
-        payout = (
-            await db.execute(select(Payout).where(Payout.player_id == 88004))
-        ).scalar_one()
-    assert payout.kind == "dispute"
-    assert payout.amount_nanotons == to_nano(1.5)
 
 
 # ---------------------------------------------------------------- пульт (меню)
