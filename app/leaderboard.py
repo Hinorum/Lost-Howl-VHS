@@ -64,7 +64,8 @@ from app.models import (
     WeeklyPot,
 )
 from app.stakes import split_equal
-from app.ton_utils import to_nano
+from app.telegram_effects import CONFETTI_EFFECT_ID
+from app.ton_utils import from_nano, to_nano
 from app.weeks import (
     human_claim_period,
     iso_week_key,
@@ -381,6 +382,35 @@ async def _claim_window_players(
     if window is None:
         return [], ""
     return window.get("players", []) or [], window.get("period", "") or ""
+
+
+async def _notify_leaderboard_winners(
+    bot: Bot | None,
+    kind: str,
+    awards: list[tuple[int, int]],
+) -> None:
+    """Личные поздравления победителям недельного или месячного лидерборда."""
+    if bot is None or not settings.player_dm or not awards:
+        return
+
+    title = "🏆 Награда за неделю" if kind == "week" else "🏆 Награда за месяц"
+    for player_id, amount_nanotons in awards:
+        text = (
+            f"{title}\n\n"
+            f"Ты в призёрах: <b>+{from_nano(amount_nanotons):g} Gram</b>. "
+            "Перевод уже в очереди."
+        )
+        try:
+            await bot.send_message(
+                player_id,
+                text,
+                parse_mode=ParseMode.HTML,
+                message_effect_id=CONFETTI_EFFECT_ID,
+            )
+        except Exception as exc:
+            logger.warning(
+                "DM победителю лидерборда %s не доставлен: %s", player_id, exc
+            )
 
 
 async def _notify_tied_players(
@@ -841,6 +871,9 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
         marker.value = prev_key
         await session.commit()
 
+    await _notify_leaderboard_winners(
+        bot, "month", [(player_id, amount) for player_id, _wallet, amount in payments]
+    )
     logger.info(
         "Копилка месяцев ≤ %s выплачена: %s нанотонов между %s%s",
         prev_key,
@@ -1046,6 +1079,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         min_payout_nano = to_nano(settings.min_payout_gram)
         network = _active_network()
         paid: list[tuple[str, str, int]] = []
+        awards: list[tuple[int, int]] = []
         for place, ((pid, correct, _gram, wallet), amount) in enumerate(zip(places, amounts, strict=False), 1):
             if amount < min_payout_nano:
                 # Дохлый перевод не создаём: комиссия сети съела бы большую
@@ -1069,6 +1103,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
                 or f"игрок {pid}"
             )
             paid.append((_MEDALS[place - 1], f"{name} — {correct} верных сцен", amount))
+            awards.append((pid, amount))
 
         # Места без достойного игрока переносятся в копилку новой недели.
         if rolled > 0:
@@ -1085,6 +1120,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         marker.value = prev_key
         await session.commit()
 
+    await _notify_leaderboard_winners(bot, "week", awards)
     logger.info(
         "Копилка недель ≤ %s выплачена: %s нанотонов → %s",
         prev_key,

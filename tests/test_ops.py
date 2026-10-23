@@ -723,11 +723,15 @@ async def test_monthly_pot_paid_to_leader(monkeypatch: pytest.MonkeyPatch) -> No
             assert (await session.execute(select(LeaderboardPot))).all() == []
             marker = await session.get(WatcherState, MARKER_KEY)
             assert marker is not None and marker.value == previous_month_key()
-            assert bot.send_message.await_count == 1
+            assert bot.send_message.await_count == 2
+            winner_call = bot.send_message.await_args_list[0]
+            assert winner_call.args[0] == ids["p1"]
+            assert "Награда за месяц" in winner_call.args[1]
+            assert winner_call.kwargs["message_effect_id"] == "5046509860389126442"
 
             # Идемпотентность: в том же месяце второй раз не платим.
             assert await settle_month_if_due(bot=bot) is False
-            assert bot.send_message.await_count == 1
+            assert bot.send_message.await_count == 2
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "leaderboard"))
             await session.execute(LeaderboardPot.__table__.delete().where(LeaderboardPot.month.in_(months)))

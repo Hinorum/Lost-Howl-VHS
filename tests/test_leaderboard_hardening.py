@@ -34,6 +34,7 @@ from app.db import SessionLocal
 from app.leaderboard import (
     _claim_times,
     _load_claim_window,
+    _notify_leaderboard_winners,
     _notify_tied_players,
     _open_claim_window,
     _prize_tied_groups,
@@ -544,6 +545,35 @@ async def test_month_boundary_tied_fourth_promoted_by_claim(monkeypatch: pytest.
 
 
 # --- Слепые ветки: утилиты, окно Claim, метки готовности, месячные края -------
+
+
+async def test_notify_leaderboard_winners_sends_confetti(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiogram.enums import ParseMode
+
+    bot = SimpleNamespace(send_message=AsyncMock())
+    await _notify_leaderboard_winners(
+        bot, "week", [(101, to_nano(5)), (102, to_nano(3))]
+    )
+    assert bot.send_message.await_count == 2
+    first = bot.send_message.await_args_list[0]
+    assert first.args[0] == 101
+    assert "Награда за неделю" in first.args[1]
+    assert "+5 Gram" in first.args[1]
+    assert first.kwargs["parse_mode"] == ParseMode.HTML
+    assert first.kwargs["message_effect_id"] == "5046509860389126442"
+
+    await _notify_leaderboard_winners(bot, "month", [(201, to_nano(0.5))])
+    month_call = bot.send_message.await_args_list[-1]
+    assert month_call.args[0] == 201
+    assert "Награда за месяц" in month_call.args[1]
+    assert "+0.5 Gram" in month_call.args[1]
+
+    disabled = SimpleNamespace(send_message=AsyncMock())
+    monkeypatch.setattr(settings, "player_dm", False)
+    await _notify_leaderboard_winners(disabled, "week", [(301, to_nano(1))])
+    disabled.send_message.assert_not_awaited()
 
 
 async def test_notify_tied_players_covers_kinds_and_failures() -> None:

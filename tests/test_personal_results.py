@@ -184,8 +184,10 @@ async def test_player_result_texts_honors_db(monkeypatch) -> None:
         stakes=[(pid_win, 500_000_000)],
         payouts=[(pid_win, "prize", 4_750_000_000)],
     )
-    texts = dict(await _player_result_texts(round_row))
+    results = await _player_result_texts(round_row)
+    texts = {player_id: text for player_id, text, _has_prize in results}
     assert pid_win in texts and pid_muted not in texts
+    assert results[0][2] is True
     body = texts[pid_win]
     assert "«Маяк»" in body
     assert "Ты угадал сцену дня!" in body
@@ -203,6 +205,26 @@ async def test_announce_player_results_delivers(monkeypatch) -> None:
     text = bot.send_message.await_args.args[1]
     assert sent_pid == pid
     assert "«Маяк»" in text
+
+
+async def test_announce_player_results_confetti_only_for_prize_winners() -> None:
+    pid_prize, pid_guessed, pid_lost = 99_106, 99_107, 99_108
+    round_row = await _seed_round(
+        105,
+        votes=[(pid_prize, 1), (pid_guessed, 1), (pid_lost, 0)],
+        stakes=[(pid_prize, 500_000_000)],
+        payouts=[(pid_prize, "prize", 4_750_000_000)],
+    )
+    bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace()))
+    delivered = await announce_player_results(bot, round_row)
+    assert delivered == 3
+    effects = {
+        call.args[0]: call.kwargs.get("message_effect_id")
+        for call in bot.send_message.await_args_list
+    }
+    assert effects[pid_prize] == "5046509860389126442"
+    assert effects[pid_guessed] is None
+    assert effects[pid_lost] is None
 
 
 async def test_announce_player_results_respects_player_dm_flag(monkeypatch) -> None:

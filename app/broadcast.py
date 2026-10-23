@@ -26,6 +26,7 @@ from app.models import Chat, Round, RoundStatus, StatusPost, WatcherState
 from app.story.schema import FIELD_LIMITS
 from app.style import day_mark
 from app.tally import format_results
+from app.telegram_effects import CONFETTI_EFFECT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -1253,11 +1254,12 @@ def _build_player_result_text(
     return "\n".join(lines)
 
 
-async def _player_result_texts(finished: Round) -> list[tuple[int, str]]:
-    """Персональные итоги для каждого проголосовавшего подписчика: (player_id, текст).
+async def _player_result_texts(finished: Round) -> list[tuple[int, str, bool]]:
+    """Персональные итоги для каждого проголосовавшего подписчика.
 
-    Только dm_subscribed: тем, кто выключил личную рассылку, личный итог не
-    лезем. Карты дня перечитываем с selectinload, чтобы названия сцен были.
+    Возвращает (player_id, текст, есть_приз). Только dm_subscribed: тем, кто
+    выключил личную рассылку, личный итог не лезем. Карты дня перечитываем с
+    selectinload, чтобы названия сцен были.
     """
     from app.models import Player, Stake, Vote
 
@@ -1305,27 +1307,35 @@ async def _player_result_texts(finished: Round) -> list[tuple[int, str]]:
         ).scalars().all():
             if payout.player_id is not None:
                 payouts.setdefault(payout.player_id, []).append(payout)
-        return [
-            (
-                player_id,
-                _build_player_result_text(
-                    loaded,
-                    cards,
-                    positions[player_id],
-                    stakes.get(player_id),
-                    payouts.get(player_id, []),
-                ),
+        results: list[tuple[int, str, bool]] = []
+        for player_id in sorted(positions):
+            player_payouts = payouts.get(player_id, [])
+            results.append(
+                (
+                    player_id,
+                    _build_player_result_text(
+                        loaded,
+                        cards,
+                        positions[player_id],
+                        stakes.get(player_id),
+                        player_payouts,
+                    ),
+                    any(
+                        payout.kind == "prize" and payout.amount_nanotons > 0
+                        for payout in player_payouts
+                    ),
+                )
             )
-            for player_id in sorted(positions)
-        ]
+        return results
 
 
 async def announce_player_results(bot: Bot | None, finished: Round) -> int:
     """Личные итоги дня каждому проголосовавшему подписчику (мой выбор → исход).
 
     Дополняет групповой пост итогов: игрок видит, за какую сцену голосовал и
-    чем она кончилась для его ставки. Своя рассылка с флуд-контролем; провал
-    одному игроку не срывает остальных. Возвращает число доставленных.
+    чем она кончилась для его ставки. Призовые победители получают сообщение
+    с эффектом конфетти. Своя рассылка с флуд-контролем; провал одному игроку
+    не срывает остальных. Возвращает число доставленных.
     """
     if bot is None or not settings.player_dm:
         return 0
@@ -1339,14 +1349,20 @@ async def announce_player_results(bot: Bot | None, finished: Round) -> int:
         return 0
     if not texts:
         return 0
-    texts_map = {player_id: text for player_id, text in texts}
+    texts_map = {player_id: text for player_id, text, _has_prize in texts}
+    prize_winners = {player_id for player_id, _text, has_prize in texts if has_prize}
     # Личные итоги: раньше здесь вообще не было обработки запрета — игрок,
     # заблокировавший бота, оставался подписчиком и получал попытки каждый
     # день. Теперь запрет обрабатывает общий помощник рассылки.
     delivered, _reasons = await _fanout(
         list(texts_map),
         lambda player_id: bot.send_message(
-            player_id, texts_map[player_id], parse_mode=ParseMode.HTML
+            player_id,
+            texts_map[player_id],
+            parse_mode=ParseMode.HTML,
+            message_effect_id=(
+                CONFETTI_EFFECT_ID if player_id in prize_winners else None
+            ),
         ),
         on_forbidden=deactivate_player,
         forbidden_reason="игрок заблокировал бота или аккаунт недоступен",

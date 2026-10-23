@@ -146,6 +146,8 @@ async def test_settle_week_pays_top3_by_places(monkeypatch: pytest.MonkeyPatch) 
     """Сильнейшие игроки получают 50%/30%; без кошелька или дней — мимо, доля переносится."""
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "weekly_min_days", 4)
+    monkeypatch.setattr("app.broadcast.whisper_to_chats", AsyncMock())
+    bot = SimpleNamespace(send_message=AsyncMock())
     base = 850_000
     pid_best, pid_second, pid_nowallet, pid_lazy = (base + i for i in range(4))
     wallets = {
@@ -186,7 +188,7 @@ async def test_settle_week_pays_top3_by_places(monkeypatch: pytest.MonkeyPatch) 
         await session.commit()
         try:
             await _set_week_ready(session, week_key)
-            assert await settle_week_if_due(bot=None) is True
+            assert await settle_week_if_due(bot=bot) is True
             rows = (
                 (
                     await session.execute(
@@ -202,6 +204,16 @@ async def test_settle_week_pays_top3_by_places(monkeypatch: pytest.MonkeyPatch) 
                 (pid_second, pot_total * 30 // 100),
             ]
             assert all(p.dest_address == wallets[p.player_id] for p in rows)
+            award_calls = [
+                call
+                for call in bot.send_message.await_args_list
+                if call.kwargs.get("message_effect_id")
+            ]
+            assert {call.args[0] for call in award_calls} == {pid_best, pid_second}
+            assert all(
+                call.kwargs["message_effect_id"] == "5046509860389126442"
+                for call in award_calls
+            )
             # Незаполненное третье место (20%) переносится в копилку текущей недели.
             current_pot = (
                 await session.execute(select(WeeklyPot).where(WeeklyPot.week != week_key))
@@ -212,7 +224,15 @@ async def test_settle_week_pays_top3_by_places(monkeypatch: pytest.MonkeyPatch) 
             marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
             assert marker is not None and marker.value == previous_week_key()
             # Идемпотентность.
-            assert await settle_week_if_due(bot=None) is False
+            assert await settle_week_if_due(bot=bot) is False
+            assert (
+                sum(
+                    1
+                    for call in bot.send_message.await_args_list
+                    if call.kwargs.get("message_effect_id")
+                )
+                == len(award_calls)
+            )
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
             await session.execute(WatcherState.__table__.delete().where(WatcherState.key == WEEKLY_MARKER_KEY))
