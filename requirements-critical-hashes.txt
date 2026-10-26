@@ -369,7 +369,7 @@ httpx==0.28.1
 #   httpx-0.28.1-py3-none-any.whl sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
 #   httpx-0.28.1.tar.gz sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc
 
-pydantic-settings==2.16.0
+pydantic-settings==2.16.1
 #   pydantic_settings-2.16.0-py3-none-any.whl sha256:7e73acf7f61936a15e5a3b6eedaea29f133357faf7272f2607ba479b049dd7f2
 #   pydantic_settings-2.16.0.tar.gz sha256:5b6c578049ede4db0e2ef3b4eaa4ad4069cfa9211f83fb38df899dfade50a614
 
