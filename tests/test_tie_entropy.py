@@ -8,7 +8,9 @@
   жребий без энтропии — ничья не зависает на сетевой ошибке.
 """
 
+from collections import Counter
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 from app.config import settings
 from app.models import Card, Player, Round, RoundStatus, Vote, WinRule
@@ -74,8 +76,8 @@ def test_pick_winner_depends_on_entropy() -> None:
     assert outcomes == {0, 1}
 
 
-def test_pick_winner_uses_last_hash_digit() -> None:
-    """Пересчёт в уме: последняя цифра root_hash по модулю претендентов."""
+def test_pick_winner_uses_full_hash() -> None:
+    """Пересчёт: весь root_hash по модулю претендентов, а не последняя цифра."""
     counts = {0: 1, 1: 1, 2: 0}
     rule = WinRule.MAJORITY
     assert pick_winner(counts, rule, "7:majority:100:f0") == 0
@@ -87,6 +89,36 @@ def test_pick_winner_uses_last_hash_digit() -> None:
     assert pick_winner(three, rule, "5:minority:9:b") == 2  # 11 % 3
     assert pick_winner(three, rule, "5:minority:9:c") == 0  # 12 % 3
     assert pick_winner(three, rule, "5:minority:9:d") == 1  # 13 % 3
+
+
+def test_pick_winner_uses_full_hash_not_just_last_digit() -> None:
+    """Одинаковый хвост хеша не должен давать одинаковый исход."""
+    counts = {0: 1, 1: 1, 2: 1}
+    rule = WinRule.MAJORITY
+    zero_tail = "0" * 64
+    value_sixteen_tail = "0" * 62 + "10"
+    assert zero_tail[-1] == value_sixteen_tail[-1] == "0"
+    assert pick_winner(counts, rule, f"7:majority:100:{zero_tail}") == 0
+    # 0x10 = 16; 16 % 3 = 1. По последней цифре было бы 0.
+    assert pick_winner(counts, rule, f"7:majority:100:{value_sixteen_tail}") == 1
+
+
+def test_pick_winner_full_hash_is_uniform_for_three_candidates() -> None:
+    """Полный хеш не даёт перекоса 6/5/5, который давала последняя цифра."""
+    counts = {0: 1, 1: 1, 2: 1}
+    rule = WinRule.MAJORITY
+    outcomes = Counter(
+        pick_winner(
+            counts,
+            rule,
+            f"7:majority:100:{sha256(str(i).encode()).hexdigest()}",
+        )
+        for i in range(3000)
+    )
+    expected = 3000 / 3
+    assert set(outcomes) == {0, 1, 2}
+    # 10% — почти 4 сигмы для 3000 бросков; перекос 6/5/5 (37,5%) не пройдёт.
+    assert max(abs(count - expected) for count in outcomes.values()) < expected * 0.10
 
 
 def test_pick_winner_hex_and_bad_hash_fall_back() -> None:
