@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import stakes as stakes_mod
 from app.config import settings
-from app.models import Income, Payout, Player, Round, RoundStatus, Stake, Vote, WinRule
+from app.models import Income, Payout, Player, Round, RoundStatus, Stake, Vote, WatcherState, WinRule
 from app.ton_utils import friendly_address, from_nano, is_valid_ton_address, normalize_address, to_nano
 from app.weeks import iso_week_key
 
@@ -1165,6 +1165,130 @@ async def test_auto_grant_returns_refund_if_no_vote(
             await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
             await db.execute(Income.__table__.delete().where(Income.round_id == round_row.id))
             await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
+            await db.delete(round_row)
+            player = await db.get(Player, pid)
+            if player is not None:
+                await db.delete(player)
+            await db.commit()
+
+
+async def test_auto_grant_no_vote_refund_dm_is_sent_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Повторный проход watcher'а по тому же переводу не повторяет DM.
+
+    Курсор с окном перекрытия перечитывает последний перевод каждый цикл.
+    Уведомление о возврате должно уйти один раз — вместе с возвратом,
+    который действительно поставлен в очередь.
+    """
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.db import SessionLocal
+    from app.ton_watch import Transfer, process_transfer
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    pid = 850_000 + int.from_bytes(os.urandom(2), "big")
+    wallet = "0:" + os.urandom(32).hex()
+    tx_hash = "autodm-" + os.urandom(8).hex()
+    bot = SimpleNamespace(send_message=AsyncMock())
+    async with SessionLocal() as db:
+        db.add(Player(id=pid, username=f"u{pid}", wallet_address=wallet))
+        round_row = _open_round(day_index=905_100)
+        db.add(round_row)
+        await db.commit()
+        try:
+            t = Transfer(
+                tx_hash, wallet, to_nano(0.2), "", int(datetime.now(UTC).timestamp())
+            )
+            assert await process_transfer(t, bot=bot) == "revote_auto_no_vote"
+            assert bot.send_message.await_count == 1
+
+            # Тот же перевод снова в окне курсора: возврат уже в очереди,
+            # второе сообщение было бы спамом.
+            assert await process_transfer(t, bot=bot) == "refund_duplicated"
+            assert bot.send_message.await_count == 1
+
+            # Еженедельная уборка снесла одноразовую метку refund:<tx>.
+            # Журнал обработанных переводов переживает её: повтор всё равно
+            # не разбирается заново и не шлёт ещё одно сообщение.
+            await db.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key == f"refund:{tx_hash}"
+                )
+            )
+            await db.commit()
+            assert await process_transfer(t, bot=bot) == "refund_duplicated"
+            assert bot.send_message.await_count == 1
+
+            payouts = (
+                await db.execute(Payout.__table__.select().where(Payout.tx_hash == tx_hash))
+            ).all()
+            assert len(payouts) == 1
+            assert payouts[0]._mapping["kind"] == "refund"
+        finally:
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
+            await db.execute(Payout.__table__.delete().where(Payout.tx_hash == tx_hash))
+            await db.delete(round_row)
+            player = await db.get(Player, pid)
+            if player is not None:
+                await db.delete(player)
+            await db.commit()
+
+
+async def test_auto_grant_no_vote_silent_when_refund_already_booked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Уже учтённый перевод не обещает возврат на каждом цикле watcher'а.
+
+    Так выглядит повторный проход после сноса одноразовой метки refund:<tx>:
+    строка Income уже есть, возврата в очереди нет — текст «перевод
+    возвращается» был бы ложью, повторяемой каждую минуту.
+    """
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.db import SessionLocal
+    from app.stakes import current_network
+    from app.ton_watch import Transfer, process_transfer
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    pid = 851_000 + int.from_bytes(os.urandom(2), "big")
+    wallet = "0:" + os.urandom(32).hex()
+    tx_hash = "autobook-" + os.urandom(8).hex()
+    bot = SimpleNamespace(send_message=AsyncMock())
+    async with SessionLocal() as db:
+        db.add(Player(id=pid, username=f"u{pid}", wallet_address=wallet))
+        round_row = _open_round(day_index=905_101)
+        db.add(round_row)
+        db.add(
+            Income(
+                kind="ton",
+                amount_nanotons=to_nano(0.2),
+                round_id=None,
+                player_id=pid,
+                network=current_network(),
+                unit_ref=tx_hash,
+                note="test:already-booked",
+            )
+        )
+        await db.commit()
+        try:
+            t = Transfer(
+                tx_hash, wallet, to_nano(0.2), "", int(datetime.now(UTC).timestamp())
+            )
+            assert await process_transfer(t, bot=bot) == "revote_auto_no_vote"
+            assert bot.send_message.await_count == 0
+            assert await process_transfer(t, bot=bot) == "revote_auto_no_vote"
+            assert bot.send_message.await_count == 0
+            payouts = (
+                await db.execute(Payout.__table__.select().where(Payout.tx_hash == tx_hash))
+            ).all()
+            assert payouts == []
+        finally:
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
             await db.delete(round_row)
             player = await db.get(Player, pid)
             if player is not None:

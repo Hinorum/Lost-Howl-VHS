@@ -23,7 +23,7 @@ from aiogram import Bot
 from sqlalchemy import select
 
 from app.config import settings
-from app.core.processed import KIND_STAKE, transfer_claim_kind
+from app.core.processed import KIND_REFUND, KIND_STAKE, transfer_claim_kind
 from app.core.registry import BEAT_KEY as BEAT_KEY
 from app.core.registry import CURSOR_KEY as CURSOR_KEY
 from app.core.registry import SCAN_BOOST_KEY as SCAN_BOOST_KEY
@@ -74,6 +74,7 @@ from app.ton_watch.ledger import (  # noqa: F401
     _record_bank_credit,
 )
 from app.ton_watch.notify import (
+    _dm_refund_queued,
     _dm_stake,
     _dm_verify_mismatch,
     _kick_dispatch_after_verify,
@@ -155,6 +156,15 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
         return "self_transfer"
     async with SessionLocal() as session:
         if await session.get(WatcherState, f"refund:{transfer.tx_hash}") is not None:
+            return "refund_duplicated"
+        # Журнал обработанных переводов переживает еженедельную уборку
+        # watcher_state (ws-cleanup сносит refund:*). Возврат, чья метка уже
+        # удалена, повторно не разбираем: иначе перевод снова проходит ветки
+        # уведомлений и обещает возврат, который давно создан.
+        if (
+            await transfer_claim_kind(session, transfer.tx_hash, current_network())
+            == KIND_REFUND
+        ):
             return "refund_duplicated"
         # Капитал казны: перевод владельца игры с мемо bank: — внешнее пополнение
         # казны. Не ставка (не создаёт «банка дня») и не возврат, идёт строкой
@@ -249,7 +259,8 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
             result = await _stash_refund(
                 session, transfer, None, ledger_result="unknown", force=True
             )
-            await _dm_verify_mismatch(bot, player, transfer)
+            if result == "refund_queued":
+                await _dm_verify_mismatch(bot, player, transfer)
             return result
         # Кошелёк привязан, но владение ещё не доказано (bv:<код> ждёт встречного
         # микро-перевода). Любой ДРУГОЙ перевод с адреса уже не может быть ни
@@ -271,13 +282,15 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
             if (transfer.comment or "").strip():
                 # Комментарий был, но код в нём не распознался (обрезан,
                 # искажён или вовсе не код) — объясняем так же, как при чужом коде.
-                await _dm_verify_mismatch(bot, player, transfer)
+                if result == "refund_queued":
+                    await _dm_verify_mismatch(bot, player, transfer)
             else:
                 # Игрок просто забыл комментарий — частый кейс новичка. Текст
                 # прямо называет причину, а не ограничивается «не подтверждён».
-                await _dm_stake(
+                await _dm_refund_queued(
                     bot,
                     player.id,
+                    result,
                     f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                     "в переводе не было комментария.\n\n"
                     "Кошелёк привязан, но ещё не подтверждён. Отправь с него казначею "
@@ -296,7 +309,7 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                 "revote_no_vote",
                 "revote_money_off",
             ):
-                await _stash_refund(
+                refund_status = await _stash_refund(
                     session,
                     transfer,
                     revote_round_id if status not in ("revote_no_vote",) else None,
@@ -304,32 +317,36 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                     ledger_player_id=player.id,
                 )
                 if status == "revote_no_vote":
-                    await _dm_stake(
+                    await _dm_refund_queued(
                         bot,
                         player.id,
+                        refund_status,
                         f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                         "за перемотку кадра платить нечего — ты ещё не сделал выбор дня. "
                         "Первая запись бесплатная: жми свой вариант, без оплаты.",
                     )
                 elif status == "revote_too_large":
-                    await _dm_stake(
+                    await _dm_refund_queued(
                         bot,
                         player.id,
+                        refund_status,
                         f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                         "сумма с rv:-мемо превышает минимум ставки — это ставка, а не перемотка кадра. "
                         "Отправь без rv:-мемо, чтобы поставить.",
                     )
                 elif status == "revote_money_off":
-                    await _dm_stake(
+                    await _dm_refund_queued(
                         bot,
                         player.id,
+                        refund_status,
                         f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                         "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
                     )
                 else:
-                    await _dm_stake(
+                    await _dm_refund_queued(
                         bot,
                         player.id,
+                        refund_status,
                         f"↩️ Оплата {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                         + ("день уже закрыт." if status == "revote_closed" else "сумма меньше нужной."),
                     )
@@ -350,17 +367,20 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                 return "revote_ok"
             if auto_status == "no_vote":
                 # День открыт, но пути ещё нет — менять нечего, а суммой это
-                # и не ставка: возвращаем сразу с объяснением.
-                await _stash_refund(
+                # и не ставка: возвращаем сразу с объяснением. Уведомление —
+                # только если возврат действительно встал в очередь: повторный
+                # проход watcher'а по тому же переводу не должен повторять DM.
+                refund_status = await _stash_refund(
                     session,
                     transfer,
                     None,
                     ledger_result="revote_auto:no_vote",
                     ledger_player_id=player.id,
                 )
-                await _dm_stake(
+                await _dm_refund_queued(
                     bot,
                     player.id,
+                    refund_status,
                     f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                     "он меньше минимума ставки, а за перемотку кадра платить нечего — "
                     "ты ещё не сделал выбор дня. Первая запись бесплатная: жми свой "
@@ -375,16 +395,17 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
             if auto_status == "revote_money_off":
                 # Бесплатный день: серверный гейт сработал, когда UI уже принял
                 # сумму за смену пути — возвращаем с объяснением.
-                await _stash_refund(
+                refund_status = await _stash_refund(
                     session,
                     transfer,
                     None,
                     ledger_result="revote_auto:money_off",
                     ledger_player_id=player.id,
                 )
-                await _dm_stake(
+                await _dm_refund_queued(
                     bot,
                     player.id,
+                    refund_status,
                     f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                     "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
                 )
@@ -410,7 +431,7 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
         )
         amount = f"{from_nano(transfer.value_nanotons):g}"
         if result in ("already_staked", "closed", "money_off"):
-            await _stash_refund(
+            refund_status = await _stash_refund(
                 session,
                 transfer,
                 round_row.id,
@@ -427,9 +448,10 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                 and transfer.value_nanotons < to_nano(settings.stake_min_ton)
             )
             if suspected_revote:
-                await _dm_stake(
+                await _dm_refund_queued(
                     bot,
                     player.id,
+                    refund_status,
                     f"↩️ Перевод {amount} Gram возвращается: эта сумма ниже минимума "
                     f"ставки ({settings.stake_min_ton:g} Gram). Если ты менял путь — "
                     "бот не распознал комментарий rv:… за переводом. Переведи снова "
@@ -437,15 +459,21 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                     "<code>rv:день</code> в комментарии. Или выбери Stars в /change — надёжнее.",
                 )
             elif result == "money_off":
-                await _dm_stake(
+                await _dm_refund_queued(
                     bot,
                     player.id,
+                    refund_status,
                     f"↩️ Перевод {amount} Gram возвращается: сегодня версия без ставок — "
                     "ставки не принимаются. Поставить можно в день со ставками.",
                 )
             else:
                 reason = "ставка на этот день уже есть" if result == "already_staked" else "день уже закрылся"
-                await _dm_stake(bot, player.id, f"↩️ Перевод {amount} Gram возвращается: {reason}.")
+                await _dm_refund_queued(
+                    bot,
+                    player.id,
+                    refund_status,
+                    f"↩️ Перевод {amount} Gram возвращается: {reason}.",
+                )
         elif result == "too_small":
             await _dm_stake(
                 bot,
@@ -467,16 +495,17 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                 session, transfer, player.id, round_row.id, f"stake:{result}"
             )
         elif result == "wallet_unverified":
-            await _stash_refund(
+            refund_status = await _stash_refund(
                 session,
                 transfer,
                 round_row.id,
                 ledger_result=f"stake:{result}",
                 ledger_player_id=player.id,
             )
-            await _dm_stake(
+            await _dm_refund_queued(
                 bot,
                 player.id,
+                refund_status,
                 f"↩️ Перевод {amount} Gram возвращается: кошелёк ещё не подтверждён — "
                 "ставки с него не принимаются.\n\n"
                 "Отправь с него микро-перевод казначею и <b>обязательно укажи "

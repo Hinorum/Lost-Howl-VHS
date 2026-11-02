@@ -26,6 +26,23 @@ async def _dm_stake(bot: Bot | None, player_id: int, text: str) -> None:
     except Exception as exc:
         logger.info("Сообщение игроку %s не доставлено: %s", player_id, exc)
 
+async def _dm_refund_queued(
+    bot: Bot | None, player_id: int, status: str, text: str
+) -> None:
+    """Личное «перевод возвращается» — только если возврат реально в очереди.
+
+    ``_stash_refund`` идемпотентен по tx_hash, но у терминальных исходов
+    (already_booked, refund_duplicated, refund_expired, refund_dust,
+    refund_capped) метки ``refund:<tx>`` нет: watcher с окном перекрытия
+    перечитывает последний перевод каждый цикл, и безусловная отправка
+    превращала один перевод в поток одинаковых сообщений. Сам возврат при
+    этом не теряется — молчит только уведомление, которое иначе обещало бы
+    деньги, никуда не отправленные.
+    """
+    if status == "refund_queued":
+        await _dm_stake(bot, player_id, text)
+
+
 async def _dm_verify_mismatch(bot: Bot | None, player: Player | None, transfer: Transfer) -> None:
     """Личное объяснение, почему микро-перевод с verify-мемо не привязал кошелёк.
 
