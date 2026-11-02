@@ -1058,18 +1058,131 @@ _KIND_LABELS = {
     "walletverify": "проверка кошелька",
     "paused": "на паузе (возврат)",
     "income": "прочий приход",
-    "unknown_in": "пыль/чужие ⚠️",
+    "unknown_in": "пыль/чужие",
     "refund": "возвраты",
     "self": "self-переводы",
     "other": "служебные",
-    "unknown_out": "вывод мимо бота ⚠️",
+    "unknown_out": "вывод мимо бота",
 }
+
+# Совпадает с app.ops.MANUAL_OUT_KIND; локальная копия — чтобы отчёт /treasury
+# не тянул весь app.ops (он сам импортирует этот модуль при сверке).
+_MANUAL_OUT_KIND = "manual_out"
 
 
 def _kind_label(kind: str) -> str:
     if kind.startswith("payout:"):
         return f"выплаты:{kind.split(':', 1)[1]}"
     return _KIND_LABELS.get(kind, kind)
+
+
+def _epoch(moment: datetime | None) -> float | None:
+    """Unix-время из timestamptz; в SQLite значения приходят наивными."""
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.timestamp()
+
+
+async def unknown_moves_balance(session, network: str, address: str) -> dict[str, int]:
+    """Сколько «непонятых» переводов ещё открыто, а сколько уже закрыто.
+
+    Трафик в отчёте валовый (сколько всего прошло мимо бота), а тревога —
+    только по остатку:
+
+    * unknown_in закрывается отправленным возвратом тому же отправителю на ту
+      же сумму. Возвраты сопоставляются один к одному и не раньше прихода:
+      иначе один возврат закрыл бы два одинаковых перевода;
+    * unknown_out закрывается ручной корректировкой manual_out, если она
+      заведена после вывода и покрывает его сумму. Такой строкой хранитель
+      сам объясняет «деньги ушли мимо бота, причина известна» (/adjust).
+    """
+    unknown_in = (
+        await session.execute(
+            select(
+                TreasuryMove.counterparty,
+                TreasuryMove.value_nanotons,
+                TreasuryMove.utime,
+            )
+            .where(
+                TreasuryMove.network == network,
+                TreasuryMove.address == address,
+                TreasuryMove.kind == "unknown_in",
+            )
+            .order_by(TreasuryMove.utime, TreasuryMove.id)
+        )
+    ).all()
+    refunds = [
+        (int(amount), dest or "", _epoch(created_at))
+        for amount, dest, created_at in (
+            await session.execute(
+                select(Payout.amount_nanotons, Payout.dest_address, Payout.created_at)
+                .where(
+                    Payout.kind == "refund",
+                    Payout.status == "sent",
+                    Payout.network == network,
+                )
+                .order_by(Payout.created_at, Payout.id)
+            )
+        ).all()
+    ]
+    refund_pool = list(refunds)
+    gross_in = 0
+    resolved_in = 0
+    for counterparty, value, utime in unknown_in:
+        amount = int(value or 0)
+        gross_in += amount
+        sender = normalize_address(counterparty or "")
+        for idx, (refund_amount, dest, created_at) in enumerate(refund_pool):
+            if refund_amount != amount or normalize_address(dest) != sender:
+                continue
+            if created_at is not None and created_at < int(utime or 0):
+                continue
+            refund_pool.pop(idx)
+            resolved_in += amount
+            break
+
+    gross_out_raw, last_out_utime = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(func.abs(TreasuryMove.balance_delta_nanotons)), 0),
+                func.max(TreasuryMove.utime),
+            ).where(
+                TreasuryMove.network == network,
+                TreasuryMove.address == address,
+                TreasuryMove.kind == "unknown_out",
+            )
+        )
+    ).one()
+    gross_out = int(gross_out_raw or 0)
+    manual_out_raw, last_adjust_at = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(Income.amount_nanotons), 0),
+                func.max(Income.created_at),
+            ).where(
+                Income.kind == _MANUAL_OUT_KIND,
+                Income.network == network,
+            )
+        )
+    ).one()
+    resolved_out = 0
+    adjusted_at = _epoch(last_adjust_at)
+    # Корректировка должна быть заведена после вывода, иначе старый /adjust
+    # «закрывал» бы любой последующий вывод мимо бота.
+    if gross_out and last_out_utime is not None and adjusted_at is not None:
+        if adjusted_at >= int(last_out_utime):
+            resolved_out = min(gross_out, int(manual_out_raw or 0))
+
+    return {
+        "gross_in": gross_in,
+        "open_in": gross_in - resolved_in,
+        "gross_out": gross_out,
+        "open_out": gross_out - resolved_out,
+        "resolved_in": resolved_in,
+        "resolved_out": resolved_out,
+    }
 
 
 async def treasury_mirror_stats(session) -> dict:
@@ -1127,6 +1240,7 @@ async def treasury_mirror_stats(session) -> dict:
             check = json.loads(check_row.value or "{}")
         except (ValueError, TypeError):
             check = {}
+    unknown = await unknown_moves_balance(session, network, address)
     return {
         "bootstrapped": bootstrapped,
         "head_lt": head_lt,
@@ -1136,6 +1250,7 @@ async def treasury_mirror_stats(session) -> dict:
         "move_count": move_count,
         "last_utime": last_utime,
         "groups": groups,
+        "unknown": unknown,
         "check": check if isinstance(check, dict) else {},
     }
 
@@ -1213,15 +1328,26 @@ async def treasury_mirror_block() -> str:
             lines.append(
                 f"  газ (реальный, из цепочки): {fees / 1e9:.4f} Gram суммарно"
             )
-        unknown = (
-            groups.get("unknown_in", {}).get("value", 0)
-            + groups.get("unknown_out", {}).get("value", 0)
-        )
-        if unknown:
+        unknown = stats.get("unknown") or {}
+        open_unknown = int(unknown.get("open_in", 0)) + int(unknown.get("open_out", 0))
+        gross_unknown = int(unknown.get("gross_in", 0)) + int(unknown.get("gross_out", 0))
+        if open_unknown:
             lines.append(
-                f"  ☑️ непонятых переводов на {unknown / 1e9:.3f} Gram — "
+                f"  ☑️ непонятых переводов на {open_unknown / 1e9:.3f} Gram — "
                 "разбери вручную (пыль/jetton/вывод мимо бота)"
             )
+        elif gross_unknown:
+            # Валовый трафик остаётся в строке «трафик» для аудита; тревоги
+            # нет, потому что каждый перевод уже закрыт возвратом или /adjust.
+            closed = []
+            resolved_in = int(unknown.get("resolved_in", 0))
+            resolved_out = int(unknown.get("resolved_out", 0))
+            if resolved_in:
+                closed.append(f"{resolved_in / 1e9:.2f} Gram возвращено")
+            if resolved_out:
+                closed.append(f"{resolved_out / 1e9:.2f} Gram списано корректировкой")
+            if closed:
+                lines.append("  ✓ непонятые переводы закрыты: " + ", ".join(closed))
     else:
         remaining_note = ""
         if stats["bottom_lt"] is not None:

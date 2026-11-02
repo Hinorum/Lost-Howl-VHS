@@ -30,7 +30,7 @@ from app.core.registry import (
     TREASURY_MIRROR_SOURCE_KEY,
 )
 from app.db import SessionLocal
-from app.models import TreasuryMove, WatcherState
+from app.models import Income, Payout, TreasuryMove, WatcherState
 from app.ton_utils import to_nano
 from app.treasury_mirror import (
     MirrorMove,
@@ -448,6 +448,79 @@ async def test_mirror_block_renders_traffic_fees_and_unknown(monkeypatch) -> Non
         assert "self" not in text.split("трафик:")[1], "self не в трафике"
     finally:
         await _wipe()
+
+
+async def test_mirror_block_closes_refunded_unknown_in(monkeypatch) -> None:
+    """Возвращённый «чужой» приход не висит тревогой: показываем закрытие."""
+    _on(monkeypatch)
+    now = int(datetime.now(UTC).timestamp())
+    sender = "0:" + "e1" * 32
+    refund_at = datetime.fromtimestamp(now + 60, UTC)
+    try:
+        async with SessionLocal() as db:
+            db.add_all([
+                WatcherState(key=TREASURY_MIRROR_BOOTSTRAP_KEY, value="1"),
+                TreasuryMove(
+                    tx_hash=_h64("ui"), network=NET, address=TREASURY,
+                    utime=now, lt=20, direction="in", kind="unknown_in",
+                    value_nanotons=to_nano(1.31),
+                    balance_delta_nanotons=to_nano(1.31),
+                    counterparty=sender,
+                ),
+                Payout(
+                    round_id=None, player_id=None, kind="refund",
+                    amount_nanotons=to_nano(1.31), dest_address=sender,
+                    network=NET, status="sent",
+                    created_at=refund_at, sent_at=refund_at,
+                ),
+            ])
+            await db.commit()
+        text = await treasury_mirror_block()
+        assert "непонятые переводы закрыты" in text
+        assert "☑️ непонятых" not in text
+        assert "1.31 Gram возвращено" in text
+        assert "пыль/чужие" in text, "валовый трафик остаётся для аудита"
+    finally:
+        await _wipe()
+        async with SessionLocal() as db:
+            await db.execute(Payout.__table__.delete().where(Payout.dest_address == sender))
+            await db.commit()
+
+
+async def test_mirror_block_closes_manual_out_unknown(monkeypatch) -> None:
+    """Вывод мимо бота, объяснённый /adjust, снимает тревогу, но виден в трафике."""
+    _on(monkeypatch)
+    now = int(datetime.now(UTC).timestamp())
+    unit_ref = "manual:test-closed-unknown-out"
+    try:
+        async with SessionLocal() as db:
+            db.add_all([
+                WatcherState(key=TREASURY_MIRROR_BOOTSTRAP_KEY, value="1"),
+                TreasuryMove(
+                    tx_hash=_h64("uo"), network=NET, address=TREASURY,
+                    utime=now, lt=21, direction="out", kind="unknown_out",
+                    value_nanotons=to_nano(0.2),
+                    balance_delta_nanotons=-to_nano(0.2028),
+                ),
+                Income(
+                    kind="manual_out",
+                    amount_nanotons=to_nano(0.203947897),
+                    network=NET,
+                    unit_ref=unit_ref,
+                    created_at=datetime.fromtimestamp(now + 3600, UTC),
+                ),
+            ])
+            await db.commit()
+        text = await treasury_mirror_block()
+        assert "непонятые переводы закрыты" in text
+        assert "☑️ непонятых" not in text
+        assert "0.20 Gram списано корректировкой" in text
+        assert "вывод мимо бота" in text, "валовый трафик остаётся для аудита"
+    finally:
+        await _wipe()
+        async with SessionLocal() as db:
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == unit_ref))
+            await db.commit()
 
 
 async def test_mirror_block_flags_frozen_sync_and_missing_history(monkeypatch) -> None:

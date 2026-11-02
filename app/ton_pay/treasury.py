@@ -284,7 +284,10 @@ async def treasury_diagnostics() -> str:
     if cursor_raw and cursor_raw.isdigit():
         cursor_dt = datetime.fromtimestamp(int(cursor_raw), tz=UTC)
         lag = int((now - cursor_dt).total_seconds())
-        lines.append(f"  курсор: {cursor_dt:%d.%m %H:%M} UTC ({lag:+d} с от текущего времени)")
+        # Знак лага читается как «отстаёт/опережает», а не как арифметика:
+        # «+11397 с» хранитель читал как будущее, хотя это отставание.
+        cursor_note = f"отстаёт на {lag} с" if lag >= 0 else f"впереди на {-lag} с"
+        lines.append(f"  курсор: {cursor_dt:%d.%m %H:%M} UTC ({cursor_note})")
         if lag < -60:
             lines.append("  ⚠️ курсор В БУДУЩЕМ: новые переводы отсекаются как «старые» — обнули ключ ton_watch_cursor_utime в watcher_state")
     elif settings.ton_enabled:
@@ -422,9 +425,10 @@ async def blockchain_diagnostics() -> str:
     now = datetime.now(UTC)
     if cursor_raw and cursor_raw.isdigit():
         cursor_dt = datetime.fromtimestamp(int(cursor_raw), tz=UTC)
+        lag = int((now - cursor_dt).total_seconds())
+        cursor_note = f"отстаёт на {lag} с" if lag >= 0 else f"впереди на {-lag} с"
         lines.append(
-            f"Watcher: курсор {cursor_dt:%d.%m %H:%M} UTC "
-            f"({int((now - cursor_dt).total_seconds()):+d} с)"
+            f"Watcher: курсор {cursor_dt:%d.%m %H:%M} UTC ({cursor_note})"
         + (f" · источник {source}" if source else "")
         )
     else:
