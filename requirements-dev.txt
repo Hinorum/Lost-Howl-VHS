@@ -28,4 +28,4 @@ import-linter==2.15
 # mypy — постепенная проверка типов: сейчас только app/ton_pay, app/ton_watch
 # и app/rounds (см. mypy.ini). Пин здесь, а не в ci.yml, чтобы Dependabot
 # обновлял и его; расширение охвата — добавлением пакетов в mypy.ini/CI.
-mypy==2.4.0
+mypy==2.4.1
