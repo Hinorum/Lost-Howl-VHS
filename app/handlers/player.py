@@ -705,12 +705,15 @@ async def on_vote(callback: CallbackQuery) -> None:
             vote = await get_vote(session, round_row.id, player.id)
             current_position: int | None = vote.card_position if vote else None
             if (
-                settings.revote_enabled
-                and round_row.status == RoundStatus.OPEN
+                round_row.status == RoundStatus.OPEN
                 and current_position is not None
                 and current_position != position
             ):
                 # Есть оплаченный грант — списываем и меняем путь прямо здесь.
+                # Флаг REVOTE_ENABLED закрывает ПРОДАЖУ перемотки, а не уже
+                # оплаченное право: игрок заплатил, и его грант не должен
+                # замерзать до закрытия дня (тогда он сгорает, а деньги остаются
+                # в казне без возврата).
                 outcome = await change_vote(session, round_row, player.id, position)
         elif result == "ok":
             # Подтверждение выбора в личку отдельным сообщением: по кнопке

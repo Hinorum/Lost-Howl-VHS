@@ -112,6 +112,63 @@ async def has_unused(session, round_id: int, player_id: int) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+async def test_paid_grant_still_works_when_revote_flag_is_off(monkeypatch) -> None:
+    """Оплаченный грант не замерзает, когда перемотку выключили.
+
+    REVOTE_ENABLED закрывает ПРОДАЖУ смены выбора, а не уже оплаченное право:
+    игрок заплатил — его грант должен списываться, а голос переписываться. Иначе
+    платёж висел до закрытия дня, грант сгорал (lifecycle.py) и деньги
+    оставались в казне без возврата.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.db import SessionLocal
+    from app.handlers import on_vote
+    from app.handlers import wallet as wallet_mod
+
+    monkeypatch.setattr(settings, "revote_enabled", False)
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setitem(wallet_mod._ACTION_COOLDOWNS, "vote_cd", 0.0)
+    pid = 817_001
+    async with SessionLocal() as db:
+        db.add(Player(id=pid, username="u817001"))
+        round_row = _open_round(day_index=7_301)
+        db.add(round_row)
+        await db.commit()
+        rid = round_row.id
+        await cast_vote(db, round_row, pid, 0)
+        db.add(RevoteGrant(round_id=rid, player_id=pid, source="ton", unit_ref="paid-1"))
+        await db.commit()
+        try:
+            callback = SimpleNamespace(
+                data=f"vote:{rid}:1",
+                message=SimpleNamespace(chat=SimpleNamespace(type="private")),
+                from_user=SimpleNamespace(id=pid, username="u817001", first_name="Т"),
+                bot=None,
+                answer=AsyncMock(),
+            )
+            await on_vote(callback)
+            # Голос переписан по оплаченному гранту.
+            vote = (
+                await db.execute(select(Vote).where(Vote.round_id == rid, Vote.player_id == pid))
+            ).scalar_one()
+            assert vote.card_position == 1
+            grant = (
+                await db.execute(
+                    select(RevoteGrant).where(RevoteGrant.round_id == rid, RevoteGrant.player_id == pid)
+                )
+            ).scalar_one()
+            assert grant.status == "used"
+            assert "Грант списан" in callback.answer.await_args.args[0]
+        finally:
+            await db.execute(delete(RevoteGrant).where(RevoteGrant.player_id == pid))
+            await db.execute(delete(Vote).where(Vote.round_id == rid))
+            await db.execute(delete(Round).where(Round.id == rid))
+            await db.execute(delete(Player).where(Player.id == pid))
+            await db.commit()
+
+
 async def test_round_schedule_follows_utc_grid(session, monkeypatch) -> None:
     """День открывается в момент конца подсчёта предыдущего и ложится на сетку UTC.
 
