@@ -1296,6 +1296,76 @@ async def test_auto_grant_no_vote_silent_when_refund_already_booked(
             await db.commit()
 
 
+async def test_revote_memo_payment_is_confirmed_to_player(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Оплата с rv:-мемо подтверждается в личку.
+
+    Инструкция обещает «грант придёт в течение минуты». Без подтверждения
+    игрок ждёт уведомления, которого не придёт, и платит повторно: второй
+    перевод с другим хешем дедупликацию проходит и приносит ещё один грант,
+    то есть деньги списываются дважды за одну смену выбора.
+    """
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.db import SessionLocal
+    from app.models import RevoteGrant
+    from app.ton_watch import Transfer, process_transfer
+    from app.voting import cast_vote
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "revote_enabled", True)
+    pid = 816_000 + int.from_bytes(os.urandom(2), "big")
+    wallet = "0:" + os.urandom(32).hex()
+    tx_hash = "rvok-" + os.urandom(8).hex()
+    bot = SimpleNamespace(send_message=AsyncMock())
+    async with SessionLocal() as db:
+        db.add(Player(id=pid, username=f"u{pid}", wallet_address=wallet))
+        round_row = _open_round(day_index=902_600)
+        db.add(round_row)
+        await db.flush()
+        await cast_vote(db, round_row, pid, 0)
+        await db.commit()
+        try:
+            transfer = Transfer(
+                tx_hash,
+                wallet,
+                to_nano(settings.revote_ton),
+                f"rv:{round_row.id}",
+                int(datetime.now(UTC).timestamp()),
+            )
+            assert await process_transfer(transfer, bot=bot) == "ok"
+            grants = (
+                await db.execute(
+                    RevoteGrant.__table__.select().where(RevoteGrant.player_id == pid)
+                )
+            ).all()
+            assert len(grants) == 1 and grants[0]._mapping["status"] == "granted"
+            # Подтверждение в личку: игрок должен видеть, что оплата принята.
+            assert bot.send_message.await_count == 1
+            sent = bot.send_message.await_args
+            assert sent.args[0] == pid
+            assert "Перемотка кадра оплачена" in sent.args[1]
+            # Повторный проход watcher'а по тому же переводу молчит: грант уже
+            # выдан, второй раз деньги не списываются и игрок не засыпается
+            # повторными сообщениями.
+            assert await process_transfer(transfer, bot=bot) == "duplicate_tx"
+            assert bot.send_message.await_count == 1
+        finally:
+            await db.execute(Income.__table__.delete().where(Income.unit_ref == tx_hash))
+            await db.execute(
+                RevoteGrant.__table__.delete().where(RevoteGrant.player_id == pid)
+            )
+            await db.execute(Vote.__table__.delete().where(Vote.player_id == pid))
+            await db.delete(round_row)
+            player = await db.get(Player, pid)
+            if player is not None:
+                await db.delete(player)
+            await db.commit()
+
+
 async def test_disabled_revote_payments_are_refunded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
