@@ -159,6 +159,12 @@ async def on_payton(callback: CallbackQuery) -> None:
     if not raw.isdigit():
         await callback.answer("Некорректный счёт.", show_alert=True)
         return
+    # Счёт мог устареть: показываем реквизиты только для активного дня и
+    # только тому, кто уже сделал первый выбор.
+    status, active_id = await _revote_status(callback.from_user)
+    if active_id != int(raw):
+        await callback.answer(status[:200], show_alert=True)
+        return
     if callback.from_user.id not in settings.admin_id_set:
         from app.handlers.wallet import _wallet_throttled
 

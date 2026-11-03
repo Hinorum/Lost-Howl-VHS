@@ -261,6 +261,15 @@ async def test_payton_requires_private_chat(stage) -> None:
     assert "только в личке" in no_message.answer.call_args.args[0]
 
 
+async def test_payton_stale_round_is_rejected(stage) -> None:
+    """Счёт из прошлого дня: активный round_id не совпал — реквизиты не
+    выдаём, иначе игрок заплатит за несуществующий кадр."""
+    callback = _callback(f"payton:{stage.round_id + 500}", stage.uid)
+    await on_payton(callback)
+    callback.message.answer.assert_not_awaited()
+    assert callback.answer.call_args.kwargs["show_alert"] is True
+
+
 async def test_payton_blocked_in_version_without_stakes(stage, monkeypatch) -> None:
     """В версии без ставок реквизиты не выдаются даже по подделанному колбэку."""
     monkeypatch.setattr(topup_mod, "_active_round_money_mode", AsyncMock(return_value=False))
