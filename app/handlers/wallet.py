@@ -477,8 +477,7 @@ _STAKE_HOWTO = (
     "до «Голосование до». Одна ставка на игрока в день.\n"
     "Перевод, не ставший ставкой (нет кошелька, ставка уже есть, день закрылся), "
     "вернётся автоматически, если он от {rmin:g} Gram (пыль дешевле газа возврата и "
-    "остаётся в казне). Сумма {revote:g}–{min:g} Gram при уже выбранном сегодня кадре "
-    "зачтётся как оплата перемотки — и без мемо."
+    "остаётся в казне).{revote_note}"
 )
 
 
@@ -501,12 +500,19 @@ async def _stake_view_text(user) -> str:
         async with SessionLocal() as session:
             if not await _pending_mode(session):
                 return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
+    # Перемотку рекламируем только когда она действительно продаётся: иначе
+    # игрок платит по инструкции, а перевод возвращается с газом казны.
+    revote_note = (
+        f" Сумма {settings.revote_ton:g}–{settings.stake_min_ton:g} Gram при уже "
+        "выбранном сегодня кадре зачтётся как оплата перемотки — и без мемо."
+        if settings.revote_enabled
+        else ""
+    )
     head = _STAKE_HOWTO.format(
         mark=money_mark(str(user.id)),
         limits=_stake_bounds_text(),
-        min=settings.stake_min_ton,
-        revote=settings.revote_ton,
         rmin=settings.refund_min_gram,
+        revote_note=revote_note,
         treasury=settings.active_treasury_address or "(адрес казначея ещё не настроен)",
     )
     status = ""

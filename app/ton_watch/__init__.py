@@ -308,11 +308,14 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                 "revote_too_large",
                 "revote_no_vote",
                 "revote_money_off",
+                "revote_disabled",
             ):
                 refund_status = await _stash_refund(
                     session,
                     transfer,
-                    revote_round_id if status not in ("revote_no_vote",) else None,
+                    revote_round_id
+                    if status not in ("revote_no_vote", "revote_disabled")
+                    else None,
                     ledger_result=f"revote:{status}",
                     ledger_player_id=player.id,
                 )
@@ -341,6 +344,14 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                         refund_status,
                         f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
                         "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
+                    )
+                elif status == "revote_disabled":
+                    await _dm_refund_queued(
+                        bot,
+                        player.id,
+                        refund_status,
+                        f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
+                        "смена выбора сейчас отключена — плата за неё не взимается.",
                     )
                 else:
                     await _dm_refund_queued(
@@ -410,6 +421,24 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                     "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
                 )
                 return "revote_auto_money_off"
+            if auto_status == "revote_disabled":
+                # Смена выбора выключена флагом: сумма из вилки не ставка,
+                # поэтому сразу возвращаем её, а не оставляем в казне.
+                refund_status = await _stash_refund(
+                    session,
+                    transfer,
+                    None,
+                    ledger_result="revote_auto:disabled",
+                    ledger_player_id=player.id,
+                )
+                await _dm_refund_queued(
+                    bot,
+                    player.id,
+                    refund_status,
+                    f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
+                    "смена выбора сейчас отключена — плата за неё не взимается.",
+                )
+                return "revote_auto_disabled"
         round_result = await session.execute(
             select(Round)
             .where(Round.status == RoundStatus.OPEN)

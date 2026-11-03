@@ -96,6 +96,14 @@ async def cmd_change(message: Message) -> None:
             "игра идёт без ставок и платных действий."
         )
         return
+    # Без адреса казначея оплату принять некуда: не обещаем кнопку, которая
+    # на следующем шаге откажет.
+    if not settings.active_treasury_address:
+        await message.answer(
+            f"{warn_mark('revote-off')} Приём Gram ещё не включён — "
+            "перемотка кадра временно недоступна."
+        )
+        return
     # Версия без ставок: перемотка за валюту выключена целиком.
     if await _active_round_money_mode() is False:
         await message.answer(
@@ -134,6 +142,9 @@ async def on_payton(callback: CallbackQuery) -> None:
     raw = (callback.data or "").split(":")[1] if ":" in (callback.data or "") else ""
     if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
         await callback.answer("Оплата — только в личке у бота (/change).", show_alert=True)
+        return
+    if not settings.revote_enabled:
+        await callback.answer("Перемотка кадра сейчас недоступна.", show_alert=True)
         return
     # Стоп-кран: во время техработ реквизиты не выдаём, чтобы игрок не
     # отправил деньги за смену пути в замороженной игре.

@@ -753,7 +753,7 @@ async def on_vote(callback: CallbackQuery) -> None:
             hint = "Твой выбор уже записан."
             if getattr(round_row, "money_mode", True) is False:
                 hint += " Сегодня версия без ставок — кадр не перемотать."
-            elif settings.ton_enabled:
+            elif settings.ton_enabled and settings.revote_enabled:
                 if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
                     hint = (
                         "Твой выбор уже записан. Перемотка кадра платная — "

@@ -113,6 +113,11 @@ async def _grant_revote(session, transfer: Transfer, player: Player, round_row: 
     return "ok"
 
 async def _process_revote(session, transfer: Transfer, player: Player, round_id: int) -> str:
+    if not settings.ton_enabled or not settings.revote_enabled:
+        # Флаг выключает не только кнопку в UI: оплата за перемотку,
+        # пришедшая на казначея, тоже не должна превращаться в грант.
+        # TON_ENABLED=false — бесплатная версия: денежный контур закрыт целиком.
+        return "revote_disabled"
     round_row = await session.get(Round, round_id)
     if round_row is None or round_row.status != RoundStatus.OPEN:
         return "revote_closed"
@@ -146,8 +151,13 @@ async def _maybe_auto_grant(session, transfer: Transfer, player: Player) -> str:
     Абсолютную равнозначность мемо не требуется: автогрант выдаётся один раз
     за перевод (unit_ref=tx_hash).
 
-    Возвращает revote_ok / no_vote / revote_closed / duplicate_tx.
+    Возвращает revote_ok / no_vote / revote_closed / revote_disabled /
+    duplicate_tx.
     """
+    if not settings.ton_enabled or not settings.revote_enabled:
+        # Как и явный rv:-мемо: выключенная перемотка (или весь денежный
+        # контур) не должна принимать деньги даже при оплате «по сумме».
+        return "revote_disabled"
     round_result = await session.execute(
         select(Round)
         .where(Round.status == RoundStatus.OPEN)

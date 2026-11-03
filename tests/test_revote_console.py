@@ -133,10 +133,25 @@ async def test_change_refuses_in_version_without_stakes(monkeypatch) -> None:
     если технически TON включён."""
     monkeypatch.setattr(settings, "revote_enabled", True)
     monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", TREASURY)
+    monkeypatch.setattr(settings, "treasury_testnet_address", TREASURY)
     monkeypatch.setattr(topup_mod, "_active_round_money_mode", AsyncMock(return_value=False))
     message = _message()
     await cmd_change(message)
     assert "без ставок" in message.answer.call_args.args[0]
+
+
+async def test_change_refuses_without_treasury_address(monkeypatch) -> None:
+    """Нет адреса казначея — не обещаем кнопку оплаты: переводить некуда,
+    а следующий шаг всё равно отказал бы."""
+    monkeypatch.setattr(settings, "revote_enabled", True)
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", "")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "")
+    message = _message()
+    await cmd_change(message)
+    assert "ещё не включён" in message.answer.call_args.args[0]
+    assert message.answer.call_count == 1
 
 
 async def test_change_without_open_day_offers_nothing(monkeypatch) -> None:
@@ -144,6 +159,8 @@ async def test_change_without_open_day_offers_nothing(monkeypatch) -> None:
     нельзя: иначе игрок заплатит за воздух."""
     monkeypatch.setattr(settings, "revote_enabled", True)
     monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", TREASURY)
+    monkeypatch.setattr(settings, "treasury_testnet_address", TREASURY)
     await _wipe(Vote, Card, Round, Player)
     message = _message()
     await cmd_change(message)
@@ -156,6 +173,8 @@ async def test_change_without_vote_is_free_and_hidden(monkeypatch) -> None:
     даже счёт не выставляем."""
     monkeypatch.setattr(settings, "revote_enabled", True)
     monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", TREASURY)
+    monkeypatch.setattr(settings, "treasury_testnet_address", TREASURY)
     uid = _uid()
     async with SessionLocal() as db:
         db.add(Player(id=uid))
@@ -259,6 +278,16 @@ async def test_payton_requires_private_chat(stage) -> None:
     no_message.message = None
     await on_payton(no_message)
     assert "только в личке" in no_message.answer.call_args.args[0]
+
+
+async def test_payton_disabled_by_feature_flag(stage, monkeypatch) -> None:
+    """Подделанный или сохранённый колбэк при REVOTE_ENABLED=false не должен
+    выдавать реквизиты: флаг закрывает продажу, а не только команду."""
+    monkeypatch.setattr(settings, "revote_enabled", False)
+    callback = _callback(f"payton:{stage.round_id}", stage.uid)
+    await on_payton(callback)
+    assert "недоступна" in callback.answer.call_args.args[0]
+    callback.message.answer.assert_not_awaited()
 
 
 async def test_payton_stale_round_is_rejected(stage) -> None:

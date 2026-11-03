@@ -1296,6 +1296,72 @@ async def test_auto_grant_no_vote_silent_when_refund_already_booked(
             await db.commit()
 
 
+async def test_disabled_revote_payments_are_refunded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REVOTE_ENABLED=false закрывает и приём денег: rv:-мемо и сумма из
+    вилки возвращаются, грант не создаётся. Иначе флаг выключал бы только
+    кнопку, а касса продолжала бы принимать оплату за отключённую механику."""
+    import os
+
+    from app.db import SessionLocal
+    from app.models import RevoteGrant
+    from app.ton_watch import Transfer, process_transfer
+
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "revote_enabled", False)
+    pid = 815_000 + int.from_bytes(os.urandom(2), "big")
+    wallet = "0:" + os.urandom(32).hex()
+    hash_memo = "rvd-" + os.urandom(8).hex()
+    hash_auto = "rva-" + os.urandom(8).hex()
+    async with SessionLocal() as db:
+        db.add(Player(id=pid, username=f"u{pid}", wallet_address=wallet))
+        round_row = _open_round(day_index=902_500)
+        db.add(round_row)
+        await db.commit()
+        try:
+            now = int(datetime.now(UTC).timestamp())
+            memo = Transfer(hash_memo, wallet, to_nano(0.2), f"rv:{round_row.id}", now)
+            assert await process_transfer(memo) == "revote_disabled"
+            auto = Transfer(hash_auto, wallet, to_nano(0.2), "", now)
+            assert await process_transfer(auto) == "revote_auto_disabled"
+
+            rows = (
+                await db.execute(
+                    Payout.__table__.select().where(
+                        Payout.tx_hash.in_([hash_memo, hash_auto])
+                    )
+                )
+            ).all()
+            kinds = {r._mapping["tx_hash"]: r._mapping["kind"] for r in rows}
+            assert kinds == {hash_memo: "refund", hash_auto: "refund"}
+            grants = (
+                await db.execute(
+                    RevoteGrant.__table__.select().where(RevoteGrant.player_id == pid)
+                )
+            ).all()
+            assert grants == []
+        finally:
+            await db.execute(
+                Income.__table__.delete().where(
+                    Income.unit_ref.in_([hash_memo, hash_auto])
+                )
+            )
+            await db.execute(
+                Payout.__table__.delete().where(
+                    Payout.tx_hash.in_([hash_memo, hash_auto])
+                )
+            )
+            await db.execute(
+                RevoteGrant.__table__.delete().where(RevoteGrant.player_id == pid)
+            )
+            await db.delete(round_row)
+            player = await db.get(Player, pid)
+            if player is not None:
+                await db.delete(player)
+            await db.commit()
+
+
 async def test_failed_revote_payments_are_refunded(monkeypatch: pytest.MonkeyPatch) -> None:
     """Оплата смены пути мала или день закрыт — деньги автоматически возвращаются."""
     import os

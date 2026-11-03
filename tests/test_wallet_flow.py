@@ -271,6 +271,25 @@ async def test_stake_button_alert_short() -> None:
     assert kwargs.get("show_alert") is True
 
 
+async def test_stake_text_hides_revote_when_disabled(monkeypatch) -> None:
+    """REVOTE_ENABLED=false: /stake не рекламирует перемотку, иначе игрок
+    платит по инструкции, а перевод возвращается за счёт газа казны."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "revote_enabled", False)
+    monkeypatch.setattr(wallet_mod, "_active_round_money_mode", AsyncMock(return_value=True))
+    text = await wallet_mod._stake_view_text(make_user(next_uid()))
+    assert "перемотк" not in text
+
+
+async def test_stake_text_mentions_revote_when_enabled(monkeypatch) -> None:
+    """Включённая перемотка остаётся в инструкции /stake: вилка и «без мемо»."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "revote_enabled", True)
+    monkeypatch.setattr(wallet_mod, "_active_round_money_mode", AsyncMock(return_value=True))
+    text = await wallet_mod._stake_view_text(make_user(next_uid()))
+    assert "оплата перемотки" in text
+
+
 async def _link_wallet(uid: int, address: str) -> None:
     await start_dialog(uid)
     message = make_message("private", uid, address)
