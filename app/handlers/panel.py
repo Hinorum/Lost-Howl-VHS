@@ -116,7 +116,7 @@ _PANEL_FOOTER = (
     "/finalize — ручная финализация застрявших дней\n"
     "/refinalize — принудительная перефинализация\n"
     "/pause … /resume — стоп-кран игры (техработы) ⏸\n"
-    "/revenue — касса (Stars/Gram)\n"
+    "/revenue — касса (Gram)\n"
     "/resetgame confirm [keepstory] — полный сброс ⚠️\n"
     "/cassette — кассеты: библиотека и назначение «следующей» 📼\n"
 )

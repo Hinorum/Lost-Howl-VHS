@@ -50,7 +50,7 @@ def _commands_help() -> list[str]:
     ]
     if settings.revote_enabled and settings.ton_enabled:
         # В бесплатной версии /change безусловно отказывает (topup) — не рекламируем.
-        lines.append("/change — перемотать кадр (⭐ или Gram)")
+        lines.append("/change — перемотать кадр (Gram)")
     if settings.ton_enabled:
         from app.style import pct_text as _pct_text
 
@@ -762,7 +762,7 @@ async def on_vote(callback: CallbackQuery) -> None:
                 else:
                     hint = (
                         f"Твой выбор уже записан. Перемотать кадр — "
-                        f"⭐{settings.revote_stars}, команда /change."
+                        f"{settings.revote_ton:g} Gram, команда /change."
                     )
             await callback.answer(hint[:200], show_alert=True)
             return

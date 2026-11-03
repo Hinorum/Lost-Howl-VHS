@@ -9,13 +9,8 @@ from unittest.mock import AsyncMock
 from sqlalchemy import delete, select
 
 from app.config import settings
-from app.models import Card, Income, Player, RevoteGrant, Round, RoundStatus, Vote, WinRule
-from app.payments import (
-    build_revote_payload,
-    parse_revote_memo,
-    parse_revote_payload,
-    revote_memo,
-)
+from app.models import Card, Player, RevoteGrant, Round, RoundStatus, Vote, WinRule
+from app.payments import parse_revote_memo, revote_memo
 from app.voting import cast_vote, change_vote
 
 
@@ -34,11 +29,7 @@ def _open_round(day_index: int = 5) -> Round:
     )
 
 
-def test_payload_and_memo_roundtrip() -> None:
-    assert build_revote_payload(7) == "revote:7"
-    assert parse_revote_payload("revote:7") == 7
-    assert parse_revote_payload("revote:x") is None
-    assert parse_revote_payload(None) is None
+def test_revote_memo_roundtrip() -> None:
     assert revote_memo(12) == "rv:12"
     assert parse_revote_memo("RV:12 ") == 12
     assert parse_revote_memo("stake something") is None
@@ -73,7 +64,7 @@ async def test_change_vote_requires_grant(session) -> None:
     await cast_vote(session, round_row, 41, 0)
 
     assert await change_vote(session, round_row, 41, 1) == "no_grant"
-    session.add(RevoteGrant(round_id=rid, player_id=41, source="stars", unit_ref="chg-1"))
+    session.add(RevoteGrant(round_id=rid, player_id=41, source="ton", unit_ref="chg-1"))
     await session.commit()
 
     assert await change_vote(session, round_row, 41, 1) == "ok"
@@ -176,9 +167,9 @@ async def test_close_voting_expires_unused_grants(session) -> None:
     round_row = _open_round()
     session.add(round_row)
     await session.commit()
-    session.add(RevoteGrant(round_id=round_row.id, player_id=43, source="stars", unit_ref="g-live"))
+    session.add(RevoteGrant(round_id=round_row.id, player_id=43, source="ton", unit_ref="g-live"))
     session.add(
-        RevoteGrant(round_id=round_row.id, player_id=43, source="stars", unit_ref="g-spent", status="used")
+        RevoteGrant(round_id=round_row.id, player_id=43, source="ton", unit_ref="g-spent", status="used")
     )
     await session.commit()
 
@@ -197,44 +188,6 @@ async def test_close_voting_expires_unused_grants(session) -> None:
     assert statuses["g-left"] == "expired"
 
 
-async def test_paystars_requires_existing_vote() -> None:
-    """Подделанный колбэк оплаты без голоса не открывает счёт."""
-    import os
-
-    from app.db import SessionLocal
-    from app.handlers import on_paystars
-
-    pid = 730_000 + int.from_bytes(os.urandom(2), "big")
-    day_index = 78_000 + int.from_bytes(os.urandom(3), "big")
-    async with SessionLocal() as db:
-        db.add(Player(id=pid))
-        round_row = _open_round(day_index=day_index)
-        db.add(round_row)
-        await db.commit()
-        rid = round_row.id
-        callback = SimpleNamespace(
-            data=f"paystars:{rid}",
-            message=SimpleNamespace(chat=SimpleNamespace(type="private")),
-            from_user=SimpleNamespace(id=pid, username=None, first_name="Т"),
-            bot=SimpleNamespace(send_invoice=AsyncMock()),
-            answer=AsyncMock(),
-        )
-        try:
-            await on_paystars(callback)
-            assert callback.bot.send_invoice.await_count == 0
-            kwargs = callback.answer.call_args.kwargs
-            assert kwargs.get("show_alert") is True
-        finally:
-            await db.execute(delete(Card).where(Card.round_id == rid))
-            round_db = await db.get(Round, rid)
-            if round_db is not None:
-                await db.delete(round_db)
-            player_db = await db.get(Player, pid)
-            if player_db is not None:
-                await db.delete(player_db)
-            await db.commit()
-
-
 async def test_paid_revote_via_card_press() -> None:
     """Полный цикл: голос → грант → нажал другую карту → путь изменён, грант списан."""
     import os
@@ -251,7 +204,7 @@ async def test_paid_revote_via_card_press() -> None:
         await db.commit()
         rid = round_row.id
         await cast_vote(db, round_row, pid, 0)
-        db.add(RevoteGrant(round_id=rid, player_id=pid, source="stars", unit_ref=f"card-{pid}"))
+        db.add(RevoteGrant(round_id=rid, player_id=pid, source="ton", unit_ref=f"card-{pid}"))
         await db.commit()
         callback = SimpleNamespace(
             data=f"vote:{rid}:2",
@@ -304,126 +257,3 @@ async def test_paid_revote_via_card_press() -> None:
             if player_db is not None:
                 await db.delete(player_db)
             await db.commit()
-
-
-async def test_successful_payment_creates_single_grant(monkeypatch) -> None:
-    """Оплата Stars создаёт один грант; повтор той же транзакции игнорируется.
-
-    Работаем с глобальной БД, как хендлер.
-    """
-    import os
-
-    from sqlalchemy import select
-
-    from app.db import SessionLocal
-    from app.handlers import on_successful_payment
-
-    pid = 710_000 + int.from_bytes(os.urandom(2), "big")
-    charge_id = f"chg-{pid}"
-    day_index = 77_000 + int.from_bytes(os.urandom(3), "big")
-    async with SessionLocal() as db:
-        db.add(Player(id=pid, username=f"u{pid}"))
-        round_row = _open_round(day_index=day_index)
-        db.add(round_row)
-        await db.commit()
-        rid = round_row.id
-
-        message = SimpleNamespace(
-            chat=SimpleNamespace(type="private"),
-            from_user=SimpleNamespace(id=pid, username=f"u{pid}", first_name="Т"),
-            successful_payment=SimpleNamespace(
-                invoice_payload=build_revote_payload(rid),
-                total_amount=settings.revote_stars,
-                telegram_payment_charge_id=charge_id,
-            ),
-            answer=AsyncMock(),
-        )
-        try:
-            await on_successful_payment(message)
-            grants = (
-                (await db.execute(select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id)))
-                .scalars()
-                .all()
-            )
-            assert len(grants) == 1 and grants[0].round_id == rid and grants[0].status == "granted"
-            assert "Оплачено" in message.answer.call_args.args[0]
-
-            await on_successful_payment(message)
-            grants = (
-                (await db.execute(select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id)))
-                .scalars()
-                .all()
-            )
-            assert len(grants) == 1
-            assert "уже учтена" in message.answer.call_args.args[0]
-        finally:
-            # Оплата пишет строку журнала дохода (topup.py) со ссылками на
-            # раунд и игрока — сносим её первой, иначе Postgres откажет в
-            # удалении родителя (SQLite порядок не проверяет).
-            await db.execute(delete(Income).where(Income.unit_ref == charge_id))
-            for g in (
-                (await db.execute(select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id)))
-                .scalars()
-                .all()
-            ):
-                await db.delete(g)
-            await db.execute(delete(Card).where(Card.round_id == rid))
-            round_db = await db.get(Round, rid)
-            if round_db is not None:
-                await db.delete(round_db)
-            player_db = await db.get(Player, pid)
-            if player_db is not None:
-                await db.delete(player_db)
-            await db.commit()
-
-
-async def test_successful_payment_for_closed_day_records_orphan() -> None:
-    """Оплата за закрытый день сохраняется без раунда — возврат вручную."""
-    import os
-
-    from sqlalchemy import select as _select
-
-    from app.db import SessionLocal
-    from app.handlers import on_successful_payment
-
-    pid = 720_000 + int.from_bytes(os.urandom(2), "big")
-    charge_id = f"orphan-{pid}"
-    async with SessionLocal() as db:
-        db.add(Player(id=pid))
-        await db.commit()
-        message = SimpleNamespace(
-            chat=SimpleNamespace(type="private"),
-            from_user=SimpleNamespace(id=pid, username=None, first_name="Т"),
-            successful_payment=SimpleNamespace(
-                invoice_payload=build_revote_payload(999_999),
-                total_amount=settings.revote_stars,
-                telegram_payment_charge_id=charge_id,
-            ),
-            answer=AsyncMock(),
-        )
-        try:
-            await on_successful_payment(message)
-            grants = (
-                (await db.execute(_select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id)))
-                .scalars()
-                .all()
-            )
-            assert len(grants) == 1 and grants[0].round_id is None
-            assert "возврата" in message.answer.call_args.args[0]
-        finally:
-            # Оплата пишет строку журнала дохода (topup.py), ссылающуюся на
-            # игрока, — сносим её первой, иначе Postgres откажет в удалении
-            # родителя (SQLite порядок не проверяет).
-            await db.execute(delete(Income).where(Income.unit_ref == charge_id))
-            for g in (
-                (await db.execute(_select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id)))
-                .scalars()
-                .all()
-            ):
-                await db.delete(g)
-            player_db = await db.get(Player, pid)
-            if player_db is not None:
-                await db.delete(player_db)
-            await db.commit()
-
-

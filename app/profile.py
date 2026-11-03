@@ -69,7 +69,7 @@ def _build_commands() -> tuple[list[BotCommand], list[BotCommand]]:
     ]
     if settings.revote_enabled and settings.ton_enabled:
         # В бесплатной версии /change безусловно отказывает — не рекламируем.
-        private.append(BotCommand(command="change", description="Перемотать кадр (⭐ или Gram)"))
+        private.append(BotCommand(command="change", description="Перемотать кадр (Gram)"))
     if settings.ton_enabled:
         private += [
             BotCommand(command="wallet", description="Привязать кошелёк Gram"),

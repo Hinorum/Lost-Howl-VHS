@@ -1,9 +1,5 @@
-# Пополнения и платная смена голоса: звёзды Telegram, банковский перевод на
-# адрес фонда и проверка подтверждений перед зачислением.
+# Платная смена голоса: перевод Gram на адрес казначея и инструкция по оплате.
 from __future__ import annotations
-
-import logging
-from datetime import UTC
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
@@ -12,19 +8,16 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    LabeledPrice,
     Message,
-    PreCheckoutQuery,
 )
-from sqlalchemy import select
 
 from app.broadcast import POSITIONS
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Income, RevoteGrant, RoundStatus
-from app.payments import build_revote_payload, parse_revote_payload, revote_memo
-from app.rounds import get_active_round, get_round
-from app.style import hint_mark, money_mark, ok_mark, path_mark, warn_mark
+from app.models import RoundStatus
+from app.payments import revote_memo
+from app.rounds import get_active_round
+from app.style import hint_mark, money_mark, path_mark, warn_mark
 from app.voting import get_vote, upsert_player
 
 from .common import (
@@ -33,8 +26,6 @@ from .common import (
     _personal_keyboard,
     router,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _revote_gram_ceiling() -> float:
@@ -48,14 +39,16 @@ def _revote_gram_ceiling() -> float:
 
 
 def _revote_keyboard(round_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"⭐ {settings.revote_stars} Stars", callback_data=f"paystars:{round_id}")]
-    ]
-    if settings.ton_enabled:
-        rows.append(
-            [InlineKeyboardButton(text=f"💎 {settings.revote_ton:g} Gram", callback_data=f"payton:{round_id}")]
-        )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"💎 {settings.revote_ton:g} Gram",
+                    callback_data=f"payton:{round_id}",
+                )
+            ]
+        ]
+    )
 
 
 async def _revote_status(user) -> tuple[str, int | None]:
@@ -103,7 +96,7 @@ async def cmd_change(message: Message) -> None:
             "игра идёт без ставок и платных действий."
         )
         return
-    # Версия без ставок: перемотка за валюту/звёзды выключена целиком.
+    # Версия без ставок: перемотка за валюту выключена целиком.
     if await _active_round_money_mode() is False:
         await message.answer(
             f"{warn_mark('revote-off')} Игра идёт в версии без ставок: "
@@ -115,9 +108,7 @@ async def cmd_change(message: Message) -> None:
         await message.answer(status)
         if round_id is not None:
             await message.answer(
-                "Выбери способ оплаты перемотки:\n\n"
-                "⭐ <b>Stars</b> — надёжно и мгновенно (кнопка оплаты в Telegram).\n"
-                "💎 <b>Gram</b> — перевод казначею: от "
+                "Оплата перемотки — <b>Gram</b>: перевод казначею от "
                 f"{settings.revote_ton:g} до {_revote_gram_ceiling():g} Gram "
                 f"(строго меньше минимума ставки {settings.stake_min_ton:g} Gram). "
                 "Мемо не обязателен — сумма в нужном диапазоне зачтётся автоматически.",
@@ -138,14 +129,14 @@ async def on_change_view(callback: CallbackQuery) -> None:
     await callback.answer(f"{status} Открой бота в личке: /change"[:200], show_alert=True)
 
 
-@router.callback_query(F.data.startswith("paystars:"))
-async def on_paystars(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("payton:"))
+async def on_payton(callback: CallbackQuery) -> None:
     raw = (callback.data or "").split(":")[1] if ":" in (callback.data or "") else ""
-    if not raw.isdigit() or callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
+    if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
         await callback.answer("Оплата — только в личке у бота (/change).", show_alert=True)
         return
-    # Стоп-кран: во время техработ платные механики не продаются,
-    # чтобы игрок не платил за смену пути в замороженной игре.
+    # Стоп-кран: во время техработ реквизиты не выдаём, чтобы игрок не
+    # отправил деньги за смену пути в замороженной игре.
     if await _game_paused_now():
         await callback.answer(
             "⏸ Идут технические работы — оплата временно недоступна. Попробуй позже.",
@@ -159,170 +150,11 @@ async def on_paystars(callback: CallbackQuery) -> None:
             show_alert=True,
         )
         return
-    status, active_id = await _revote_status(callback.from_user)
-    round_id = int(raw)
-    if active_id != round_id:
-        await callback.answer(status[:200], show_alert=True)
-        return
-    # Кулдаун на выставление счёта. send_invoice — это вызов Bot API: без
-    # ограничения кнопка «Оплатить» превращается в способ жечь квоту бота и
-    # ловить flood-ожидание, и токен бота страдает от чужих нажатий.
-    if callback.from_user.id not in settings.admin_id_set:
-        from app.handlers.wallet import _wallet_throttled
-
-        async with SessionLocal() as session:
-            if await _wallet_throttled(session, callback.from_user.id, "paystars_cd"):
-                await callback.answer(
-                    f"{hint_mark('wallet-throttle')} Счёт только что выставлен — подожди полминуты.",
-                    show_alert=True,
-                )
-                return
-    bot = callback.bot
-    if bot is None:
-        await callback.answer("Не удалось определить бота для выставления счёта.", show_alert=True)
-        return
-    await bot.send_invoice(
-        chat_id=callback.message.chat.id,
-        title="Перемотка кадра",
-        description="Разовое право переписать выбор в сегодняшнем кадре. Действует до конца дня.",
-        payload=build_revote_payload(round_id),
-        currency="XTR",
-        prices=[LabeledPrice(label="Перемотка кадра", amount=settings.revote_stars)],
-    )
-    await callback.answer()
-
-
-@router.pre_checkout_query()
-async def on_pre_checkout(query: PreCheckoutQuery) -> None:
-    if parse_revote_payload(query.invoice_payload) is None:
-        await query.answer(ok=False, error_message="Счёт устарел. Вызови /change заново.")
-        return
-    # Второй рубеж стоп-крана: счёт мог быть выставлен до паузы —
-    # отклоняем оплату ДО списания Stars.
-    if await _game_paused_now():
-        await query.answer(
-            ok=False,
-            error_message="⏸ Идут технические работы — оплата приостановлена. Попробуй позже.",
-        )
-        return
-    # Версия без ставок: даже выставленный до переключения счёт не списываем.
-    if await _active_round_money_mode() is False:
-        await query.answer(
-            ok=False,
-            error_message="Игра перешла в версию без ставок — перемотка кадра отключена.",
-        )
-        return
-    await query.answer(ok=True)
-
-
-@router.message(F.successful_payment)
-async def on_successful_payment(message: Message) -> None:
-    payment = message.successful_payment
-    if payment is None:
-        return
-    round_id = parse_revote_payload(payment.invoice_payload)
-    async with SessionLocal() as session:
-        player = await upsert_player(session, message.from_user)
-        duplicate = await session.execute(
-            select(RevoteGrant.id).where(RevoteGrant.unit_ref == payment.telegram_payment_charge_id)
-        )
-        if duplicate.scalar_one_or_none() is not None:
-            await message.answer("Эта оплата уже учтена.")
-            return
-        valid = False
-        if round_id is not None:
-            round_row = await get_round(session, round_id)
-            valid = round_row is not None and round_row.status == RoundStatus.OPEN
-        session.add(
-            RevoteGrant(
-                round_id=round_id if valid else None,
-                player_id=player.id,
-                source="stars",
-                unit_ref=payment.telegram_payment_charge_id,
-            )
-        )
-        # Ledger доходов: звёзды оседают на балансе бота — фиксируем сумму.
-        session.add(
-            Income(
-                kind="stars",
-                amount_stars=payment.total_amount,
-                round_id=round_id if valid else None,
-                player_id=player.id,
-                unit_ref=payment.telegram_payment_charge_id,
-                note="revote",
-            )
-        )
-        await session.commit()
-    if valid:
-        await message.answer(f"{ok_mark(str(round_id))} Оплачено ⭐ Нажми другой вариант — кадр перемотается.")
-    else:
-        await message.answer(
-            f"{warn_mark('late-pay')} Оплата прошла, но день уже закрылся — грант сохранён. "
-            "Напиши хранителю игры для возврата."
-        )
-
-
-@router.message(F.refunded_payment)
-async def on_refunded_payment(message: Message) -> None:
-    """Возврат Stars через Telegram: грант отзывается, ledger помечается.
-
-    Если грант ещё не потрачен — он больше не даст сменить путь; если уже
-    потрачен, смена пути остаётся, а хранитель получает алерт о расхождении.
-    """
-    from datetime import datetime
-
-    from app.ops import notify_admins
-
-    payment = message.refunded_payment
-    if payment is None:
-        return
-    charge_id = payment.telegram_payment_charge_id
-    spent_at_refund = False
-    player_ref = message.from_user.id if message.from_user else 0
-    async with SessionLocal() as session:
-        grant = (
-            await session.execute(select(RevoteGrant).where(RevoteGrant.unit_ref == charge_id))
-        ).scalar_one_or_none()
-        if grant is not None:
-            if grant.status == "granted":
-                grant.status = "refunded"
-            else:
-                spent_at_refund = True
-        income = (
-            await session.execute(select(Income).where(Income.unit_ref == charge_id))
-        ).scalar_one_or_none()
-        if income is not None:
-            stamp = int(datetime.now(UTC).timestamp())
-            tail = f"refunded:{stamp}"
-            income.note = (f"{income.note} | {tail}" if income.note else tail)[:200]
-        await session.commit()
-    try:
-        await message.answer(
-            "↩️ Возврат звёзд проведён. Грант на перемотку кадра отозван."
-            if not spent_at_refund
-            else "↩️ Возврат проведён, но перемотка кадра уже была использована — напишу хранителю."
-        )
-    except Exception as exc:
-        # Деньги уже возвращены и хранитель получит уведомление строкой ниже;
-        # не доставившийся ответ — не повод ронять обработчик. Но и не повод
-        # замолчать: причина может быть не блокировкой бота, а сбоем сети.
-        logger.debug("Возврат звёзд: ответ игроку не доставлен: %s", exc)
-    bot = getattr(message, "bot", None)
-    await notify_admins(
-        bot,
-        f"↩️ Stars refund: charge `{charge_id}` от игрока {player_ref}"
-        + (" — грант был УЖЕ потрачен." if spent_at_refund else "."),
-    )
-
-
-@router.callback_query(F.data.startswith("payton:"))
-async def on_payton(callback: CallbackQuery) -> None:
-    raw = (callback.data or "").split(":")[1] if ":" in (callback.data or "") else ""
-    if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
-        await callback.answer("Оплата — только в личке у бота (/change).", show_alert=True)
-        return
     if not settings.ton_enabled or not settings.active_treasury_address:
-        await callback.answer("Приём Gram ещё не включён. Используй Stars.", show_alert=True)
+        await callback.answer(
+            "Приём Gram ещё не включён — оплата перемотки временно недоступна.",
+            show_alert=True,
+        )
         return
     if not raw.isdigit():
         await callback.answer("Некорректный счёт.", show_alert=True)
@@ -348,8 +180,7 @@ async def on_payton(callback: CallbackQuery) -> None:
         f"<code>{revote_memo(int(raw))}</code> в любой части комментария.\n\n"
         "Грант придёт в течение минуты и живёт до конца дня. "
         f"Ровно {settings.stake_min_ton:g} Gram — уже минимальная ставка, не оплата перемотки.\n"
-        "💡 Проще и без кошелька — Stars: кнопка в /change. "
-        "Для оплаты Gram кошелёк должен быть привязан: /wallet.",
+        "Для оплаты кошелёк должен быть привязан: /wallet.",
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()

@@ -783,8 +783,8 @@ async def test_stakes_listing(monkeypatch) -> None:
     assert "refunded" in text
 
 
-async def test_revenue_splits_stars_and_gram(monkeypatch) -> None:
-    """Касса: звёзды и Gram отдельно, ручные корректировки казны — не доход."""
+async def test_revenue_reports_gram_only(monkeypatch) -> None:
+    """Касса: только Gram-доход, ручные корректировки и старые Stars-строки — нет."""
     monkeypatch.setattr(settings, "admin_ids", str(ADMIN))
     await _wipe(Income)
     empty = make_message("/revenue")
@@ -795,6 +795,8 @@ async def test_revenue_splits_stars_and_gram(monkeypatch) -> None:
     async with SessionLocal() as db:
         db.add_all(
             [
+                # Историческая Stars-строка: оплата снята с продажи, в кассе
+                # текущего контура её быть не должно.
                 Income(
                     kind="stars",
                     amount_stars=120,
@@ -805,17 +807,7 @@ async def test_revenue_splits_stars_and_gram(monkeypatch) -> None:
                     created_at=datetime.now(UTC),
                 ),
                 Income(
-                    kind="stars",
-                    amount_stars=30,
-                    amount_nanotons=0,
-                    unit_ref="s-2",
-                    note="оплата",
-                    network=current_network(),
-                    created_at=datetime.now(UTC) - timedelta(days=40),
-                ),
-                Income(
                     kind="ton",
-                    amount_stars=0,
                     amount_nanotons=to_nano(5),
                     unit_ref="t-1",
                     note="перевод",
@@ -823,8 +815,15 @@ async def test_revenue_splits_stars_and_gram(monkeypatch) -> None:
                     created_at=datetime.now(UTC),
                 ),
                 Income(
+                    kind="ton",
+                    amount_nanotons=to_nano(2),
+                    unit_ref="t-2",
+                    note="перевод",
+                    network=current_network(),
+                    created_at=datetime.now(UTC) - timedelta(days=40),
+                ),
+                Income(
                     kind=ops.MANUAL_OUT_KIND,
-                    amount_stars=0,
                     amount_nanotons=to_nano(9),
                     unit_ref="m-out",
                     note="корректировка",
@@ -833,7 +832,6 @@ async def test_revenue_splits_stars_and_gram(monkeypatch) -> None:
                 ),
                 Income(
                     kind=ops.MANUAL_IN_KIND,
-                    amount_stars=0,
                     amount_nanotons=to_nano(4),
                     unit_ref="m-in",
                     note="корректировка",
@@ -846,10 +844,10 @@ async def test_revenue_splits_stars_and_gram(monkeypatch) -> None:
 
     text = await _revenue_text()
     assert "Месяц" in text and "Всего" in text
-    assert "⭐ 120 (1 оплат)" in text
-    # 150 звёзд за всё время, но за месяц только 120.
-    assert "⭐ 150 (2 оплат)" in text
     assert "💎 5.0000 Gram (1 переводов)" in text
+    # 7 Gram за всё время, но за месяц только 5.
+    assert "💎 7.0000 Gram (2 переводов)" in text
+    assert "⭐" not in text and "120" not in text
     assert "9.0000 Gram" not in text
     assert "4.0000 Gram" not in text
 

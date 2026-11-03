@@ -66,7 +66,7 @@ async def test_one_grant_buys_one_change(session) -> None:
     await session.commit()
     await cast_vote(session, round_row, PLAYER_ID, 0)
     session.add(
-        RevoteGrant(round_id=round_row.id, player_id=PLAYER_ID, source="stars", unit_ref="g-1")
+        RevoteGrant(round_id=round_row.id, player_id=PLAYER_ID, source="ton", unit_ref="g-1")
     )
     await session.commit()
 
@@ -94,7 +94,7 @@ async def test_concurrent_changes_spend_one_grant() -> None:
         await cast_vote(db, round_row, PLAYER_ID, 0)
         db.add(
             RevoteGrant(
-                round_id=round_id, player_id=PLAYER_ID, source="stars", unit_ref="g-race"
+                round_id=round_id, player_id=PLAYER_ID, source="ton", unit_ref="g-race"
             )
         )
         await db.commit()

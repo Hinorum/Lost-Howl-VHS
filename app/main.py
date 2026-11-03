@@ -607,7 +607,7 @@ async def run_webhook(bot, dispatcher) -> None:
     await site.start()
     if settings.public_base_url:
         # drop_pending_updates=False: накопленные за сон апдейты (голоса
-        # кнопками, оплаты Stars!) должны обработаться, а не выброситься.
+        # кнопками и прочие действия) должны обработаться, а не выброситься.
         await bot.set_webhook(
             f"{settings.public_base_url}{path}",
             secret_token=secret,

@@ -374,7 +374,6 @@ class Settings(BaseSettings):
     story_cassettes_db: bool = True
 
     revote_enabled: bool = True
-    revote_stars: int = 25
     revote_ton: float = 0.1
     # Период само-пинга /health: держит free plan Render от засыпания, чтобы
     # день открывался по UTC-сетке. 0 — выключить.

@@ -29,8 +29,7 @@ from app.handlers import (
     cmd_resume,
     on_adjust_action,
     on_panel_action,
-    on_paystars,
-    on_pre_checkout,
+    on_payton,
 )
 from app.handlers import panel as panel_mod
 from app.models import (
@@ -1151,36 +1150,28 @@ async def test_panel_refresh_identical_content_is_not_error(admin_only) -> None:
     view.answer.assert_awaited_with("Без изменений.")
 
 
-async def test_stars_payment_blocked_while_paused(admin_only, ton_on) -> None:
-    """Стоп-кран закрывает и платные механики: счёт не выдаётся,
-    а выставленный до паузы счёт отклоняется ДО списания Stars."""
+async def test_gram_payment_blocked_while_paused(admin_only, ton_on) -> None:
+    """Стоп-кран закрывает и платные механики: реквизиты для оплаты Gram
+    не выдаются, пока игра на техработах."""
     await _wipe_pause()
     try:
         async with SessionLocal() as session:
             await ops.set_game_paused(session, True, "техработы")
 
-        paystars = SimpleNamespace(
-            data="paystars:1",
+        payton = SimpleNamespace(
+            data="payton:1",
             from_user=SimpleNamespace(id=ADMIN_ID),
             bot=AsyncMock(),
-            message=SimpleNamespace(chat=SimpleNamespace(id=ADMIN_ID, type="private")),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=ADMIN_ID, type="private"),
+                answer=AsyncMock(),
+            ),
             answer=AsyncMock(),
         )
-        await on_paystars(paystars)
-        paystars.bot.send_invoice.assert_not_awaited()
-        kwargs = paystars.answer.call_args.kwargs
+        await on_payton(payton)
+        payton.message.answer.assert_not_awaited()
+        kwargs = payton.answer.call_args.kwargs
         assert kwargs.get("show_alert") is True
-        assert "технические" in paystars.answer.call_args.args[0]
-
-        from app.payments import build_revote_payload
-
-        pre_checkout = SimpleNamespace(
-            invoice_payload=build_revote_payload(1),
-            answer=AsyncMock(),
-        )
-        await on_pre_checkout(pre_checkout)
-        kwargs = pre_checkout.answer.call_args.kwargs
-        assert kwargs.get("ok") is False
-        assert "технические" in kwargs.get("error_message", "")
+        assert "технические" in payton.answer.call_args.args[0]
     finally:
         await _wipe_pause()

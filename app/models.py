@@ -509,12 +509,12 @@ class PackFundLedger(Base):
 
 
 class RevoteGrant(Base):
-    """Оплаченное право изменить свой выбор в дне (Stars или TON).
+    """Оплаченное право изменить свой выбор в дне (TON).
 
-    unit_ref — идемпотентность платежа: telegram_payment_charge_id для Stars,
-    хеш транзакции для TON. granted → used в момент фактической смены пути.
-    round_id nullable — так записываются «осиротевшие» оплаты за закрытый день
-    (возврат таких — ручная операция хранителя).
+    unit_ref — идемпотентность платежа: хеш транзакции (у исторических
+    записей — id платежа Telegram). granted → used в момент фактической
+    смены пути. round_id nullable — так записываются «осиротевшие» оплаты
+    за закрытый день (возврат таких — ручная операция хранителя).
     """
 
     __tablename__ = "revote_grants"
@@ -522,7 +522,7 @@ class RevoteGrant(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     round_id: Mapped[int | None] = mapped_column(ForeignKey("rounds.id"), nullable=True, index=True)
     player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), index=True)
-    source: Mapped[str] = mapped_column(String(16), default="stars")
+    source: Mapped[str] = mapped_column(String(16), default="ton")
     unit_ref: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="granted")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -532,10 +532,10 @@ class RevoteGrant(Base):
 class Income(Base):
     """Поступление в казну: ledger для сверки с балансом бота и кошелька.
 
-    kind="stars" — Telegram Stars за смену пути (amount_stars), выводятся
-    владельцем через Fragment; kind="ton" — прямые переводы в казну
-    (amount_nanotons); network помечает TON-строки (mainnet/testnet), чтобы
-    сверка казны не смешивала контуры. unit_ref — тот же идемпотент, что у гранта.
+    kind="ton" — прямые переводы в казну (amount_nanotons); network помечает
+    TON-строки (mainnet/testnet), чтобы сверка казны не смешивала контуры.
+    amount_stars — историческое поле старых начислений, новые не создаются.
+    unit_ref — тот же идемпотент, что у гранта.
     """
 
     __tablename__ = "incomes"

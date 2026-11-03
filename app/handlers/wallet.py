@@ -348,7 +348,6 @@ _VOTE_COOLDOWN = 3.0
 _ACTION_COOLDOWNS = {
     "wallet_cd": _WALLET_COOLDOWN,
     "change_cd": _WALLET_COOLDOWN,
-    "paystars_cd": _WALLET_COOLDOWN,
     "payton_cd": _WALLET_COOLDOWN,
     "vote_cd": _VOTE_COOLDOWN,
 }

@@ -403,7 +403,7 @@ async def test_boot_game_takes_lock_before_first_tick(monkeypatch) -> None:
 async def test_run_webhook_lifecycle(monkeypatch) -> None:
     """Полный жизненный цикл вебхука: роуты, секрет, set_webhook, старт бота,
     затем по сигналу — глушение планировщика, отмена задач и закрытие сессий.
-    Накопленные за сон апдейты (голоса, оплаты Stars) не должны выбрасываться."""
+    Накопленные за сон апдейты (голоса кнопками) не должны выбрасываться."""
     scheduler = importlib.import_module("app.scheduler")
     monkeypatch.setattr(settings, "webhook_base_url", "https://way.example")
     monkeypatch.setattr(settings, "webhook_secret", "hook-secret")

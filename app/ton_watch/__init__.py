@@ -456,7 +456,7 @@ async def process_transfer(transfer: Transfer, bot: Bot | None = None) -> str:
                     f"ставки ({settings.stake_min_ton:g} Gram). Если ты менял путь — "
                     "бот не распознал комментарий rv:… за переводом. Переведи снова "
                     "без мемо (сумма из вилки зачтётся автоматически) либо с "
-                    "<code>rv:день</code> в комментарии. Или выбери Stars в /change — надёжнее.",
+                    "<code>rv:день</code> в комментарии.",
                 )
             elif result == "money_off":
                 await _dm_refund_queued(

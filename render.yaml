@@ -333,7 +333,5 @@ services:
         value: "Эхо Стаи"
       - key: REVOTE_ENABLED
         value: "true"
-      - key: REVOTE_STARS
-        value: "25"
       - key: REVOTE_TON
         value: "0.1"

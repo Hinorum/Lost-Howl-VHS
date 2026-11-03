@@ -647,19 +647,17 @@ async def _revenue_text() -> str:
     Корректировки казны (manual_out/manual_in из /adjust) доходом не
     считаются — они видны в /treasury отдельной строкой.
     """
-    from app.ops import MANUAL_IN_KIND, MANUAL_OUT_KIND
-
     now = datetime.now(UTC)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    revenue_kinds = Income.kind.notin_([MANUAL_OUT_KIND, MANUAL_IN_KIND])
+    # Касса ведётся только в Gram: ручные корректировки и исторические
+    # Stars-строки доходом текущего контура не считаются.
+    revenue_kinds = Income.kind == "ton"
 
     def _block(title: str, data) -> str:
-        parts = []
-        for kind, count, stars, nanotons in data:
-            if kind == "stars":
-                parts.append(f"⭐ {stars} ({count} оплат)")
-            else:
-                parts.append(f"💎 {from_nano(nanotons):.4f} Gram ({count} переводов)")
+        parts = [
+            f"💎 {from_nano(nanotons):.4f} Gram ({count} переводов)"
+            for _kind, count, nanotons in data
+        ]
         return f"{title}: " + ("; ".join(parts) if parts else "пусто")
 
     async with SessionLocal() as session:
@@ -668,7 +666,6 @@ async def _revenue_text() -> str:
                 select(
                     Income.kind,
                     func.count(),
-                    func.coalesce(func.sum(Income.amount_stars), 0),
                     func.coalesce(func.sum(Income.amount_nanotons), 0),
                 )
                 .where(Income.created_at >= month_start, revenue_kinds)
@@ -680,7 +677,6 @@ async def _revenue_text() -> str:
                 select(
                     Income.kind,
                     func.count(),
-                    func.coalesce(func.sum(Income.amount_stars), 0),
                     func.coalesce(func.sum(Income.amount_nanotons), 0),
                 )
                 .where(revenue_kinds)
