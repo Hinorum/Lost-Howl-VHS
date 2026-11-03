@@ -1263,6 +1263,11 @@ async def test_auto_grant_no_vote_silent_when_refund_already_booked(
         db.add(Player(id=pid, username=f"u{pid}", wallet_address=wallet))
         round_row = _open_round(day_index=905_101)
         db.add(round_row)
+        # Родителя — до строки с внешним ключом: без relationship() unit of work
+        # не ставит INSERT игрока перед INSERT'ом incomes (сортировка идёт по
+        # именам мапперов), и на Postgres получается ForeignKeyViolationError.
+        # SQLite внешние ключи не проверяет, поэтому кейс годами проходил молча.
+        await db.flush()
         db.add(
             Income(
                 kind="ton",
