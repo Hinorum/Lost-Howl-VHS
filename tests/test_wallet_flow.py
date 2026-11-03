@@ -281,10 +281,28 @@ async def test_stake_text_hides_revote_when_disabled(monkeypatch) -> None:
     assert "перемотк" not in text
 
 
+async def test_stake_text_hides_revote_without_treasury_address(monkeypatch) -> None:
+    """Без адреса казначея перемотку не рекламируем.
+
+    Флаг включён, а платить некуда: /change в такой конфигурации отказывает,
+    и реклама в /stake звала бы игрока оплачивать перевод, который некуда
+    отправить."""
+    monkeypatch.setattr(settings, "ton_enabled", True)
+    monkeypatch.setattr(settings, "revote_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", "")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "")
+    monkeypatch.setattr(wallet_mod, "_active_round_money_mode", AsyncMock(return_value=True))
+    text = await wallet_mod._stake_view_text(make_user(next_uid()))
+    assert "перемотк" not in text
+    assert "адрес казначея ещё не настроен" in text
+
+
 async def test_stake_text_mentions_revote_when_enabled(monkeypatch) -> None:
     """Включённая перемотка остаётся в инструкции /stake: вилка и «без мемо»."""
     monkeypatch.setattr(settings, "ton_enabled", True)
     monkeypatch.setattr(settings, "revote_enabled", True)
+    monkeypatch.setattr(settings, "treasury_address", "UQTestTreasury")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "UQTestTreasury")
     monkeypatch.setattr(wallet_mod, "_active_round_money_mode", AsyncMock(return_value=True))
     text = await wallet_mod._stake_view_text(make_user(next_uid()))
     assert "оплата перемотки" in text

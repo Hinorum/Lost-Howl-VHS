@@ -502,10 +502,11 @@ async def _stake_view_text(user) -> str:
                 return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
     # Перемотку рекламируем только когда она действительно продаётся: иначе
     # игрок платит по инструкции, а перевод возвращается с газом казны.
+    # Без адреса казначея платить некуда, даже когда флаг включён.
     revote_note = (
         f" Сумма {settings.revote_ton:g}–{settings.stake_min_ton:g} Gram при уже "
         "выбранном сегодня кадре зачтётся как оплата перемотки — и без мемо."
-        if settings.revote_enabled
+        if settings.revote_enabled and settings.active_treasury_address
         else ""
     )
     head = _STAKE_HOWTO.format(
