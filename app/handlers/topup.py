@@ -133,6 +133,23 @@ async def cmd_change(message: Message) -> None:
 
 @router.callback_query(F.data == "change:view")
 async def on_change_view(callback: CallbackQuery) -> None:
+    # Кнопка «Перемотать кадр» живёт в сообщениях чата и переживает выключение
+    # фичи: тап по старой кнопке не должен продавать то, что уже не продаётся
+    # (/change в этом случае отказывает).
+    if not settings.revote_enabled:
+        await callback.answer("Перемотка кадра сейчас недоступна.", show_alert=True)
+        return
+    if not settings.ton_enabled:
+        await callback.answer(
+            "Перемотка кадра недоступна в бесплатной версии.", show_alert=True
+        )
+        return
+    if not settings.active_treasury_address:
+        await callback.answer(
+            "Приём Gram ещё не включён — перемотка кадра временно недоступна.",
+            show_alert=True,
+        )
+        return
     status, _round_id = await _revote_status(callback.from_user)
     await callback.answer(f"{status} Открой бота в личке: /change"[:200], show_alert=True)
 

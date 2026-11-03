@@ -249,6 +249,33 @@ async def test_change_view_callback_explains_and_points_to_dm(stage) -> None:
     assert len(text) <= 200
 
 
+async def test_change_view_callback_does_not_sell_disabled_revote(stage, monkeypatch) -> None:
+    """Старая кнопка в чате не продаёт выключенную перемотку.
+
+    Кнопка «Перемотать кадр» живёт в сообщениях и переживает выключение фичи:
+    тап по ней отвечает продающим текстом, хотя /change в этот момент
+    отказывает. Игрок платит по инструкции, которой нет.
+    """
+    monkeypatch.setattr(settings, "revote_enabled", False)
+    callback = SimpleNamespace(from_user=_user(stage.uid), answer=AsyncMock())
+    await on_change_view(callback)
+    text = callback.answer.call_args.args[0]
+    assert "недоступна" in text
+    assert "Оплати перемотку" not in text
+    assert "/change" not in text
+
+
+async def test_change_view_callback_without_treasury_address(stage, monkeypatch) -> None:
+    """Без адреса казначея кнопка не зовёт оплачивать перемотку."""
+    monkeypatch.setattr(settings, "treasury_address", "")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "")
+    callback = SimpleNamespace(from_user=_user(stage.uid), answer=AsyncMock())
+    await on_change_view(callback)
+    text = callback.answer.call_args.args[0]
+    assert "Приём Gram ещё не включён" in text
+    assert "Оплати перемотку" not in text
+
+
 async def test_change_is_rate_limited(stage, monkeypatch) -> None:
     """/change подряд не перебирает игрока и раунд впустую."""
     from app.handlers import wallet as wallet_mod
