@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from conftest import ensure_player, ensure_round
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -209,6 +210,12 @@ async def test_stash_refund_skips_transfer_booked_as_stake(
 
     monkeypatch.setattr(settings, "watch_refund_max_age_days", 30)
     monkeypatch.setattr(settings, "refund_min_gram", 0)
+    # Родители — до ставки: без relationship() unit of work не ставит INSERT
+    # родителя перед INSERT'ом ребёнка, и с включёнными внешними ключами такой
+    # порядок отвергается (раньше проходило только потому, что SQLite внешние
+    # ключи не проверял).
+    await ensure_round(1, session=session)
+    await ensure_player(7, session=session)
     session.add(
         Stake(
             round_id=1,

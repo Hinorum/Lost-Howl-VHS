@@ -94,7 +94,35 @@ sqlite3.register_adapter(_dt.date, lambda v: v.isoformat())
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler as _AsyncIOScheduler
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+
+def _enable_sqlite_foreign_keys(engine) -> None:
+    """Включить проверку внешних ключей на SQLite.
+
+    SQLite по умолчанию внешние ключи НЕ проверяет: строка с несуществующим
+    родителем проходит молча, и дефект всплывает только на Postgres в CI —
+    через неделю и через другой коммит (так погиб тест «перевод уже учтён»:
+    Income вставлялся раньше Player, и на Postgres приходил
+    ForeignKeyViolationError). С этой прагмой тот же дефект падает на
+    локальном прогоне, где его видно сразу, а Postgres остаётся эталоном:
+    проверка FK у него включена всегда.
+
+    Прагма действует на соединение, а не на базу — поэтому слушатель
+    вешается на движок и срабатывает на каждом новом подключении.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _fk_pragma(dbapi_connection, _connection_record) -> None:
+        # У aiosqlite это адаптированное соединение, у которого нет
+        # exec_driver_sql — прагму ставит курсор (через зелёный мост SQLAlchemy
+        # вызов синхронный и ждёт завершения).
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 def pytest_configure(config) -> None:
@@ -206,8 +234,9 @@ def test_db_guard():
 @pytest.fixture(scope="session", autouse=True)
 async def _global_db_schema():
     """Глобальная БД (SessionLocal) пересоздаётся по текущим моделям каждый прогон."""
-    from app.db import init_db
+    from app.db import engine, init_db
 
+    _enable_sqlite_foreign_keys(engine)
     await init_db()
     yield
     # Временная база прогона — на диске её оставать незачем: файл в темпе
@@ -298,8 +327,29 @@ async def truncate_all(db) -> None:
         await db.execute(delete(table))
 
 
-async def ensure_player(player_id: int) -> None:
-    """Гарантировать игрока в глобальной БД — родителя для payouts/stakes/votes.
+def _test_round(round_id: int):
+    """Заготовка дня-родителя для тестов: минимум обязательных полей."""
+    from app.models import Round, RoundStatus, WinRule
+
+    now = datetime.now(UTC)
+    return Round(
+        id=round_id,
+        day_index=round_id,
+        status=RoundStatus.OPEN,
+        win_rule=WinRule.MAJORITY,
+        chapter_title=f"Тестовый день {round_id}",
+        chapter_text="Тестовая глава",
+        opens_at=now,
+        voting_ends_at=now,
+        tally_ends_at=now,
+    )
+
+
+async def ensure_player(player_id: int, session=None) -> None:
+    """Гарантировать игрока — родителя для payouts/stakes/votes.
+
+    Без переданной сессии — в глобальной БД (SessionLocal); с переданной — в
+    ней же, что нужно тестам на фикстуре `session` (у неё своя база).
 
     SQLite внешние ключи не проверяет, поэтому тесты исторически сыпали
     player_id «из воздуха»: на SQLite зелёно, на Postgres IntegrityError.
@@ -307,43 +357,46 @@ async def ensure_player(player_id: int) -> None:
     Импорт — `from conftest import ensure_player` (pytest добавляет tests/ в
     sys.path для модулей без __init__.py).
     """
-    from app.db import SessionLocal
     from app.models import Player
 
-    async with SessionLocal() as session:
+    if session is not None:
         if await session.get(Player, player_id) is None:
             session.add(Player(id=player_id))
-            await session.commit()
+            await session.flush()
+        return
+
+    from app.db import SessionLocal
+
+    async with SessionLocal() as db:
+        if await db.get(Player, player_id) is None:
+            db.add(Player(id=player_id))
+            await db.commit()
 
 
-async def ensure_round(round_id: int) -> None:
-    """Гарантировать раунд c id=round_id в глобальной БД — родителя для строк.
+async def ensure_round(round_id: int, session=None) -> None:
+    """Гарантировать раунд c id=round_id — родителя для строк.
+
+    Без переданной сессии — в глобальной БД; с переданной — в ней же.
 
     Тесты привязаны к фиксированному id раунда (комменты вида way:<day>#<id>,
     day_index), поэтому день создаётся с day_index=id: приложение держит их
     выровненными, а расхождение дало бы уникальный конфликт на day_index.
     Идемпотентно: существующий раунд не трогается.
     """
-    from app.db import SessionLocal
-    from app.models import Round, RoundStatus, WinRule
+    from app.models import Round
 
-    now = datetime.now(UTC)
-    async with SessionLocal() as session:
+    if session is not None:
         if await session.get(Round, round_id) is None:
-            session.add(
-                Round(
-                    id=round_id,
-                    day_index=round_id,
-                    status=RoundStatus.OPEN,
-                    win_rule=WinRule.MAJORITY,
-                    chapter_title=f"Тестовый день {round_id}",
-                    chapter_text="Тестовая глава",
-                    opens_at=now,
-                    voting_ends_at=now,
-                    tally_ends_at=now,
-                )
-            )
-            await session.commit()
+            session.add(_test_round(round_id))
+            await session.flush()
+        return
+
+    from app.db import SessionLocal
+
+    async with SessionLocal() as db:
+        if await db.get(Round, round_id) is None:
+            db.add(_test_round(round_id))
+            await db.commit()
 
 
 @pytest.fixture(autouse=True)
@@ -432,6 +485,7 @@ def _refund_caps_off(monkeypatch):
 @pytest.fixture
 async def session(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    _enable_sqlite_foreign_keys(engine)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)

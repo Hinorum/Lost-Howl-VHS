@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from conftest import ensure_player, ensure_round
 from sqlalchemy import delete, func, select
 
 from app import ops, treasury_mirror
@@ -245,6 +246,12 @@ def test_classify_outgoing_by_memo() -> None:
 
 
 async def test_resolve_kind_incoming_stake_linked(session) -> None:
+    # Родители — до ставки: без relationship() unit of work не ставит INSERT
+    # родителя перед INSERT'ом ребёнка, и с включёнными внешними ключами такой
+    # порядок отвергается (раньше это проходило только потому, что SQLite
+    # внешние ключи не проверял).
+    await ensure_round(1, session=session)
+    await ensure_player(1, session=session)
     session.add(Stake(round_id=1, player_id=1, amount_nanotons=to_nano(1),
                       tx_hash=_h64("stk"), network=NET, status="confirmed"))
     move = _move("stk")

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from conftest import ensure_player
+
 from app import ops
 from app.config import settings
 from app.core.registry import LOCAL_TIE_PREFIX
@@ -173,6 +175,8 @@ async def test_money_day_stays_unpredictable_after_global_switch_off(
 
     round_row = await _seed_tied_day(session, 855)
     round_row.money_mode = True  # день открыт со ставками
+    # Игрок-родитель для ставки — до её INSERT'а (внешний ключ).
+    await ensure_player(900_031, session=session)
     session.add(
         Stake(
             round_id=round_row.id,
