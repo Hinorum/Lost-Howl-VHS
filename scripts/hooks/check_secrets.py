@@ -330,6 +330,11 @@ def _iter_paths(staged: bool) -> list[Path]:
             rel = p.as_posix()
             if rel.startswith(".git/") or "/__pycache__/" in rel:
                 continue
+            if "/node_modules/" in rel:
+                # Локальные установки инструментов (npm), а не файлы репозитория:
+                # в CI такого каталога нет, а локально сканер спотыкается о чужие
+                # исходники и минифицированные бандлы — и краснеет без причины.
+                continue
             if rel.startswith("data/") or rel.startswith(".venv/"):
                 continue
             names.append(rel)
