@@ -192,7 +192,7 @@ aiosqlite==0.22.1
 #   aiosqlite-0.22.1-py3-none-any.whl sha256:21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb
 #   aiosqlite-0.22.1.tar.gz sha256:043e0bd78d32888c0a9ca90fc788b38796843360c855a7262a532813133a0650
 
-alembic==1.20.0
+alembic==1.20.1
 #   alembic-1.20.0-py3-none-any.whl sha256:77eb101048d95f982c0353e9233404889dcd7a6fc244c107836c0e2fc9cf7d9d
 #   alembic-1.20.0.tar.gz sha256:db505480647bc60386c5369402f4a57a506b7539c9e9ef5e270d45cbbe4939bf
 
@@ -460,7 +460,7 @@ pyyaml==6.0.3
 #   pyyaml-6.0.3-cp39-cp39-win_amd64.whl sha256:2e71d11abed7344e42a8849600193d15b6def118602c4c176f748e4583246007
 #   pyyaml-6.0.3.tar.gz sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
 
-sqlalchemy==2.1.4
+sqlalchemy==2.1.6
 #   sqlalchemy-2.1.4-cp311-cp311-macosx_11_0_arm64.whl sha256:a6d147c31e189541ae7cd990482c4f960f9e8abce186551225fa355856dbf1a5
 #   sqlalchemy-2.1.4-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl sha256:55072780d1aae84dea443ce27edeb745f6cc4d19ad89416abbb6b49712080e7c
 #   sqlalchemy-2.1.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl sha256:343a0493a81278bfe30be1ec81214a55f2f44aaa4662d230be359ab2aa18cc2a
