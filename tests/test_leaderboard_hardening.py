@@ -67,6 +67,15 @@ from app.ton_utils import to_nano
 from app.weeks import iso_week_key, previous_week_key, week_bounds
 
 
+def _net(amount: int) -> int:
+    """Сумма выплаты по правилу «получатель получает чистыми».
+
+    Газ платит копилка (недели/месяца), а не остаток казны: доля места уходит
+    получателю минус комиссия сети за его перевод.
+    """
+    return amount - to_nano(settings.payout_fee_gram)
+
+
 def _sunday_last_of_month() -> datetime:
     """Ближайшее воскресенье, которое одновременно последний день месяца."""
     cursor = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
@@ -242,10 +251,11 @@ async def test_week_boundary_tied_fourth_promoted_by_claim(monkeypatch: pytest.M
                 for p in (await session.execute(select(Payout).where(Payout.kind == "weekly"))).scalars()
             }
             # A(6), B(5) держат 50/30; третье место — заявившийся №4 (4 верных).
+            # Получатели получают чистыми: газ платит копилка недели.
             assert by_pid == {
-                760_000: to_nano(10) * 50 // 100,
-                760_001: to_nano(10) * 30 // 100,
-                760_003: to_nano(10) * 20 // 100,
+                760_000: _net(to_nano(10) * 50 // 100),
+                760_001: _net(to_nano(10) * 30 // 100),
+                760_003: _net(to_nano(10) * 20 // 100),
             }
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
@@ -305,9 +315,10 @@ async def test_week_dust_place_rolls_to_next_week_pot(monkeypatch: pytest.Monkey
             }
             place_3 = pot_total * 20 // 100
             assert place_3 < to_nano(settings.min_payout_gram)
+            # Получатели получают чистыми: газ платит копилка недели.
             assert by_pid == {
-                base: pot_total * 50 // 100,
-                base + 1: pot_total * 30 // 100,
+                base: _net(pot_total * 50 // 100),
+                base + 1: _net(pot_total * 30 // 100),
             }
             current_week = iso_week_key(datetime.now(UTC))
             pot_row = (
@@ -419,11 +430,12 @@ async def test_month_dust_recarries_to_current_pot(monkeypatch: pytest.MonkeyPat
         try:
             assert await settle_month_if_due(bot=None) is True
             # Второе место (30% от 0.05 Грама = 0.015 < 0.02) — пыль: не платится.
+            # Первый получает чистыми: газ платит копилка месяца.
             payouts = {
                 p.player_id: p.amount_nanotons
                 for p in (await session.execute(select(Payout).where(Payout.kind == "leaderboard"))).scalars()
             }
-            assert payouts == {base: to_nano(0.05) * 70 // 100}
+            assert payouts == {base: _net(to_nano(0.05) * 70 // 100)}
             current_month = datetime.now(UTC).strftime("%Y-%m")
             current_pot = (
                 await session.execute(select(LeaderboardPot).where(LeaderboardPot.month == current_month))
@@ -523,10 +535,11 @@ async def test_month_boundary_tied_fourth_promoted_by_claim(monkeypatch: pytest.
                 for p in (await session.execute(select(Payout).where(Payout.kind == "leaderboard"))).scalars()
             }
             # A(3), B(2) держат 50/30; третье место — заявившийся №4 (1 верный).
+            # Получатели получают чистыми: газ платит копилка месяца.
             assert by_pid == {
-                base: to_nano(10) * 50 // 100,
-                base + 1: to_nano(10) * 30 // 100,
-                base + 3: to_nano(10) * 20 // 100,
+                base: _net(to_nano(10) * 50 // 100),
+                base + 1: _net(to_nano(10) * 30 // 100),
+                base + 3: _net(to_nano(10) * 20 // 100),
             }
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "leaderboard"))

@@ -60,7 +60,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.core.fees import fee_estimate_nano
+from app.core.fees import fee_estimate_nano, net_payout_amount, net_payout_pool
 from app.core.processed import KIND_STAKE, claim_transfer, transfer_claim_kind
 from app.models import (
     LeaderboardPot,
@@ -113,7 +113,7 @@ def refund_net_amount(
     if ratio > 0:
         return max(0, int(stake_amount_nanotons * (1.0 - ratio)))
     fee = to_nano(settings.payout_fee_gram) if fee_nanotons is None else fee_nanotons
-    return max(0, stake_amount_nanotons - fee)
+    return net_payout_amount(stake_amount_nanotons, fee)
 
 
 def split_pot(prize_pool_nanotons: int, entries: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -392,6 +392,7 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
         ).all()
     )
     network = current_network()
+    fee_nano = await fee_estimate_nano(session)
     created = 0
     for pot in rows:
         wallet = wallets.get(pot.referrer_id)
@@ -406,6 +407,11 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
             # а диспатч такие строки не берёт (amount > 0) — вечный хвост в
             # очереди и раздутый счётчик «ожидает».
             continue
+        # Награда — выплата, значит газ платит копилка пригласившего: получатель
+        # получает чистыми, из копилки уходит ровно накопленное.
+        net = net_payout_amount(amount, fee_nano)
+        if net <= 0:
+            continue  # накопление меньше газа — ждём роста
         claimed = await session.execute(
             update(ReferralPot)
             .where(ReferralPot.id == pot.id, ReferralPot.nanotons == amount)
@@ -418,7 +424,7 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
                 round_id=None,
                 player_id=pot.referrer_id,
                 kind="referral",
-                amount_nanotons=amount,
+                amount_nanotons=net,
                 dest_address=wallet,
                 network=network,
             )
@@ -565,6 +571,14 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             weekly_cut = pot * weekly_bp // 10_000
             fund_cut = pot * fund_bp // 10_000
 
+            # Рейк хранителю — тоже выплата, значит газ платит сам рейк, а не
+            # остаток казны. Рейк меньше газа переводить нечем: он целиком
+            # уходит в копилку недели, иначе копилка потеряла бы копейки.
+            rake_payout = net_payout_amount(house_cut, fee_nano) if house_cut > 0 else 0
+            if house_cut > 0 and rake_payout <= 0:
+                weekly_cut += house_cut
+                house_cut = 0
+
             # Реферальная награда: доля referral_pct от подтверждённых ставок
             # приведённых игроков уходит пригласившим, а НЕ в пул победителей.
             # День без приведённых ставок делится как раньше (96%), при всех
@@ -592,7 +606,7 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
             prize_pool = pot - house_cut - board_cut - weekly_cut - fund_cut - referral_cut
 
             min_payout_nano = to_nano(settings.min_payout_gram)
-            net_pool = prize_pool - fee_nano * len(winning_stakes)
+            net_pool = net_payout_pool(prize_pool, len(winning_stakes), fee_nano)
             dust_to_week = 0
             if net_pool < min_payout_nano:
                 dust_to_week = prize_pool
@@ -635,8 +649,8 @@ async def finalize_day_payouts(session: AsyncSession, round_row: Round) -> int:
                     )
                 for referrer_id, share in referral_shares.items():
                     await _credit_referral(session, round_row.id, referrer_id, share)
-            if house_cut > 0:
-                created += add_treasury_payout("rake", house_cut)
+            if rake_payout > 0:
+                created += add_treasury_payout("rake", rake_payout)
             if board_cut > 0 and await _claim_pot(session, round_row.id, "month"):
                 month = round_row.tally_ends_at.strftime("%Y-%m")
                 # Атомарный upsert (см. _credit_referral): месяц уникален,

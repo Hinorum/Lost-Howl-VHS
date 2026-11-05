@@ -311,10 +311,12 @@ async def test_finalize_payouts_proportional_and_rake(
     assert ("prize", 3) not in by_kind_player
     # Микровыплат угадавшим без ставки больше нет — их 2% капает в копилку недели.
     assert all(kind != "bonus" for kind, _pid in by_kind_player)
-    # Консервация фонда: приз (чистыми) + рейк + копилка недели + копилка месяца + фонд + газ = весь пул.
-    assert sum(row["amount_nanotons"] for row in payouts) + board_cut + weekly_cut + fund_cut + fee == pot
-    # Доли казны уходят хранителю без игрока.
+    # Консервация фонда: приз (чистыми) + рейк (чистыми) + копилка недели +
+    # копилка месяца + фонд + газ (за оба перевода) = весь пул.
+    assert sum(row["amount_nanotons"] for row in payouts) + board_cut + weekly_cut + fund_cut + fee * 2 == pot
+    # Доли казны уходят хранителю без игрока — тоже чистыми: газ из рейка.
     assert by_kind_player[("rake", None)]["dest_address"] == "keeper-wallet"
+    assert by_kind_player[("rake", None)]["amount_nanotons"] == house - fee
     # Копилка месяца — отдельный учёт в LeaderboardPot, а не Payout.
     assert len(payouts) == created == 2
     # Копилка месяца записана отдельной строкой учёта, недели — своей.
@@ -742,7 +744,9 @@ async def test_unknown_sender_transfer_is_auto_refunded(monkeypatch: pytest.Monk
             ).first()._mapping
             assert row["kind"] == "refund"
             assert row["dest_address"] == source
-            assert row["amount_nanotons"] == to_nano(0.3)
+            # Возврат — тоже выплата: получатель получает чистыми, газ из суммы
+            # возврата (не из остатка казны).
+            assert row["amount_nanotons"] == to_nano(0.3) - to_nano(settings.payout_fee_gram)
             assert row["round_id"] is None
             assert row["player_id"] is None
             assert row["status"] == "pending"
@@ -956,7 +960,9 @@ async def test_repeat_stake_and_closed_day_transfers_are_refunded(
             row = (
                 await db.execute(Payout.__table__.select().where(Payout.tx_hash == hash_dup))
             ).first()._mapping
-            assert row["kind"] == "refund" and row["amount_nanotons"] == to_nano(2)
+            assert row["kind"] == "refund" and row["amount_nanotons"] == (
+                to_nano(2) - to_nano(settings.payout_fee_gram)
+            )
             assert row["round_id"] == round_row.id
             stakes_left = (
                 await db.execute(

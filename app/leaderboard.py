@@ -42,6 +42,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import case, delete, func, or_, select, text
 
 from app.config import settings
+from app.core.fees import fee_estimate_nano, net_payout_amount
 from app.core.registry import (
     MARKER_KEY,
     MONTH_CLAIM_WINDOW_KEY,
@@ -829,18 +830,28 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
         # съела бы большую часть). Неоплаченная пыль возвращается в копилку
         # ТЕКУЩЕГО месяца — старые горши ниже удаляются, деньги не теряются.
         min_payout_nano = to_nano(settings.min_payout_gram)
-        payments = [
-            (player_id, wallet, amount)
-            for player_id, wallet, amount in payments
-            if amount >= min_payout_nano
-        ]
-        if not payments:
+        fee_nano = await fee_estimate_nano(session)
+        allocated = sum(amount for _pid, _wallet, amount in payments)
+        dust = 0
+        payable: list[tuple[int, str, int]] = []
+        for player_id, wallet, amount in payments:
+            # Получатель получает ЧИСТЫМИ: газ платит копилка месяца, а не
+            # остаток казны. Доля, которая не переживает газ, уходит целиком
+            # в копилку текущего месяца (перевода на ноль не создаём).
+            net = net_payout_amount(amount, fee_nano)
+            if net <= 0 or net < min_payout_nano:
+                dust += amount
+                continue
+            payable.append((player_id, wallet, net))
+        if not payable:
             logger.warning(
                 "Копилка %d нанотонов ждёт: все доли ниже min_payout_gram — ждём роста горша",
                 total,
             )
             return False
-        recarry = total - sum(amount for _pid, _wallet, amount in payments)
+        payments = payable
+        # В копилку возвращается незаполненное (свободные веса) и пыль.
+        recarry = total - allocated + dust
         if recarry > 0:
             current_month = now.strftime("%Y-%m")
             pot_row = (
@@ -882,9 +893,11 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
         f" (без кошелька пропущены: {skipped})" if skipped else "",
     )
     if bot is not None and settings.admin_id_set:
+        paid_total = sum(amount for _pid, _wallet, amount in payments)
         text = (
             f"🏆 Копилка лидерборда за {prev_key} отправлена: "
-            f"{total / 1e9:.2f} Gram между {len(payments)} лидером(ами)."
+            f"{paid_total / 1e9:.2f} Gram между {len(payments)} лидером(ами) "
+            f"(газ {fee_nano * len(payments) / 1e9:.4f} Gram платит копилка)."
         )
         for admin_id in settings.admin_id_set:
             try:
@@ -1077,6 +1090,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
 
         amounts, rolled = _week_prize_amounts(total, len(places))
         min_payout_nano = to_nano(settings.min_payout_gram)
+        fee_nano = await fee_estimate_nano(session)
         network = _active_network()
         paid: list[tuple[str, str, int]] = []
         awards: list[tuple[int, int]] = []
@@ -1086,12 +1100,20 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
                 # часть доли. Переносится в копилку новой недели, как пустое место.
                 rolled += amount
                 continue
+            # Получатель получает ЧИСТЫМИ: газ платит копилка недели, а не
+            # остаток казны. Доля, которая не переживает газ, уходит целиком
+            # в копилку новой недели — копейки не теряются, а перевода на ноль
+            # не создаётся.
+            net = net_payout_amount(amount, fee_nano)
+            if net <= 0 or net < min_payout_nano:
+                rolled += amount
+                continue
             session.add(
                 Payout(
                     round_id=None,
                     player_id=pid,
                     kind="weekly",
-                    amount_nanotons=amount,
+                    amount_nanotons=net,
                     dest_address=wallet,
                     network=network,
                 )
@@ -1102,8 +1124,8 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
                 or (name_row.first_name if name_row else None)
                 or f"игрок {pid}"
             )
-            paid.append((_MEDALS[place - 1], f"{name} — {correct} верных сцен", amount))
-            awards.append((pid, amount))
+            paid.append((_MEDALS[place - 1], f"{name} — {correct} верных сцен", net))
+            awards.append((pid, net))
 
         # Места без достойного игрока переносятся в копилку новой недели.
         if rolled > 0:
@@ -1145,7 +1167,11 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         except Exception as exc:
             logger.warning("Церемония недели не разослана: %s", exc)
     if bot is not None and settings.admin_id_set:
-        admin_text = f"🗓 Копилка недели {prev_key} отправлена: {total / 1e9:.4f} Gram."
+        paid_total = sum(amount for _medal, _name, amount in paid)
+        admin_text = (
+            f"🗓 Копилка недели {prev_key} отправлена: {paid_total / 1e9:.4f} Gram "
+            f"(газ {fee_nano * len(paid) / 1e9:.4f} Gram платит копилка)."
+        )
         for admin_id in settings.admin_id_set:
             try:
                 await bot.send_message(admin_id, admin_text)

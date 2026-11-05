@@ -5,12 +5,18 @@
 + газ сети (payout_fee_gram за каждый отправляемый перевод). Ничего не
 теряется и не создаётся из воздуха — для победного дня, возвратного дня,
 дня с пылью и дня, где газ съел весь пул.
+
+ПРАВИЛО ВЫПЛАТ: получатель получает ЧИСТЫМИ — комиссию сети платит та
+копилка, из которой платят, а не остаток казны. Поэтому газ уже сидит
+ВНУТРИ сумм выплат (в пуле вычтен заранее, из каждой выплаты — при её
+создании), и в проверке он стоит отдельной строкой: из входа ушли выплаты
+(чистые), копилки и сам газ.
 """
 
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import stakes as stakes_mod
@@ -52,13 +58,14 @@ async def _assert_day_balances(
     session: AsyncSession,
     round_row: Round,
     n_winning_stakes: int,
-    n_refund_rows: int,
 ) -> None:
     """сумма всех ставок раунда == суммы Payout + копилки + газ за переводы.
 
-    n_winning_stakes — сколько переводов приза «оплачено» газом (даже при
-    пылевой доле перевод не создаётся, но газ вычтен заранее). n_refund_rows —
-    сколько строк возврата создалось (за каждую тоже газ).
+    n_winning_stakes — сколько выигравших делили пул: газ за их переводы
+    удержан из пула заранее (pool - fee × победителей), даже если чья-то
+    доля ушла в копилку недели пылью и перевода не было. Остальные переводы
+    (возвраты, рейк, рефералка) платят газ из своей суммы — таких строк
+    ровно столько же, сколько выплат такого вида.
 
     Во «вход» входят все полученные казной суммы раунда: подтверждённые
     (пот) и застрявшие (rejected/pending), возвращаемые отдельной строкой.
@@ -68,7 +75,15 @@ async def _assert_day_balances(
         r.amount_nanotons
         for r in (await session.execute(select(Stake).where(Stake.round_id == round_row.id))).scalars().all()
     )
-    rows = list((await session.execute(select(Payout).where(Payout.round_id == round_row.id))).scalars().all())
+    rows = list(
+        (
+            await session.execute(
+                select(Payout).where(
+                    or_(Payout.round_id == round_row.id, Payout.kind == "referral")
+                )
+            )
+        ).scalars().all()
+    )
     week = sum(
         r.nanotons for r in (await session.execute(select(stakes_mod.WeeklyPot))).scalars().all()
     )
@@ -82,7 +97,9 @@ async def _assert_day_balances(
         r.nanotons for r in (await session.execute(select(stakes_mod.ReferralPot))).scalars().all()
     )
     out = sum(r.amount_nanotons for r in rows) + week + month + fund + ref
-    gas = fee * (n_winning_stakes + n_refund_rows)
+    # Газ за переводы, чья сумма уже уменьшена на комиссию.
+    n_paid = sum(1 for r in rows if r.kind in ("refund", "rake", "referral"))
+    gas = fee * (n_winning_stakes + n_paid)
     assert out + gas == stakes_in, (
         f"день {round_row.day_index}: in={stakes_in} out={out} gas={gas} pot={round_row.pot_nanotons}"
     )
@@ -167,7 +184,7 @@ async def test_conservation_single_winner_with_losers_and_stuck(session: AsyncSe
     created = await stakes_mod.finalize_day_payouts(session, round_row)
     # prize(1) + rake(1) + refund stuck(1) — месяц в LeaderboardPot, неделя своя.
     assert created == 3
-    await _assert_day_balances(session, round_row, n_winning_stakes=1, n_refund_rows=1)
+    await _assert_day_balances(session, round_row, n_winning_stakes=1)
 
 
 async def test_conservation_two_winners_proportional(session: AsyncSession) -> None:
@@ -189,7 +206,7 @@ async def test_conservation_two_winners_proportional(session: AsyncSession) -> N
     await session.commit()
 
     await stakes_mod.finalize_day_payouts(session, round_row)
-    await _assert_day_balances(session, round_row, n_winning_stakes=2, n_refund_rows=0)
+    await _assert_day_balances(session, round_row, n_winning_stakes=2)
 
 
 async def test_conservation_dust_share_rolls_to_week(session: AsyncSession, monkeypatch) -> None:
@@ -213,7 +230,7 @@ async def test_conservation_dust_share_rolls_to_week(session: AsyncSession, monk
     # Только рейк казны: призовые доли целиком ушли в неделю. Газ вычтен за
     # обоих победителей как за потенциальные переводы.
     assert created == 1
-    await _assert_day_balances(session, round_row, n_winning_stakes=2, n_refund_rows=0)
+    await _assert_day_balances(session, round_row, n_winning_stakes=2)
 
 
 async def test_conservation_refund_day(session: AsyncSession) -> None:
@@ -234,7 +251,7 @@ async def test_conservation_refund_day(session: AsyncSession) -> None:
 
     created = await stakes_mod.finalize_day_payouts(session, round_row)
     assert created == 2
-    await _assert_day_balances(session, round_row, n_winning_stakes=0, n_refund_rows=2)
+    await _assert_day_balances(session, round_row, n_winning_stakes=0)
 
 
 async def test_conservation_gas_eaten_pool(session: AsyncSession, monkeypatch) -> None:
@@ -252,6 +269,8 @@ async def test_conservation_gas_eaten_pool(session: AsyncSession, monkeypatch) -
     await session.commit()
 
     created = await stakes_mod.finalize_day_payouts(session, round_row)
-    assert created == 1  # только рейк казны
+    # Рейка тоже не осталось: он меньше газа, поэтому перевода не будет —
+    # целиком уходит в копилку недели (вместе с призовым пулом).
+    assert created == 0
     # Переводы приза не создавались — казна газ не вычитала и не тратит.
-    await _assert_day_balances(session, round_row, n_winning_stakes=0, n_refund_rows=0)
+    await _assert_day_balances(session, round_row, n_winning_stakes=0)

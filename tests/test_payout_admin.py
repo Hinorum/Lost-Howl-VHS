@@ -76,7 +76,8 @@ async def test_stash_refund_skips_ancient_transfers(
     monkeypatch.setattr(settings, "refund_min_gram", 0)
     now = datetime.now(UTC).timestamp()
     ancient = Transfer(tx_hash="ancient", source="0:aa", value_nanotons=1_000, comment="РЕКЛАМА", utime=int(now - 40 * 86_400))
-    fresh = Transfer(tx_hash="fresh", source="0:bb", value_nanotons=2_000, comment="", utime=int(now - 3_600))
+    # Свежий перевод покрывает газ возврата: выплата создаётся (чистыми).
+    fresh = Transfer(tx_hash="fresh", source="0:bb", value_nanotons=1_000_000_000, comment="", utime=int(now - 3_600))
 
     assert await _stash_refund(session, ancient, None) == "refund_expired"
     assert (await session.execute(select(Payout))).scalars().all() == []

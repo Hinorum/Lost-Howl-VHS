@@ -54,6 +54,15 @@ def _week_prize_contract():
     settings.weekly_prize_pcts = prev
 
 
+def _net(amount: int) -> int:
+    """Сумма выплаты по правилу «получатель получает чистыми».
+
+    Газ платит копилка недели, а не остаток казны: доля места уходит
+    получателю минус комиссия сети за его перевод.
+    """
+    return amount - to_nano(settings.payout_fee_gram)
+
+
 async def _set_week_ready(session: AsyncSession, week_key: str) -> None:
     """Ставит флаг готовности недельного лидерборда (эпилог последнего дня недели записан)."""
     session.add(WatcherState(key=WEEK_READY_KEY, value=week_key))
@@ -199,9 +208,10 @@ async def test_settle_week_pays_top3_by_places(monkeypatch: pytest.MonkeyPatch) 
                 .all()
             )
             # Места только у достойных: best (место 1, 50%) и second (место 2, 30%).
+            # Получатель получает чистыми: газ платит копилка недели.
             assert [(p.player_id, p.amount_nanotons) for p in rows] == [
-                (pid_best, pot_total * 50 // 100),
-                (pid_second, pot_total * 30 // 100),
+                (pid_best, _net(pot_total * 50 // 100)),
+                (pid_second, _net(pot_total * 30 // 100)),
             ]
             assert all(p.dest_address == wallets[p.player_id] for p in rows)
             award_calls = [
@@ -379,9 +389,9 @@ async def test_settle_week_pays_top_three_individuals_not_tiers(monkeypatch: pyt
                 .scalars()
                 .all()
             )
-            first = pot_total * 50 // 100
-            second = pot_total * 30 // 100
-            third = pot_total * 20 // 100
+            first = _net(pot_total * 50 // 100)
+            second = _net(pot_total * 30 // 100)
+            third = _net(pot_total * 20 // 100)
             amounts = {(p.player_id): p.amount_nanotons for p in rows}
             # Места — игроки: a7 и b7 равны (верность и Gram) — меньший id первым.
             assert amounts[pid_a7] == first
@@ -391,8 +401,9 @@ async def test_settle_week_pays_top_three_individuals_not_tiers(monkeypatch: pyt
             assert pid_e6_lazy not in amounts  # без кошелька и стажа — вне радара
             assert len(rows) == 3
             assert all(p.dest_address == wallets[p.player_id] for p in rows)
-            # Копилка недели выплачена до нанотона.
-            assert sum(amounts.values()) == pot_total
+            # Копилка недели выплачена: три перевода — три газа, и каждый
+            # получатель получил свою долю чистыми.
+            assert sum(amounts.values()) == pot_total - 3 * to_nano(settings.payout_fee_gram)
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
             await session.execute(WatcherState.__table__.delete().where(WatcherState.key == WEEKLY_MARKER_KEY))
@@ -454,8 +465,9 @@ Player(id=pids[0], username="one", wallet_address=wallets[pids[0]], wallet_verif
             first = pot_total * 50 // 100
             second = pot_total * 30 // 100
             by_pid = {p.player_id: p.amount_nanotons for p in rows}
-            assert by_pid[pids[0]] == first  # ничья по Gram — меньший player_id выше
-            assert by_pid[pids[1]] == second
+            # Получатель получает чистыми: газ платит копилка недели.
+            assert by_pid[pids[0]] == _net(first)  # ничья по Gram — меньший player_id выше
+            assert by_pid[pids[1]] == _net(second)
             current_pot = (
                 await session.execute(select(WeeklyPot).where(WeeklyPot.week != week_key))
             ).scalar_one()
@@ -809,8 +821,8 @@ async def test_settle_week_claim_breaks_tie(monkeypatch: pytest.MonkeyPatch) -> 
             }
             # Ранний Claim перевешивает даже равенство по id-порядку не нарушая 50/30.
             assert by_pid == {
-                pid_early: to_nano(10) * 50 // 100,
-                pid_late: to_nano(10) * 30 // 100,
+                pid_early: _net(to_nano(10) * 50 // 100),
+                pid_late: _net(to_nano(10) * 30 // 100),
             }
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
@@ -878,8 +890,8 @@ async def test_settle_week_claimer_beats_silent_rival(monkeypatch: pytest.Monkey
                 for p in (await session.execute(select(Payout).where(Payout.kind == "weekly"))).scalars()
             }
             assert by_pid == {
-                pid_claimer: to_nano(10) * 50 // 100,
-                pid_quiet: to_nano(10) * 30 // 100,
+                pid_claimer: _net(to_nano(10) * 50 // 100),
+                pid_quiet: _net(to_nano(10) * 30 // 100),
             }
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "weekly"))
@@ -1022,8 +1034,8 @@ async def test_settle_week_tie_pays_after_all_claimed(monkeypatch: pytest.Monkey
                 for p in (await session.execute(select(Payout).where(Payout.kind == "weekly"))).scalars()
             }
             assert by_pid == {
-                pid_one: to_nano(10) * 50 // 100,
-                pid_two: to_nano(10) * 30 // 100,
+                pid_one: _net(to_nano(10) * 50 // 100),
+                pid_two: _net(to_nano(10) * 30 // 100),
             }
             # Окно закрыто после выплаты.
             assert await session.get(WatcherState, WEEK_CLAIM_WINDOW_KEY) is None
@@ -1165,8 +1177,8 @@ async def test_settle_week_rollover_keeps_claims_of_absorbed_weeks(
             }
             total = to_nano(10)
             assert by_pid == {
-                pids[0]: total * 50 // 100,  # заявил раньше (час 1)
-                pids[1]: total * 30 // 100,
+                pids[0]: _net(total * 50 // 100),  # заявил раньше (час 1)
+                pids[1]: _net(total * 30 // 100),
             }
             # Окно закрыто, а не переоткрыто под период B.
             assert await session.get(WatcherState, WEEK_CLAIM_WINDOW_KEY) is None
@@ -1233,7 +1245,7 @@ async def test_concurrent_week_settle_pays_exactly_once(
                 .all()
             )
             assert [(p.player_id, p.amount_nanotons) for p in payouts] == [
-                (pid, to_nano(10) * 50 // 100)
+                (pid, _net(to_nano(10) * 50 // 100))
             ]
             marker = await session.get(WatcherState, WEEKLY_MARKER_KEY)
             assert marker is not None and marker.value == week_key

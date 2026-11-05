@@ -9,10 +9,11 @@ from datetime import UTC, datetime
 from sqlalchemy import func, select
 
 from app.config import settings
+from app.core.fees import fee_estimate_nano
 from app.core.processed import KIND_REFUND, claim_transfer, transfer_claim_kind
 from app.models import Income, Payout, Stake
 from app.ops import claim_once
-from app.stakes import current_network
+from app.stakes import current_network, refund_net_amount
 from app.ton_utils import from_nano, to_nano
 from app.ton_watch.ledger import _ledger_stuck_incoming
 from app.ton_watch.sources import Transfer
@@ -190,6 +191,24 @@ async def _stash_refund(
     # проход watcher'а не создаст второй выплат. Потолок проверяется ДО
     # метки: перевод, который упёрся в потолок, ждёт ручного возврата и
     # должен получить шанс снова.
+    # Возврат — тоже выплата: газ платит сам возврат, а не остаток казны.
+    # Получатель получает чистыми, как и при возврате ставки (refund_net_amount).
+    fee_nano = await fee_estimate_nano(session)
+    refund_amount = refund_net_amount(
+        transfer.value_nanotons, fee_nanotons=fee_nano
+    )
+    if refund_amount <= 0:
+        # Газ дороже самого перевода: возвращать нечего, перевод остаётся в
+        # казне и ждёт ручного возврата — как и пыль под порогом.
+        logger.warning(
+            "Перевод %s на %s Gram не покрывает газ возврата — ждёт ручного возврата",
+            transfer.tx_hash[:16],
+            f"{from_nano(transfer.value_nanotons):g}",
+        )
+        await _ledger_stuck_incoming(
+            session, transfer, ledger_player_id, "refund:fee"
+        )
+        return "refund_fee"
     if not await claim_transfer(
         session,
         transfer.tx_hash,
@@ -203,7 +222,7 @@ async def _stash_refund(
             round_id=round_id,
             player_id=None,
             kind="refund",
-            amount_nanotons=transfer.value_nanotons,
+            amount_nanotons=refund_amount,
             dest_address=transfer.source or "",
             tx_hash=transfer.tx_hash[:80],
             network=current_network(),

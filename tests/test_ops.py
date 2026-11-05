@@ -33,6 +33,15 @@ from app.payments import parse_revote_memo
 from app.ton_utils import to_nano
 
 
+def _net(amount: int) -> int:
+    """Сумма выплаты по правилу «получатель получает чистыми».
+
+    Газ платит копилка месяца, а не остаток казны: доля лидера уходит
+    получателю минус комиссия сети за его перевод.
+    """
+    return amount - to_nano(settings.payout_fee_gram)
+
+
 def _source_page(transfers, ok: bool = True):
     """Страница источника в текущем контракте (сырой размер, а не фильтрованный).
 
@@ -717,7 +726,8 @@ async def test_monthly_pot_paid_to_leader(monkeypatch: pytest.MonkeyPatch) -> No
                     select(Payout).where(Payout.kind == "leaderboard", Payout.player_id == ids["p1"])
                 )
             ).scalar_one()
-            assert payout.amount_nanotons == total
+            # Получатель получает чистыми: газ платит копилка месяца.
+            assert payout.amount_nanotons == _net(total)
             assert payout.dest_address == ids["w1"]
             assert payout.round_id is None
             assert (await session.execute(select(LeaderboardPot))).all() == []
@@ -810,10 +820,11 @@ async def test_monthly_pot_split_between_tied_leaders(monkeypatch: pytest.Monkey
                 (pid_a, wallet_a),
                 (pid_b, wallet_b),
             ]
-            assert sum(p.amount_nanotons for p in rows) == to_nano(1)
+            # Получатель получает чистыми: газ платит копилка месяца (два перевода).
+            assert sum(p.amount_nanotons for p in rows) == to_nano(1) - 2 * to_nano(settings.payout_fee_gram)
             # Взвешенный дележ 50/30 (нормализованы на двоих из топ-3).
-            assert rows[0].amount_nanotons == 625_000_000
-            assert rows[1].amount_nanotons == 375_000_000
+            assert rows[0].amount_nanotons == _net(625_000_000)
+            assert rows[1].amount_nanotons == _net(375_000_000)
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "leaderboard"))
             await session.execute(LeaderboardPot.__table__.delete().where(LeaderboardPot.month == month_key))
@@ -904,8 +915,11 @@ async def test_monthly_pot_pays_top_k_by_weights(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(settings, "monthly_prize_top_k", 2)
     monkeypatch.setattr(settings, "monthly_prize_weights", "60,30,10")
     # Горш теста — символические 1000 нанотонов; тест проверяет РАСКЛАД ПО ВЕСАМ,
-    # а не реальные суммы. Порог снимаем, чтобы пыль не блокировала выплату.
+    # а не реальные суммы. Порог снимаем, чтобы пыль не блокировала выплату,
+    # и газ обнуляем: символический горш меньше любой комиссии сети, а правило
+    # «получатель получает чистыми» проверяется в test_net_payouts.py.
     monkeypatch.setattr(settings, "min_payout_gram", 0.0)
+    monkeypatch.setattr(settings, "payout_fee_gram", 0.0)
     pid_a = 960_000 + int.from_bytes(os.urandom(2), "big")
     pid_b = pid_a + 1
     wallet_a = "0:" + os.urandom(32).hex()
@@ -1185,10 +1199,11 @@ async def test_monthly_pot_gram_tiebreak_at_third_place(monkeypatch: pytest.Monk
                 for p in (await session.execute(select(Payout).where(Payout.kind == "leaderboard"))).scalars()
             }
             # Все равны по верным путям — места решает вклад Gram: p5, p4, p3.
+            # Получатель получает чистыми: газ платит копилка месяца.
             assert amounts == {
-                pids[4]: 500_000_000,
-                pids[3]: 300_000_000,
-                pids[2]: 200_000_000,
+                pids[4]: _net(500_000_000),
+                pids[3]: _net(300_000_000),
+                pids[2]: _net(200_000_000),
             }
         finally:
             await session.execute(Payout.__table__.delete().where(Payout.kind == "leaderboard"))

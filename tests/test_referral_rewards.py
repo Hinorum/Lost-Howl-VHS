@@ -244,7 +244,9 @@ async def test_referral_pays_only_above_threshold_with_verified_wallet(
         await session.execute(select(Payout).where(Payout.kind == "referral"))
     ).scalar_one()
     assert payout.player_id == referrer
-    assert payout.amount_nanotons == referral_cut
+    # Правило выплат: получатель получает чистыми — газ платит копилка
+    # пригласившего, поэтому из накопления уходит только сумма за вычетом газа.
+    assert payout.amount_nanotons == referral_cut - to_nano(settings.payout_fee_gram)
     assert payout.dest_address == "wallet-5000"
     assert payout.round_id is None
 
@@ -287,7 +289,8 @@ async def test_referral_below_threshold_accumulates_then_pays(
     payout = (
         await session.execute(select(Payout).where(Payout.kind == "referral"))
     ).scalar_one()
-    assert payout.amount_nanotons == to_nano(40) * 100 // 10_000 * 2
+    # Получатель получает чистыми: копилка отдаёт накопление минус газ.
+    assert payout.amount_nanotons == to_nano(40) * 100 // 10_000 * 2 - to_nano(settings.payout_fee_gram)
 
 
 async def test_referral_without_verified_wallet_waits(session: AsyncSession) -> None:
@@ -376,7 +379,10 @@ async def test_gas_day_accrues_referral_despite_dust_pool(
     # Газ (0.5 Грама) больше пула → призов нет, весь пул ушёл в копилку недели…
     assert (await session.execute(select(Payout).where(Payout.kind == "prize"))).scalars().all() == []
     weekly_cut = pot * round(settings.weekly_pot_pct * 100) // 10_000
-    assert round_row.weekly_nanotons == weekly_cut + prize_pool
+    # …и рейк казны туда же: он меньше газа, платить из него нечего, поэтому
+    # целиком уходит в копилку недели (вместе с призовым пулом).
+    house_cut = pot * round(settings.owner_rake_pct * 100) // 10_000
+    assert round_row.weekly_nanotons == weekly_cut + house_cut + prize_pool
     # …а реферальная доля начислена (снята с фонда ДО вычета газа).
     assert round_row.referral_nanotons == referral_cut
     assert await _referral_pot_total(session) == {referrer: referral_cut}
@@ -404,7 +410,10 @@ async def test_zero_threshold_creates_no_empty_payouts(
 
     assert created == 1
     payouts = (await session.execute(select(Payout).where(Payout.kind == "referral"))).scalars().all()
-    assert [(p.player_id, p.amount_nanotons) for p in payouts] == [(referrer_dust, to_nano(0.1))]
+    # Получатель получает чистыми: 0.1 Gram минус газ.
+    assert [(p.player_id, p.amount_nanotons) for p in payouts] == [
+        (referrer_dust, to_nano(0.1) - to_nano(settings.payout_fee_gram))
+    ]
     assert await _referral_pot_total(session) == {referrer_zero: 0, referrer_dust: 0}
 
 

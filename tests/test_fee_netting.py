@@ -187,15 +187,18 @@ async def test_gas_eaten_pool_goes_to_week_and_is_not_refund(
     }
     assert "prize" not in kinds
     assert "refund" not in kinds  # ставка победителя не «возвращена» — она разыграна
-    assert created == 1  # только рейк казны (копилка месяца — в LeaderboardPot)
+    # Рейка тоже не осталось: он меньше газа, платить из него нечего — целиком
+    # уходит в копилку недели вместе с призовым пулом.
+    assert created == 0
 
     pot = to_nano(1)
     weekly_cut = pot * 200 // 10_000
+    house_cut = pot * 50 // 10_000
     prize_pool = pot - pot * 50 // 10_000 * 2 - weekly_cut - pot * round(settings.pack_fund_pct * 100) // 10_000
     week = (
         await session.execute(select(stakes_mod.WeeklyPot).limit(1))
     ).scalar_one()
-    assert week.nanotons == weekly_cut + prize_pool
+    assert week.nanotons == weekly_cut + house_cut + prize_pool
 
     # Итоги не называют этот день «возвратом ставок»: коэффициента нет,
     # но и ложного «все ставки возвращены» тоже нет.
