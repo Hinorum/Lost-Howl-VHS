@@ -978,6 +978,100 @@ async def settle_week_if_due(bot: Bot | None = None) -> bool:
         return await _settle_week_locked(bot)
 
 
+async def _resolve_week_winners(
+    session: AsyncSession,
+    bot: Bot | None,
+    period_start: datetime,
+    period_end: datetime,
+    prev_key: str,
+    now: datetime,
+    total: int,
+    min_days: int,
+    relaxed: bool,
+) -> tuple[list[tuple[str, str, int]], list[tuple[int, int]], int, int] | None:
+    """Выбирает места недельной копилки и формирует выплаты.
+
+    Возвращает ``(paid, awards, rolled)`` либо ``None`` — если с выплатой
+    ничего не сделать (логи внутри; метку двигать нельзя, копилка ждёт).
+
+    Места — три сильнейших игрока по (верные пути, вклад Gram, Claim, player_id),
+    а не ступени счёта: внутри места приз не делится. Претензии за весь
+    поглощаемый период недель — как claim_months в месяце: если settle недели
+    A откладывался (открытое окно Claim, даунтайм), в понедельник недели B
+    горш A+B считается заново и заявки недели A обязаны участвовать в
+    сортировке — иначе roll-over теряет их и переоткрывает окно уже под
+    периодом B с новым таймером.
+    """
+    rows = await _rank_window(session, period_start, period_end, by="opens_at", limit=50)
+    staked = await _players_with_stake(session, period_start, period_end, by="opens_at")
+    claim_weeks: list[str] = []
+    cursor = period_start
+    while cursor < period_end:
+        claim_weeks.append(iso_week_key(cursor))
+        cursor += timedelta(weeks=1)
+    claims = (
+        await _claim_times(session, "week", claim_weeks)
+        if settings.leaderboard_claim_enabled
+        else {}
+    )
+    candidates: list[tuple[int, int, int, str]] = []
+    for pid, correct, days, gram in rows:
+        if correct <= 0 or days < min_days or pid not in staked:
+            continue
+        player = await session.get(Player, pid)
+        if player is None or not player.wallet_address or not player.wallet_verified:
+            continue
+        candidates.append((pid, correct, gram, player.wallet_address))
+    ordered = _order_by_ties(candidates, claims)
+    places = ordered[:3]
+    if not places:
+        logger.warning(
+            "Копилка недели %d нанотонов ждёт: нет игроков с подтверждённым кошельком, "
+            "%s+ днями голосования и ставкой за неделю%s",
+            total,
+            min_days or settings.weekly_min_days,
+            " (короткая стартовая неделя — порог снят)" if relaxed else "",
+        )
+        return None
+    if not await _resolve_claim_window(
+        session, bot, "week", prev_key, ordered, top_k=3, claims=claims, now=now
+    ):
+        return None
+    amounts, rolled = _week_prize_amounts(total, len(places))
+    min_payout_nano = to_nano(settings.min_payout_gram)
+    fee_nano = await fee_estimate_nano(session)
+    network = _active_network()
+    paid: list[tuple[str, str, int]] = []
+    awards: list[tuple[int, int]] = []
+    for place, ((pid, correct, _gram, wallet), amount) in enumerate(zip(places, amounts, strict=True), 1):
+        if amount < min_payout_nano:
+            rolled += amount
+            continue
+        net = net_payout_amount(amount, fee_nano)
+        if net <= 0 or net < min_payout_nano:
+            rolled += amount
+            continue
+        session.add(
+            Payout(
+                round_id=None,
+                player_id=pid,
+                kind="weekly",
+                amount_nanotons=net,
+                dest_address=wallet,
+                network=network,
+            )
+        )
+        name_row = await session.get(Player, pid)
+        name = (
+            (name_row.username if name_row and name_row.username else None)
+            or (name_row.first_name if name_row else None)
+            or f"игрок {pid}"
+        )
+        paid.append((_MEDALS[place - 1], f"{name} — {correct} верных сцен", net))
+        awards.append((pid, net))
+    return paid, awards, rolled, fee_nano
+
+
 async def _settle_week_locked(bot: Bot | None = None) -> bool:
     """Выплачивает копилку прошедших недель топ-3, если последний день недели закрыт.
 
@@ -1061,93 +1155,17 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
             logger.warning("Не удалось проверить короткую стартовую неделю", exc_info=True)
 
         min_days = 0 if relaxed else max(1, settings.weekly_min_days)
-        rows = await _rank_window(session, period_start, period_end, by="opens_at", limit=50)
-        staked = await _players_with_stake(session, period_start, period_end, by="opens_at")
-        # Места недели — три сильнейших ИГРОКА по (верные пути, вклад Gram,
-        # Claim, player_id), а не ступени счёта: внутри места приз не делится.
-        # Претензии за ВЕСЬ поглощаемый период недель — как claim_months в
-        # месяце: если settle недели A откладывался (открытое окно Claim,
-        # даунтайм), в понедельник недели B горш A+B считается заново и
-        # заявки недели A обязаны участвовать в сортировке — иначе roll-over
-        # теряет их и переоткрывает окно уже под периодом B с новым таймером.
-        claim_weeks: list[str] = []
-        cursor = period_start
-        while cursor < period_end:
-            claim_weeks.append(iso_week_key(cursor))
-            cursor += timedelta(weeks=1)
-        claims = (
-            await _claim_times(session, "week", claim_weeks)
-            if settings.leaderboard_claim_enabled
-            else {}
+        resolved = await _resolve_week_winners(
+            session, bot, period_start, period_end, prev_key, now, total, min_days, relaxed,
         )
-        candidates: list[tuple[int, int, int, str]] = []
-        for pid, correct, days, gram in rows:
-            if correct <= 0 or days < min_days or pid not in staked:
-                continue
-            player = await session.get(Player, pid)
-            if player is None or not player.wallet_address or not player.wallet_verified:
-                continue
-            candidates.append((pid, correct, gram, player.wallet_address))
-        # Полный порядок (с Claim-тайбрейком) нужен для поиска ничьей на
-        # ГРАНИЦЕ призового среза; места для выплаты — первые top-3 поверхности.
-        ordered = _order_by_ties(candidates, claims)
-        places = ordered[:3]
-
-        if not places:
-            # Достойных нет: метку НЕ двигаем, копилка ждёт следующей недели.
-            logger.warning(
-                "Копилка недели %d нанотонов ждёт: нет игроков с подтверждённым кошельком, "
-                "%s+ днями голосования и ставкой за неделю%s",
-                total,
-                min_days or settings.weekly_min_days,
-                " (короткая стартовая неделя — порог снят)" if relaxed else "",
-            )
-            return False
-
-        # --- Ничья: блокировка выплаты до Claim или дедлайма ---
-        if not await _resolve_claim_window(
-            session, bot, "week", prev_key, ordered, top_k=3, claims=claims, now=now
-        ):
-            return False
-
-        amounts, rolled = _week_prize_amounts(total, len(places))
-        min_payout_nano = to_nano(settings.min_payout_gram)
-        fee_nano = await fee_estimate_nano(session)
-        network = _active_network()
         paid: list[tuple[str, str, int]] = []
         awards: list[tuple[int, int]] = []
-        for place, ((pid, correct, _gram, wallet), amount) in enumerate(zip(places, amounts, strict=True), 1):
-            if amount < min_payout_nano:
-                # Дохлый перевод не создаём: комиссия сети съела бы большую
-                # часть доли. Переносится в копилку новой недели, как пустое место.
-                rolled += amount
-                continue
-            # Получатель получает ЧИСТЫМИ: газ платит копилка недели, а не
-            # остаток казны. Доля, которая не переживает газ, уходит целиком
-            # в копилку новой недели — копейки не теряются, а перевода на ноль
-            # не создаётся.
-            net = net_payout_amount(amount, fee_nano)
-            if net <= 0 or net < min_payout_nano:
-                rolled += amount
-                continue
-            session.add(
-                Payout(
-                    round_id=None,
-                    player_id=pid,
-                    kind="weekly",
-                    amount_nanotons=net,
-                    dest_address=wallet,
-                    network=network,
-                )
-            )
-            name_row = await session.get(Player, pid)
-            name = (
-                (name_row.username if name_row and name_row.username else None)
-                or (name_row.first_name if name_row else None)
-                or f"игрок {pid}"
-            )
-            paid.append((_MEDALS[place - 1], f"{name} — {correct} верных сцен", net))
-            awards.append((pid, net))
+        rolled = 0
+        if resolved is None:
+            # Хелпер уже залогировал причину отказа; метку двигать нельзя —
+            # копилка ждёт следующей недели.
+            return False
+        paid, awards, rolled, fee_nano = resolved
 
         # Места без достойного игрока переносятся в копилку новой недели.
         if rolled > 0:
