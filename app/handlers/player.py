@@ -733,14 +733,13 @@ async def on_vote(callback: CallbackQuery) -> None:
                             "адрес» пригодится для любого другого кошелька."
                         )
                     bot = callback.bot
-                    if bot is None:
-                        return
-                    await bot.send_message(
-                        callback.from_user.id,
-                        text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=markup,
-                    )
+                    if bot is not None:
+                        await bot.send_message(
+                            callback.from_user.id,
+                            text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=markup,
+                        )
                 except Exception as exc:
                     logger.debug("Личное подтверждение выбора игроку %s не доставлено: %s", callback.from_user.id, exc)
     if result == "already":

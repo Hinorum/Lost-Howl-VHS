@@ -553,7 +553,7 @@ async def cmd_finalize(message: Message) -> None:
             if row is None:
                 await message.answer(f"День {target_day} не найден.")
                 return
-            status = row.status.value if hasattr(row.status, 'value') else str(row.status)
+            status = row.status.value
             fin = row.payouts_finalized
             pot = row.pot_nanotons
             wc = row.winner_card
@@ -664,7 +664,7 @@ async def cmd_refinalize(message: Message) -> None:
             await message.answer(f"День {target_day} не найден.")
             return
         if row.status != RoundStatus.CLOSED:
-            status = row.status.value if hasattr(row.status, 'value') else str(row.status)
+            status = row.status.value
             await message.answer(f"День {target_day}: статус={status}, нужен CLOSED.")
             return
 

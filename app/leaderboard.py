@@ -779,7 +779,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             # tied-претендент за границей среза в выплату не попадает.
             winners = placed[:top_k]
             top_amount = _weighted_amounts(total, winners, weights)
-            for (player_id, _score, _gram, wallet), amount in zip(winners, top_amount, strict=False):
+            for (player_id, _score, _gram, wallet), amount in zip(winners, top_amount, strict=True):
                 payments.append((player_id, wallet, amount))
         else:
             # Прежнее поведение: победители, набравшие максимум, делят ровно.
@@ -1094,7 +1094,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         network = _active_network()
         paid: list[tuple[str, str, int]] = []
         awards: list[tuple[int, int]] = []
-        for place, ((pid, correct, _gram, wallet), amount) in enumerate(zip(places, amounts, strict=False), 1):
+        for place, ((pid, correct, _gram, wallet), amount) in enumerate(zip(places, amounts, strict=True), 1):
             if amount < min_payout_nano:
                 # Дохлый перевод не создаём: комиссия сети съела бы большую
                 # часть доли. Переносится в копилку новой недели, как пустое место.
