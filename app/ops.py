@@ -1085,288 +1085,293 @@ async def _drop_exhausted_days(session, kinds: list[str]) -> list[str]:
     return kept
 
 
-async def check_anomalies(bot: Bot | None) -> list[str]:
-    """Фоновые проверки раз в минутный цикл обслуживания; возвращает список проблем."""
-    # Проблемы собираются во время проверок, а не в конце: тревога должна уйти
-    # до сохранения снимка — иначе сломанная рассылка оставила бы /health
-    # говорить «всё хорошо» после того, как аномалия замечена. Список
-    # общий с _raise и чистится в начале прохода: прошлый вердикт не должен
-    # переезжать в новый, а упавшая середина проверки — в следующий.
-    problems = _problems_in_flight
-    problems.clear()
-    _problem_entry.clear()
-    async with SessionLocal() as session:
-        # 0. Планировщик молчит — дни не закрываются, выплаты не уходят.
-        # tick_age is None — маркер тика ни разу не записан: bootstrap упал до
-        # первого тика (или это свежая БД). Раньше такая дыра молчала, в отличие
-        # от watcher'а, у которого «ещё ни разу» проверяется.
-        tick_age = _age_seconds(await _get_state(session, TICK_KEY))
-        if tick_age is None:
-            note = "планировщик ни разу не выполнялся"
-            await _raise(
-                session,
-                bot,
-                ALERT_TICK_KEY,
-                note,
-                f"⚠️ {note.capitalize()}. Дни не переключаются, смотрите логи сервиса.",
-            )
-        elif tick_age > _TICK_STALE_AFTER.total_seconds():
-            note = f"планировщик не тикает {int(tick_age // 60)} мин"
-            await _raise(
-                session,
-                bot,
-                ALERT_TICK_KEY,
-                note,
-                f"⚠️ {note.capitalize()}. Дни не переключаются, смотрите логи сервиса.",
-            )
-        # 0b. Лок планировщика потерян — этот инстанс больше не ведёт игру.
-        # Лок живёт на физическом соединении с Postgres и может умереть сам
-        # (сбой сети, рестарт PG, pgbouncer): на сервере он освобождается
-        # сразу, и второй инстанс берёт его. Тик это замечает и замирает
-        # (иначе два процесса вели бы один день), а метку оставляет нам —
-        # поднять тревогу отсюда, с кулдауном и сводкой.
-        lock_lost_at = await _get_state(session, LOCK_LOST_KEY)
-        if lock_lost_at:
-            note = "лок планировщика потерян — игру ведёт другой процесс"
-            await _raise(
-                session,
-                bot,
-                ALERT_LOCK_LOST_KEY,
-                note,
-                "⚠️ Лок планировщика потерян: этот инстанс больше не ведёт игру — "
-                "лок у другого процесса (старый билд или зомби после деплоя). "
-                "Проверьте, сколько инстансов на этой базе, и остановите лишние: "
-                "два тикающих процесса ведут один день (двойные анонсы и выплаты).",
-            )
-        # 1. Watcher не завершает успешные циклы — ставки перестают находиться.
-        # Сердцебиение ставит каждый цикл с живым TonAPI, даже если переводов
-        # нет: тишина в цепочке — здоровье, а не простой. Курсор для этого
-        # не годится: он двигается только переводами.
-        if settings.ton_enabled:
-            from app.ton_watch import BEAT_KEY
+async def _check_scheduler_tick(session, bot) -> None:
+    """Trevogi: tik planirshchika ne vyklyuchayetsya ili poteryan lok planirshchik."""
+    tick_age = _age_seconds(await _get_state(session, TICK_KEY))
+    if tick_age is None:
+        note = "планировщик ни разу не выполнялся"
+        await _raise(
+            session,
+            bot,
+            ALERT_TICK_KEY,
+            note,
+            f"⚠️ {note.capitalize()}. Дни не переключаются, смотрите логи сервиса.",
+        )
+    elif tick_age > _TICK_STALE_AFTER.total_seconds():
+        note = f"планировщик не тикает {int(tick_age // 60)} мин"
+        await _raise(
+            session,
+            bot,
+            ALERT_TICK_KEY,
+            note,
+            f"⚠️ {note.capitalize()}. Дни не переключаются, смотрите логи сервиса.",
+        )
+    # 0b. Лок планировщика потерян — этот инстанс больше не ведёт игру.
+    # Лок живёт на физическом соединении с Postgres и может умереть сам
+    # (сбой сети, рестарт PG, pgbouncer): на сервере он освобождается
+    # сразу, и второй инстанс берёт его. Тик это замечает и замирает
+    # (иначе два процесса вели бы один день), а метку оставляет нам —
+    # поднять тревогу отсюда, с кулдауном и сводкой.
+    lock_lost_at = await _get_state(session, LOCK_LOST_KEY)
+    if lock_lost_at:
+        note = "лок планировщика потерян — игру ведёт другой процесс"
+        await _raise(
+            session,
+            bot,
+            ALERT_LOCK_LOST_KEY,
+            note,
+            "⚠️ Лок планировщика потерян: этот инстанс больше не ведёт игру — "
+            "лок у другого процесса (старый билд или зомби после деплоя). "
+            "Проверьте, сколько инстансов на этой базе, и остановите лишние: "
+            "два тикающих процесса ведут один день (двойные анонсы и выплаты).",
+        )
+    # 1. Watcher не завершает успешные циклы — ставки перестают находиться.
+    # Сердцебиение ставит каждый цикл с живым TonAPI, даже если переводов
+    # нет: тишина в цепочке — здоровье, а не простой. Курсор для этого
+    # не годится: он двигается только переводами.
 
-            beat_age = _age_seconds(await _get_state(session, BEAT_KEY))
-            watcher_note: str | None = None
-            if beat_age is None:
-                watcher_note = "watcher ещё ни разу не завершал цикл"
-            elif beat_age > _WATCHER_STALE_AFTER.total_seconds():
-                watcher_note = f"watcher молчит {int(beat_age // 60)} мин"
-            if watcher_note is not None:
-                await _raise(
-                    session,
-                    bot,
-                    ALERT_WATCHER_KEY,
-                    watcher_note,
-                    f"⚠️ TON-watcher отстаёт: {watcher_note}. Ставки копятся необработанными.",
-                )
-        # 1b. Проход не вычитал окно входящих целиком — бюджет страниц кончился
-        # раньше курсора. Цикл при этом «здоровый» (сердцебиение стоит, новые
-        # переводы обработаны), поэтому без этой проверки дыра была бы видна
-        # только в логах. Курсор при этом встаёт на дно прочитанного, то есть
-        # непрочитанная часть окна догоняется следующими циклами; если backlog
-        # не тает — нужен либо больший WATCH_MAX_PAGES, либо ручной разбор.
-        if settings.ton_enabled:
-            from app.ton_watch import _read_scan_gap
 
-            gap = await _read_scan_gap(session)
-            if gap and gap.get("floor") is not None and gap.get("since") is not None:
-                gap_note = (
-                    f"непрочитанное окно входящих: курсор {_human_ts(gap['since'])} → "
-                    f"прочитано до {_human_ts(gap['floor'])}"
-                )
-                await _raise(
-                    session,
-                    bot,
-                    ALERT_SCAN_GAP_KEY,
-                    gap_note,
-                    "⚠️ Входящие в окне не дочитаны: ниже прочитанной границы переводы "
-                    f"ещё не обработаны (окно {_human_ts(gap['since'])} — "
-                    f"{_human_ts(gap['floor'])}). Курсор стоит на границе покрытия, бюджет "
-                    "страниц поднят; если так дольше 15 минут — подними WATCH_MAX_PAGES "
-                    "или разбери окно через /incoming и /adjust.",
-                )
-        # 1c. Парсер провайдера роняет item'ы. Счётчик лежит в watcher_state
-        #     вместе с parse_fail_last (хеш, utime, время) — /blockchain видит
-        #     детали. Сбрасывается успешным циклом без потерь; пока ненулевой —
-        #     стоит алерт, чтобы «битый item» не уходил молча через фильтры.
-        #     Раньше ошибка парсера возвращала None и сливалась с jetton/
-        #     старыми/пустыми item'ами: один разломанный перевод казался
-        #     чистой страницей, курсор уезжал за него — деньги терялись.
-        if settings.ton_enabled:
-            parse_fail_raw = await _get_state(session, PARSE_FAIL_COUNT_KEY)
-            parse_fail_count = (
-                int(parse_fail_raw) if parse_fail_raw and parse_fail_raw.isdigit() else 0
-            )
-            last_raw = await _get_state(session, PARSE_FAIL_LAST_KEY)
-            last_note = ""
-            if last_raw:
-                try:
-                    import json as _json
 
-                    payload = _json.loads(last_raw)
-                    if isinstance(payload, dict):
-                        last_note = (
-                            f" (последний: hash={payload.get('tx_hash')!s}, "
-                            f"utime={_human_ts(payload.get('utime'))})"
-                        )
-                except (ValueError, TypeError) as exc:
-                    # Поле могло пострадать от старой версии бота или миграции;
-                    # счётчик важнее sample'а, тревогу глушить нельзя.
-                    logger.debug("parse_fail_last не разобран: %s", exc)
-            if parse_fail_count > 0:
-                await _raise(
-                    session,
-                    bot,
-                    ALERT_PARSE_FAIL_KEY,
-                    f"парсер отбросил {parse_fail_count} item'ов",
-                    f"⚠️ Парсер TonAPI/Toncenter отбросил {parse_fail_count} item'ов с исключением "
-                    f"за цикл{last_note}. Это значит: один или несколько переводов НЕ стали "
-                    "ставками — проверь лог и /blockchain до сброса счётчика.",
-                )
-        # 2. Очередь выплат старше получаса — казначей застрял или сеть лежит.
-        oldest = (
-            await session.execute(
-                select(func.min(Payout.created_at)).where(
-                    Payout.status.in_(["pending", "sending"]),
-                    Payout.amount_nanotons > 0,
-                )
-            )
-        ).scalar_one()
-        if oldest is not None:
-            moment = oldest if oldest.tzinfo else oldest.replace(tzinfo=UTC)
-            age_min = int((_now() - moment).total_seconds() // 60)
-            if age_min >= _QUEUE_OLD_AFTER.total_seconds() // 60:
-                reason = ""
-                if not settings.ton_enabled:
-                    reason = " Причина: TON выключен (TON_ENABLED=false), ретраи не идут."
-                elif not settings.active_treasury_mnemonic:
-                    reason = " Причина: нет мнемоники казначея для активной сети (TREASURY_TESTNET_MNEMONIC?)."
-                await _raise(
-                    session,
-                    bot,
-                    ALERT_QUEUE_KEY,
-                    f"очередь выплат стоит {age_min} мин",
-                    f"⚠️ Очередь выплат не двигается {age_min} мин.{reason} Проверь казначея/сеть.",
-                )
-        # 3. Dead-letter выплаты существуют — деньги ждут ручного разбора.
-        dead = (
-            await session.execute(
-                select(Payout.id, Payout.last_error).where(Payout.status == "failed").limit(20)
-            )
-        ).all()
-        if dead:
-            reasons = [f"#{row_id} {reason}" for row_id, reason in dead[:2] if reason]
-            reason_note = f": {'; '.join(reasons)}" if reasons else ""
+
+async def _check_watcher(session, bot) -> None:
+    """Trevogi TON-watcher: tik, neprochitannoe okno, padayushchii parser."""
+    if settings.ton_enabled:
+        from app.ton_watch import BEAT_KEY
+
+        beat_age = _age_seconds(await _get_state(session, BEAT_KEY))
+        watcher_note: str | None = None
+        if beat_age is None:
+            watcher_note = "watcher ещё ни разу не завершал цикл"
+        elif beat_age > _WATCHER_STALE_AFTER.total_seconds():
+            watcher_note = f"watcher молчит {int(beat_age // 60)} мин"
+        if watcher_note is not None:
             await _raise(
                 session,
                 bot,
-                ALERT_DEAD_KEY,
-                f"dead-letter выплат: {len(dead)}",
-                "⚠️ Есть безнадёжные выплаты (failed после всех ретраев): "
-                f"{', '.join(str(row_id) for row_id, _r in dead[:10])}{reason_note}. "
-                "Разбор: /payouts → /payout <id> retry|spam перед сбросом игры.",
+                ALERT_WATCHER_KEY,
+                watcher_note,
+                f"⚠️ TON-watcher отстаёт: {watcher_note}. Ставки копятся необработанными.",
             )
-        # 3b. Возврат ставки (refund) висит неотправленным: игрок не получил
-        #     деньги обратно. Отдельный целевой алерт, а не общий «очередь стоит».
-        oldest_refund = (
-            await session.execute(
-                select(func.min(Payout.created_at)).where(
-                    Payout.kind == "refund",
-                    Payout.status.in_(["pending", "sending"]),
-                    Payout.amount_nanotons > 0,
-                )
+    # 1b. Проход не вычитал окно входящих целиком — бюджет страниц кончился
+    # раньше курсора. Цикл при этом «здоровый» (сердцебиение стоит, новые
+    # переводы обработаны), поэтому без этой проверки дыра была бы видна
+    # только в логах. Курсор при этом встаёт на дно прочитанного, то есть
+    # непрочитанная часть окна догоняется следующими циклами; если backlog
+    # не тает — нужен либо больший WATCH_MAX_PAGES, либо ручной разбор.
+    if settings.ton_enabled:
+        from app.ton_watch import _read_scan_gap
+
+        gap = await _read_scan_gap(session)
+        if gap and gap.get("floor") is not None and gap.get("since") is not None:
+            gap_note = (
+                f"непрочитанное окно входящих: курсор {_human_ts(gap['since'])} → "
+                f"прочитано до {_human_ts(gap['floor'])}"
             )
-        ).scalar_one()
-        refund_dead = (
-            await session.execute(
-                select(func.count())
-                .select_from(Payout)
-                .where(Payout.kind == "refund", Payout.status == "failed")
+            await _raise(
+                session,
+                bot,
+                ALERT_SCAN_GAP_KEY,
+                gap_note,
+                "⚠️ Входящие в окне не дочитаны: ниже прочитанной границы переводы "
+                f"ещё не обработаны (окно {_human_ts(gap['since'])} — "
+                f"{_human_ts(gap['floor'])}). Курсор стоит на границе покрытия, бюджет "
+                "страниц поднят; если так дольше 15 минут — подними WATCH_MAX_PAGES "
+                "или разбери окно через /incoming и /adjust.",
             )
-        ).scalar_one()
-        if oldest_refund is not None:
-            moment = (
-                oldest_refund
-                if oldest_refund.tzinfo
-                else oldest_refund.replace(tzinfo=UTC)
-            )
-            age_min = int((_now() - moment).total_seconds() // 60)
-            if age_min >= _REFUND_OLD_AFTER.total_seconds() // 60:
-                tail = ""
-                if refund_dead:
-                    tail = f" Плюс {refund_dead} безнадёжных возврата (failed)."
-                await _raise(
-                    session,
-                    bot,
-                    ALERT_REFUND_KEY,
-                    f"возврат ставки ждёт {age_min} мин",
-                    "⚠️ Возврат ставки не доставлен: игрок не получил деньги "
-                    f"обратно уже {age_min} мин.{tail} Разбор: /payouts",
-                )
-        # 3c. Необработанные переводы-ставки висят дольше двойного окна
-        #     подтверждения — ставки копятся, никто не получает ни статус, ни
-        #     возврат. Прямой ответ на «сколько переводов не обработано».
-        if settings.ton_enabled:
-            stale_threshold = settings.stake_confirm_seconds * _STAKE_CONFIRM_STALE_MULT
-            oldest_stake = (
-                await session.execute(
-                    select(func.min(Stake.created_at)).where(Stake.status == "pending")
-                )
-            ).scalar_one()
-            if oldest_stake is not None:
-                moment = (
-                    oldest_stake
-                    if oldest_stake.tzinfo
-                    else oldest_stake.replace(tzinfo=UTC)
-                )
-                if (_now() - moment).total_seconds() >= stale_threshold:
-                    pending_stakes_count = (
-                        await session.execute(
-                            select(func.count())
-                            .select_from(Stake)
-                            .where(Stake.status == "pending")
-                        )
-                    ).scalar_one()
-                    await _raise(
-                        session,
-                        bot,
-                        ALERT_STAKE_KEY,
-                        f"ставок не обработано: {pending_stakes_count}",
-                        "⚠️ Переводы-ставки не обрабатываются: "
-                        f"{pending_stakes_count} висят без подтверждения дольше "
-                        "положенного. /stakes",
+    # 1c. Парсер провайдера роняет item'ы. Счётчик лежит в watcher_state
+    #     вместе с parse_fail_last (хеш, utime, время) — /blockchain видит
+    #     детали. Сбрасывается успешным циклом без потерь; пока ненулевой —
+    #     стоит алерт, чтобы «битый item» не уходил молча через фильтры.
+    #     Раньше ошибка парсера возвращала None и сливалась с jetton/
+    #     старыми/пустыми item'ами: один разломанный перевод казался
+    #     чистой страницей, курсор уезжал за него — деньги терялись.
+    if settings.ton_enabled:
+        parse_fail_raw = await _get_state(session, PARSE_FAIL_COUNT_KEY)
+        parse_fail_count = (
+            int(parse_fail_raw) if parse_fail_raw and parse_fail_raw.isdigit() else 0
+        )
+        last_raw = await _get_state(session, PARSE_FAIL_LAST_KEY)
+        last_note = ""
+        if last_raw:
+            try:
+                import json as _json
+
+                payload = _json.loads(last_raw)
+                if isinstance(payload, dict):
+                    last_note = (
+                        f" (последний: hash={payload.get('tx_hash')!s}, "
+                        f"utime={_human_ts(payload.get('utime'))})"
                     )
-        # 3d. Stuck-список watcher'а непуст — сбойные переводы зависли в казне.
-        #     Авто-лечение точит их само, но пока запись живёт, админ должен
-        #     видеть, что деньги не затерялись молча (инцидент Kote: 1 G казны
-        #     висел из-за схема-бага, а сообщения не приходило).
-        if settings.ton_enabled:
-            stuck_row = await session.get(WatcherState, STUCK_TX_KEY)
-            stuck = _load_only_stuck(stuck_row.value if stuck_row is not None else None)
-            if stuck:
-                stuck_count = len(stuck)
+            except (ValueError, TypeError) as exc:
+                # Поле могло пострадать от старой версии бота или миграции;
+                # счётчик важнее sample'а, тревогу глушить нельзя.
+                logger.debug("parse_fail_last не разобран: %s", exc)
+        if parse_fail_count > 0:
+            await _raise(
+                session,
+                bot,
+                ALERT_PARSE_FAIL_KEY,
+                f"парсер отбросил {parse_fail_count} item'ов",
+                f"⚠️ Парсер TonAPI/Toncenter отбросил {parse_fail_count} item'ов с исключением "
+                f"за цикл{last_note}. Это значит: один или несколько переводов НЕ стали "
+                "ставками — проверь лог и /blockchain до сброса счётчика.",
+            )
+    # 2. Очередь выплат старше получаса — казначей застрял или сеть лежит.
+
+
+
+
+async def _check_payouts(session, bot) -> None:
+    """Trevogi kassanevskogo kontura: ochered, dead-letter, vozvraty, stavki, stuck."""
+    oldest = (
+        await session.execute(
+            select(func.min(Payout.created_at)).where(
+                Payout.status.in_(["pending", "sending"]),
+                Payout.amount_nanotons > 0,
+            )
+        )
+    ).scalar_one()
+    if oldest is not None:
+        moment = oldest if oldest.tzinfo else oldest.replace(tzinfo=UTC)
+        age_min = int((_now() - moment).total_seconds() // 60)
+        if age_min >= _QUEUE_OLD_AFTER.total_seconds() // 60:
+            reason = ""
+            if not settings.ton_enabled:
+                reason = " Причина: TON выключен (TON_ENABLED=false), ретраи не идут."
+            elif not settings.active_treasury_mnemonic:
+                reason = " Причина: нет мнемоники казначея для активной сети (TREASURY_TESTNET_MNEMONIC?)."
+            await _raise(
+                session,
+                bot,
+                ALERT_QUEUE_KEY,
+                f"очередь выплат стоит {age_min} мин",
+                f"⚠️ Очередь выплат не двигается {age_min} мин.{reason} Проверь казначея/сеть.",
+            )
+    # 3. Dead-letter выплаты существуют — деньги ждут ручного разбора.
+    dead = (
+        await session.execute(
+            select(Payout.id, Payout.last_error).where(Payout.status == "failed").limit(20)
+        )
+    ).all()
+    if dead:
+        reasons = [f"#{row_id} {reason}" for row_id, reason in dead[:2] if reason]
+        reason_note = f": {'; '.join(reasons)}" if reasons else ""
+        await _raise(
+            session,
+            bot,
+            ALERT_DEAD_KEY,
+            f"dead-letter выплат: {len(dead)}",
+            "⚠️ Есть безнадёжные выплаты (failed после всех ретраев): "
+            f"{', '.join(str(row_id) for row_id, _r in dead[:10])}{reason_note}. "
+            "Разбор: /payouts → /payout <id> retry|spam перед сбросом игры.",
+        )
+    # 3b. Возврат ставки (refund) висит неотправленным: игрок не получил
+    #     деньги обратно. Отдельный целевой алерт, а не общий «очередь стоит».
+    oldest_refund = (
+        await session.execute(
+            select(func.min(Payout.created_at)).where(
+                Payout.kind == "refund",
+                Payout.status.in_(["pending", "sending"]),
+                Payout.amount_nanotons > 0,
+            )
+        )
+    ).scalar_one()
+    refund_dead = (
+        await session.execute(
+            select(func.count())
+            .select_from(Payout)
+            .where(Payout.kind == "refund", Payout.status == "failed")
+        )
+    ).scalar_one()
+    if oldest_refund is not None:
+        moment = (
+            oldest_refund
+            if oldest_refund.tzinfo
+            else oldest_refund.replace(tzinfo=UTC)
+        )
+        age_min = int((_now() - moment).total_seconds() // 60)
+        if age_min >= _REFUND_OLD_AFTER.total_seconds() // 60:
+            tail = ""
+            if refund_dead:
+                tail = f" Плюс {refund_dead} безнадёжных возврата (failed)."
+            await _raise(
+                session,
+                bot,
+                ALERT_REFUND_KEY,
+                f"возврат ставки ждёт {age_min} мин",
+                "⚠️ Возврат ставки не доставлен: игрок не получил деньги "
+                f"обратно уже {age_min} мин.{tail} Разбор: /payouts",
+            )
+    # 3c. Необработанные переводы-ставки висят дольше двойного окна
+    #     подтверждения — ставки копятся, никто не получает ни статус, ни
+    #     возврат. Прямой ответ на «сколько переводов не обработано».
+    if settings.ton_enabled:
+        stale_threshold = settings.stake_confirm_seconds * _STAKE_CONFIRM_STALE_MULT
+        oldest_stake = (
+            await session.execute(
+                select(func.min(Stake.created_at)).where(Stake.status == "pending")
+            )
+        ).scalar_one()
+        if oldest_stake is not None:
+            moment = (
+                oldest_stake
+                if oldest_stake.tzinfo
+                else oldest_stake.replace(tzinfo=UTC)
+            )
+            if (_now() - moment).total_seconds() >= stale_threshold:
+                pending_stakes_count = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(Stake)
+                        .where(Stake.status == "pending")
+                    )
+                ).scalar_one()
                 await _raise(
                     session,
                     bot,
-                    ALERT_STUCK_KEY,
-                    f"сбойных переводов в stuck: {stuck_count} (в т.ч. брошенных: "
-                    f"{sum(1 for r in stuck.values() if isinstance(r, dict) and r.get('reported'))})",
-                    "⚠️ Сбойные переводы не обработаны: "
-                    f"{stuck_count} в stuck-списке (watcher_state[{STUCK_TX_KEY}]). "
-                    "Авто-лечение запущено, но записи дольше часа требуют "
-                    "взгляда: /blockchain",
+                    ALERT_STAKE_KEY,
+                    f"ставок не обработано: {pending_stakes_count}",
+                    "⚠️ Переводы-ставки не обрабатываются: "
+                    f"{pending_stakes_count} висят без подтверждения дольше "
+                    "положенного. /stakes",
                 )
+    # 3d. Stuck-список watcher'а непуст — сбойные переводы зависли в казне.
+    #     Авто-лечение точит их само, но пока запись живёт, админ должен
+    #     видеть, что деньги не затерялись молча (инцидент Kote: 1 G казны
+    #     висел из-за схема-бага, а сообщения не приходило).
+    if settings.ton_enabled:
+        stuck_row = await session.get(WatcherState, STUCK_TX_KEY)
+        stuck = _load_only_stuck(stuck_row.value if stuck_row is not None else None)
+        if stuck:
+            stuck_count = len(stuck)
+            await _raise(
+                session,
+                bot,
+                ALERT_STUCK_KEY,
+                f"сбойных переводов в stuck: {stuck_count} (в т.ч. брошенных: "
+                f"{sum(1 for r in stuck.values() if isinstance(r, dict) and r.get('reported'))})",
+                "⚠️ Сбойные переводы не обработаны: "
+                f"{stuck_count} в stuck-списке (watcher_state[{STUCK_TX_KEY}]). "
+                "Авто-лечение запущено, но записи дольше часа требуют "
+                "взгляда: /blockchain",
+            )
 # 4. Сверка баланса казначея с учётом БД. Две беды разного рода:
-    #    дефицит под очередь (пополни — и всё уйдёт само) и расхождение
-    #    с ожиданиями (ручной вывод, потерянные средства, чужой доступ).
-    # 3.9. Рассылка прошла, а не дошла. Метки delivery:* пишут
-    #      «доставлено/попыток» на каждой рассылке; раньше их не существовало,
-    #      поэтому день, ушедший пустым, был неотличим от доставленного всем.
-    #      Тревога только на НУЛЕ: частичные потери — норма (заблокировавшие
-    #      бота, чаты без прав), порог по доле кричал бы без причины.
-    #      Почему не доставлено — в delivery_reason:* (кладётся только вместе
-    #      с нулём): факт «не дошло» по логам не разобрать, а причина
-    #      (kicked против сети на Render) решает, куда идти.
+#    дефицит под очередь (пополни — и всё уйдёт само) и расхождение
+#    с ожиданиями (ручной вывод, потерянные средства, чужой доступ).
+# 3.9. Рассылка прошла, а не дошла. Метки delivery:* пишут
+#      «доставлено/попыток» на каждой рассылке; раньше их не существовало,
+#      поэтому день, ушедший пустым, был неотличим от доставленного всем.
+#      Тревога только на НУЛЕ: частичные потери — норма (заблокировавшие
+#      бота, чаты без прав), порог по доле кричал бы без причины.
+#      Почему не доставлено — в delivery_reason:* (кладётся только вместе
+#      с нулём): факт «не дошло» по логам не разобрать, а причина
+#      (kicked против сети на Render) решает, куда идти.
+
+
+
+
+async def _check_delivery(session, bot) -> None:
+    """Trevogi: rassylka ne dostala; u zakrytykh dnya net marki dostavki."""
     if bot is not None:
         from app.rounds import utc_aware
 
@@ -1480,6 +1485,12 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
     #       получатель появился: первое сообщение в чате (авто-привязка),
     #       вернувшийся игрок, заново добавленный бот. Иначе тревога
     #       висела бы до следующего анонса.
+
+
+
+
+async def _check_announce_empty(session, bot) -> None:
+    """Trevogi: anons novogo dnya ukhol v pustomu."""
     empty_day = await _get_state(session, ANNOUNCE_EMPTY_DAY_KEY)
     if empty_day is not None:
         from app.broadcast import announce_audience_size, set_announce_empty_marker
@@ -1502,6 +1513,12 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
                 "/start в личке (иначе бот не сможет им писать).",
             )
 
+
+
+
+
+async def _check_treasury(session, bot) -> None:
+    """Trevogi: balans kassaneeva vs ozhidaya BD; rassinhronizatsiya zerkala."""
     if settings.ton_enabled and settings.active_treasury_address:
         balance_note = await _treasury_balance_anomaly(session)
         if balance_note is not None:
@@ -1526,21 +1543,28 @@ async def check_anomalies(bot: Bot | None) -> list[str]:
     #    уходит на локальный secrets-жребий: он не подделываем и не может быть
     #    пересчитан игроком. Формально это «фолбэк, чтобы день не завис»,
     #    фактически — исход перестал быть проверяемым, и в этом надо жить.
+
+async def check_anomalies(bot: Bot | None) -> list[str]:
+    """Fоbornye provery raz v minyutnyy tsik obsledovaniya; vozvodyat list problem."""
+    problems = _problems_in_flight
+    problems.clear()
+    _problem_entry.clear()
+    async with SessionLocal() as session:
+        await _check_scheduler_tick(session, bot)
+        if settings.ton_enabled:
+            await _check_watcher(session, bot)
+        await _check_payouts(session, bot)
+    if bot is not None:
+        await _check_delivery(session, bot)
+    await _check_announce_empty(session, bot)
+    if settings.ton_enabled and settings.active_treasury_address:
+        await _check_treasury(session, bot)
     if settings.ton_enabled:
         await _check_entropy_fallback(session, bot)
-        # Ничья, решённая локальной случайностью (сеть лежала в момент
-        # закрытия голосов): исход не пересчитать по эксплореру.
         await _check_local_tie(session, bot)
-        # Комиссия сети выросла — оценка в настройках отстала.
         await _check_fee_growth(session, bot)
-    # Сюжет: месяц без кассеты — это месяц без сюжета (движок играет шаблон).
     await _check_missing_cassette(session, bot)
-    # 6. Свежесть бэкапа. Проверка вне условия ton_enabled: потеря базы означает
-    #    потерю истории выплат и зеркала казны независимо от того, включены ли
-    #    деньги сейчас, а сломанный pg_dump — это в первую очередь вопрос
-    #    бота, а не игроков.
     await _check_backup_freshness(session, bot)
-    # Итог прохода: кто из тревог ушёл сам, кто держится дольше часа.
     await _settle_alerts(session, bot, problems)
     # Снимок для /health и /ops. Кэш, а не пересчёт на каждый опрос: одно и то
     # же «что сломано» отвечают и мониторинг, и команда хранителя.
