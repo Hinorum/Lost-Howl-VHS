@@ -4,7 +4,7 @@ import json
 import logging
 import secrets
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.engine import CursorResult
@@ -48,6 +48,18 @@ from .voting import (
 logger = logging.getLogger(__name__)
 
 
+async def _rollback_and_reraise(session: AsyncSession, error: Exception) -> NoReturn:
+    """Откатывает транзакцию и пробрасывает ошибку дальше.
+
+    Единый скелет обработки падений внутри транзакций: каждая ``except``
+    логирует причину и откатывает сессию ДО проброса — иначе неудачный
+    тик мог оставить сессию в полусостоянии, и восстановление (например,
+    heal_stale_rounds) работало бы уже на «мертвой» сессии.
+    """
+    await session.rollback()
+    raise error
+
+
 async def create_next_round_detailed(
     session: AsyncSession, base_day_index: int | None = None
 ) -> tuple[Round, bool]:
@@ -59,10 +71,9 @@ async def create_next_round_detailed(
     """
     try:
         latest = await get_latest_round(session)
-    except Exception:
+    except Exception as exc:
         logger.exception("get_latest_round (1st) упал")
-        await session.rollback()
-        raise
+        await _rollback_and_reraise(session, exc)
     target_day = (
         base_day_index + 1
         if base_day_index is not None
@@ -73,27 +84,24 @@ async def create_next_round_detailed(
         already = (
             await session.execute(select(Round).where(Round.day_index == target_day).limit(1))
         ).scalar_one_or_none()
-    except Exception:
+    except Exception as exc:
         logger.exception("Запрос Round.day_index упал (target_day=%s)", target_day)
-        await session.rollback()
-        raise
+        await _rollback_and_reraise(session, exc)
     if already is not None:
         return already, False
     # Устаревшая прегенерация — чистим, чтобы открытый день не перезаписался.
     try:
         stale = await session.get(PreparedDay, target_day)
-    except Exception:
+    except Exception as exc:
         logger.exception("Запрос PreparedDay упал (target_day=%s)", target_day)
-        await session.rollback()
-        raise
+        await _rollback_and_reraise(session, exc)
     if stale is not None:
         await session.delete(stale)
         try:
             await session.commit()
-        except Exception:
+        except Exception as exc:
             logger.exception("Commit удаления устаревшего PreparedDay упал")
-            await session.rollback()
-            raise
+            await _rollback_and_reraise(session, exc)
 
     day_index = target_day
     opens_hint = (
