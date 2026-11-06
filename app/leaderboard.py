@@ -40,6 +40,7 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import case, delete, func, or_, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.fees import fee_estimate_nano, net_payout_amount
@@ -645,6 +646,121 @@ async def settle_month_if_due(bot: Bot | None = None) -> bool:
         return await _settle_month_locked(bot)
 
 
+async def _resolve_month_winners(
+    session: AsyncSession,
+    bot: Bot | None,
+    period_start: datetime,
+    period_end: datetime,
+    top_k: int,
+    prev_key: str,
+    now: datetime,
+    total: int,
+) -> tuple[list[tuple[int, str, int]], int] | None:
+    """Выбирает победителей месячной копилки и формирует выплаты.
+
+    Возвращает ``(payments, skipped)`` либо ``None`` — если с выплатой
+    ничего не сделать (логи внутри; метку месяца двигать нельзя, горш ждёт).
+
+    top-K > 1: платим сглаженно по верности с весами (месячные веса);
+    ничьи решаются через Claim, затем широкий ранг режется top_k.
+    top-K <= 1: прежнее поведение — победители с максимальным счётом делят
+    горш поровну (split_equal).
+    """
+    ranked = await _rank_window(
+        session, period_start, period_end, by="tally_ends_at", limit=50
+    )
+    staked = await _players_with_stake(
+        session, period_start, period_end, by="tally_ends_at"
+    )
+    claim_months: list[str] = []
+    cursor = period_start
+    while cursor < period_end:
+        claim_months.append(cursor.strftime("%Y-%m"))
+        cursor = (cursor + timedelta(days=35)).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+    claims = (
+        await _claim_times(session, "month", claim_months)
+        if settings.leaderboard_claim_enabled
+        else {}
+    )
+    candidates: list[tuple[int, int, int, str]] = []
+    skipped = 0
+    if top_k > 1:
+        for pid, score, _days, gram in ranked:
+            player = await session.get(Player, pid)
+            if (
+                player is not None
+                and player.wallet_address
+                and player.wallet_verified
+                and pid in staked
+            ):
+                candidates.append((pid, score, gram, player.wallet_address))
+            else:
+                skipped += 1
+        if not candidates:
+            logger.warning(
+                "Копилка %d нанотонов ждёт: у топ-%d лидеров нет подтверждённого кошелька/ставки",
+                total, top_k,
+            )
+            return None
+        placed = _order_by_ties(candidates, claims)
+        if not await _resolve_claim_window(
+            session, bot, "month", prev_key, placed, top_k=top_k,
+            claims=claims, now=now,
+        ):
+            return None
+        weights = parse_prize_pcts(settings.monthly_prize_weights)
+        if not weights:
+            # Пустой список весов (опечатка конфига) не должен сжечь горш:
+            # метку не трогаем, копилка ждёт, пока конфиг не починят.
+            logger.error(
+                "Копилка %d нанотонов ждёт: monthly_prize_weights не содержат "
+                "чисел — исправь конфиг, горш не тронут",
+                total,
+            )
+            return None
+        winners = placed[:top_k]
+        top_amount = _weighted_amounts(total, winners, weights)
+        payments = [
+            (player_id, wallet, amount)
+            for (player_id, _score, _gram, wallet), amount in zip(winners, top_amount, strict=True)
+        ]
+        return payments, skipped
+    # Прежнее поведение: победители, набравшие максимум, делят ровно.
+    correct_winners = await _top_correct_voters(session, period_start, period_end)
+    staked = await _players_with_stake(
+        session, period_start, period_end, by="tally_ends_at"
+    )
+    payable_ids: list[int] = []
+    wallets: dict[int, str] = {}
+    for player_id, _count in correct_winners:
+        player = await session.get(Player, player_id)
+        if (
+            player is not None
+            and player.wallet_address
+            and player.wallet_verified
+            and player_id in staked
+        ):
+            wallets[player_id] = player.wallet_address
+            payable_ids.append(player_id)
+    skipped = len(correct_winners) - len(payable_ids)
+    if not payable_ids:
+        # Платить некому: метку НЕ двигаем, копилка ждёт следующего цикла.
+        logger.warning(
+            "Копилка %d нанотонов ждёт: у лидеров (%s) нет подтверждённого кошелька "
+            "или ставки в этом месяце",
+            total, [pid for pid, _ in correct_winners] or "нет голосов",
+        )
+        return None
+    shares = split_equal(total, payable_ids)
+    payments = [
+        (player_id, wallets[player_id], amount)
+        for player_id, amount in shares.items()
+    ]
+    return payments, skipped
+
+
 async def _settle_month_locked(bot: Bot | None = None) -> bool:
     """Выплачивает копилку прошедших месяцев, если последний день месяца закрыт.
 
@@ -713,110 +829,16 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             return False
 
         top_k = max(1, settings.monthly_prize_top_k)
-        if top_k > 1:
-            # Сглаживание дисперсии: платим топ-K по верности с весами,
-            # а не «забрал всё сильнейший». Веса из месячного весового списка;
-            # ничьи решаются вкладом Gram, затем Claim.
-            # Усекать кандидатов до top_k нельзя: tied-игрок ПОД границей среза
-            # (№top_k+1, абсолютно равный №top_k) не попал бы в _resolve_claim_window
-            # и лишился бы окна Claim, как в неделе. Берём широкий ранг, а места
-            # для выплаты режем после разрешения ничьи временем Claim.
-            ranked = await _rank_window(
-                session, period_start, month_start, by="tally_ends_at", limit=50
-            )
-            staked = await _players_with_stake(
-                session, period_start, month_start, by="tally_ends_at"
-            )
-            claim_months: list[str] = []
-            cursor = period_start
-            while cursor < month_start:
-                claim_months.append(cursor.strftime("%Y-%m"))
-                cursor = (cursor + timedelta(days=35)).replace(
-                    day=1, hour=0, minute=0, second=0, microsecond=0
-                )
-            claims = (
-                await _claim_times(session, "month", claim_months)
-                if settings.leaderboard_claim_enabled
-                else {}
-            )
-            candidates: list[tuple[int, int, int, str]] = []
-            skipped = 0
-            for pid, score, _days, gram in ranked:
-                player = await session.get(Player, pid)
-                if (
-                    player is not None
-                    and player.wallet_address
-                    and player.wallet_verified
-                    and pid in staked
-                ):
-                    candidates.append((pid, score, gram, player.wallet_address))
-                else:
-                    skipped += 1
-            if not candidates:
-                logger.warning(
-                    "Копилка %d нанотонов ждёт: у топ-%d лидеров нет подтверждённого кошелька/ставки",
-                    total, top_k,
-                )
-                return False
-            placed = _order_by_ties(candidates, claims)
-            if not await _resolve_claim_window(
-                session, bot, "month", prev_key, placed, top_k=top_k,
-                claims=claims, now=now,
-            ):
-                return False
-            weights = parse_prize_pcts(settings.monthly_prize_weights)
-            if not weights:
-                # Пустой список весов (опечатка конфига) не должен сжечь горш:
-                # метку не трогаем, копилка ждёт, пока конфиг не починят.
-                logger.error(
-                    "Копилка %d нанотонов ждёт: monthly_prize_weights не содержат "
-                    "чисел — исправь конфиг, горш не тронут",
-                    total,
-                )
-                return False
-            payments: list[tuple[int, str, int]] = []
-            # Места — первые top_k после разрешения ничьи (Claim, player_id):
-            # tied-претендент за границей среза в выплату не попадает.
-            winners = placed[:top_k]
-            top_amount = _weighted_amounts(total, winners, weights)
-            for (player_id, _score, _gram, wallet), amount in zip(winners, top_amount, strict=True):
-                payments.append((player_id, wallet, amount))
-        else:
-            # Прежнее поведение: победители, набравшие максимум, делят ровно.
-            correct_winners = await _top_correct_voters(
-                session, period_start, month_start
-            )
-            staked = await _players_with_stake(
-                session, period_start, month_start, by="tally_ends_at"
-            )
-            payable_ids: list[int] = []
-            wallets: dict[int, str] = {}
-            for player_id, _count in correct_winners:
-                player = await session.get(Player, player_id)
-                if (
-                    player is not None
-                    and player.wallet_address
-                    and player.wallet_verified
-                    and player_id in staked
-                ):
-                    wallets[player_id] = player.wallet_address
-                    payable_ids.append(player_id)
-            skipped = len(correct_winners) - len(payable_ids)
-            if not payable_ids:
-                # Платить некому: метку НЕ двигаем, копилка ждёт следующего цикла.
-                logger.warning(
-                    "Копилка %d нанотонов ждёт: у лидеров (%s) нет подтверждённого кошелька "
-                    "или ставки в этом месяце",
-                    total,
-                    [pid for pid, _ in correct_winners] or "нет голосов",
-                )
-                return False
-            shares = split_equal(total, payable_ids)
-            payments = [
-                (player_id, wallets[player_id], amount)
-                for player_id, amount in shares.items()
-            ]
-
+        resolved = await _resolve_month_winners(
+            session, bot, period_start, month_start, top_k, prev_key, now, total,
+        )
+        payments: list[tuple[int, str, int]] = []
+        skipped = 0
+        if resolved is None:
+            # Хелпер уже залогировал причину отказа; метку двигать нельзя —
+            # копилка ждёт следующего цикла.
+            return False
+        payments, skipped = resolved
         if not payments:
             # Страховка на любой неожиданный путь top-K: пустые выплаты не
             # двигают метку и не удаляют горш.
