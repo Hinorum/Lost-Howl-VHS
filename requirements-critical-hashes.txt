@@ -460,7 +460,7 @@ pyyaml==6.0.3
 #   pyyaml-6.0.3-cp39-cp39-win_amd64.whl sha256:2e71d11abed7344e42a8849600193d15b6def118602c4c176f748e4583246007
 #   pyyaml-6.0.3.tar.gz sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
 
-sqlalchemy==2.1.6
+sqlalchemy==2.1.8
 #   sqlalchemy-2.1.6-cp311-cp311-macosx_11_0_arm64.whl sha256:e4e4a43cde0dcdff974304ddb48246d6a094e618b6ee9642827ddbfe9fbebadb
 #   sqlalchemy-2.1.6-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl sha256:9b6b5fdcdb6891025117f76f48d7d0f89245d66fab6519f3b856294bab317387
 #   sqlalchemy-2.1.6-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl sha256:3d877b2c46298825e8f32059e8d912d0d100af0e9fefe31fb2abb52192817afb
