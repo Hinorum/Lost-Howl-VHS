@@ -923,6 +923,321 @@ async def cmd_cassette(message: Message) -> None:
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard())
 
 
+async def _cassette_entry_or_alert(
+    callback: CallbackQuery, file_name: str
+) -> LibraryEntry | None:
+    """Живая кассета по имени из callback или алерт «нет в библиотеке»."""
+    entry = _library_entry(file_name)
+    if entry is None or entry.cassette is None:
+        await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
+        return None
+    return entry
+
+
+async def _show_cassette_scene(
+    message: Message,
+    file_name: str,
+    entry: LibraryEntry,
+    *,
+    awaiting: bool,
+    hint: str = "",
+) -> None:
+    """Перерисовать «Редактор плёнки» с актуальным статусом и бейджем."""
+    status = await _scene_status(entry)
+    await message.edit_text(
+        f"{_scene_text(entry, status)}{_scene_badge(awaiting, hint)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_scene_keyboard(
+            file_name, awaiting=awaiting, has_backup=_has_backup(file_name)
+        ),
+    )
+
+
+async def _cassette_set_next(callback: CallbackQuery, file_name: str) -> None:
+    """Назначить кассету следующей; неизвестная — алерт, без записи."""
+    if await _cassette_entry_or_alert(callback, file_name) is None:
+        return
+    async with SessionLocal() as session:
+        await set_next_cassette(session, file_name)
+    await callback.answer("Назначено следующей кассетой.")
+
+
+async def _cassette_clear_next(callback: CallbackQuery) -> None:
+    async with SessionLocal() as session:
+        await set_next_cassette(session, None)
+    await callback.answer("Назначение снято.")
+
+
+async def _cassette_show_scene(
+    callback: CallbackQuery, message: Message, file_name: str
+) -> bool:
+    """Экран «Редактор плёнки»: статус и бейдж ожидания правки.
+
+    False — кассеты нет, игроку уже показан алерт; ответ «Готово» не нужен.
+    """
+    entry = await _cassette_entry_or_alert(callback, file_name)
+    if entry is None:
+        return False
+    async with SessionLocal() as session:
+        edit_file, _unused = await get_edit_intent(session)
+    await _show_cassette_scene(
+        message, file_name, entry, awaiting=edit_file == file_name
+    )
+    return True
+
+
+async def _cassette_month(
+    callback: CallbackQuery, message: Message, file_name: str
+) -> bool:
+    entry = await _cassette_entry_or_alert(callback, file_name)
+    if entry is None:
+        return False
+    assert entry.cassette is not None
+    payload = scenario_yaml(entry.cassette).encode("utf-8")
+    await message.answer_document(
+        BufferedInputFile(payload, filename=Path(file_name).with_suffix(".yaml").name)
+    )
+    return True
+
+
+async def _cassette_pick_day(
+    callback: CallbackQuery, message: Message, file_name: str, parts: list[str]
+) -> bool:
+    """Сетка дней дороги: выбор дня для скачивания или чтения."""
+    road = parts[3] if len(parts) > 3 else "main"
+    action = parts[4] if len(parts) > 4 else "dl"
+    entry = await _cassette_entry_or_alert(callback, file_name)
+    if entry is None:
+        return False
+    assert entry.cassette is not None
+    await message.edit_text(
+        (
+            f"🎞 {entry.cassette.title}"
+            f"{' · дорога ' + road if road != 'main' else ''} — день?"
+        ),
+        reply_markup=_day_grid_keyboard(entry.cassette, file_name, road, action),
+    )
+    return True
+
+
+async def _cassette_open_day(
+    callback: CallbackQuery, message: Message, file_name: str, parts: list[str]
+) -> bool:
+    """Скачать фрагмент дня или прочитать кадр."""
+    road = parts[3] if len(parts) > 3 else "main"
+    action = parts[4] if len(parts) > 4 else "dl"
+    try:
+        day_index = int(parts[5])
+    except (IndexError, ValueError):
+        await callback.answer("Нажми день в сетке.", show_alert=True)
+        return False
+    entry = await _cassette_entry_or_alert(callback, file_name)
+    if entry is None:
+        return False
+    assert entry.cassette is not None
+    item = entry.cassette.day_for(day_index, road)
+    if item is None:
+        await callback.answer("Такого дня на дороге нет.", show_alert=True)
+        return False
+    if action == "dl":
+        payload = day_yaml(item, road=road).encode("utf-8")
+        await message.answer_document(
+            BufferedInputFile(
+                payload, filename=_day_doc_name(file_name, road, day_index)
+            )
+        )
+    else:
+        for chunk in _chunk_message(day_view_text(entry.cassette, day_index, road)):
+            await message.answer(chunk)
+    return True
+
+
+async def _cassette_edit_or_check(
+    callback: CallbackQuery,
+    message: Message,
+    file_name: str,
+    parts: list[str],
+    *,
+    check: bool,
+) -> bool:
+    """Включить ожидание документа правки или проверки без записи."""
+    mode = parts[3] if len(parts) > 3 else "month"
+    entry = await _cassette_entry_or_alert(callback, file_name)
+    if entry is None:
+        return False
+    intent = f"{mode}-check" if check else mode
+    async with SessionLocal() as session:
+        await set_edit_intent(session, file_name, intent)
+    if check:
+        meaning = {
+            "month": "проверю целый сценарий без записи",
+            "day": "проверю фрагмент дня без записи",
+        }.get(mode, "проверю без записи")
+    else:
+        meaning = {
+            "month": "целый сценарий .yaml (скачай, измени, пришли файлом)",
+            "day": "фрагмент одного дня .yaml (скачай, измени, пришли файлом)",
+        }.get(mode, "")
+    await _show_cassette_scene(
+        message, file_name, entry, awaiting=True, hint=meaning
+    )
+    return True
+
+
+async def _cassette_new(message: Message) -> None:
+    """Экран «Новая кассета»: ждём YAML-документ нового месяца."""
+    async with SessionLocal() as session:
+        await set_edit_intent(session, "<new>", "new")
+    await message.edit_text(
+        "➕ <b>НОВАЯ КАССЕТА</b>\n\n"
+        "Пришли документом YAML-сценарий нового месяца (контракт §1). "
+        "Шаблон — «Скачать месяц» любой существующей плёнки. Имя файла "
+        "выведется из cassette_id и месяца; перезаписать существующие "
+        "нельзя.\n\n"
+        "⏳ Жду документ.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_new_keyboard(),
+    )
+
+
+async def _cassette_snapshot(
+    callback: CallbackQuery, message: Message, file_name: str
+) -> None:
+    """Снять слепок кассеты и, если клавиатура изменилась, перерисовать экран."""
+    safe = _safe_cassette_name(file_name)
+    if not safe:
+        await callback.answer("Некорректное имя кассеты.", show_alert=True)
+        return
+    path = default_cassettes_dir() / safe
+    if not path.is_file():
+        await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
+        return
+    had_backup = _has_backup(file_name)  # до снятия слепка
+    ok, lines = snapshot_backup(safe, default_cassettes_dir())
+    if not ok:
+        await callback.answer("\n".join(lines)[:200], show_alert=True)
+        return
+    # Слепок — не правка контента: в базу уходит только колонка backup,
+    # edited_at не двигается (иначе деплой навсегда закрыл бы строку).
+    persisted = await story_store.persist_backup(safe, default_cassettes_dir())
+    entry = _library_entry(file_name)
+    if not had_backup and entry is not None and entry.cassette is not None:
+        # Клавиатура изменилась (появилась «Вернуть бэкап») — перерисуем
+        # экран; при уже имеющемся слепке сообщение не изменилось,
+        # и повторный edit_text упал бы на «message is not modified».
+        async with SessionLocal() as session:
+            edit_file, _unused = await get_edit_intent(session)
+        await _show_cassette_scene(
+            message, file_name, entry, awaiting=edit_file == file_name
+        )
+    await callback.answer(
+        "Слепок снят: состояние кассеты зафиксировано."
+        if persisted
+        else "Слепок снят только на диске — в базу не ушёл, "
+        "пропадёт при рестарте."
+    )
+
+
+async def _cassette_restore(
+    callback: CallbackQuery, message: Message, file_name: str
+) -> None:
+    """Вернуть кассету из бэкапа и показать библиотеку."""
+    safe = _safe_cassette_name(file_name)
+    if not safe:
+        await callback.answer("Некорректное имя кассеты.", show_alert=True)
+        return
+    path = default_cassettes_dir() / safe
+    if not path.is_file():
+        await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
+        return
+    ok, lines = restore_backup(safe, default_cassettes_dir())
+    if not ok:
+        await callback.answer("\n".join(lines)[:200], show_alert=True)
+        return
+    # Откат — тоже правка: файл на диске уже прежняя версия, переносим
+    # её в базу, иначе деплой вернёт состояние до восстановления.
+    persisted = await story_store.persist(safe, default_cassettes_dir())
+    async with SessionLocal() as session:
+        text = await _cassette_menu_text(session)
+    await message.edit_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
+    )
+    await callback.answer(
+        "Кассета восстановлена из бэкапа."
+        if persisted
+        else "Кассета восстановлена в кэш, но не в базу — правка "
+        "пропадёт при рестарте."
+    )
+
+
+async def _cassette_delete_confirm(
+    callback: CallbackQuery, message: Message, file_name: str
+) -> bool:
+    """Экран подтверждения удаления кассеты."""
+    entry = await _cassette_entry_or_alert(callback, file_name)
+    if entry is None:
+        return False
+    await message.edit_text(
+        _delete_text(entry),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_delete_keyboard(file_name),
+    )
+    return True
+
+
+async def _cassette_delete_ok(
+    callback: CallbackQuery, message: Message, file_name: str
+) -> None:
+    """Удалить кассету, снять указатели и показать библиотеку."""
+    result = await story_store.delete(file_name, default_cassettes_dir())
+    if not result.file_gone:
+        await callback.answer(
+            "Файл не удалился (см. лог бота) — кассета на месте.",
+            show_alert=True,
+        )
+        return
+    # Указатели на удалённую плёнку: «следующая» и намерение правки.
+    # Иначе меню назначало бы призрака, а документ уходил бы в никуда.
+    async with SessionLocal() as session:
+        if await get_next_cassette(session) == file_name:
+            await set_next_cassette(session, None)
+        edit_file, _unused = await get_edit_intent(session)
+        if edit_file == file_name:
+            await clear_edit_intent(session)
+        text = await _cassette_menu_text(session)
+    await message.edit_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
+    )
+    if result.row_gone:
+        await callback.answer("Кассета удалена из зеркала и базы.")
+    else:
+        await callback.answer(
+            "Файл удалён, но строка в базе осталась — кассета вернётся "
+            "зеркалом в течение минуты.",
+            show_alert=True,
+        )
+
+
+async def _cassette_stop(message: Message) -> None:
+    """Отменить ожидание документа правки."""
+    async with SessionLocal() as session:
+        await clear_edit_intent(session)
+    await message.edit_text(
+        "Загрузка отменена. Кассета не изменена: правки возвращались "
+        "документом.",
+        reply_markup=await _cassette_keyboard(),
+    )
+
+
+async def _cassette_back(message: Message) -> None:
+    """Вернуться к списку кассет."""
+    async with SessionLocal() as session:
+        text = await _cassette_menu_text(session)
+    await message.edit_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
+    )
+
+
 @router.callback_query(F.data.startswith("cassette:"))
 @require_admin("Пульт только для хранителя.")
 async def on_cassette_action(callback: CallbackQuery) -> None:
@@ -941,18 +1256,10 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
     message = callback_message(callback)
     try:
         if op == "set":
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            async with SessionLocal() as session:
-                await set_next_cassette(session, file_name)
-            await callback.answer("Назначено следующей кассетой.")
+            await _cassette_set_next(callback, file_name)
             return
         if op == "clear":
-            async with SessionLocal() as session:
-                await set_next_cassette(session, None)
-            await callback.answer("Назначение снято.")
+            await _cassette_clear_next(callback)
             return
         # Остальные действия правят сообщение панели или отвечают в него.
         # Старое (недоступное) сообщение править нельзя — это обычное
@@ -960,249 +1267,46 @@ async def on_cassette_action(callback: CallbackQuery) -> None:
         if message is None:
             await callback.answer("Кнопка устарела — открой панель заново.", show_alert=True)
             return
+        # Ветки ниже либо правят сообщение и получают ответ «Готово», либо
+        # уже ответили алертом сами (False) — тогда второй answer не шлём.
+        handled = True
         if op == "scene":
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            async with SessionLocal() as session:
-                edit_file, _unused = await get_edit_intent(session)
-            status = await _scene_status(entry)
-            await message.edit_text(
-                f"{_scene_text(entry, status)}{_scene_badge(edit_file == file_name)}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=_scene_keyboard(
-                    file_name,
-                    awaiting=(edit_file == file_name),
-                    has_backup=_has_backup(file_name),
-                ),
-            )
+            handled = await _cassette_show_scene(callback, message, file_name)
         elif op in ("month",):
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            payload = scenario_yaml(entry.cassette).encode("utf-8")
-            await message.answer_document(
-                BufferedInputFile(payload, filename=Path(file_name).with_suffix(".yaml").name)
-            )
+            handled = await _cassette_month(callback, message, file_name)
         elif op in ("pick",):
-            road = parts[3] if len(parts) > 3 else "main"
-            action = parts[4] if len(parts) > 4 else "dl"
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            await message.edit_text(
-                (
-                    f"🎞 {entry.cassette.title}"
-                    f"{' · дорога ' + road if road != 'main' else ''} — день?"
-                ),
-                reply_markup=_day_grid_keyboard(entry.cassette, file_name, road, action),
-            )
+            handled = await _cassette_pick_day(callback, message, file_name, parts)
         elif op in ("day",):
-            road = parts[3] if len(parts) > 3 else "main"
-            action = parts[4] if len(parts) > 4 else "dl"
-            try:
-                day_index = int(parts[5])
-            except (IndexError, ValueError):
-                await callback.answer("Нажми день в сетке.", show_alert=True)
-                return
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            item = entry.cassette.day_for(day_index, road)
-            if item is None:
-                await callback.answer("Такого дня на дороге нет.", show_alert=True)
-                return
-            if action == "dl":
-                payload = day_yaml(item, road=road).encode("utf-8")
-                await message.answer_document(
-                    BufferedInputFile(
-                        payload, filename=_day_doc_name(file_name, road, day_index)
-                    )
-                )
-            else:
-                for chunk in _chunk_message(day_view_text(entry.cassette, day_index, road)):
-                    await message.answer(chunk)
+            handled = await _cassette_open_day(callback, message, file_name, parts)
         elif op == "edit":
-            mode = parts[3] if len(parts) > 3 else "month"
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            async with SessionLocal() as session:
-                await set_edit_intent(session, file_name, mode)
-            meaning = {
-                "month": "целый сценарий .yaml (скачай, измени, пришли файлом)",
-                "day": "фрагмент одного дня .yaml (скачай, измени, пришли файлом)",
-            }.get(mode, "")
-            status = await _scene_status(entry)
-            await message.edit_text(
-                f"{_scene_text(entry, status)}{_scene_badge(True, meaning)}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=_scene_keyboard(
-                    file_name, awaiting=True, has_backup=_has_backup(file_name)
-                ),
+            handled = await _cassette_edit_or_check(
+                callback, message, file_name, parts, check=False
             )
         elif op == "check":
-            mode = parts[3] if len(parts) > 3 else "month"
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            async with SessionLocal() as session:
-                await set_edit_intent(session, file_name, f"{mode}-check")
-            meaning = {
-                "month": "проверю целый сценарий без записи",
-                "day": "проверю фрагмент дня без записи",
-            }.get(mode, "проверю без записи")
-            status = await _scene_status(entry)
-            await message.edit_text(
-                f"{_scene_text(entry, status)}{_scene_badge(True, meaning)}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=_scene_keyboard(
-                    file_name, awaiting=True, has_backup=_has_backup(file_name)
-                ),
+            handled = await _cassette_edit_or_check(
+                callback, message, file_name, parts, check=True
             )
         elif op == "new":
-            async with SessionLocal() as session:
-                await set_edit_intent(session, "<new>", "new")
-            await message.edit_text(
-                "➕ <b>НОВАЯ КАССЕТА</b>\n\n"
-                "Пришли документом YAML-сценарий нового месяца (контракт §1). "
-                "Шаблон — «Скачать месяц» любой существующей плёнки. Имя файла "
-                "выведется из cassette_id и месяца; перезаписать существующие "
-                "нельзя.\n\n"
-                "⏳ Жду документ.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=_new_keyboard(),
-            )
+            await _cassette_new(message)
         elif op == "snapshot":
-            safe = _safe_cassette_name(file_name)
-            if not safe:
-                await callback.answer("Некорректное имя кассеты.", show_alert=True)
-                return
-            path = default_cassettes_dir() / safe
-            if not path.is_file():
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            had_backup = _has_backup(file_name)  # до снятия слепка
-            ok, lines = snapshot_backup(safe, default_cassettes_dir())
-            if not ok:
-                await callback.answer("\n".join(lines)[:200], show_alert=True)
-                return
-            # Слепок — не правка контента: в базу уходит только колонка backup,
-            # edited_at не двигается (иначе деплой навсегда закрыл бы строку).
-            persisted = await story_store.persist_backup(safe, default_cassettes_dir())
-            entry = _library_entry(file_name)
-            if not had_backup and entry is not None and entry.cassette is not None:
-                # Клавиатура изменилась (появилась «Вернуть бэкап») — перерисуем
-                # экран; при уже имеющемся слепке сообщение не изменилось,
-                # и повторный edit_text упал бы на «message is not modified».
-                async with SessionLocal() as session:
-                    edit_file, _unused = await get_edit_intent(session)
-                status = await _scene_status(entry)
-                await message.edit_text(
-                    f"{_scene_text(entry, status)}{_scene_badge(edit_file == file_name)}",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_scene_keyboard(
-                        file_name,
-                        awaiting=(edit_file == file_name),
-                        has_backup=True,
-                    ),
-                )
-            await callback.answer(
-                "Слепок снят: состояние кассеты зафиксировано."
-                if persisted
-                else "Слепок снят только на диске — в базу не ушёл, "
-                "пропадёт при рестарте."
-            )
+            await _cassette_snapshot(callback, message, file_name)
             return
         elif op == "restore":
-            safe = _safe_cassette_name(file_name)
-            if not safe:
-                await callback.answer("Некорректное имя кассеты.", show_alert=True)
-                return
-            path = default_cassettes_dir() / safe
-            if not path.is_file():
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            ok, lines = restore_backup(safe, default_cassettes_dir())
-            if not ok:
-                await callback.answer("\n".join(lines)[:200], show_alert=True)
-                return
-            # Откат — тоже правка: файл на диске уже прежняя версия, переносим
-            # её в базу, иначе деплой вернёт состояние до восстановления.
-            persisted = await story_store.persist(safe, default_cassettes_dir())
-            async with SessionLocal() as session:
-                text = await _cassette_menu_text(session)
-            await message.edit_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
-            )
-            await callback.answer(
-                "Кассета восстановлена из бэкапа."
-                if persisted
-                else "Кассета восстановлена в кэш, но не в базу — правка "
-                "пропадёт при рестарте."
-            )
+            await _cassette_restore(callback, message, file_name)
             return
         elif op == "del":
-            entry = _library_entry(file_name)
-            if entry is None or entry.cassette is None:
-                await callback.answer("Такой кассеты нет в библиотеке.", show_alert=True)
-                return
-            await message.edit_text(
-                _delete_text(entry),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_delete_keyboard(file_name),
-            )
+            handled = await _cassette_delete_confirm(callback, message, file_name)
         elif op == "delok":
-            result = await story_store.delete(file_name, default_cassettes_dir())
-            if not result.file_gone:
-                await callback.answer(
-                    "Файл не удалился (см. лог бота) — кассета на месте.",
-                    show_alert=True,
-                )
-                return
-            # Указатели на удалённую плёнку: «следующая» и намерение правки.
-            # Иначе меню назначало бы призрака, а документ уходил бы в никуда.
-            async with SessionLocal() as session:
-                if await get_next_cassette(session) == file_name:
-                    await set_next_cassette(session, None)
-                edit_file, _unused = await get_edit_intent(session)
-                if edit_file == file_name:
-                    await clear_edit_intent(session)
-                text = await _cassette_menu_text(session)
-            await message.edit_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
-            )
-            if result.row_gone:
-                await callback.answer("Кассета удалена из зеркала и базы.")
-            else:
-                await callback.answer(
-                    "Файл удалён, но строка в базе осталась — кассета вернётся "
-                    "зеркалом в течение минуты.",
-                    show_alert=True,
-                )
+            await _cassette_delete_ok(callback, message, file_name)
             return
         elif op == "stop":
-            async with SessionLocal() as session:
-                await clear_edit_intent(session)
-            await message.edit_text(
-                "Загрузка отменена. Кассета не изменена: правки возвращались "
-                "документом.",
-                reply_markup=await _cassette_keyboard(),
-            )
+            await _cassette_stop(message)
         elif op == "back":
-            async with SessionLocal() as session:
-                text = await _cassette_menu_text(session)
-            await message.edit_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
-            )
+            await _cassette_back(message)
         else:
             await callback.answer("Неизвестное действие.", show_alert=True)
+            return
+        if not handled:
             return
         await callback.answer("Готово.")
     except Exception as exc:
