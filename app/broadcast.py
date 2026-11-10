@@ -970,6 +970,133 @@ async def _ensure_cards(round_row: Round) -> Round:
     return loaded if loaded is not None else round_row
 
 
+async def _announce_no_bot(round_row: Round) -> list[int]:
+    """Анонс дня без бота: тревога и метрика фиксируются, доставок нет."""
+    logger.warning(
+        "Анонс дня %s пропущен: бот не установлен (set_bot не вызван)",
+        round_row.day_index,
+    )
+    from app.metrics import inc
+
+    inc("announce_no_bot_total")
+    return []
+
+
+async def _mark_announce_empty(round_row: Round) -> None:
+    """Пустая аудитория анонса: метка пустого дня ставится, claim снимается.
+
+    True-ветка (аудитория есть) снимает метку молча — день считается
+    объявленным, доставка продолжается. False-ветка: аудитория пуста — тревога
+    и метрика, метка ставится, claim снимается, день дождёт получателя.
+    """
+    if await announce_audience_size() > 0:
+        await set_announce_empty_marker(None)
+        return
+    from app.metrics import inc
+
+    inc("announce_no_audience_total")
+    logger.warning(
+        "Анонс дня %s ушёл в пустоту: нет ни активных чатов, ни игроков с "
+        "личной рассылкой — новость не увидит никто (бота не добавили ни "
+        "в один чат, игроки не подписаны через /start)",
+        round_row.day_index,
+    )
+    await set_announce_empty_marker(round_row.day_index)
+    # Пустая аудитория ≠ состоявшийся анонс: снимаем claim (announced_at).
+    # Стоящая метка означала бы, что день объявлен, а восстановитель
+    # видит только announced_at IS NULL — и когда получатель появится
+    # (привязанный чат, вернувшийся игрок), пост не вернулся бы никогда.
+    # Отправлять-то по-прежнему некому, дубля не будет.
+    try:
+        from app.rounds import unclaim_announcement
+
+        async with SessionLocal() as unclaim_session:
+            await unclaim_announcement(unclaim_session, round_row.id)
+    except Exception:
+        logger.warning(
+            "Claim дня %s не снят после пустого анонса — день не "
+            "дождётся появившегося получателя",
+            round_row.day_index,
+            exc_info=True,
+        )
+
+
+async def _deliver_announcement_to_chat(
+    bot: Bot,
+    chat_id: int,
+    round_row: Round,
+    finished: Round | None,
+    results_text: str | None,
+    reasons: Counter[str],
+) -> int | None:
+    """Доставка одного пакета дня в один чат через ограниченный пул."""
+
+    async with asyncio.Semaphore(_BROADCAST_PARALLELISM):
+        return await _deliver_chat(
+            bot, chat_id, round_row, finished, results_text, reasons=reasons
+        )
+
+
+async def _deliver_day_announcements(
+    bot: Bot,
+    chat_ids: list[int],
+    round_row: Round,
+    finished: Round | None,
+    results_text: str | None,
+) -> list[int]:
+    """Рассылка пакета дня по чатам; возвращает доставленные.
+
+    Чаты доставляются параллельно ограниченным пулом: последовательная
+    рассылка (~7 сообщений и 4 аплоада на чат) упирается в часы уже на
+    сотнях чатов.
+    """
+    reasons: Counter[str] = Counter()
+    outcomes = await asyncio.gather(
+        *(
+            _deliver_announcement_to_chat(
+                bot, chat_id, round_row, finished, results_text, reasons
+            )
+            for chat_id in chat_ids
+        )
+    )
+    delivered = [chat_id for chat_id in outcomes if chat_id is not None]
+    logger.info(
+        "Анонс дня %s разослан: доставлено %d из %d чатов",
+        round_row.day_index,
+        len(delivered),
+        len(chat_ids),
+    )
+    await record_delivery(
+        f"day:{round_row.day_index}", len(delivered), len(chat_ids), reasons
+    )
+    return delivered
+
+
+async def _deliver_personal_dms(
+    bot: Bot,
+    round_row: Round,
+    finished: Round | None,
+    results_text: str | None,
+) -> int:
+    """Личные дубликаты пакета дня игрокам (флаг settings.player_dm)."""
+    if not settings.player_dm:
+        return 0
+    delivered_dm = await _dm_send_all(
+        bot,
+        lambda pid: _deliver_day(
+            bot, pid, round_row, finished, results_text, is_dm=True
+        ),
+        f"Личный пакет дня {round_row.day_index}",
+    )
+    if delivered_dm:
+        logger.info(
+            "Личный пакет дня %s доставлен %d игроку(ам)",
+            round_row.day_index,
+            delivered_dm,
+        )
+    return delivered_dm
+
+
 async def announce_new_day(
     bot: Bot | None,
     round_row: Round,
@@ -987,20 +1114,13 @@ async def announce_new_day(
     """
     if bot is None:
         # Claim дня (announced_at) уже стоит у вызывающего, поэтому
-        # молчаливый возврат оставлял бы «объявленный» день без единого
+        # молчаливый возврат оставил бы «объявленный» день без единого
         # следа — ни лога, ни метки, ни счётчика. Метку announce_empty_day
         # здесь сознательно НЕ ставим: её читает check_anomalies, а это
         # джоба того же планировщика. Бота нет — значит тиков нет, тревоги
         # всё равно некому поднять, остаётся то, что видно и без
         # планировщика: лог (Render) и /metrics (внешний сборщик).
-        logger.warning(
-            "Анонс дня %s пропущен: бот не установлен (set_bot не вызван)",
-            round_row.day_index,
-        )
-        from app.metrics import inc
-
-        inc("announce_no_bot_total")
-        return []
+        return await _announce_no_bot(round_row)
     round_row = await _ensure_cards(round_row)
     chat_ids = await active_chat_ids()
     # Аудитория важнее самой отправки: claim дня уже стоит, и при пустой
@@ -1008,80 +1128,17 @@ async def announce_new_day(
     # Раньше это читалось как «рассылка не работает» — теперь состояние
     # помечается, видно в /ops и метрике, а тревога снимается сама, как
     # только появляется первый получатель.
-    if await announce_audience_size() > 0:
-        await set_announce_empty_marker(None)
-    else:
-        from app.metrics import inc
-
-        inc("announce_no_audience_total")
-        logger.warning(
-            "Анонс дня %s ушёл в пустоту: нет ни активных чатов, ни игроков с "
-            "личной рассылкой — новость не увидит никто (бота не добавили ни "
-            "в один чат, игроки не подписаны через /start)",
-            round_row.day_index,
-        )
-        await set_announce_empty_marker(round_row.day_index)
-        # Пустая аудитория ≠ состоявшийся анонс: снимаем claim (announced_at).
-        # Стоящая метка означала бы, что день объявлен, а восстановитель
-        # видит только announced_at IS NULL — и когда получатель появится
-        # позже (привязанный чат, вернувшийся игрок), пост не вернулся бы
-        # никогда. Отправлять-то по-прежнему некому, дубля не будет.
-        try:
-            from app.rounds import unclaim_announcement
-
-            async with SessionLocal() as unclaim_session:
-                await unclaim_announcement(unclaim_session, round_row.id)
-        except Exception:
-            logger.warning(
-                "Claim дня %s не снят после пустого анонса — день не "
-                "дождётся появившегося получателя",
-                round_row.day_index,
-                exc_info=True,
-            )
+    await _mark_announce_empty(round_row)
     if not chat_ids:
         logger.warning(
             "Анонс дня %s: активных чатов нет — в группу или канал не уйдёт ничего",
             round_row.day_index,
         )
     results_text = await results_body(finished) if finished is not None else None
-    semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
-    reasons: Counter[str] = Counter()
-
-    async def worker(chat_id: int) -> int | None:
-        async with semaphore:
-            return await _deliver_chat(
-                bot, chat_id, round_row, finished, results_text,
-                reasons=reasons,
-            )
-
-    outcomes = await asyncio.gather(*(worker(chat_id) for chat_id in chat_ids))
-    delivered = [chat_id for chat_id in outcomes if chat_id is not None]
-    logger.info(
-        "Анонс дня %s разослан: доставлено %d из %d чатов",
-        round_row.day_index,
-        len(delivered),
-        len(chat_ids),
+    delivered = await _deliver_day_announcements(
+        bot, chat_ids, round_row, finished, results_text
     )
-    await record_delivery(
-        f"day:{round_row.day_index}", len(delivered), len(chat_ids), reasons
-    )
-    # Личные дубликаты подписчикам: тот же пакет дня (итоги, обложка, кнопки
-    # выбора) в личку. Без /start у игрока бот писать не может — такие молча
-    # пропускаются; кнопки голосования работают из лички, как и из группы.
-    if settings.player_dm:
-        delivered_dm = await _dm_send_all(
-            bot,
-            lambda pid: _deliver_day(
-                bot, pid, round_row, finished, results_text, is_dm=True
-            ),
-            f"Личный пакет дня {round_row.day_index}",
-        )
-        if delivered_dm:
-            logger.info(
-                "Личный пакет дня %s доставлен %d игроку(ам)",
-                round_row.day_index,
-                delivered_dm,
-            )
+    await _deliver_personal_dms(bot, round_row, finished, results_text)
     return delivered
 
 
