@@ -11,6 +11,7 @@ import logging
 from datetime import UTC, datetime
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.registry import COLD_START_SEQNO_KEY
@@ -123,13 +124,14 @@ def treasury_pair_check_text() -> str:
     )
 
 
-async def treasury_diagnostics() -> str:
-    """Полный отчёт по казначею одной строкой-текстом для /treasury."""
-    network = settings.active_network
-    lines = [f"🏛 Казначей ({network})"]
-    if not settings.ton_enabled:
-        lines.append("TON выключен (TON_ENABLED=false): ставки и выплаты не работают.")
-        return "\n".join(lines)
+async def _diagnostics_wallet_lines() -> list[str]:
+    """Строки адреса казначея, пары мнемоника/адрес и баланса для /treasury.
+
+    Шапка-строка «🏛 Казначей (...)» собирается оркестратором; здесь — только
+    состояние: адрес, пара, баланс. Требует включённого TON (выключен — короткий
+    ответ без адресов и баланса; см. treasury_diagnostics).
+    """
+    lines: list[str] = []
     if settings.active_treasury_address:
         shown = friendly_address(settings.active_treasury_address, testnet=settings.is_testnet)
         lines.append(f"Адрес: <code>{shown}</code>")
@@ -162,7 +164,11 @@ async def treasury_diagnostics() -> str:
             lines.append(f"Баланс: {from_nano(balance):.4f} Gram{note} · источник {source}")
             if balance <= 0:
                 lines.append("Баланс пуст: пополнить через @testgiver_ton_bot (testnet).")
-    # Сверка с ожиданиями БД, корректировки казны и стоп-кран (/adjust, /pause).
+    return lines
+
+
+async def _diagnostics_sync_lines() -> list[str]:
+    """Сверка с ожиданиями БД, корректировки казны и стоп-кран (/adjust, /pause)."""
     from app.ops import (
         MANUAL_IN_KIND,
         MANUAL_OUT_KIND,
@@ -190,6 +196,7 @@ async def treasury_diagnostics() -> str:
     except Exception:
         logger.warning("Сверка казны для /treasury не собралась", exc_info=True)
         drift_state, adjustments, paused, reason = None, [], False, None
+    lines: list[str] = []
     if paused:
         lines.append(
             f"⏸ Игра на паузе ({reason or 'техработы'}): входящие переводы "
@@ -212,58 +219,69 @@ async def treasury_diagnostics() -> str:
             lines.append(
                 f"Сверка с БД сходится ✓ (ожидается ~{drift_state.expected_nanotons / 1e9:.4f} Gram)"
             )
-    # Зеркало казны: независимая копия истории кошелька со сверкой «в ноль».
+    return lines
+
+
+async def _diagnostics_mirror_lines() -> list[str]:
+    """Блок «Зеркало казны» для /treasury; не должен ломать весь отчёт."""
     try:
         from app.treasury_mirror import treasury_mirror_block
 
         mirror_text = await treasury_mirror_block()
         if mirror_text:
-            lines.append("")
-            lines.append(mirror_text)
+            return ["", mirror_text]
     except Exception as exc:
         logger.warning("Блок «Зеркало казны» в /treasury не собрался: %s", exc)
-    async with SessionLocal() as session:
-        waiting = (
-            await session.execute(
-                select(func.count()).select_from(Payout).where(Payout.status.notin_(["sent", "dismissed"]))
-            )
-        ).scalar_one()
-        dead = (
-            await session.execute(select(func.count()).select_from(Payout).where(Payout.status == "failed"))
-        ).scalar_one()
-        # Глазами watcher'а: куда смотрит, когда последний раз видел цепочку
-        # и где стоит курсор. Одна команда отвечает на «почему не видно пополнений».
-        from app.ton_watch import BEAT_KEY, CURSOR_KEY, SOURCE_KEY
+    return []
 
-        beat_iso = None
-        watcher_source = None
-        cursor_raw = None
-        cold_start_raw = None
-        for key, slot in (
-            (BEAT_KEY, "b"),
-            (SOURCE_KEY, "s"),
-            (CURSOR_KEY, "c"),
-            (COLD_START_SEQNO_KEY, "k"),
-        ):
-            row = await session.get(WatcherState, key)
-            if row is not None:
-                if slot == "b":
-                    beat_iso = row.value
-                elif slot == "s":
-                    watcher_source = row.value
-                elif slot == "c":
-                    cursor_raw = row.value
-                else:
-                    cold_start_raw = row.value
-    lines.append(f"Очередь выплат: ожидает {waiting} · failed {dead}")
-    if waiting or dead:
-        lines.append("Разбор: /payouts — причина видна у каждой строки.")
-    now = datetime.now(UTC)
-    lines.append("Watcher:")
+
+async def _payout_queue_counts(session: AsyncSession) -> tuple[int, int]:
+    """Счёт ожидающих и упавших выплат (статусы размечает сам payout-конвейер)."""
+    waiting = (
+        await session.execute(
+            select(func.count()).select_from(Payout).where(Payout.status.notin_(["sent", "dismissed"]))
+        )
+    ).scalar_one()
+    dead = (
+        await session.execute(select(func.count()).select_from(Payout).where(Payout.status == "failed"))
+    ).scalar_one()
+    return waiting, dead
+
+
+async def _diagnostics_watcher_lines(session: AsyncSession, network: str) -> list[str]:
+    """Строки состояния watcher'а для /treasury: адрес, сердцебиение, курсор, старт.
+
+    «Глазами watcher'а»: куда смотрит, когда последний раз видел цепочку и
+    где стоит курсор. Одна команда отвечает на «почему не видно пополнений».
+    """
+    from app.ton_watch import BEAT_KEY, CURSOR_KEY, SOURCE_KEY
+
+    beat_iso = None
+    watcher_source = None
+    cursor_raw = None
+    cold_start_raw = None
+    for key, slot in (
+        (BEAT_KEY, "b"),
+        (SOURCE_KEY, "s"),
+        (CURSOR_KEY, "c"),
+        (COLD_START_SEQNO_KEY, "k"),
+    ):
+        row = await session.get(WatcherState, key)
+        if row is not None:
+            if slot == "b":
+                beat_iso = row.value
+            elif slot == "s":
+                watcher_source = row.value
+            elif slot == "c":
+                cursor_raw = row.value
+            else:
+                cold_start_raw = row.value
+    lines = ["Watcher:"]
     if not settings.active_treasury_address:
         lines.append("  адрес не задан — смотреть не на что ⚠️")
     else:
         lines.append(f"  смотрит на: {settings.active_treasury_address[:8]}…{settings.active_treasury_address[-6:]} ({network})")
+    now = datetime.now(UTC)
     beat_age = None
     if beat_iso:
         try:
@@ -278,9 +296,9 @@ async def treasury_diagnostics() -> str:
     lines.append(
         f"  успешный цикл: {'never' if beat_age is None else f'{beat_age} с назад'}"
         + (f" · источник {watcher_source}" if watcher_source else "")
-        )
+    )
     if beat_age is not None and beat_age > 180:
-        lines.append("  ⚠️ циклы не проходят >3 мин: индексаторы недоступны или процесс спит")
+        lines.append("  ⚠️ циклы не проходят >3 min: индексаторы недоступны или процесс спит")
     if cursor_raw and cursor_raw.isdigit():
         cursor_dt = datetime.fromtimestamp(int(cursor_raw), tz=UTC)
         lag = int((now - cursor_dt).total_seconds())
@@ -293,6 +311,25 @@ async def treasury_diagnostics() -> str:
     elif settings.ton_enabled:
         lines.append("  курсора нет — стартует с отката 12 ч")
     lines.extend(_cold_start_lines(cold_start_raw))
+    return lines
+
+
+async def treasury_diagnostics() -> str:
+    """Полный отчёт по казначею одной строкой-текстом для /treasury."""
+    network = settings.active_network
+    lines = [f"🏛 Казначей ({network})"]
+    if not settings.ton_enabled:
+        lines.append("TON выключен (TON_ENABLED=false): ставки и выплаты не работают.")
+        return "\n".join(lines)
+    lines += await _diagnostics_wallet_lines()
+    lines += await _diagnostics_sync_lines()
+    lines += await _diagnostics_mirror_lines()
+    async with SessionLocal() as session:
+        waiting, dead = await _payout_queue_counts(session)
+        lines.append(f"Очередь выплат: ожидает {waiting} · failed {dead}")
+        if waiting or dead:
+            lines.append("Разбор: /payouts — причина видна у каждой строки.")
+        lines += await _diagnostics_watcher_lines(session, network)
     return "\n".join(lines)
 
 
