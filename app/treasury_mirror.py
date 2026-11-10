@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.registry import (
@@ -758,6 +759,207 @@ def _advance_cursor(
     return next_lt, None
 
 
+async def _bootstrap_sync(
+    session: AsyncSession, network: str, max_pages: int
+) -> tuple[int, int, int, str, bool, bool]:
+    """Бутстрап-спуск зеркала: от головы к генезису, страницами по before_lt.
+
+    Дно фиксируется в BOTTOM, при пустой странице зеркало объявляется
+    выстроенным (BOOTSTRAPPED), тождество измеряется, а строки вне цепочки
+    вычищаются — но только если весь спуск уместился в один цикл (см.
+    _purge_moves_missing_from_chain).
+
+    Returns: (pages, added, updated, source, bootstrapped, page_ok).
+    """
+    before_lt = await _state_int(session, TREASURY_MIRROR_BOTTOM_KEY)
+    head_lt = await _state_int(session, TREASURY_MIRROR_CURSOR_KEY)
+    offset = None
+    prev_window: tuple[int, int] | None = None
+    prev_source: str | None = None
+    seen_hashes: set[str] = set()
+    full_walk = before_lt is None
+    pages = added = updated = 0
+    source = "none"
+    bootstrapped = False
+    page_ok = False
+    for _ in range(max_pages):
+        moves, source, ok = await _fetch_page(before_lt, offset=offset)
+        if not ok:
+            break
+        page_ok = True
+        pages += 1
+        if not moves:
+            bootstrapped = True
+            purged = 0
+            if full_walk:
+                purged = await _purge_moves_missing_from_chain(
+                    session, network, _address_for(network), seen_hashes
+                )
+            else:
+                logger.warning(
+                    "Зеркало казны: генезис достигнут за несколько циклов — "
+                    "чистка строк вне цепочки пропущена (виден только "
+                    "последний отрезок спуска)"
+                )
+            await _set_state(session, TREASURY_MIRROR_BOOTSTRAP_KEY, "1")
+            await session.commit()
+            logger.info(
+                "Зеркало казны: бутстрап до генезиса завершён, вычищено "
+                "строк вне цепочки: %d",
+                purged,
+            )
+            break
+        window = (min(move.lt for move in moves), max(move.lt for move in moves))
+        if window == prev_window and source == prev_source:
+            logger.warning(
+                "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
+                "двигается, спуск к генезису остановлен",
+                source,
+                window[0],
+                window[1],
+            )
+            break
+        prev_window = window
+        prev_source = source
+        if head_lt is None:
+            head_lt = moves[0].lt
+        seen_hashes.update(move.tx_hash for move in moves)
+        kinds = await _resolve_kinds_batch(session, moves)
+        part_added, part_updated = await _apply_page(session, moves, kinds)
+        added += part_added
+        updated += part_updated
+        before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
+        await _set_state(session, TREASURY_MIRROR_BOTTOM_KEY, str(before_lt))
+        if head_lt is not None:
+            await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
+        await session.commit()
+    return pages, added, updated, source, bootstrapped, page_ok
+
+
+async def _increment_sync(
+    session: AsyncSession, network: str, max_pages: int
+) -> tuple[int, int, int, str, bool]:
+    """Инкремент: новые транзакции выше головы (CURSOR), до пересечения
+    известной границы; при реорганизации монтируется перезапись строк.
+
+    Returns: (pages, added, updated, source, page_ok).
+    """
+    before_lt = None
+    offset = None
+    prev_window = None
+    prev_source = None
+    head_lt = await _state_int(session, TREASURY_MIRROR_CURSOR_KEY)
+    pages = added = updated = 0
+    source = "none"
+    page_ok = False
+    for _ in range(max_pages):
+        moves, source, ok = await _fetch_page(before_lt, offset=offset)
+        if not ok:
+            break
+        page_ok = True
+        pages += 1
+        if not moves:
+            break
+        page_max = max(move.lt for move in moves)
+        if head_lt is not None and page_max <= head_lt:
+            break  # самая свежая уже учтена — ничего нового
+        window = (min(move.lt for move in moves), page_max)
+        if window == prev_window and source == prev_source:
+            logger.warning(
+                "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
+                "двигается, догон головы остановлен",
+                source,
+                window[0],
+                window[1],
+            )
+            break
+        prev_window = window
+        prev_source = source
+        kinds = await _resolve_kinds_batch(session, moves)
+        part_added, part_updated = await _apply_page(session, moves, kinds)
+        added += part_added
+        updated += part_updated
+        prev_head = head_lt
+        head_lt = max(head_lt or 0, page_max)
+        await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
+        await session.commit()
+        before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
+        if prev_head is not None and before_lt is not None and before_lt <= prev_head:
+            # Страница пересекла известную границу — хвост под меткой,
+            # новые транзакции выше головы все учтены.
+            break
+    return pages, added, updated, source, page_ok
+
+
+async def _check_mirror(
+    session: AsyncSession,
+    summary: dict,
+    network: str,
+    source: str,
+    bootstrapped: bool,
+    pages: int,
+    added: int,
+    updated: int,
+) -> None:
+    """После успешного спуска/инкремента: сверка «Σ balance_delta = живой баланс»."""
+    mirror_sum = int(
+        (
+            await session.execute(
+                select(func.coalesce(func.sum(TreasuryMove.balance_delta_nanotons), 0))
+                .where(
+                    TreasuryMove.network == network,
+                    TreasuryMove.address == _address_for(network),
+                )
+            )
+        ).scalar_one()
+    )
+    from app.ton_pay import fetch_account_state
+
+    try:
+        chain_balance, _status, _src = await fetch_account_state()
+    except Exception as exc:
+        logger.warning("Зеркало: живой баланс для сверки не прочитан: %s", exc)
+        chain_balance = None
+    exact = None
+    diff = None
+    if chain_balance is not None:
+        diff = mirror_sum - chain_balance
+        exact = diff == 0
+        await _set_state(
+            session,
+            TREASURY_MIRROR_CHECK_KEY,
+            json.dumps(
+                {
+                    "exact": exact,
+                    "diff_nanotons": diff,
+                    "mirror_balance": mirror_sum,
+                    "chain_balance": chain_balance,
+                    "checked_at": datetime.now(UTC).isoformat(),
+                    "source": source,
+                }
+            ),
+        )
+    summary.update(
+        exact=exact,
+        diff_nanotons=diff,
+        mirror_balance=mirror_sum,
+        chain_balance=chain_balance,
+    )
+    await _set_state(session, TREASURY_MIRROR_BEAT_KEY, datetime.now(UTC).isoformat())
+    await session.commit()
+    logger.info(
+        "Зеркало казны: страниц %d, +%d/%d, источник %s, бутстрап %s, "
+        "тождество %s (diff %.4f Gram)",
+        pages,
+        added,
+        updated,
+        source,
+        "да" if bootstrapped else "нет",
+        "±0" if exact else "N/A",
+        (diff or 0) / 1e9,
+    )
+
+
 async def sync_treasury_mirror() -> dict:
     """Один цикл синка зеркала. Возвращает сводку для лога/отчёта.
 
@@ -772,7 +974,7 @@ async def sync_treasury_mirror() -> dict:
 
     Каждая страница коммитится отдельно: краш между страницами не теряет
     наработанного прогресса. Когда зеркало выстроено, цикл дополнительно
-    проверяет тождество «Σ balance_delta = живой баланс» и кладет результат
+    проверяет тождество «Σ balance_delta = живой баланс» и кладёт результат
     в CHECK (читается автосверкой без лишнего запроса к индексатору).
     """
     summary = {
@@ -795,133 +997,22 @@ async def sync_treasury_mirror() -> dict:
         bootstrapped = (
             await session.get(WatcherState, TREASURY_MIRROR_BOOTSTRAP_KEY)
         ) is not None
-        head_lt = await _state_int(session, TREASURY_MIRROR_CURSOR_KEY)
-        bottom_lt = await _state_int(session, TREASURY_MIRROR_BOTTOM_KEY)
         pages = added = updated = 0
         source = "none"
         page_ok = False
-
         if not bootstrapped:
-            # Спуск к генезису: продолжаем с достигнутого дна либо с головы.
-            # offset — курсор Toncenter (его before_lt не режет выборку),
-            # before_lt — курсор TonAPI. Провайдер сменился: чужой курсор
-            # обнуляем, страницы этого провайдера перезапишутся идемпотентно.
-            before_lt = bottom_lt
-            offset = None
-            prev_window: tuple[int, int] | None = None
-            prev_source: str | None = None
-            # Хеши, реально встреченные в цепочке за этот спуск. Полный обход
-            # ограничен max_pages × limit, так что накопление bounded — в отличие
-            # от бесконечного «где-то там строки», которое purge не вычистит.
-            seen_hashes: set[str] = set()
-            # Чистка фантомов допустима, только если ВЕСЬ спуск от головы до
-            # генезиса уместился в этот цикл: тогда seen_hashes — вся история.
-            # Многоцикловый спуск (лимит страниц на цикл) начинает следующий
-            # цикл с сохранённого дна, и его seen_hashes покрывает лишь последний
-            # отрезок, а строки ранних циклов для чистки «неизвестны». Раньше
-            # финальный цикл чистил по неполному множеству и сносил валидные
-            # строки, вернуть которые уже нечем: зеркало объявлено bootstrapped,
-            # а инкремент читает только голову.
-            full_walk = bottom_lt is None
-            for _ in range(max_pages):
-                moves, source, ok = await _fetch_page(before_lt, offset=offset)
-                if not ok:
-                    break
-                page_ok = True
-                pages += 1
-                if not moves:
-                    bootstrapped = True
-                    purged = 0
-                    if full_walk:
-                        purged = await _purge_moves_missing_from_chain(
-                            session, network, _address_for(network), seen_hashes
-                        )
-                    else:
-                        logger.warning(
-                            "Зеркало казны: генезис достигнут за несколько циклов — "
-                            "чистка строк вне цепочки пропущена (виден только "
-                            "последний отрезок спуска)"
-                        )
-                    await _set_state(session, TREASURY_MIRROR_BOOTSTRAP_KEY, "1")
-                    await session.commit()
-                    logger.info(
-                        "Зеркало казны: бутстрап до генезиса завершён, вычищено "
-                        "строк вне цепочки: %d",
-                        purged,
-                    )
-                    break
-                window = (min(move.lt for move in moves), max(move.lt for move in moves))
-                if window == prev_window and source == prev_source:
-                    # Тот же провайдер отдал то же окно: курсор не работает,
-                    # спуск к генезису не сдвинется. Молча крутить max_pages
-                    # раз и ждать, будто что-то изменится, — худший вариант.
-                    # Смена провайдера исключена: у нового курсор чужой, он
-                    # по закону начинает с головы и повторяет это же окно.
-                    logger.warning(
-                        "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
-                        "двигается, спуск к генезису остановлен",
-                        source, window[0], window[1],
-                    )
-                    break
-                prev_window = window
-                prev_source = source
-                if head_lt is None:
-                    head_lt = moves[0].lt
-                seen_hashes.update(move.tx_hash for move in moves)
-                kinds = await _resolve_kinds_batch(session, moves)
-                part_added, part_updated = await _apply_page(session, moves, kinds)
-                added += part_added
-                updated += part_updated
-                before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
-                await _set_state(session, TREASURY_MIRROR_BOTTOM_KEY, str(before_lt))
-                if head_lt is not None:
-                    await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
-                await session.commit()
+            (
+                pages,
+                added,
+                updated,
+                source,
+                bootstrapped,
+                page_ok,
+            ) = await _bootstrap_sync(session, network, max_pages)
         else:
-            # Новое поверх головы; первая страница — самая свежая.
-            before_lt = None
-            offset = None
-            prev_window = None
-            prev_source = None
-            for _ in range(max_pages):
-                moves, source, ok = await _fetch_page(before_lt, offset=offset)
-                if not ok:
-                    break
-                page_ok = True
-                pages += 1
-                if not moves:
-                    break
-                page_max = max(move.lt for move in moves)
-                if head_lt is not None and page_max <= head_lt:
-                    break  # самая свежая уже учтена — ничего нового
-                window = (min(move.lt for move in moves), page_max)
-                if window == prev_window and source == prev_source:
-                    logger.warning(
-                        "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
-                        "двигается, догон головы остановлен",
-                        source, window[0], window[1],
-                    )
-                    break
-                prev_window = window
-                prev_source = source
-                kinds = await _resolve_kinds_batch(session, moves)
-                part_added, part_updated = await _apply_page(session, moves, kinds)
-                added += part_added
-                updated += part_updated
-                prev_head = head_lt
-                head_lt = max(head_lt or 0, page_max)
-                await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
-                await session.commit()
-                before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
-                if (
-                    prev_head is not None
-                    and before_lt is not None
-                    and before_lt <= prev_head
-                ):
-                    # Страница пересекла известную границу — хвост под меткой,
-                    # новые транзакции выше головы все учтены.
-                    break
-
+            pages, added, updated, source, page_ok = await _increment_sync(
+                session, network, max_pages
+            )
         if page_ok:
             await _set_state(session, TREASURY_MIRROR_SOURCE_KEY, source)
         summary.update(
@@ -931,62 +1022,17 @@ async def sync_treasury_mirror() -> dict:
             source=source,
             bootstrapped=bootstrapped,
         )
-
         if not bootstrapped:
             return summary
-
-        mirror_sum = int(
-            (
-                await session.execute(
-                    select(func.coalesce(func.sum(TreasuryMove.balance_delta_nanotons), 0))
-                    .where(
-                        TreasuryMove.network == network,
-                        TreasuryMove.address == _address_for(network),
-                    )
-                )
-            ).scalar_one()
-        )
-        # Безопасно: ton_pay импортируется локально — ton_pay загружает тяжёлые
-        # pytoniq-зависимости и держит циклический импорт с этим модулем.
-        from app.ton_pay import fetch_account_state
-
-        try:
-            chain_balance, _status, _src = await fetch_account_state()
-        except Exception as exc:
-            logger.warning("Зеркало: живой баланс для сверки не прочитан: %s", exc)
-            chain_balance = None
-        exact = None
-        diff = None
-        if chain_balance is not None:
-            diff = mirror_sum - chain_balance
-            exact = diff == 0
-            await _set_state(
-                session,
-                TREASURY_MIRROR_CHECK_KEY,
-                json.dumps(
-                    {
-                        "exact": exact,
-                        "diff_nanotons": diff,
-                        "mirror_balance": mirror_sum,
-                        "chain_balance": chain_balance,
-                        "checked_at": datetime.now(UTC).isoformat(),
-                        "source": source,
-                    }
-                ),
-            )
-        summary.update(
-            exact=exact,
-            diff_nanotons=diff,
-            mirror_balance=mirror_sum,
-            chain_balance=chain_balance,
-        )
-        await _set_state(session, TREASURY_MIRROR_BEAT_KEY, datetime.now(UTC).isoformat())
-        await session.commit()
-        logger.info(
-            "Зеркало казны: страниц %d, +%d/%d, источник %s, бутстрап %s, "
-            "тождество %s (diff %.4f Gram)",
-            pages, added, updated, source, "да" if bootstrapped else "нет",
-            "±0" if exact else "N/A", (diff or 0) / 1e9,
+        await _check_mirror(
+            session,
+            summary,
+            network,
+            source,
+            bootstrapped,
+            pages,
+            added,
+            updated,
         )
     return summary
 
