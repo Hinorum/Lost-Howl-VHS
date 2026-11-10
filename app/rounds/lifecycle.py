@@ -400,37 +400,19 @@ async def _tally_counts_for(session: AsyncSession, round_row: Round) -> dict[int
     return counts
 
 
-async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, bool]:
-    """Закрывает подсчёт атомарно. Второе значение — закрыт ли день этим вызовом.
+async def _resolve_tie_note(
+    round_row: Round,
+    counts: dict[int, int],
+    used_stakes: bool,
+    winner: int,
+    tied: list[int],
+    seed: str,
+) -> str | None:
+    """Формирует текст нотки ничьей дня (для round.tie_note и UI).
 
-    Условный UPDATE (status='tallying' → 'closed') защищает от гонки между
-    планировщиком и /advance.
+    Жребий по блоку TON (если энтропия сохранена) + «Равные банки → голоса»:
+    счёт разделился, и ничью разрешили голосом стаи.
     """
-    # id снимаем ДО любых commit/rollback: откат истекает прикреплённые
-    # инстансы, и чтение round_row.id после отката — это lazy load вне
-    # greenlet-контекста (MissingGreenlet). Ветки отката обязаны знать id
-    # дня, не трогая истёкший объект.
-    round_id = round_row.id
-    if round_row.status != RoundStatus.TALLYING:
-        loaded = await get_round(session, round_id)
-        return (loaded or round_row), False
-    counts = getattr(round_row, "_tally_counts", None)
-    used_stakes = getattr(round_row, "_tally_used_stakes", None)
-    staked_counts: dict[int, int] = {0: 0, 1: 0, 2: 0}
-    # Голоса для хранения и отображения — всегда бесплатные, без бонуса.
-    vote_counts = getattr(round_row, "_tally_votes", None) or await plain_vote_counts(
-        session, round_row.id
-    )
-    counts = getattr(round_row, "_tally_counts", None)
-    if counts is None or used_stakes is None:
-        # Пересчёт (heal/другой процесс): выбор совпадает с close_voting.
-        decisive, used_stakes = await _decisive_counts(session, round_row, vote_counts)
-        counts = decisive
-    if used_stakes:
-        staked_counts = await count_stakes_for_tally(session, round_row.id)
-    display_counts = vote_counts
-    seed = tie_seed(round_row)
-    winner, tied = await _winner_and_tied(session, round_row, counts, seed, vote_counts)
     tie_note: str | None = None
     if len(tied) > 1:
         path_names = " и ".join(_ROMAN[p] for p in tied)
@@ -460,9 +442,6 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
         if tie_note is None:
             tie_note = f"{head} ({path_names}) — {theater}"
         tie_note = tie_note[:200]
-    # «Равные банки → голоса»: счёт Gram разделился, и ничью разрешил голос
-    # стаи. Игрок должен видеть, ПОЧЕМУ день ушёл не по деньгам, — иначе
-    # правило работает втихую, и это выглядит как жребий на пустом месте.
     if (
         tie_note is None
         and used_stakes
@@ -475,21 +454,25 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
                 f"Счёт Gram на сценах разделился ({path_names}) — "
                 f"голос стаи вывел сцену {_ROMAN[winner]}"
             )[:200]
-    if not round_row.cards:
-        loaded = await get_round(session, round_id)
-        if loaded is not None:
-            round_row = loaded
-    cards = {card.position: card for card in round_row.cards}
-    winning_card = cards.get(winner) or SimpleNamespace(
-        title=f"Сцена {_ROMAN[winner]}",
-        consequence="Сцена растворилась в тумане, не оставив следа.",
-    )
-    counts_json = json.dumps({str(key): value for key, value in display_counts.items()})
-    stake_counts_json = (
-        json.dumps({str(key): value for key, value in staked_counts.items()})
-        if used_stakes
-        else None
-    )
+    return tie_note
+
+
+async def _close_round_tally(
+    session: AsyncSession,
+    round_row: Round,
+    round_id: int,
+    winner: int,
+    winning_card: Card | SimpleNamespace,
+    counts_json: str,
+    stake_counts_json: str | None,
+    tie_note: str | None,
+) -> tuple[Round, bool]:
+    """Закрывает раунд: UPDATE статуса TALLYING → CLOSED + запись канона дня.
+
+    Возвращает (round, closed): closed=False — закрытие уже сделано другой
+    параллельной операцией (задача исчерпана), round — актуальная загруженная
+    копия; closed=True — день закрыт этой операцией.
+    """
     result = await session.execute(
         update(Round)
         .where(Round.id == round_row.id, Round.status == RoundStatus.TALLYING)
@@ -548,3 +531,67 @@ async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, 
         loaded = await get_round(session, round_id)
         return (loaded or round_row), False
     return await get_round(session, round_id), True  # type: ignore[return-value]
+
+
+async def finish_tally(session: AsyncSession, round_row: Round) -> tuple[Round, bool]:
+    """Закрывает подсчёт атомарно. Второе значение — закрыт ли день этим вызовом.
+
+    Условный UPDATE (status='tallying' → 'closed') защищает от гонки между
+    планировщиком и /advance.
+    """
+    # id снимаем ДО любых commit/rollback: откат истекает прикреплённые
+    # инстансы, и чтение round_row.id после отката — это lazy load вне
+    # greenlet-контекста (MissingGreenlet). Ветки отката обязаны знать id
+    # дня, не трогая истёкший объект.
+    round_id = round_row.id
+    if round_row.status != RoundStatus.TALLYING:
+        loaded = await get_round(session, round_id)
+        return (loaded or round_row), False
+    counts = getattr(round_row, "_tally_counts", None)
+    used_stakes = getattr(round_row, "_tally_used_stakes", None)
+    staked_counts: dict[int, int] = {0: 0, 1: 0, 2: 0}
+    # Голоса для хранения и отображения — всегда бесплатные, без бонуса.
+    vote_counts = getattr(round_row, "_tally_votes", None) or await plain_vote_counts(
+        session, round_row.id
+    )
+    counts = getattr(round_row, "_tally_counts", None)
+    if counts is None or used_stakes is None:
+        # Пересчёт (heal/другой процесс): выбор совпадает с close_voting.
+        decisive, used_stakes = await _decisive_counts(session, round_row, vote_counts)
+        counts = decisive
+    if used_stakes:
+        staked_counts = await count_stakes_for_tally(session, round_row.id)
+    display_counts = vote_counts
+    seed = tie_seed(round_row)
+    winner, tied = await _winner_and_tied(session, round_row, counts, seed, vote_counts)
+    tie_note = await _resolve_tie_note(
+        round_row, counts, used_stakes, winner, tied, seed
+    )
+    if not round_row.cards:
+        loaded = await get_round(session, round_id)
+        if loaded is not None:
+            round_row = loaded
+    cards = {card.position: card for card in round_row.cards}
+    winning_card = cards.get(winner) or SimpleNamespace(
+        title=f"Сцена {_ROMAN[winner]}",
+        consequence="Сцена растворилась в тумане, не оставив следа.",
+    )
+    counts_json = json.dumps({str(key): value for key, value in display_counts.items()})
+    stake_counts_json = (
+        json.dumps({str(key): value for key, value in staked_counts.items()})
+        if used_stakes
+        else None
+    )
+    result_round, closed = await _close_round_tally(
+        session,
+        round_row,
+        round_id,
+        winner,
+        winning_card,
+        counts_json,
+        stake_counts_json,
+        tie_note,
+    )
+    return result_round, closed
+
+
