@@ -377,20 +377,12 @@ def _cold_start_lines(raw: str | None) -> list[str]:
     return [f"  холодный старт: seqno совпал ({lite}){stamp}"]
 
 
-async def blockchain_diagnostics() -> str:
-    """Аудит блокчейн-контура одной строкой-текстом для /blockchain.
+async def _blockchain_watcher_lines(session: AsyncSession, network: str) -> list[str]:
+    """Строки блока «watcher → очередь выплат → казначей» для /blockchain.
 
-    Показывает глазами всей связки watcher → очередь выплат → казначей:
-    курсор и источник, stuck-список сбойных входящих, очередь по статусам,
-    неопознанные «sent» (ждут сверки), глубину сверки истории и флаг её
-    доступности в последнем цикле. Поиск «куда делось» начинается здесь,
-    без перебора логов и запросов к индексаторам руками.
+    Глазами всей внешней части контура: курсор и источник, stuck-список
+    сбойных входящих, очередь по статусам, неопознанные «sent».
     """
-    network = settings.active_network
-    lines = [f"⛓ Блокчейн-контур ({network})"]
-    if not settings.ton_enabled:
-        lines.append("TON выключен (TON_ENABLED=false): ставки и выплаты не работают.")
-        return "\n".join(lines)
     # Watcher-состояние одним запросом (курсор, источник, сердцебиение, stuck).
     from app.ton_watch import (  # локально: ton_watch не импортируется сверху
         BEAT_KEY,
@@ -409,56 +401,55 @@ async def blockchain_diagnostics() -> str:
     sent_unconfirmed = 0
     waiting_dest = 0
     verified_wallets = 0
-    async with SessionLocal() as session:
-        for key, slot in ((BEAT_KEY, "b"), (SOURCE_KEY, "s"), (CURSOR_KEY, "c")):
-            row = await session.get(WatcherState, key)
-            if row is None:
-                continue
-            if slot == "b":
-                beat_iso = row.value
-            elif slot == "s":
-                source = row.value
-            else:
-                cursor_raw = row.value
-        stuck_row = await session.get(WatcherState, STUCK_KEY)
-        if stuck_row is not None:
-            try:
-                stuck = json.loads(stuck_row.value) or {}
-            except (ValueError, TypeError):
-                stuck = {}
-            if not isinstance(stuck, dict):
-                stuck = {}
-        for status in ("pending", "sending", "sent", "failed"):
-            n = (
-                await session.execute(
-                    select(func.count()).select_from(Payout).where(
-                        Payout.status == status, Payout.network == network
-                    )
-                )
-            ).scalar_one()
-            queue[status] = n
-        sent_unconfirmed = (
+    for key, slot in ((BEAT_KEY, "b"), (SOURCE_KEY, "s"), (CURSOR_KEY, "c")):
+        row = await session.get(WatcherState, key)
+        if row is None:
+            continue
+        if slot == "b":
+            beat_iso = row.value
+        elif slot == "s":
+            source = row.value
+        else:
+            cursor_raw = row.value
+    stuck_row = await session.get(WatcherState, STUCK_KEY)
+    if stuck_row is not None:
+        try:
+            stuck = json.loads(stuck_row.value) or {}
+        except (ValueError, TypeError):
+            stuck = {}
+        if not isinstance(stuck, dict):
+            stuck = {}
+    for status in ("pending", "sending", "sent", "failed"):
+        n = (
             await session.execute(
                 select(func.count()).select_from(Payout).where(
-                    Payout.status == "sent",
-                    Payout.network == network,
-                    or_(Payout.tx_hash.is_(None), Payout.tx_hash.like("bcast:%")),
+                    Payout.status == status, Payout.network == network
                 )
             )
         ).scalar_one()
-        waiting_dest = (
-            await session.execute(
-                select(func.count()).select_from(Payout).where(
-                    Payout.dest_address == "", Payout.network == network
-                )
+        queue[status] = n
+    sent_unconfirmed = (
+        await session.execute(
+            select(func.count()).select_from(Payout).where(
+                Payout.status == "sent",
+                Payout.network == network,
+                or_(Payout.tx_hash.is_(None), Payout.tx_hash.like("bcast:%")),
             )
-        ).scalar_one()
-        verified_wallets = (
-            await session.execute(
-                select(func.count()).select_from(Player).where(Player.wallet_verified.is_(True))
+        )
+    ).scalar_one()
+    waiting_dest = (
+        await session.execute(
+            select(func.count()).select_from(Payout).where(
+                Payout.dest_address == "", Payout.network == network
             )
-        ).scalar_one()
-    # Курсор: лаг от текущего времени (тот же расчёт, что в /treasury).
+        )
+    ).scalar_one()
+    verified_wallets = (
+        await session.execute(
+            select(func.count()).select_from(Player).where(Player.wallet_verified.is_(True))
+        )
+    ).scalar_one()
+    lines: list[str] = []
     now = datetime.now(UTC)
     if cursor_raw and cursor_raw.isdigit():
         cursor_dt = datetime.fromtimestamp(int(cursor_raw), tz=UTC)
@@ -494,8 +485,14 @@ async def blockchain_diagnostics() -> str:
     if waiting_dest:
         lines.append(f"  {waiting_dest} строк ждут кошелёк игрока (dest пустой) — уйдут после /wallet")
     lines.append(f"Кошельков verified: {verified_wallets}")
+    return lines
+
+
+async def _blockchain_runtime_lines() -> list[str]:
+    """Баланс казначея и сверка глубины истории для /blockchain."""
     import app.ton_pay as _tp
 
+    lines: list[str] = []
     balance, _status, balance_source = await _tp.fetch_account_state()
     if balance is not None:
         lines.append(f"Баланс казначея: {balance / 1e9:.4f} Gram ({balance_source})")
@@ -506,4 +503,24 @@ async def blockchain_diagnostics() -> str:
         f"до {settings.payout_reconcile_max_pages} стр · "
         f"история {'доступна' if _state._RECONCILE_HISTORY_OK else 'НЕДОСТУПНА ⚠️ повторы выплат заморожены'}"
     )
+    return lines
+
+
+async def blockchain_diagnostics() -> str:
+    """Аудит блокчейн-контура одной строкой-текстом для /blockchain.
+
+    Показывает глазами всей связки watcher → очередь выплат → казначей:
+    курсор и источник, stuck-список сбойных входящих, очередь по статусам,
+    неопознанные «sent» (ждут сверки), глубину сверки истории и флаг её
+    доступности в последнем цикле. Поиск «куда делось» начинается здесь,
+    без перебора логов и запросов к индексаторам руками.
+    """
+    network = settings.active_network
+    lines = [f"⛓ Блокчейн-контур ({network})"]
+    if not settings.ton_enabled:
+        lines.append("TON выключен (TON_ENABLED=false): ставки и выплаты не работают.")
+        return "\n".join(lines)
+    async with SessionLocal() as session:
+        lines += await _blockchain_watcher_lines(session, network)
+    lines += await _blockchain_runtime_lines()
     return "\n".join(lines)
