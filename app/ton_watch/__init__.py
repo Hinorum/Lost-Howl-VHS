@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 
 from aiogram import Bot
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.processed import KIND_REFUND, KIND_STAKE, transfer_claim_kind
@@ -768,31 +769,27 @@ async def _heal_stuck_transfers(bot: Bot | None = None) -> int:
             await _write_stuck(session, stuck)
     return healed
 
-async def watch_once(bot: Bot | None = None) -> None:
-    async with SessionLocal() as session:
-        await _migrate_wallet_formats(session)
-        since = await _read_cursor(session)
-        raw_cursor = await _read_cursor_raw(session)
-        stuck = await _read_stuck(session)
-        scan_boost = await _read_scan_boost(session)
-    transfers, api_ok, source, gap_at, parse_fail_count = await _collect_transfers(
-        since, _MAX_PAGES * scan_boost
-    )
-    # Item'ы, отброшенные парсером с исключением (см. P0 #4 в README лога):
-    # раньше parser глушил ошибку как «нормальный None» и считать их было
-    # негде. Теперь счётчик за цикл уезжает в watcher_state как
-    # parse_fail_count и поднимает alarm до чистого цикла.
-    if parse_fail_count > 0:
-        async with SessionLocal() as session:
-            await _bump_parse_fail(session, parse_fail_count)
-        logger.warning(
-            "За цикл отброшено %d item'ов парсером TonAPI/Toncenter — "
-            "счётчик записан в watcher_state[parse_fail_count]",
-            parse_fail_count,
-        )
+async def _watch_state_read(session: AsyncSession) -> tuple[int, int, dict, int]:
+    """Состояние цикла watcher'а: курсор, stuck-список, буст сканирования."""
+    await _migrate_wallet_formats(session)
+    since = await _read_cursor(session)
+    raw_cursor = await _read_cursor_raw(session)
+    stuck = await _read_stuck(session)
+    scan_boost = await _read_scan_boost(session)
+    return since, raw_cursor, stuck, scan_boost
+
+
+async def _watch_process_batch(
+    transfers: list[Transfer], bot: Bot | None, stuck: dict, since: int
+) -> int:
+    """Обрабатывает пачку переводов watcher'а; возвращает processed_through.
+
+    Сбойная транзакция НЕ двигает курсор за себя: обрабатываем остаток
+    пачки (skip без потери), но курсор останавливается перед ней, и в
+    следующем цикле окно перечитает её заново. Так временный сбой
+    (сеть, провайдер, баг версии) не стирает деньги молча.
+    """
     processed_through = since
-    # Сбойные транзакции попадают в stuck-список (watcher_state): они не должны
-    # остаться за окном перекрытия навсегда (см. генерацию курсора ниже).
     for i, transfer in enumerate(transfers):
         try:
             status = await process_transfer(transfer, bot=bot)
@@ -805,10 +802,6 @@ async def watch_once(bot: Bot | None = None) -> None:
                 transfer.utime,
             )
         except Exception as exc:
-            # Сбойная транзакция НЕ двигает курсор за себя: обрабатываем остаток
-            # пачки (skip без потери), но курсор останавливается перед ней, и в
-            # следующем цикле окно перечитает её заново. Так временный сбой
-            # (сеть, провайдер, баг версии) не стирает деньги молча.
             logger.warning("Перевод %s не обработан: %s (продолжаем остаток пачки)", transfer.tx_hash[:16], exc)
             entry = stuck.get(transfer.tx_hash)
             if entry is None:
@@ -836,27 +829,30 @@ async def watch_once(bot: Bot | None = None) -> None:
         processed_through = max(processed_through, transfer.utime)
         if i % 50 == 49:
             await asyncio.sleep(0.05)
-    try:
-        await confirm_aged_pending(bot)
-    except Exception:
-        logger.exception("Подтверждение отложенных ставок упало (не мешает циклу)")
-    # Свежие подтверждения выростили банк дня, а в постах-статусах он застыл:
-    # правим их актуальным банком, чтобы игроки не гоняли /today за цифрой.
-    # Необязательный слой: сбой правки не должен рвать цикл watcher'а.
-    try:
-        from app.broadcast import refresh_day_bank
+    return processed_through
 
-        await refresh_day_bank(bot)
-    except Exception:
-        logger.exception("Актуализация банка дня в постах упала (не мешает циклу)")
-# Курсор — нижняя граница окна, прочитанного ЦЕЛИКОМ. Полный проход даёт
-    # processed_through (самая свежая обработанная транзакция). Усечённый по
-    # бюджету страниц проход даёт gap_at — дно прочитанного: всё выше него
-    # перечислено, а непрочитанное ниже догоняется следующими циклами, потому
-    # что курсор стоит на границе покрытия, а не на «непрочитанной» позиции.
-    # Раньше усечённый проход считался полным (complete=True), и курсор уезжал
-    # по processed_through — окно между gap_at и processed_through выпадало из
-    # чтения навсегда: тихо, без записи и без тревоги.
+
+async def _watch_persist_cursor(
+    session: AsyncSession,
+    *,
+    api_ok: bool,
+    since: int,
+    gap_at: int | None,
+    raw_cursor: int,
+    stuck: dict,
+    processed_through: int,
+) -> None:
+    """Запись курсора цикла watcher'а с защитой от потери/залипания окна.
+
+    Курсор — нижняя граница окна, прочитанного ЦЕЛИКОМ. Полный проход даёт
+    processed_through (самая свежая обработанная транзакция). Усечённый по
+    бюджету страниц проход даёт gap_at — дно прочитанного: всё выше него
+    перечислено, а непрочитанное ниже догоняется следующими циклами, потому
+    что курсор стоит на границе покрытия, а не на «непрочитанной» позиции.
+    Раньше усечённый проход считался полным (complete=True), и курсор уезжал
+    по processed_through — окно между gap_at и processed_through выпадало из
+    чтения навсегда: тихо, без записи и без тревоги.
+    """
     cursor_candidate = gap_at if gap_at is not None else processed_through
     if api_ok and cursor_candidate > raw_cursor:
         # Stuck-защита: курсор не уходит дальше самой свежей ТАК И НЕ обработанной
@@ -871,7 +867,8 @@ async def watch_once(bot: Bot | None = None) -> None:
         if fresh_floor is not None:
             cursor_candidate = min(cursor_candidate, max(raw_cursor, fresh_floor))
         expired = [
-            r for r in stuck.values()
+            r
+            for r in stuck.values()
             if r.get("fails", 0) > _STUCK_MAX_FAILS and not r.get("reported")
         ]
         if expired:
@@ -882,25 +879,35 @@ async def watch_once(bot: Bot | None = None) -> None:
             )
             for record in expired:
                 record["reported"] = True
-        async with SessionLocal() as session:
-            await _write_cursor(session, cursor_candidate)
+        await _write_cursor(session, cursor_candidate)
+
+
+async def _watch_persist_stuck(session: AsyncSession, *, api_ok: bool, stuck: dict) -> None:
+    """Фиксирует stuck-список каждым успешным циклом (пустой dict — пустой список)."""
     if api_ok:
-        async with SessionLocal() as session:
-            # stuck-список фиксируем каждым полным проходом, когда в нём что-то
-            # есть ИЛИ когда его нужно очистить после успешных повторов: прежний
-            # сбой уже записан в БД, молчание сейчас оставило бы устаревшую
-            # запись висеть в ручном разборе. Пустой dict=пустой список.
-            if stuck or (await session.get(WatcherState, STUCK_TX_KEY)) is not None:
-                await _write_stuck(session, stuck)
+        # stuck-список фиксируем каждым полным проходом, когда в нём что-то
+        # есть ИЛИ когда его нужно очистить после успешных повторов: прежний
+        # сбой уже записан в БД, молчание сейчас оставило бы устаревшую
+        # запись висеть в ручном разборе. Пустой dict=пустой список.
+        if stuck or (await session.get(WatcherState, STUCK_TX_KEY)) is not None:
+            await _write_stuck(session, stuck)
+
+
+async def _watch_heartbeat(session: AsyncSession, source: str, *, api_ok: bool) -> None:
+    """Сердцебиение ставится каждым успешным циклом — даже без переводов:
+    тишина в цепочке это здоровье, а не простой."""
     if api_ok:
-        async with SessionLocal() as session:
-            # Сердцебиение ставится каждым успешным циклом — даже без
-            # переводов: тишина в цепочке это здоровье, а не простой.
-            await _write_beat(session)
-            await _write_source(session, source)
-    # Дыра окна (бюджет страниц исчерпан раньше курсора): запомнить границы,
-    # удвоить бюджет страниц на следующий цикл и НИКОГДА не терять её молча —
-    # тревогу поднимет ops.py по watcher_state[SCAN_GAP_KEY].
+        await _write_beat(session)
+        await _write_source(session, source)
+
+
+async def _watch_scan_gap(
+    *, api_ok: bool, since: int, gap_at: int | None, scan_boost: int
+) -> None:
+    """Дыра окна (бюджет страниц исчерпан раньше курсора): запомнить границы,
+    удвоить бюджет страниц на следующий цикл и НИКОГДА не терять её молча —
+    тревогу поднимет ops.py по watcher_state[SCAN_GAP_KEY].
+    """
     async with SessionLocal() as session:
         if gap_at is not None and api_ok:
             await _write_scan_gap(session, since, gap_at, _MAX_PAGES * scan_boost)
@@ -917,15 +924,69 @@ async def watch_once(bot: Bot | None = None) -> None:
             )
         elif api_ok:
             await _reset_scan_state(session)
+
+
+async def _watch_heal_stuck(bot: Bot | None) -> int:
+    """Авто-лечение брошенных сбойных переводов: не даём деньгам зависать
+    в казне до ручного разбора (инцидент Kote). Идемпотентно и не мешает
+    циклу, если лечение временно падает."""
+    return await _heal_stuck_transfers(bot)
+
+
+async def watch_once(bot: Bot | None = None) -> None:
+    async with SessionLocal() as session:
+        since, raw_cursor, stuck, scan_boost = await _watch_state_read(session)
+    transfers, api_ok, source, gap_at, parse_fail_count = await _collect_transfers(
+        since, _MAX_PAGES * scan_boost
+    )
+    # Item'ы, отброшенные парсером с исключением (см. P0 #4 в README лога):
+    # раньше parser глушил ошибку как «нормальный None» и считать их было
+    # негде. Теперь счётчик за цикл уезжает в watcher_state как
+    # parse_fail_count и поднимает alarm до чистого цикла.
+    if parse_fail_count > 0:
+        async with SessionLocal() as session:
+            await _bump_parse_fail(session, parse_fail_count)
+        logger.warning(
+            "За цикл отброшено %d item'ов парсером TonAPI/Toncenter — "
+            "счётчик записан в watcher_state[parse_fail_count]",
+            parse_fail_count,
+        )
+    processed_through = await _watch_process_batch(transfers, bot, stuck, since)
+    try:
+        await confirm_aged_pending(bot)
+    except Exception:
+        logger.exception("Подтверждение отложенных ставок упало (не мешает циклу)")
+    # Свежие подтверждения выросли банк дня, а в постах-статусах он застыл:
+    # правим их актуальным банком, чтобы игроки не гоняли /today за цифрой.
+    # Необязательный слой: сбой правки не должен рвать цикл watcher'а.
+    try:
+        from app.broadcast import refresh_day_bank
+
+        await refresh_day_bank(bot)
+    except Exception:
+        logger.exception("Актуализация банка дня в постах упала (не мешает циклу)")
+    async with SessionLocal() as session:
+        await _watch_persist_cursor(
+            session,
+            api_ok=api_ok,
+            since=since,
+            gap_at=gap_at,
+            raw_cursor=raw_cursor,
+            stuck=stuck,
+            processed_through=processed_through,
+        )
+        await _watch_persist_stuck(session, api_ok=api_ok, stuck=stuck)
+        await _watch_heartbeat(session, source, api_ok=api_ok)
+    await _watch_scan_gap(api_ok=api_ok, since=since, gap_at=gap_at, scan_boost=scan_boost)
     try:
         # Авто-лечение брошенных сбойных переводов: не даём деньгам зависать
         # в казне до ручного разбора (инцидент Kote). Идемпотентно и не мешает
         # циклу, если лечение временно падает.
-        healed = await _heal_stuck_transfers(bot)
+        healed = await _watch_heal_stuck(bot)
         if healed:
-            logger.info("Авто-лечение stuck-транзакций: исцелено %d", healed)
+            logger.info("Авто-лечение stuck-трансакций: исцелено %d", healed)
     except Exception:
-        logger.exception("Авто-лечение stuck-транзакций упало (не мешает циклу)")
+        logger.exception("Авто-лечение stuck-трансакций упало (не мешает циклу)")
     if transfers:
         logger.info(
             "Цикл watcher: найдено %d переводов, курсор %d → %d, проход %s (источник %s), stuck %d",
