@@ -61,35 +61,17 @@ async def _refund_cap_reason(session, source: str) -> str | None:
     return None
 
 
-async def _stash_refund(
+async def _refund_reject_reason(
     session,
     transfer: Transfer,
-    round_id: int | None,
-    comment: str | None = None,
+    ledger_player_id: int | None,
     *,
-    ledger_result: str | None = None,
-    ledger_player_id: int | None = None,
-    force: bool = False,
-) -> str:
-    """Авто-возврат перевода + запись в ledger доходов за один коммит.
+    force: bool,
+) -> str | None:
+    """Возраст или «пыль» (< refund_min_gram): авто-возврат не создаётся.
 
-    Идемпотентно по tx_hash: повторная обработка той же транзакции не плодит
-    вторую выплату. Отправка — обычным порядком через dispatch_pending_payouts.
-
-    Древние переводы (старше WATCH_REFUND_MAX_AGE_DAYS) не возвращаются: после
-    сброса базы курсор обнуляется и история казны перечитывается целиком —
-    без лимита старый спам вечно рождал бы новые dead-letter возвраты.
-    comment — свободный текст перевода вместо служебного memo «way:…»
-    (возвраты при паузе игры объясняют игроку, что идут техработы).
-    ledger_result — если передан, создаётся запись Income в том же коммите.
-    force — вернуть даже сумму меньше refund_min_gram («пыль»). По умолчанию
-    пыль не возвращается (газ дороже), НО это верно для анонимного спама;
-    известный отправитель (привязанный игрок, неудачная верификация кошелька)
-    должен получить свои копейки назад — иначе деньги пропадают молча.
-
-    Потолок авто-возвратов (refund_max_per_sender_day / refund_max_total_day)
-    применяется и к force-пути: сжигание газа казны ограничивает не тип
-    перевода, а количество исходящих транзакций.
+    Возвращает причину статуса для стаки в ledger, либо None — проверка
+    пройдена, следующий шаг тот же.
     """
     age_days = (datetime.now(UTC).timestamp() - transfer.utime) / 86_400
     if age_days > max(0, settings.watch_refund_max_age_days):
@@ -111,15 +93,17 @@ async def _stash_refund(
         )
         await _ledger_stuck_incoming(session, transfer, ledger_player_id, "refund:dust")
         return "refund_dust"
-    # Защита от двойной выплаты: транзакция уже учтена как ставка (Stake) или
-    # как входящий доход казны (Income — ставка, revote-оплата, микро-верификация).
-    # Повторный проход (сброс курсора, overlap-окно, пауза, ре-скан) НЕ должен
-    # создавать второй авто-возврат: монета уже легла в банк дня (приз/Фонд)
-    # или в выручку, и повторный refund — это двойной расход казны.
-    # Журнал обработанных переводов — общий источник правды для всех веток
-    # watcher'а: он ловит и те случаи, когда Stake.tx_hash был перезаписан
-    # (пылевая ставка, вытесненная валидной), и те, когда возврат создал
-    # другой путь (вытеснение пылевой ставки).
+    return None
+
+
+async def _refund_already_booked(session, transfer: Transfer) -> str | None:
+    """Возврат под защитой от двойной выплаты: что уже заняло перевод?
+
+    Журнал обработанных переводов — общий источник правды для всех веток
+    watcher'а: ловит случаи, когда Stake.tx_hash был перезаписан (пылевая
+    ставка, вытесненная валидной), и случаи, когда возврат создал другой путь
+    (вытеснение пылевой ставки).
+    """
     claimed_kind = await transfer_claim_kind(session, transfer.tx_hash, current_network())
     if claimed_kind is not None:
         if claimed_kind == KIND_REFUND:
@@ -165,58 +149,26 @@ async def _stash_refund(
     )
     if duplicate.scalar_one_or_none() is not None:
         return "refund_duplicated"
-    # Cross-process маркер в той же транзакции, что и создание выплаты:
-    # два watcher-процесса не создадут по своему возврату на один перевод
-    # (payouts.tx_hash не уникален), проигравший уйдёт без изменения данных.
-    if not await claim_once(session, f"refund:{transfer.tx_hash}"):
-        return "refund_duplicated"
-    # Потолок авто-возвратов. Проверка после claim_once, чтобы два инстанса не
-    # создавали по одному возврату на перевод, но до создания выплаты: перешагнувший
-    # потолок перевод уходит в ledger и ждёт ручного возврата, а не исчезает.
-    capped = await _refund_cap_reason(session, transfer.source or "")
-    if capped is not None:
-        logger.warning(
-            "Перевод %s на %s Gram не возвращён автоматически: %s. Деньги в казне, "
-            "верни вручную (/incoming, /adjust).",
-            transfer.tx_hash[:16],
-            f"{from_nano(transfer.value_nanotons):g}",
-            capped,
-        )
-        await _ledger_stuck_incoming(
-            session, transfer, ledger_player_id, capped.split(":")[0]
-        )
-        return "refund_capped"
-    # Метка «перевод разобран» — в той же транзакции, что и сам возврат:
-    # возврат без метки (или метка без возврата) невозможны, и повторный
-    # проход watcher'а не создаст второй выплат. Потолок проверяется ДО
-    # метки: перевод, который упёрся в потолок, ждёт ручного возврата и
-    # должен получить шанс снова.
-    # Возврат — тоже выплата: газ платит сам возврат, а не остаток казны.
-    # Получатель получает чистыми, как и при возврате ставки (refund_net_amount).
+    return None
+
+
+async def _refund_net_amount(session, transfer: Transfer) -> int:
+    """Сколько реально возвращаем отправителю после вычета газа возврата."""
     fee_nano = await fee_estimate_nano(session)
-    refund_amount = refund_net_amount(
-        transfer.value_nanotons, fee_nanotons=fee_nano
-    )
-    if refund_amount <= 0:
-        # Газ дороже самого перевода: возвращать нечего, перевод остаётся в
-        # казне и ждёт ручного возврата — как и пыль под порогом.
-        logger.warning(
-            "Перевод %s на %s Gram не покрывает газ возврата — ждёт ручного возврата",
-            transfer.tx_hash[:16],
-            f"{from_nano(transfer.value_nanotons):g}",
-        )
-        await _ledger_stuck_incoming(
-            session, transfer, ledger_player_id, "refund:fee"
-        )
-        return "refund_fee"
-    if not await claim_transfer(
-        session,
-        transfer.tx_hash,
-        current_network(),
-        KIND_REFUND,
-        transfer.value_nanotons,
-    ):
-        return "refund_duplicated"
+    return refund_net_amount(transfer.value_nanotons, fee_nanotons=fee_nano)
+
+
+async def _book_refund_payout(
+    session,
+    transfer: Transfer,
+    round_id: int | None,
+    comment: str | None,
+    *,
+    refund_amount: int,
+    ledger_result: str | None,
+    ledger_player_id: int | None,
+) -> None:
+    """Создаёт выплату-возврат и, при заданном ledger_result, доход в ledger."""
     session.add(
         Payout(
             round_id=round_id,
@@ -245,6 +197,95 @@ async def _stash_refund(
                     note=f"in:{ledger_result};src:…{transfer.source[-10:]}"[:200],
                 )
             )
+
+
+async def _stash_refund(
+    session,
+    transfer: Transfer,
+    round_id: int | None,
+    comment: str | None = None,
+    *,
+    ledger_result: str | None = None,
+    ledger_player_id: int | None = None,
+    force: bool = False,
+) -> str:
+    """Авто-возврат перевода + запись в ledger доходов за один коммит.
+
+    Идемпотентно по tx_hash: повторная обработка той же транзакции не плодит
+    вторую выплату. Отправка — обычным порядком через dispatch_pending_payouts.
+
+    Древние переводы (старше WATCH_REFUND_MAX_AGE_DAYS) не возвращаются: после
+    сброса базы курсор обнуляется и история казны перечитывается целиком —
+    без лимита старый спам вечно рождал бы новые dead-letter возвраты.
+    comment — свободный текст перевода вместо служебного memo «way:…»
+    (возвраты при паузе игры объясняют игроку, что идут техработы).
+    ledger_result — если передан, создаётся запись Income в том же коммите.
+    force — вернуть даже сумму меньше refund_min_gram («пыль»). По умолчанию
+    пыль не возвращается (газ дороже), НО это верно для анонимного спама;
+    известный отправитель (привязанный игрок, неудачная верификация кошелька)
+    должен получить свои копейки назад — иначе деньги пропадают молча.
+
+    Потолок авто-возвратов (refund_max_per_sender_day / refund_max_total_day)
+    применяется и к force-пути: сжигание газа казны ограничивает не тип
+    перевода, а количество исходящих транзакций.
+    """
+    reject = await _refund_reject_reason(session, transfer, ledger_player_id, force=force)
+    if reject is not None:
+        return reject
+    booked = await _refund_already_booked(session, transfer)
+    if booked is not None:
+        return booked
+    # Cross-process маркер в той же транзакции, что и создание выплаты:
+    # два watcher-процесса не создадут по своему возврату на один перевод
+    # (payouts.tx_hash не уникален), проигравший уйдёт без изменения данных.
+    if not await claim_once(session, f"refund:{transfer.tx_hash}"):
+        return "refund_duplicated"
+    # Потолок авто-возвратов. Проверка после claim_once, чтобы два инстанса не
+    # создавали по одному возврату на перевод, но до создания выплаты: перешагнувший
+    # потолок перевод уходит в ledger и ждёт ручного возврата, а не исчезает.
+    capped = await _refund_cap_reason(session, transfer.source or "")
+    if capped is not None:
+        logger.warning(
+            "Перевод %s на %s Gram не возвращён автоматически: %s. Деньги в казне, "
+            "верни вручную (/incoming, /adjust).",
+            transfer.tx_hash[:16],
+            f"{from_nano(transfer.value_nanotons):g}",
+            capped,
+        )
+        await _ledger_stuck_incoming(
+            session, transfer, ledger_player_id, capped.split(":")[0]
+        )
+        return "refund_capped"
+    refund_amount = await _refund_net_amount(session, transfer)
+    if refund_amount <= 0:
+        # Газ дороже самого перевода: возвращать нечего, перевод остаётся в
+        # казне и ждёт ручного возврата — как и пыль под порогом.
+        logger.warning(
+            "Перевод %s на %s Gram не покрывает газ возврата — ждёт ручного возврата",
+            transfer.tx_hash[:16],
+            f"{from_nano(transfer.value_nanotons):g}",
+        )
+        await _ledger_stuck_incoming(
+            session, transfer, ledger_player_id, "refund:fee"
+        )
+        return "refund_fee"
+    if not await claim_transfer(
+        session,
+        transfer.tx_hash,
+        current_network(),
+        KIND_REFUND,
+        transfer.value_nanotons,
+    ):
+        return "refund_duplicated"
+    await _book_refund_payout(
+        session,
+        transfer,
+        round_id,
+        comment,
+        refund_amount=refund_amount,
+        ledger_result=ledger_result,
+        ledger_player_id=ledger_player_id,
+    )
     await session.commit()
     logger.info("Перевод %s возвращён отправителю", transfer.tx_hash[:16])
     return "refund_queued"
