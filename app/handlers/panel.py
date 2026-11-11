@@ -363,6 +363,224 @@ async def cmd_panel(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("panel:"))
 @require_admin("Пульт только для хранителя.")
+async def _panel_refresh(callback: CallbackQuery, message: Message) -> None:
+    """Обновление текста панели (кнопка «Обновить» / возврат к /panel)."""
+    async with SessionLocal() as session:
+        text = await _admin_panel_text(session)
+    try:
+        await message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=await _panel_keyboard()
+        )
+    except TelegramBadRequest as exc:
+        # Двойной тап «Обновить» — нормальный жест, а не ошибка:
+        # Telegram отклоняет правку без изменений содержимого.
+        if "message is not modified" in str(exc).lower():
+            await callback.answer("Без изменений.")
+            return
+        raise
+    await callback.answer("Обновлено.")
+
+
+async def _panel_payouts(callback: CallbackQuery, message: Message) -> None:
+    """Кнопка «Выплаты» на пульте: список с очередью."""
+    await message.answer(await _payouts_text())
+    await callback.answer("Список ниже.")
+
+
+async def _panel_stakes(callback: CallbackQuery, message: Message) -> None:
+    """Кнопка «Ставки» на пульте: необработанные ставки и статусы."""
+    await message.answer(await _stakes_panel_text())
+    await callback.answer("Ставки ниже.")
+
+
+async def _panel_refunds(callback: CallbackQuery, message: Message) -> None:
+    """Кнопка «Возвраты» на пульте: список возвратов."""
+    await message.answer(await _refunds_panel_text())
+    await callback.answer("Возвраты ниже.")
+
+
+async def _panel_adjust(callback: CallbackQuery, message: Message) -> None:
+    """Меню корректировок казны (/adjust): текст + клавиатура."""
+    await message.answer(
+        await _adjust_menu_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_adjust_keyboard(),
+    )
+    await callback.answer()
+
+
+async def _panel_money(callback: CallbackQuery, message: Message, action: str) -> None:
+    """Переключение версии игры (со ставками / без) с двойным подтверждением."""
+    from app.ops import set_money_mode
+
+    want_money = action == "money"
+    confirm = (
+        (
+            "Переключить в версию БЕЗ ставок? Ставки и платная смена "
+            "выбора закроются со следующего дня; входящие переводы уйдут "
+            "обратно. Нажми кнопку ещё раз для подтверждения."
+        )
+        if not want_money
+        else (
+            "Вернуть версию СО СТАВКАМИ?\n"
+            "— ставки и платная смена выбора снова доступны со следующего дня."
+            "\n\nНажми кнопку ещё раз для подтверждения."
+        )
+    )
+    if not await _panel_confirm(
+        f"panel_confirm:{callback.from_user.id}:{action}"
+    ):
+        await callback.answer(confirm, show_alert=True)
+        return
+    async with SessionLocal() as session:
+        changed = await set_money_mode(session, want_money)
+    if not changed:
+        await callback.answer(
+            "Версия уже установлена." if not want_money else "Версия уже активна.",
+            show_alert=True,
+        )
+        return
+    state_name = "со ставками и платной сменой выбора" if want_money else "без ставок"
+    async with SessionLocal() as session:
+        text = await _admin_panel_text(session)
+    try:
+        await message.edit_text(
+            f"💰 Версия «{state_name}» включена со СЛЕДУЮЩЕГО дня.\n"
+            "Текущий день живёт по своему режиму.\n\n"
+            + text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=await _panel_keyboard(),
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            # Повторное нажатие привело к тому же тексту: Telegram
+            # отвечает ошибкой, а менять нечего. Молчание уместно.
+            pass
+        else:
+            raise
+    await callback.answer("Готово.")
+
+
+async def _panel_pause(callback: CallbackQuery, message: Message, action: str) -> None:
+    """Стоп-кран с последствиями: первый тап предупреждает, повторный — делает."""
+    want_paused = action == "pause"
+    if not await _panel_confirm(
+        f"panel_confirm:{callback.from_user.id}:{action}"
+    ):
+        confirm = (
+            "Остановить игру: дни замрут, входящие переводы пойдут обратно "
+            "с пометкой о техработах. Нажми кнопку ещё раз для подтверждения."
+            if want_paused
+            else "Возобновить игру? Новый день откроется сам в ближайший тик. "
+            "Нажми кнопку ещё раз для подтверждения."
+        )
+        await callback.answer(confirm, show_alert=True)
+        return
+    changed, delivered = await _set_paused_and_broadcast(
+        callback.bot, want_paused, "технические работы"
+    )
+    if not changed:
+        await callback.answer(
+            "Игра уже на паузе." if want_paused else "Игра и так идёт.",
+            show_alert=True,
+        )
+        return
+    chats = f" Анонс в {delivered} чат(ах)." if delivered else ""
+    status_msg = "⏸ Игра остановлена." if want_paused else "▶️ Игра возобновляется."
+    async with SessionLocal() as session:
+        text = await _admin_panel_text(session)
+    try:
+        await message.edit_text(
+            status_msg + chats + "\n\n" + text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=await _panel_keyboard(),
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            # Повторное нажатие привело к тому же тексту: Telegram
+            # отвечает ошибкой, а менять нечего. Молчание уместно.
+            pass
+        else:
+            raise
+    await callback.answer("Готово.")
+
+
+async def _panel_treasury(callback: CallbackQuery, message: Message) -> None:
+    """Кнопка «Казначей» на пульте: полный отчёт /treasury."""
+    from app.ton_pay import treasury_diagnostics
+
+    await message.answer(
+        await treasury_diagnostics(), parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+
+async def _panel_revenue(callback: CallbackQuery, message: Message) -> None:
+    """Кнопка «Доход» на пульте: справочник выручки."""
+    await message.answer(await _revenue_text())
+    await callback.answer()
+
+
+async def _panel_cassettes(callback: CallbackQuery, message: Message) -> None:
+    """Кнопка «Кассеты» на пульте: меню библиотеки."""
+    async with SessionLocal() as session:
+        text = await _cassette_menu_text(session)
+    await message.answer(
+        text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
+    )
+    await callback.answer()
+
+
+async def _panel_advance(callback: CallbackQuery, message: Message, action: str) -> None:
+    """«advance»: досрочное закрытие с двойным подтверждением (action == advance:go — без подтверждения)."""
+    if action != "advance:go":
+        # Досрочное закрытие — действие с последствиями. Кнопка всегда
+        # шлёт один и тот же callback_data, поэтому «нажми ещё раз»
+        # фиксируется в памяти: второй тап в окне подтверждает.
+        # (Раньше ветка ":go" была недостижима из UI — кнопка не могла
+        # завершить день никогда, только просила «ещё раз» вечно.)
+        if not await _panel_confirm(
+            f"panel_confirm:{callback.from_user.id}:advance"
+        ):
+            await callback.answer(
+                "Закрыть голосование досрочно и открыть следующий день? "
+                "Нажми кнопку ещё раз для подтверждения.",
+                show_alert=True,
+            )
+            return
+    _answers: list[str] = []
+
+    class _ShimMessage:
+        """Лёгкий двойник Message: переиспользуем логику /advance."""
+
+        chat = SimpleNamespace(type=ChatType.PRIVATE)
+        text = "/advance"
+        bot = callback.bot
+        from_user = callback.from_user
+
+        async def answer(self, text, *args, **kwargs):
+            _answers.append(str(text))
+
+    await cmd_advance(_ShimMessage())
+    summary = "\n".join(_answers)[:3500] or "Готово."
+    async with SessionLocal() as session:
+        text = await _admin_panel_text(session)
+    try:
+        await message.edit_text(
+            f"⏩ {summary}\n\n" + text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=await _panel_keyboard(),
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            # Повторное нажатие привело к тому же тексту: Telegram
+            # отвечает ошибкой, а менять нечего. Молчание уместно.
+            pass
+        else:
+            raise
+    await callback.answer("День переключён.")
+
+
 async def on_panel_action(callback: CallbackQuery) -> None:
     """Единая точка кнопок пульта: гейт хранителя + маршрутизация действий."""
     data = callback.data or ""
@@ -375,211 +593,46 @@ async def on_panel_action(callback: CallbackQuery) -> None:
         return
     try:
         if action in {"view", "refresh"}:
-            async with SessionLocal() as session:
-                text = await _admin_panel_text(session)
-            try:
-                await message.edit_text(
-                    text, parse_mode=ParseMode.HTML, reply_markup=await _panel_keyboard()
-                )
-            except TelegramBadRequest as exc:
-                # Двойной тап «Обновить» — нормальный жест, а не ошибка:
-                # Telegram отклоняет правку без изменений содержимого.
-                if "message is not modified" in str(exc).lower():
-                    await callback.answer("Без изменений.")
-                    return
-                raise
-            await callback.answer("Обновлено.")
+            await _panel_refresh(callback, message)
             return
         if action == "payouts":
-            await message.answer(await _payouts_text())
-            await callback.answer("Список ниже.")
+            await _panel_payouts(callback, message)
             return
         if action == "stakes":
-            await message.answer(await _stakes_panel_text())
-            await callback.answer("Ставки ниже.")
+            await _panel_stakes(callback, message)
             return
         if action == "refunds":
-            await message.answer(await _refunds_panel_text())
-            await callback.answer("Возвраты ниже.")
+            await _panel_refunds(callback, message)
             return
         if action == "adjust":
-            await message.answer(
-                await _adjust_menu_text(),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_adjust_keyboard(),
-            )
-            await callback.answer()
+            await _panel_adjust(callback, message)
             return
         if action in {"money", "now"}:
             # Версия игры: со ставками / без. Вступает со СЛЕДУЮЩЕГО дня —
             # текущий день живёт по своему снимку Round.money_mode.
-            from app.ops import set_money_mode
-
-            want_money = action == "money"
-            confirm = (
-                (
-                    "Переключить в версию БЕЗ ставок? Ставки и платная смена "
-                    "выбора закроются со следующего дня; входящие переводы уйдут "
-                    "обратно. Нажми кнопку ещё раз для подтверждения."
-                )
-                if not want_money
-                else (
-                    "Вернуть версию СО СТАВКАМИ?\n"
-                    "— ставки и платная смена выбора снова доступны со следующего дня."
-                    "\n\nНажми кнопку ещё раз для подтверждения."
-                )
-            )
-            if not await _panel_confirm(
-                f"panel_confirm:{callback.from_user.id}:{action}"
-            ):
-                await callback.answer(confirm, show_alert=True)
-                return
-            async with SessionLocal() as session:
-                changed = await set_money_mode(session, want_money)
-            if not changed:
-                await callback.answer(
-                    "Версия уже установлена." if not want_money else "Версия уже активна.",
-                    show_alert=True,
-                )
-                return
-            state_name = "со ставками и платной сменой выбора" if want_money else "без ставок"
-            async with SessionLocal() as session:
-                text = await _admin_panel_text(session)
-            try:
-                await message.edit_text(
-                    f"💰 Версия «{state_name}» включена со СЛЕДУЮЩЕГО дня.\n"
-                    "Текущий день живёт по своему режиму.\n\n"
-                    + text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=await _panel_keyboard(),
-                )
-            except TelegramBadRequest as exc:
-                if "message is not modified" in str(exc).lower():
-                    # Повторное нажатие привело к тому же тексту: Telegram
-                    # отвечает ошибкой, а менять нечего. Молчание уместно.
-                    pass
-                else:
-                    raise
-            await callback.answer("Готово.")
+            await _panel_money(callback, message, action)
             return
         if action in {"pause", "resume"}:
             # Стоп-кран с последствиями: первый тап предупреждает,
             # повторный тап той же кнопки в течение двух минут — делает.
-            want_paused = action == "pause"
-            if not await _panel_confirm(
-                f"panel_confirm:{callback.from_user.id}:{action}"
-            ):
-                confirm = (
-                    "Остановить игру: дни замрут, входящие переводы пойдут обратно "
-                    "с пометкой о техработах. Нажми кнопку ещё раз для подтверждения."
-                    if want_paused
-                    else "Возобновить игру? Новый день откроется сам в ближайший тик. "
-                    "Нажми кнопку ещё раз для подтверждения."
-                )
-                await callback.answer(confirm, show_alert=True)
-                return
-            changed, delivered = await _set_paused_and_broadcast(
-                callback.bot, want_paused, "технические работы"
-            )
-            if not changed:
-                await callback.answer(
-                    "Игра уже на паузе." if want_paused else "Игра и так идёт.",
-                    show_alert=True,
-                )
-                return
-            chats = f" Анонс в {delivered} чат(ах)." if delivered else ""
-            status_msg = "⏸ Игра остановлена." if want_paused else "▶️ Игра возобновляется."
-            async with SessionLocal() as session:
-                text = await _admin_panel_text(session)
-            try:
-                await message.edit_text(
-                    status_msg + chats + "\n\n" + text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=await _panel_keyboard(),
-                )
-            except TelegramBadRequest as exc:
-                if "message is not modified" in str(exc).lower():
-                    # Повторное нажатие привело к тому же тексту: Telegram
-                    # отвечает ошибкой, а менять нечего. Молчание уместно.
-                    pass
-                else:
-                    raise
-            await callback.answer("Готово.")
+            await _panel_pause(callback, message, action)
             return
         if action == "treasury":
-            from app.ton_pay import treasury_diagnostics
-
-            await message.answer(
-                await treasury_diagnostics(), parse_mode=ParseMode.HTML
-            )
-            await callback.answer()
+            await _panel_treasury(callback, message)
             return
         if action == "revenue":
-            await message.answer(await _revenue_text())
-            await callback.answer()
+            await _panel_revenue(callback, message)
             return
         if action == "cassettes":
-            async with SessionLocal() as session:
-                text = await _cassette_menu_text(session)
-            await message.answer(
-                text, parse_mode=ParseMode.HTML, reply_markup=await _cassette_keyboard()
-            )
-            await callback.answer()
+            await _panel_cassettes(callback, message)
             return
         if action in {"advance", "advance:go"}:
-            if action != "advance:go":
-                # Досрочное закрытие — действие с последствиями. Кнопка всегда
-                # шлёт один и тот же callback_data, поэтому «нажми ещё раз»
-                # фиксируется в памяти: второй тап в окне подтверждает.
-                # (Раньше ветка ":go" была недостижима из UI — кнопка не могла
-                # завершить день никогда, только просила «ещё раз» вечно.)
-                if not await _panel_confirm(
-                    f"panel_confirm:{callback.from_user.id}:advance"
-                ):
-                    await callback.answer(
-                        "Закрыть голосование досрочно и открыть следующий день? "
-                        "Нажми кнопку ещё раз для подтверждения.",
-                        show_alert=True,
-                    )
-                    return
-            _answers: list[str] = []
-
-            class _ShimMessage:
-                """Лёгкий двойник Message: переиспользуем логику /advance."""
-
-                chat = SimpleNamespace(type=ChatType.PRIVATE)
-                text = "/advance"
-                bot = callback.bot
-                from_user = callback.from_user
-
-                async def answer(self, text, *args, **kwargs):
-                    _answers.append(str(text))
-
-            await cmd_advance(_ShimMessage())
-            summary = "\n".join(_answers)[:3500] or "Готово."
-            async with SessionLocal() as session:
-                text = await _admin_panel_text(session)
-            try:
-                await message.edit_text(
-                    f"⏩ {summary}\n\n" + text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=await _panel_keyboard(),
-                )
-            except TelegramBadRequest as exc:
-                if "message is not modified" in str(exc).lower():
-                    # Повторное нажатие привело к тому же тексту: Telegram
-                    # отвечает ошибкой, а менять нечего. Молчание уместно.
-                    pass
-                else:
-                    raise
-            await callback.answer("День переключён.")
+            await _panel_advance(callback, message, action)
             return
         await callback.answer("Неизвестное действие.", show_alert=True)
     except Exception as exc:
         logger.exception("Действие пульта %s не удалось", action)
         await callback.answer(f"Не получилось: {redact(str(exc))}", show_alert=True)
-
-
 async def _cassette_menu_text(session) -> str:
     """Список библиотеки кассет: валидные файлы, назначение, замечания."""
     today = datetime.now(UTC).date()
