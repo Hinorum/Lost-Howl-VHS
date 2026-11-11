@@ -115,16 +115,26 @@ def _indexer(monkeypatch, *, tonapi, toncenter) -> list[str]:
     return asked
 
 
-def _lt_server(monkeypatch, ledger: list[dict], *, toncenter: list[dict] | None = None) -> None:
+def _lt_server(
+    monkeypatch,
+    ledger: list[dict],
+    *,
+    toncenter: list[dict] | None = None,
+    seen_limits: list[int | None] | None = None,
+) -> None:
     """HTTP-слой зеркала «по-настоящему»: страницы по before_lt, как у живого.
 
     Статичный ответ в цикле бутстрапа водит по кругу (одна и та же страница
     до max_pages), поэтому сервер обязан честно отдавать «глубже» и пустоту.
+    seen_limits — журнал запрошенных размеров страницы для проверки, что
+    бутстрап и инкремент ходят разными лимитами.
     """
     monkeypatch.setattr(treasury_mirror, "get_http_client", lambda: object())
     backup = toncenter or []
 
     async def fake_get(client, url, *, params=None, headers=None, **kwargs):
+        if seen_limits is not None:
+            seen_limits.append((params or {}).get("limit"))
         before = (params or {}).get("before_lt")
         source = backup if "toncenter" in url else ledger
         page = [i for i in source if before is None or int(i["lt"]) < int(before)]
@@ -191,6 +201,24 @@ async def test_fetch_page_reads_tonapi(monkeypatch) -> None:
     assert moves[0].network == NET and moves[0].direction == "in"
 
 
+async def test_fetch_page_honours_explicit_limit(monkeypatch) -> None:
+    """Размер страницы — параметр вызова: инкремент и бутстрап ходят разными."""
+    _on(monkeypatch)
+    seen: list[dict] = []
+
+    async def fake_get(client, url, *, params=None, headers=None, **kwargs):
+        seen.append(dict(params or {}))
+        return _Resp({"transactions": []})
+
+    monkeypatch.setattr(treasury_mirror, "get_http_client", lambda: object())
+    monkeypatch.setattr(treasury_mirror, "http_get_with_retry", fake_get)
+    assert await _fetch_page(limit=7) == ([], "tonapi", True)
+    assert seen[0]["limit"] == 7
+    # По умолчанию — маленькая инкрементальная страница, а не бутстраповая.
+    assert await _fetch_page() == ([], "tonapi", True)
+    assert seen[1]["limit"] == treasury_mirror._MIRROR_INCREMENT_PAGE_LIMIT
+
+
 async def test_fetch_page_falls_back_to_toncenter(monkeypatch) -> None:
     """TonAPI молчит — та же страница берётся у Toncenter v3."""
     _on(monkeypatch)
@@ -211,9 +239,12 @@ async def test_fetch_page_falls_back_to_toncenter(monkeypatch) -> None:
     assert toncenter_call["params"]["account"] == TREASURY
     assert toncenter_call["params"]["sort"] == "desc"
     # Размер страницы берётся из кода, а не вписан числом: прежний тест держал
-    # тут 100, и любое осознанное изменение _MIRROR_PAGE_LIMIT роняло его,
-    # хотя поведение зеркала оставалось правильным.
-    assert toncenter_call["params"]["limit"] == treasury_mirror._MIRROR_PAGE_LIMIT
+    # тут 100, и любое осознанное изменение лимита роняло его, хотя поведение
+    # зеркала оставалось правильным. Инкремент ходит маленькой страницей.
+    assert (
+        toncenter_call["params"]["limit"]
+        == treasury_mirror._MIRROR_INCREMENT_PAGE_LIMIT
+    )
 
 
 async def test_fetch_page_reports_unavailable_when_both_silent(monkeypatch) -> None:
@@ -337,7 +368,12 @@ async def test_sync_keeps_last_good_check_when_balance_unreadable(monkeypatch) -
 async def test_sync_bootstrap_uses_both_providers(monkeypatch) -> None:
     """Бутстрап до дна на живом _fetch_page: пустая страница = выстроено."""
     _on(monkeypatch)
-    _lt_server(monkeypatch, [_item("x", lt=10_000), _item("y", lt=9_000)])
+    limits: list[int | None] = []
+    _lt_server(
+        monkeypatch,
+        [_item("x", lt=10_000), _item("y", lt=9_000)],
+        seen_limits=limits,
+    )
     import app.ton_pay
 
     monkeypatch.setattr(app.ton_pay, "fetch_account_state", AsyncMock(
@@ -348,6 +384,10 @@ async def test_sync_bootstrap_uses_both_providers(monkeypatch) -> None:
         assert result["pages"] == 2, "вторая страница — пустая, дно истории"
         assert result["source"] == "tonapi"
         assert result["exact"] is True
+        assert limits and all(
+            value == treasury_mirror._MIRROR_BOOTSTRAP_PAGE_LIMIT
+            for value in limits
+        ), "бутстрап обязан просить крупную страницу"
         async with SessionLocal() as db:
             assert await db.get(WatcherState, TREASURY_MIRROR_BOOTSTRAP_KEY) is not None
             bottom = await db.get(WatcherState, TREASURY_MIRROR_BOTTOM_KEY)

@@ -407,8 +407,14 @@ def _fake_page_serving(ledger: list[dict], ton_api: bool = True):
     раньше синк слал toncenter before_lt и получал одну и ту же страницу.
     """
 
-    async def fetch(before_lt: int | None = None, offset: int | None = None):
+    async def fetch(
+        before_lt: int | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ):
         # Сортируем на каждый вызов: ledger в тестах мутируется между циклами.
+        # limit принимаем, но страницу держим по 100: тесты проверяют логику
+        # пагинации, а не выбранный размер страницы.
         ordered = sorted(ledger, key=lambda i: -int(i["lt"]))
         if ton_api:
             items = [i for i in ordered if before_lt is None or int(i["lt"]) < before_lt]
@@ -539,7 +545,7 @@ async def test_bootstrap_survives_tonapi_dying_midwalk(ton_mirror, monkeypatch) 
     )
     calls = {"n": 0}
 
-    async def flaky(before_lt=None, offset=None):
+    async def flaky(before_lt=None, offset=None, limit=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return await tonapi_page(before_lt, offset=offset)
@@ -566,7 +572,7 @@ async def test_bootstrap_stops_when_provider_repeats_itself(ton_mirror, monkeypa
     ledger = [_tonapi_item(f"s{i}", lt=50_000 + i) for i in range(150)]
     ordered = sorted(ledger, key=lambda i: -int(i["lt"]))
 
-    async def stuck(before_lt=None, offset=None):
+    async def stuck(before_lt=None, offset=None, limit=None):
         # игнорируем оба курсора и всегда отдаём свежую страницу — как было
         # с before_lt у toncenter v3 до фикса
         parsed = [parse_tonapi_move(i, NET, TREASURY) for i in ordered[:100]]

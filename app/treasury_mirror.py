@@ -49,8 +49,11 @@ from app.ton_utils import normalize_address
 
 logger = logging.getLogger(__name__)
 
-# Страница истории (лимит индексатора), совмещена с выбором watcher'а.
-_MIRROR_PAGE_LIMIT = 200
+# Размер страницы истории: инкремент в простое не должен скачивать сотни
+# транзакций ради проверки «есть ли что-то новее головы», а бутстрап вглубь
+# наоборот экономит запросы крупной страницей.
+_MIRROR_INCREMENT_PAGE_LIMIT = max(1, int(settings.treasury_mirror_increment_page_limit))
+_MIRROR_BOOTSTRAP_PAGE_LIMIT = max(1, int(settings.treasury_mirror_bootstrap_page_limit))
 
 
 @dataclass(frozen=True)
@@ -430,9 +433,15 @@ async def _set_state(session, key: str, value: str) -> None:
 
 
 async def _fetch_page(
-    before_lt: int | None = None, offset: int | None = None
+    before_lt: int | None = None,
+    offset: int | None = None,
+    limit: int = _MIRROR_INCREMENT_PAGE_LIMIT,
 ) -> tuple[list[MirrorMove], str, bool]:
     """Страница истории казначея (новые сверху): (движения, источник, ok).
+
+    limit — размер страницы: инкременту хватает маленькой (в простое это
+    единственный запрос цикла), бутстрап просит крупную, чтобы реже ходить
+    в сеть на десятках тысяч транзакций.
 
     TonAPI — основной источник, его курсор `before_lt` режет выборку сам.
     Toncenter v3 этот параметр ИГНОРИРУЕТ: проверено на testnet, что и
@@ -465,7 +474,7 @@ async def _fetch_page(
     )
     for kind, url, api_key in candidates:
         try:
-            params: dict[str, Any] = {"limit": _MIRROR_PAGE_LIMIT, "sort_order": "desc"}
+            params: dict[str, Any] = {"limit": limit, "sort_order": "desc"}
             if kind == "toncenter":
                 params["account"] = treasury
                 params["sort"] = "desc"
@@ -783,7 +792,9 @@ async def _bootstrap_sync(
     bootstrapped = False
     page_ok = False
     for _ in range(max_pages):
-        moves, source, ok = await _fetch_page(before_lt, offset=offset)
+        moves, source, ok = await _fetch_page(
+            before_lt, offset=offset, limit=_MIRROR_BOOTSTRAP_PAGE_LIMIT
+        )
         if not ok:
             break
         page_ok = True
