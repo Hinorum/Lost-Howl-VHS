@@ -497,6 +497,134 @@ def _rollback_deferred_batch(payouts: list[Payout], prior_attempts: dict[int, in
         rest.last_error = reason
 
 
+async def _payout_batch_pass(
+    payouts: list[Payout], markers: set[str], v5_batch_capable: bool
+) -> tuple[int, set[int]]:
+    """Пачка одним внешним сообщением (флаг PAYOUT_V5_BATCH + capability v5r1).
+
+    Возвращает (отправлено, skip_ids): строки из skip — уже обработаны
+    пачечным проходом (либо отправлены одним сообщением, либо удержаны после
+    неясного вещания); остальные пачка отправит поштучно ниже.
+    """
+    if not (settings.payout_v5_batch and v5_batch_capable and payouts):
+        return 0, set()
+    return await _try_send_batch_v5(payouts, markers)
+
+
+def _mark_payout_sent(payout: Payout, tx_hash: str | None, *, reset_attempts: bool = True) -> None:
+    """Фиксирует доставку подтверждённого перевода: sent без повтора.
+
+    Совпадение memo'а в маркерах (раньше ушло в цепочку, но статус не сохранился
+    после краха/таймаута) и подтверждение после таймаута вещания — оба случая
+    означают «деньги ушли», повтор был бы реальным двойным платежом.
+    reset_attempts=False — для совпадений с отправленным ранее: прошлую попытку
+    не трогаем, она уже засчитана.
+    """
+    payout.tx_hash = tx_hash
+    payout.status = "sent"
+    payout.sent_at = datetime.now(UTC)
+    payout.last_error = None
+    if reset_attempts:
+        payout.attempts = 0
+
+
+def _defer_unconfirmed_history(payout: Payout, prior_attempts: dict[int, int]) -> None:
+    """Повтор (>1 попытки) при недоступной/неполной истории казначея — отложить.
+
+    Пустой ответ маркеров означает «молчат оба провайдера» либо «скан упёрся в
+    max_pages, не дотянувшись до глубины», а не «перевода нет». Переотправка в
+    «не знаю» = реальный двойной платёж. Замораживаем строку с видимой
+    причиной: история вернётся — сверка повторится сама, без ручного retry.
+    """
+    payout.status = "pending"
+    # Отправки не было — попытку клейма возвращаем: иначе недоступная история
+    # казначея съедала бы по попытке за цикл у каждой повторной выплаты.
+    payout.attempts = prior_attempts.get(payout.id, int(payout.attempts or 0))
+    payout.last_error = (
+        "история казначея недоступна или неполна — повтор отложен (анти-дубль), "
+        "сверка с memo невозможна"
+    )
+    logger.warning(
+        "Выплата %d: повтор отложен — история казначея недоступна/неполна",
+        payout.id,
+    )
+
+
+async def _wait_prev_memo(payout: Payout, prev_memo: set[str]) -> bool:
+    """Дожидаться подтверждения предыдущего перевода блоком перед подписью следующего.
+
+    Возвращает False, если окно подтверждения истекло — пачка должна остановиться
+    в этом цикле (deferred): живой seqno можно читать только после того, как
+    предыдущий перевод встанет в блок; до этого — пауза.
+    """
+    if not await _wait_for_broadcast_memo(prev_memo, settings.payout_batch_confirm_seconds):
+        logger.warning(
+            "Выплата %d: предыдущий перевод не подтвердился за %d с — "
+            "пачка на этом цикле остановлена, seqno не читаем из сети, "
+            "пока предыдущий не в блоке",
+            payout.id,
+            settings.payout_batch_confirm_seconds,
+        )
+        return False
+    logger.debug(
+        "Выплата %d: предыдущий перевод подтверждён в блоке — seqno актуален",
+        payout.id,
+    )
+    return True
+
+
+async def _send_payout_tx(payout: Payout, comment: str) -> tuple[bool, str | None]:
+    """Отправка перевода с таймаутом; при таймауте ждём memo в окне подтверждения.
+
+    «Таймаут» — ещё не «перевод не ушёл»: отменённая корутина могла успеть отдать
+    внешний месседж в сеть. Раньше строка сразу уходила в pending, и следующий
+    цикл переотправлял тот же memo, пока первый перевод не проиндексирован —
+    реальный двойной платёж. Ждём memo ограниченное окно (как после успешного
+    вещания): нашли — перевод в цепочке, фиксируем sent без повтора (реальный
+    хеш дожмёт confirm_broadcast_payouts); нет — обычный ретрай с видимой причиной.
+
+    Возвращает (отправлено, tx_hash): отправлено=True — перевод ушёл и (при
+    таймауте) подтверждён memo'ом; в этом случае payout уже находится в статусе
+    sent. Иначе отправлено=False, причина уже записана в payout.last_error.
+    """
+    try:
+        # Через app.ton_pay — чтобы monkeypatch.setattr(ton_pay, "send_ton_transfer", mock) из тестов доходил до вызова.
+        import app.ton_pay as _tp
+
+        tx_hash = await asyncio.wait_for(
+            _tp.send_ton_transfer(
+                payout.dest_address,
+                payout.amount_nanotons,
+                comment=comment,
+            ),
+            timeout=settings.payout_send_timeout_seconds,
+        )
+        if tx_hash is None:
+            # Отправка невозможна в принципе (TON выключен/мнемоника нет):
+            # send_ton_transfer вернул None, не бросив исключение — досадно,
+            # но так написано. Не мним «отправлено»: исключение здесь не было.
+            return False, None
+        _mark_payout_sent(payout, tx_hash)
+        return True, tx_hash
+    except TimeoutError:
+        logger.warning("Выплата %s: таймаут вещания >%ss", payout.id, settings.payout_send_timeout_seconds)
+        payout.last_error = f"таймаут вещания (>{settings.payout_send_timeout_seconds} с)"
+        if await _wait_for_broadcast_memo(
+            set(_payout_comment_candidates(payout)), settings.payout_batch_confirm_seconds
+        ):
+            _mark_payout_sent(payout, None)
+            return True, None
+        return False, None
+    except Exception as exc:
+        # «no alive peers» сюда уже не доходит: send_ton_transfer перехватывает
+        # сбой лайтсерного канала и уходит в HTTP (тот при неуспехе падает
+        # текстом провайдера — он и виден).
+        reason = str(exc)
+        logger.warning("Выплата %s не ушла: %s", payout.id, exc)
+        payout.last_error = redact(reason)[:200]
+        return False, None
+
+
 async def _run_payout_pass(
     payouts: list[Payout],
     markers: set[str],
@@ -511,9 +639,6 @@ async def _run_payout_pass(
     только после подтверждения предыдущего перевода блоком.
     """
     sent = 0
-    # Батч-режим (seqno + capability v5r1) настраивается в _init_payout_batch
-    # до входа в проход — здесь только отправка по пачке и поштучный цикл.
-
     # Известен ли уже разосланный на этом цикле перевод? Если да — ждём его
     # memo в блоке перед подписью следующего (гонка двух быстрых переводов
     # HTTP-канала: вплотную разосланные месседжи со следующими seqno
@@ -523,20 +648,14 @@ async def _run_payout_pass(
     # строки, которые остались в 'sending' за нами, НИКОГДА не вещаем в этом
     # цикле — иначе их seqno пришлось бы угадывать вслепую.
     deferred = False
-    # Пачечный проход (флаг PAYOUT_V5_BATCH + контракт v5r1): пробует
-    # увести все отправляемые строки цикла ОДНИМ внешним сообщением.
-    # Строки, уже найденные в маркерах, и замороженные повторы сюда не
-    # берутся — их разбирает поштучный проход ниже, как раньше.
     try:
-        batch_skip_ids: set[int] = set()
-        if settings.payout_v5_batch and v5_batch_capable and payouts:
-            batch_sent, batch_skip_ids = await _try_send_batch_v5(payouts, markers)
-            sent += batch_sent
+        batch_sent, batch_skip_ids = await _payout_batch_pass(payouts, markers, v5_batch_capable)
+        sent += batch_sent
         for payout in payouts:
             if payout.id in batch_skip_ids:
-                # Строка уже разобрана пачечным проходом: либо помечена
-                # sent одним сообщением, либо удержана после неясного
-                # вещания (повтор в этом цикле мог бы задвоить платёж).
+                # Строка уже разобрана пачечным проходом: либо помечена sent
+                # одним сообщением, либо удержана после неясного вещания
+                # (повтор в этом цикле мог бы задвоить платёж).
                 continue
             # Свободный комментарий (возвраты при паузе) дополняется
             # служебным суффиксом «way:<день>:<тип>#<id>», чтобы анти-дубль
@@ -548,9 +667,7 @@ async def _run_payout_pass(
                 # сохранился (краш/таймаут после вещания). Повтор задвоил бы
                 # платёж — фиксируем доставку без новой отправки.
                 payout.tx_hash = None
-                payout.status = "sent"
-                payout.sent_at = datetime.now(UTC)
-                payout.last_error = None
+                _mark_payout_sent(payout, None, reset_attempts=False)
                 sent += 1
                 logger.warning(
                     "Выплата %d уже разослана ранее (memo найдено у казначея) — помечена sent без повтора",
@@ -565,48 +682,21 @@ async def _run_payout_pass(
                 and not any(candidate in markers for candidate in candidates)
                 and not history_trusted
             ):
-                # Повтор (>1 попытки) и история казначея НЕДОСТУПНА ИЛИ НЕПОЛНА:
-                # не знаем, не ушёл ли этот перевод тем же memo в прошлом цикле
-                # (краш между вещанием и коммитом). Пустой ответ маркеров в этом
-                # случае означает «молчат оба провайдера» либо «скан упёрся в
-                # max_pages, не дотянувшись до глубины», а НЕ «перевода нет».
-                # Переотправка в «не знаю» = реальный двойной платёж.
-                # Замораживаем строку с видимой причиной: история вернётся —
-                # сверка повторится сама, без ручного retry.
-                payout.status = "pending"
-                # Отправки не было — попытку клейма возвращаем: иначе
-                # недоступная история казначея съедала бы по попытке за
-                # цикл у каждой повторной выплаты.
-                payout.attempts = prior_attempts.get(payout.id, int(payout.attempts or 0))
-                payout.last_error = (
-                    "история казначея недоступна или неполна — повтор отложен (анти-дубль), "
-                    "сверка с memo невозможна"
-                )
-                logger.warning(
-                    "Выплата %d: повтор отложен — история казначея недоступна/неполна",
-                    payout.id,
-                )
+                _defer_unconfirmed_history(payout, prior_attempts)
                 continue
             if prev_memo:
                 # Гонка двух быстрых переводов: следующий seqno подписываем,
                 # только когда предыдущий перевод этого цикла подтверждён в
                 # блоке. Канал тут ни при чём — окно нужно на ЛЮБОМ пути,
-                # лайтсерверном в том числе: подписанный seqno+1 может ещё
+                # лайтсерном в том числе: подписанный seqno+1 может ещё
                 # лежать в мемпуле узла, и следующий внешний месседж с
                 # seqno+2 сражается с ним за место (второй молча теряется,
                 # ловим только 2-часовой сверкой). Условие на
                 # _http_channel_engaged_at было оптимизацией, которая
                 # осталась после того, как seqno начали переиспользовать и
-                # на лайтсерверном пути (до этого каждый перевод брал
+                # на лайтсерном пути (до этого каждый перевод брал
                 # свежий get_seqno и ждать было нечего).
-                if await _wait_for_broadcast_memo(
-                    prev_memo, settings.payout_batch_confirm_seconds
-                ):
-                    logger.debug(
-                        "Выплата %d: предыдущий перевод подтверждён в блоке — seqno актуален",
-                        payout.id,
-                    )
-                else:
+                if not await _wait_prev_memo(payout, prev_memo):
                     # За окно подтверждения перевод не пришёл: он в пути или
                     # потерян. Пачку на этом цикле останавливаем, и это не
                     # перестраховка, а требование корректности: сброс
@@ -618,80 +708,19 @@ async def _run_payout_pass(
                     # встанет в блок; до этого — пауза. Оставшиеся строки
                     # вернёт _reset_retriable следующим циклом, а судьбу
                     # неподтверждённого перевода дожмёт confirm_broadcast_payouts.
-                    logger.warning(
-                        "Выплата %d: предыдущий перевод не подтвердился за %d с — "
-                        "пачка на этом цикле остановлена, seqno не читаем из сети, "
-                        "пока предыдущий не в блоке",
-                        payout.id,
-                        settings.payout_batch_confirm_seconds,
-                    )
                     _state._batch_seqno = None
                     deferred = True
                     break
-            try:
-                # Через app.ton_pay — чтобы monkeypatch.setattr(ton_pay,
-                # "send_ton_transfer", mock) из тестов доходил до вызова.
-                import app.ton_pay as _tp
-
-                tx_hash = await asyncio.wait_for(
-                    _tp.send_ton_transfer(
-                        payout.dest_address,
-                        payout.amount_nanotons,
-                        comment=comment,
-                    ),
-                    timeout=settings.payout_send_timeout_seconds,
-                )
-            except TimeoutError:
-                # Зависший лайтсервер не имеет права замораживать цикл, но
-                # «таймаут» — ещё не «перевод не ушёл»: отменённая корутина
-                # могла успеть отдать внешний месседж в сеть. Раньше строка
-                # сразу уходила в pending, и следующий цикл переотправлял тот
-                # же memo, пока первый перевод ещё не проиндексирован, —
-                # реальный двойной платёж. Ждём memo ограниченное окно (как
-                # после успешного вещания): нашёлся — перевод в цепочке,
-                # фиксируем sent без повтора (реальный хеш дожмёт
-                # confirm_broadcast_payouts); нет — обычный ретрай с видимой
-                # причиной, как раньше.
-                logger.warning("Выплата %s: таймаут вещания >%ss", payout.id, settings.payout_send_timeout_seconds)
-                payout.last_error = f"таймаут вещания (>{settings.payout_send_timeout_seconds} с)"
-                if await _wait_for_broadcast_memo(
-                    set(candidates), settings.payout_batch_confirm_seconds
-                ):
-                    payout.tx_hash = None
-                    payout.status = "sent"
-                    payout.sent_at = datetime.now(UTC)
-                    payout.attempts = 0
-                    payout.last_error = None
-                    sent += 1
-                    prev_memo = set(candidates)
-                    logger.warning(
-                        "Выплата %d: таймаут вещания, но memo найдено у казначея — "
-                        "помечена sent без повтора",
-                        payout.id,
-                    )
-                    continue
-                tx_hash = None
-            except Exception as exc:
-                # «no alive peers» сюда уже не доходит: send_ton_transfer
-                # перехватывает сбой лайтсерверного канала и уходит в HTTP
-                # (тот при неуспехе падает текстом провайдера — он и виден).
-                reason = str(exc)
-                logger.warning("Выплата %s не ушла: %s", payout.id, exc)
-                payout.last_error = redact(reason)[:200]
-                tx_hash = None
-            if tx_hash is None and payout.last_error is None:
-                # Единственный путь сюда — guard выключенного TON/мнемоники.
-                payout.last_error = "отправка недоступна: TON выключен или нет мнемоники казначея"
-            if tx_hash:
-                payout.tx_hash = tx_hash
-                payout.status = "sent"
-                payout.sent_at = datetime.now(UTC)
-                payout.attempts = 0
-                payout.last_error = None
+            sent_now, tx_hash = await _send_payout_tx(payout, comment)
+            if sent_now:
                 sent += 1
                 # Следующий перевод пачки дождётся подтверждения ЭТОГО в блоке.
                 prev_memo = set(candidates)
-            elif payout.attempts >= settings.payout_max_attempts:
+                continue
+            if payout.last_error is None:
+                # Единственный путь сюда — guard выключенного TON/мнемоники.
+                payout.last_error = "отправка недоступна: TON выключен или нет мнемоники казначея"
+            if payout.attempts >= settings.payout_max_attempts:
                 payout.status = "failed"
             else:
                 # Лимит не исчерпан — вернётся в очередь следующего цикла;
