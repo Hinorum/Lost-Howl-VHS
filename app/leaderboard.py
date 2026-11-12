@@ -761,6 +761,105 @@ async def _resolve_month_winners(
     return payments, skipped
 
 
+async def _month_settlement_gate(session, prev_key: str) -> WatcherState | None:
+    """Кто может закрывать месяц: метка не закрывала его раньше и лидерборд за него готов.
+
+    Возвращает маркер, если закрытие месяца возможно, иначе None (причина уже
+    залогирована маркером/флагом готовности).
+    """
+    marker = await _claim_marker_lock(session, MARKER_KEY)
+    settled_through = marker.value
+    if settled_through >= prev_key:
+        return None  # этот месяц уже закрыт (или вообще ещё не наступил)
+    ready_marker = await session.get(WatcherState, MONTH_READY_KEY)
+    ready_month = ready_marker.value if ready_marker is not None else ""
+    if ready_month < prev_key:
+        # Последний день ещё не закрыт — лидерборд ждёт.
+        return None
+    return marker
+
+
+async def _month_pots_and_total(
+    session, prev_key: str
+) -> tuple[list[LeaderboardPot], int, datetime] | None:
+    """Горшки непогашенных месяцев ≤ prev_key: (pots, total, period_start).
+
+    None — горшка нет (месяц без ставок: двигаем метку, копилка не капала).
+    """
+    pots = (
+        await session.execute(
+            select(LeaderboardPot).where(LeaderboardPot.month <= prev_key).order_by(LeaderboardPot.month.asc())
+        )
+    ).scalars().all()
+    if not pots:
+        # Горшка нет (месяц без ставок — банк в копилку не капал):
+        # двигаем метку, как в неделе, иначе warning каждые 120с маскирует
+        # реальные «ждём»-состояния. Поздний catch-up-вклад такого месяца
+        # не пропадёт: он ляжет в pots следующего цикла (month <= prev_key).
+        return None
+    total = sum(pot.nanotons for pot in pots)
+    # Период лидерборда: от начала самого старого НЕвыплаченного месяца
+    # (после простоя копилка копится за несколько месяцев сразу) до начала
+    # текущего — ровно то, за что платим.
+    year, mon = map(int, pots[0].month.split("-"))
+    period_start = datetime(year, mon, 1, tzinfo=UTC)
+    return pots, total, period_start
+
+
+async def _month_has_unfinished(session, period_start: datetime, month_start: datetime) -> bool:
+    """Есть ли в периоде лидерборда месяца нефинализированный день?
+
+    Последние дни месяца ещё не финализированы (долгий тик, сбой) —
+    их вклад в копилку может быть недолит. Как в неделе: платим только
+    когда весь период закрыт и выплаты дней финализированы. True — значит,
+    платить рано и метку не двигать.
+    """
+    unfinished = await session.execute(
+        select(Round.id)
+        .where(
+            Round.tally_ends_at >= period_start,
+            Round.tally_ends_at < month_start,
+            or_(
+                Round.status != RoundStatus.CLOSED,
+                Round.payouts_finalized.is_(False),
+            ),
+        )
+        .limit(1)
+    )
+    return unfinished.scalar_one_or_none() is not None
+
+
+def _month_dust_allocation(
+    payments: list[tuple[int, str, int]],
+    total: int,
+    fee_nano: int,
+    min_payout_nano: int,
+) -> tuple[list[tuple[int, str, int]], int]:
+    """Отбор оплачиваемых выплат и пыль, возвращающаяся в копилку месяца.
+
+    Доли ниже min_payout_gram не создают дохлые переводы (комиссия сети
+    съела бы большую часть). Неоплаченная пыль возвращается в копилку
+    ТЕКУЩЕГО месяца — старые горши ниже удаляются, деньги не теряются.
+
+    Возвращает (payable, recarry): payable — чистые суммы, которые реально
+    уйдут в выплаты (доли, пережившие газ); recarry — незаполненное
+    (свободные веса) и пыль, возвращаемая в копилку текущего месяца.
+    """
+    allocated = sum(amount for _pid, _wallet, amount in payments)
+    dust = 0
+    payable: list[tuple[int, str, int]] = []
+    for player_id, wallet, amount in payments:
+        # Получатель получает ЧИСТЫМИ: газ платит копилка месяца, а не
+        # остаток казны. Доля, которая не переживает газ, уходит целиком
+        # в копилку текущего месяца (перевода на ноль не создаём).
+        net = net_payout_amount(amount, fee_nano)
+        if net <= 0 or net < min_payout_nano:
+            dust += amount
+            continue
+        payable.append((player_id, wallet, net))
+    return payable, total - allocated + dust
+
+
 async def _settle_month_locked(bot: Bot | None = None) -> bool:
     """Выплачивает копилку прошедших месяцев, если последний день месяца закрыт.
 
@@ -778,54 +877,20 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     async with SessionLocal() as session:
-        marker = await _claim_marker_lock(session, MARKER_KEY)
-        settled_through = marker.value
-        if settled_through >= prev_key:
-            return False  # этот месяц уже закрыт (или вообще ещё не наступил)
-
-        # Флаг готовности: последний день месяца закрыт (финализирован).
-        ready_marker = await session.get(WatcherState, MONTH_READY_KEY)
-        ready_month = ready_marker.value if ready_marker is not None else ""
-        if ready_month < prev_key:
-            # Последний день ещё не закрыт — лидерборд ждёт.
+        marker = await _month_settlement_gate(session, prev_key)
+        if marker is None:
             return False
 
-        pots = (
-            await session.execute(
-                select(LeaderboardPot).where(LeaderboardPot.month <= prev_key).order_by(LeaderboardPot.month.asc())
-            )
-        ).scalars().all()
-        if not pots:
-            # Горшка нет (месяц без ставок — банк в копилку не капал):
-            # двигаем метку, как в неделе, иначе warning каждые 120с маскирует
-            # реальные «ждём»-состояния. Поздний catch-up-вклад такого месяца
-            # не пропадёт: он ляжет в pots следующего цикла (month <= prev_key).
+        pots_data = await _month_pots_and_total(session, prev_key)
+        if pots_data is None:
             marker.value = prev_key
             await session.commit()
             return False
-        total = sum(pot.nanotons for pot in pots)
-        # Период лидерборда: от начала самого старого НЕвыплаченного месяца
-        # (после простоя копилка копится за несколько месяцев сразу) до начала
-        # текущего — ровно то, за что платим.
-        year, mon = map(int, pots[0].month.split("-"))
-        period_start = datetime(year, mon, 1, tzinfo=UTC)
-
-        # Последние дни месяца ещё не финализированы (долгий тик, сбой) —
-        # их вклад в копилку может быть недолит. Как в неделе: платим только
-        # когда весь период закрыт и выплаты дней финализированы.
-        unfinished = await session.execute(
-            select(Round.id)
-            .where(
-                Round.tally_ends_at >= period_start,
-                Round.tally_ends_at < month_start,
-                or_(
-                    Round.status != RoundStatus.CLOSED,
-                    Round.payouts_finalized.is_(False),
-                ),
-            )
-            .limit(1)
-        )
-        if unfinished.scalar_one_or_none() is not None:
+        pots, total, period_start = pots_data
+        if await _month_has_unfinished(session, period_start, month_start):
+            # Последние дни месяца ещё не финализированы (долгий тик, сбой) —
+            # их вклад в копилку может быть недолит. Как в неделе: платим только
+            # когда весь период закрыт и выплаты дней финализированы.
             return False
 
         top_k = max(1, settings.monthly_prize_top_k)
@@ -848,23 +913,9 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             )
             return False
 
-        # Доли ниже min_payout_gram не создают дохлые переводы (комиссия сети
-        # съела бы большую часть). Неоплаченная пыль возвращается в копилку
-        # ТЕКУЩЕГО месяца — старые горши ниже удаляются, деньги не теряются.
         min_payout_nano = to_nano(settings.min_payout_gram)
         fee_nano = await fee_estimate_nano(session)
-        allocated = sum(amount for _pid, _wallet, amount in payments)
-        dust = 0
-        payable: list[tuple[int, str, int]] = []
-        for player_id, wallet, amount in payments:
-            # Получатель получает ЧИСТЫМИ: газ платит копилка месяца, а не
-            # остаток казны. Доля, которая не переживает газ, уходит целиком
-            # в копилку текущего месяца (перевода на ноль не создаём).
-            net = net_payout_amount(amount, fee_nano)
-            if net <= 0 or net < min_payout_nano:
-                dust += amount
-                continue
-            payable.append((player_id, wallet, net))
+        payable, recarry = _month_dust_allocation(payments, total, fee_nano, min_payout_nano)
         if not payable:
             logger.warning(
                 "Копилка %d нанотонов ждёт: все доли ниже min_payout_gram — ждём роста горша",
@@ -872,8 +923,6 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             )
             return False
         payments = payable
-        # В копилку возвращается незаполненное (свободные веса) и пыль.
-        recarry = total - allocated + dust
         if recarry > 0:
             current_month = now.strftime("%Y-%m")
             pot_row = (
