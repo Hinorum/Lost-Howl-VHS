@@ -47,7 +47,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -67,6 +67,13 @@ _TMP_SUFFIX = ".tmp"
 # Суффикс слепка, который ставит редактор (совпадает с editor._backup).
 _BACKUP_SUFFIX = ".bak"
 
+# Кэш зеркала: путь → (updated_at строки, stat основного файла, stat слепка).
+# Пока ни база (updated_at), ни файлы не менялись, payload из базы не читается
+# вовсе — минутный story-sync не тянет ~183 КБ кассет каждый такт. Любое
+# изменение (правка из /panel, деплой, ручная порча/пропажа файла) меняет
+# штамп или stat и заставляет перечитать содержимое.
+_SYNC_CACHE: dict[str, tuple[str, tuple[int, int] | None, tuple[int, int] | None]] = {}
+
 
 def enabled() -> bool:
     """Включено ли хранение кассет в базе.
@@ -80,6 +87,22 @@ def enabled() -> bool:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _next_stamp(previous: datetime | None) -> datetime:
+    """Метка обновления строго новее прежней — даже при грубых часах.
+
+    story-sync пропускает чтение payload, пока `updated_at` не изменился.
+    Системные часы (особенно Windows/контейнер) могут выдать одинаковое
+    значение двум правкам подряд, и вторая осталась бы незамеченной. Поэтому
+    для существующей строки штамп двигаем минимум на микросекунду вперёд.
+    """
+    now = _now()
+    if previous is None:
+        return now
+    if previous.tzinfo is None:
+        previous = previous.replace(tzinfo=UTC)
+    return now if now > previous else previous + timedelta(microseconds=1)
 
 
 def _stamp(moment: datetime | None) -> str:
@@ -139,6 +162,33 @@ async def _rows() -> list[_Row]:
     return [_Row(*row) for row in rows]
 
 
+class _RowMeta(NamedTuple):
+    """Лёгкая строка для story-sync: без payload и слепка."""
+
+    name: str
+    updated_at: datetime | None
+
+
+async def _rows_meta() -> list[_RowMeta]:
+    """Только имена и штампы: тело кассет не читается, пока не изменилось."""
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(StoryCassette.name, StoryCassette.updated_at)
+            )
+        ).all()
+    return [_RowMeta(*row) for row in rows]
+
+
+async def _row_content(name: str) -> tuple[str, str | None] | None:
+    """Payload и слепок одной кассеты (None — строку успели удалить)."""
+    async with SessionLocal() as session:
+        row = await session.get(StoryCassette, name)
+        if row is None:
+            return None
+        return row.payload, row.backup
+
+
 async def _upsert(
     name: str, payload: str, backup: str | None, edited_at: datetime | None
 ) -> None:
@@ -158,7 +208,7 @@ async def _upsert(
             row.payload = payload
             row.backup = backup
             row.edited_at = edited_at
-            row.updated_at = _now()
+            row.updated_at = _next_stamp(row.updated_at)
         await session.commit()
 
 
@@ -179,6 +229,15 @@ def _same(path: Path, text: str) -> bool:
 def _read_backup(path: Path) -> str | None:
     bak = path.with_name(path.name + _BACKUP_SUFFIX)
     return _read(bak)
+
+
+def _stat_sig(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size) файла или None, если файла нет/он недоступен."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 async def _adopt_disk(directory: Path) -> SyncResult:
@@ -268,16 +327,21 @@ async def bootstrap() -> SyncResult:
 async def sync_from_db() -> SyncResult:
     """Выложить базу в каталог-зеркало: только изменившиеся файлы.
 
-    Сравнение идёт по содержимому, а не по mtime: метка времени файла —
-    момент записи на диск, `updated_at` — момент записи в базу, и по
-    времени зеркало переписывалось бы каждый такт впустую. Пустая база
-    ничего не трогает (файлы — работа git, их примет bootstrap), посторонние
-    `*.json` не удаляются; убираются только осиротевшие слепки `*.bak`.
+    Сравнение идёт по содержимому, но содержимое читается не каждый такт:
+    сначала лёгкий запрос `name, updated_at` и stat файлов. Если штамп строки
+    и оба stat'а (кассета и её `.bak`) совпали с прошлым проходом, файлы
+    заведомо те же — payload из базы не тянется. Изменился штамп (правка из
+    /panel, контент-фикс, бэкап) или stat (файл испорчен/пропал/подменён) —
+    читаем payload и сверяем по содержимому, как раньше. `updated_at` ставят
+    все пути записи (`_upsert`, `persist_backup`), поэтому пропустить
+    изменение базы кэш не может. Пустая база ничего не трогает (файлы —
+    работа git, их примет bootstrap), посторонние `*.json` не удаляются;
+    убираются только осиротевшие слепки `*.bak`.
     """
     result = SyncResult()
     if not enabled():
         return result
-    rows = await _rows()
+    rows = await _rows_meta()
     if not rows:
         return result
     directory = default_cassettes_dir()
@@ -291,21 +355,38 @@ async def sync_from_db() -> SyncResult:
             result.failed = True
             continue
         path = directory / row.name
+        bak = path.with_name(path.name + _BACKUP_SUFFIX)
+        main_sig = _stat_sig(path)
+        bak_sig = _stat_sig(bak)
+        stamp = _stamp(row.updated_at)
+        cache_key = str(path)
+        cached = _SYNC_CACHE.get(cache_key)
+        if cached == (stamp, main_sig, bak_sig):
+            continue
+        content = await _row_content(row.name)
+        if content is None:
+            continue
+        payload, backup = content
         try:
-            if not _same(path, row.payload):
-                _atomic_write(path, row.payload)
+            if main_sig is None or not _same(path, payload):
+                _atomic_write(path, payload)
                 result.written += 1
-            bak = path.with_name(path.name + _BACKUP_SUFFIX)
-            if row.backup is not None:
-                if not _same(bak, row.backup):
-                    _atomic_write(bak, row.backup)
-            elif bak.is_file():
+            if backup is not None:
+                if bak_sig is None or not _same(bak, backup):
+                    _atomic_write(bak, backup)
+            elif bak_sig is not None:
                 # Слепка в базе нет — вычищаем старый .bak с диска.
                 bak.unlink()
                 result.removed += 1
         except OSError:
             result.failed = True
             logger.exception("Зеркало кассеты %s не обновилось", row.name)
+            continue
+        _SYNC_CACHE[cache_key] = (
+            stamp,
+            _stat_sig(path),
+            _stat_sig(bak),
+        )
     for stale in sorted(directory.glob(f"*{_BACKUP_SUFFIX}")):
         if stale.name not in known_bak and stale.is_file():
             try:
@@ -467,7 +548,7 @@ async def persist_backup(file_name: str, directory: Path | None = None) -> bool:
                 )
             else:
                 row.backup = backup
-                row.updated_at = _now()
+                row.updated_at = _next_stamp(row.updated_at)
             await session.commit()
     except Exception:
         logger.exception(

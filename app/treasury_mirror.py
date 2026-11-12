@@ -31,6 +31,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import ton_head as _head
 from app.config import settings
 from app.core.registry import (
     TREASURY_MIRROR_BEAT_KEY,
@@ -38,6 +39,8 @@ from app.core.registry import (
     TREASURY_MIRROR_BOTTOM_KEY,
     TREASURY_MIRROR_CHECK_KEY,
     TREASURY_MIRROR_CURSOR_KEY,
+    TREASURY_MIRROR_HEAD_CHECK_KEY,
+    TREASURY_MIRROR_HEAD_KEY,
     TREASURY_MIRROR_SOURCE_KEY,
 )
 from app.db import SessionLocal
@@ -849,11 +852,14 @@ async def _bootstrap_sync(
 
 async def _increment_sync(
     session: AsyncSession, network: str, max_pages: int
-) -> tuple[int, int, int, str, bool]:
+) -> tuple[int, int, int, str, bool, bool]:
     """Инкремент: новые транзакции выше головы (CURSOR), до пересечения
     известной границы; при реорганизации монтируется перезапись строк.
 
-    Returns: (pages, added, updated, source, page_ok).
+    Returns: (pages, added, updated, source, page_ok, complete).
+    complete=True только когда догон реально дошёл до известной границы
+    (или истории выше головы нет): отпечаток головы после неполного догона
+    пропустил бы ещё не прочитанный хвост.
     """
     before_lt = None
     offset = None
@@ -863,6 +869,7 @@ async def _increment_sync(
     pages = added = updated = 0
     source = "none"
     page_ok = False
+    complete = False
     for _ in range(max_pages):
         moves, source, ok = await _fetch_page(before_lt, offset=offset)
         if not ok:
@@ -870,9 +877,11 @@ async def _increment_sync(
         page_ok = True
         pages += 1
         if not moves:
+            complete = True
             break
         page_max = max(move.lt for move in moves)
         if head_lt is not None and page_max <= head_lt:
+            complete = True
             break  # самая свежая уже учтена — ничего нового
         window = (min(move.lt for move in moves), page_max)
         if window == prev_window and source == prev_source:
@@ -898,8 +907,9 @@ async def _increment_sync(
         if prev_head is not None and before_lt is not None and before_lt <= prev_head:
             # Страница пересекла известную границу — хвост под меткой,
             # новые транзакции выше головы все учтены.
+            complete = True
             break
-    return pages, added, updated, source, page_ok
+    return pages, added, updated, source, page_ok, complete
 
 
 async def _check_mirror(
@@ -1011,6 +1021,7 @@ async def sync_treasury_mirror() -> dict:
         pages = added = updated = 0
         source = "none"
         page_ok = False
+        probe: _head.HeadProbe | None = None
         if not bootstrapped:
             (
                 pages,
@@ -1021,9 +1032,48 @@ async def sync_treasury_mirror() -> dict:
                 page_ok,
             ) = await _bootstrap_sync(session, network, max_pages)
         else:
-            pages, added, updated, source, page_ok = await _increment_sync(
-                session, network, max_pages
-            )
+            if settings.ton_head_probe_enabled:
+                probe = await _head.fetch_head_probe()
+            if probe is not None and probe.ok:
+                head = await _head.read_head(session, TREASURY_MIRROR_HEAD_KEY)
+                head_check = await _head.read_check(session, TREASURY_MIRROR_HEAD_CHECK_KEY)
+                if _head.head_is_fresh(
+                    head_check, settings.treasury_mirror_full_rescan_seconds
+                ) and _head.same_head(head, probe):
+                    # Голова та же: истории выше неё нет, страницу зеркала
+                    # читать не нужно. Тождество всё равно меряем — это один
+                    # лёгкий запрос баланса + сумма по БД.
+                    summary.update(source=probe.source, skipped=True, bootstrapped=True)
+                    await _check_mirror(
+                        session, summary, network, probe.source, True, 0, 0, 0
+                    )
+                    return summary
+            (
+                pages,
+                added,
+                updated,
+                source,
+                page_ok,
+                complete,
+            ) = await _increment_sync(session, network, max_pages)
+            if (
+                complete
+                and page_ok
+                and probe is not None
+                and probe.ok
+                and probe.source == source
+            ):
+                # Отпечаток — только после полного догона и только если
+                # страницы читались тем же источником, что и зонд.
+                await _head.write_head(
+                    session,
+                    key=TREASURY_MIRROR_HEAD_KEY,
+                    check_key=TREASURY_MIRROR_HEAD_CHECK_KEY,
+                    lt=probe.lt,
+                    head_hash=probe.hash,
+                    source=probe.source,
+                    cursor=0,
+                )
         if page_ok:
             await _set_state(session, TREASURY_MIRROR_SOURCE_KEY, source)
         summary.update(
@@ -1070,6 +1120,8 @@ async def reset_treasury_mirror() -> str:
             TREASURY_MIRROR_CURSOR_KEY,
             TREASURY_MIRROR_CHECK_KEY,
             TREASURY_MIRROR_BEAT_KEY,
+            TREASURY_MIRROR_HEAD_CHECK_KEY,
+            TREASURY_MIRROR_HEAD_KEY,
             TREASURY_MIRROR_SOURCE_KEY,
         ):
             row = await session.get(WatcherState, key)

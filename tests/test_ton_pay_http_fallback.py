@@ -670,6 +670,28 @@ async def test_wait_for_broadcast_memo_found_on_first_poll(monkeypatch: pytest.M
     assert calls == [{"way:9:prize#1"}]
 
 
+async def test_wait_for_broadcast_memo_uses_shallow_scan_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ожидание после вещания читает голову истории, а не всё окно сверки.
+
+    Полное окно (12×256 tx) на каждый двухсекундный опрос — мегабайты трафика
+    при промахе; только что отправленный перевод лежит на первой странице.
+    """
+    from app.ton_pay import state as _st
+
+    seen: list[tuple[int, int] | None] = []
+
+    async def fake_tx_map(targets: set[str] | None = None) -> dict[str, str]:
+        seen.append(_st.RECONCILE_SCAN_OVERRIDE.get())
+        return {"way:9:prize#1": "hash"}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+    assert await ton_pay._wait_for_broadcast_memo({"way:9:prize#1"}, seconds=5.0) is True
+    assert seen == [(25, 2)]
+    assert _st.RECONCILE_SCAN_OVERRIDE.get() is None, "override обязан сброситься"
+
+
 async def test_wait_for_broadcast_memo_appears_after_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     """Перевод ложится в блок между опросами — дожидаемся и возвращаем True."""
     state = {"count": 0}

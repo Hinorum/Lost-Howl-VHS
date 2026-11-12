@@ -49,6 +49,10 @@ if not _LIVE_E2E:
 #   $env:E2E_TESTNET=1; $env:TON_NETWORK=testnet; pytest -m e2e
 os.environ.setdefault("TON_ENABLED", "false")
 os.environ.setdefault("TON_NETWORK", "mainnet")
+# Дешёвый зонд головы по умолчанию выключен в тестах: иначе каждый цикл
+# watcher'а/зеркала ходил бы в реальную сеть, а тесты без сети становились бы
+# негерметичными. Тесты самой оптимизации включают его явно.
+os.environ.setdefault("TON_HEAD_PROBE_ENABLED", "false")
 # BOT_TOKEN/ADMIN_IDS — ровно CI-шные (см. .github/workflows/ci.yml): чистый
 # клон без них падал на пяти тестах (test_log_scrub: пустой набор секретов
 # выключает краску, и счётчик сбоев не растёт; test_backup_command: пустой

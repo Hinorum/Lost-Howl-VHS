@@ -8,6 +8,7 @@ import logging
 import time
 from datetime import UTC, datetime, timedelta
 
+from app import ton_head as _head
 from app import ton_watch as _pkg
 from app.config import settings
 from app.core.registry import (
@@ -19,6 +20,8 @@ from app.core.registry import (
     SCAN_GAP_KEY,
     SOURCE_KEY,
     STUCK_TX_KEY,
+    WATCH_HEAD_CHECK_KEY,
+    WATCH_HEAD_KEY,
 )
 from app.models import WatcherState
 
@@ -85,6 +88,35 @@ async def _write_source(session, source: str) -> None:
     await session.commit()
 
 
+async def _read_head(session) -> dict | None:
+    """Отпечаток головы последнего полного прохода или None."""
+    return await _head.read_head(session, WATCH_HEAD_KEY)
+
+
+async def _read_head_check(session) -> str | None:
+    """ISO-время последнего полного прохода (None — прохода ещё не было)."""
+    return await _head.read_check(session, WATCH_HEAD_CHECK_KEY)
+
+
+async def _write_head(
+    session, *, lt: int, head_hash: str, source: str, cursor: int
+) -> None:
+    """Запомнить голову и время полного прохода одним коммитом.
+
+    Пишется ТОЛЬКО после полного успешного прохода (без дыры и деградации):
+    иначе пропуск следующего цикла опирался бы на непрочитанное окно.
+    """
+    await _head.write_head(
+        session,
+        key=WATCH_HEAD_KEY,
+        check_key=WATCH_HEAD_CHECK_KEY,
+        lt=lt,
+        head_hash=head_hash,
+        source=source,
+        cursor=cursor,
+    )
+
+
 # Во сколько раз бюджет страниц прохода может превысить watch_max_pages, пока
 # окно не вычитано целиком. Каждый усечённый проход удваивает множитель, полный —
 # сбрасывает в 1. Потолок ограничивает нагрузку на индексатор: страниц много,
@@ -149,7 +181,12 @@ async def _write_scan_gap(session, since: int, floor_utime: int, max_pages: int)
 
 
 async def _read_scan_gap(session) -> dict | None:
-    """Границы дыры последнего усечённого прохода (None — дыры нет)."""
+    """Границы дыры последнего усечённого прохода (None — дыры нет).
+
+    Повреждённая запись возвращает ``{"corrupt": True}``, а не None: пока
+    факт незакрытой дыры не опровергнут полным проходом, пропускать цикл по
+    неизменной голове нельзя — курсор мог стоять на дне прочитанного.
+    """
     row = await session.get(WatcherState, SCAN_GAP_KEY)
     if row is None:
         return None
@@ -157,8 +194,8 @@ async def _read_scan_gap(session) -> dict | None:
         value = json.loads(row.value)
     except (ValueError, TypeError):
         logger.warning("Границы дыры watcher'а повреждены (%r)", row.value[:128])
-        return None
-    return value if isinstance(value, dict) else None
+        return {"corrupt": True}
+    return value if isinstance(value, dict) else {"corrupt": True}
 
 _STUCK_MAX_FAILS = 5
 

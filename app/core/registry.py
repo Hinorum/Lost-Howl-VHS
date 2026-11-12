@@ -170,6 +170,15 @@ PARSE_FAIL_COUNT_KEY = "ton_watch_parse_fail_count"
 # Деталь для /blockchain и оператора, отдельный от счётчика — позволяет понять
 # «что именно сломалось» без подъёма логов.
 PARSE_FAIL_LAST_KEY = "ton_watch_parse_fail_last"
+# Голова истории на момент последнего ПОЛНОГО успешного прохода (JSON:
+# lt, hash, source, cursor). Пока живёт и совпадает с дешёвым зондом
+# (limit=1), полный проход истории можно пропустить: новых переводов выше
+# головы нет. cursor ловит ручной сброс/перевод курсора — тогда голова
+# перестаёт быть доказательством покрытия.
+WATCH_HEAD_KEY = "ton_watch_head"
+# Время последнего полного прохода (ISO). Отдельно от головы, чтобы
+# страховочный проход по расписанию не зависел от целостности JSON головы.
+WATCH_HEAD_CHECK_KEY = "ton_watch_head_check"
 # --- Холодный старт кошелька (app/ton_pay/wallet.py) ---
 
 # Результат последней сверки seqno казначея на холодном старте (JSON: lite,
@@ -207,3 +216,12 @@ TREASURY_MIRROR_SOURCE_KEY = "treasury_mirror_last_source"
 # exact, diff_nanotons, checked_at). Читается ежедневной автосверкой без
 # лишнего запроса к индексатору.
 TREASURY_MIRROR_CHECK_KEY = "treasury_mirror_check"
+# Голова истории на момент последнего успешного инкремента (JSON: lt, hash,
+# source). Дешёвый зонд limit=1 сравнивается с ней, чтобы не читать страницу
+# истории каждые TREASURY_MIRROR_INTERVAL_SECONDS в простое. lt дублирует
+# TREASURY_MIRROR_CURSOR_KEY: cursor — граница покрытия зеркала, а здесь —
+# отпечаток головы вместе с хешем и источником.
+TREASURY_MIRROR_HEAD_KEY = "treasury_mirror_head"
+# Время последнего полного инкремента (ISO) — для страховочного прохода
+# по расписанию (TREASURY_MIRROR_FULL_RESCAN_SECONDS).
+TREASURY_MIRROR_HEAD_CHECK_KEY = "treasury_mirror_head_check"

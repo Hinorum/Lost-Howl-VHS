@@ -22,6 +22,11 @@ from .memo import _payout_comment_candidates
 logger = logging.getLogger(__name__)
 
 _BROADCAST_CONFIRM_POLL = 2.0
+# Ожиданию после вещания хватает головы истории: только что отправленный
+# перевод лежит на первой странице. Полное окно сверки (12×256 tx, ~8.6 МБ
+# за опрос при промахе) здесь избыточно — 2×25 покрывает пачку с запасом.
+_BROADCAST_CONFIRM_PAGE_LIMIT = 25
+_BROADCAST_CONFIRM_MAX_PAGES = 2
 
 async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
     """Сверяет «sent»-выплаты с реальным блокчейном и чинит потерю перевода.
@@ -234,6 +239,11 @@ async def _wait_for_broadcast_memo(candidates: set[str], seconds: float) -> bool
     # Снапшот входа: любой выход (в т.ч. исключение) возвращает флаги как были.
     saved_ok = _state._RECONCILE_HISTORY_OK
     saved_window = _state._RECONCILE_WINDOW_COMPLETE
+    # Узкое окно — только для этой задачи: ContextVar не сужает параллельную
+    # сверку очереди, которой по-прежнему нужно всё окно истории.
+    scan_token = _state.RECONCILE_SCAN_OVERRIDE.set(
+        (_BROADCAST_CONFIRM_PAGE_LIMIT, _BROADCAST_CONFIRM_MAX_PAGES)
+    )
     try:
         deadline = time.monotonic() + seconds
         while True:
@@ -244,5 +254,6 @@ async def _wait_for_broadcast_memo(candidates: set[str], seconds: float) -> bool
                 return False
             await asyncio.sleep(_BROADCAST_CONFIRM_POLL)
     finally:
+        _state.RECONCILE_SCAN_OVERRIDE.reset(scan_token)
         _state._RECONCILE_HISTORY_OK = saved_ok
         _state._RECONCILE_WINDOW_COMPLETE = saved_window

@@ -130,6 +130,43 @@ async def test_sync_skips_identical_and_restores_tampered_file(library) -> None:
     assert path.read_text(encoding="utf-8") == payload
 
 
+async def test_sync_reads_payloads_only_when_row_or_file_changed(
+    library, monkeypatch
+) -> None:
+    """Минутный sync не тянет тела кассет, пока не изменился штамп или файл."""
+    name = "store-meta-2099-11.json"
+    _write_cassette(library, name, "2099-11", 30, "meta")
+    initial = await store.bootstrap()
+    assert initial.written == 1 and await _row(name) is not None
+
+    reads = {"n": 0}
+    real_content = store._row_content
+
+    async def counting_content(file_name: str):
+        reads["n"] += 1
+        return await real_content(file_name)
+
+    monkeypatch.setattr(store, "_row_content", counting_content)
+
+    idle = await store.sync_from_db()
+    assert idle.written == 0
+    assert reads["n"] == 0, "неизменённая кассета не должна читаться из базы"
+
+    # Порча файла меняет stat — тело перечитывается и зеркало восстанавливается.
+    (library / name).write_text('{"битая": "правка"}', encoding="utf-8")
+    active = await store.sync_from_db()
+    assert active.written == 1
+    assert reads["n"] == 1
+
+    # Правка в базе меняет updated_at — тело читается снова (файл при этом
+    # не трогаем: проверяем именно реакцию на штамп строки).
+    payload = (library / name).read_text(encoding="utf-8")
+    await store._upsert(name, payload, None, edited_at=None)
+    changed = await store.sync_from_db()
+    assert changed.written == 0  # диск уже совпадает с новой строкой
+    assert reads["n"] == 2, "смена штампа обязана перечитать payload"
+
+
 async def test_sync_cleans_stale_backup_and_keeps_foreign_json(library) -> None:
     """Сирота-слепок убирается, посторонний *.json (работа git) — нет."""
     name = "store-bak-2099-05.json"

@@ -82,7 +82,12 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
 
     tx_map: dict[str, str] = {}
     cutoff = time.time() - settings.payout_reconcile_history_seconds
-    max_pages = max(1, settings.payout_reconcile_max_pages)
+    page_limit, max_pages = _state.RECONCILE_SCAN_OVERRIDE.get() or (
+        _state._RECONCILE_PAGE_LIMIT,
+        max(1, settings.payout_reconcile_max_pages),
+    )
+    max_pages = max(1, max_pages)
+    page_limit = max(1, page_limit)
     # Полнота окна считается по ФАКТУ прохода, а не по «провайдер ответил»:
     # скан может упереться в max_pages, не дойдя до границы окна, и тогда
     # «memo не найдено» — это «не знаю», а не «перевода нет». Стартовое False
@@ -96,7 +101,7 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
         response = await client.get(
             url,
             params={
-                "limit": _state._RECONCILE_PAGE_LIMIT,
+                "limit": page_limit,
                 "sort_order": "desc",
                 **({"before_lt": before_lt} if before_lt else {}),
             },
@@ -137,7 +142,7 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
         if oldest_utime is not None and float(oldest_utime) < cutoff:
             _state._RECONCILE_WINDOW_COMPLETE = True  # окно истории покрыто целиком
             break
-        if len(items) < _state._RECONCILE_PAGE_LIMIT:
+        if len(items) < page_limit:
             _state._RECONCILE_WINDOW_COMPLETE = True  # неполная страница = хвост истории
             break
         before_lt = str(items[-1].get("lt") or "")
@@ -163,7 +168,12 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
     headers = {"X-API-Key": settings.toncenter_api_key} if settings.toncenter_api_key else {}
     tx_map: dict[str, str] = {}
     cutoff = time.time() - settings.payout_reconcile_history_seconds
-    max_pages = max(1, settings.payout_reconcile_max_pages)
+    page_limit, max_pages = _state.RECONCILE_SCAN_OVERRIDE.get() or (
+        _state._RECONCILE_PAGE_LIMIT,
+        max(1, settings.payout_reconcile_max_pages),
+    )
+    max_pages = max(1, max_pages)
+    page_limit = max(1, page_limit)
     # Полнота окна — по факту прохода (см. _tx_map_via_tonapi): усечение по
     # max_pages оставляет отрицательные ответы недоказанными.
     _state._RECONCILE_WINDOW_COMPLETE = False
@@ -173,7 +183,7 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
     for _ in range(max_pages):
         params = {
             "account": settings.active_treasury_address,
-            "limit": _state._RECONCILE_PAGE_LIMIT,
+            "limit": page_limit,
             "sort": "desc",
             "offset": offset,
         }
@@ -208,7 +218,7 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
         if oldest_utime is not None and float(oldest_utime) < cutoff:
             _state._RECONCILE_WINDOW_COMPLETE = True  # окно истории покрыто целиком
             break
-        if len(items) < _state._RECONCILE_PAGE_LIMIT:
+        if len(items) < page_limit:
             _state._RECONCILE_WINDOW_COMPLETE = True  # неполная страница = хвост истории
             break
         # Шаг — от ФАКТИЧЕСКИ пришедших записей, а не от запрошенного лимита.

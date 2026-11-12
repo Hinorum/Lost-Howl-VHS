@@ -20,7 +20,7 @@ import pytest
 from conftest import ensure_player, ensure_round
 from sqlalchemy import delete, func, select
 
-from app import ops, treasury_mirror
+from app import ops, ton_head, treasury_mirror
 from app.config import settings
 from app.core.registry import (
     TREASURY_MIRROR_BEAT_KEY,
@@ -28,6 +28,8 @@ from app.core.registry import (
     TREASURY_MIRROR_BOTTOM_KEY,
     TREASURY_MIRROR_CHECK_KEY,
     TREASURY_MIRROR_CURSOR_KEY,
+    TREASURY_MIRROR_HEAD_CHECK_KEY,
+    TREASURY_MIRROR_HEAD_KEY,
     TREASURY_MIRROR_SOURCE_KEY,
 )
 from app.db import SessionLocal
@@ -376,6 +378,8 @@ _MIRROR_STATE_KEYS = [
     TREASURY_MIRROR_CURSOR_KEY,
     TREASURY_MIRROR_CHECK_KEY,
     TREASURY_MIRROR_BEAT_KEY,
+    TREASURY_MIRROR_HEAD_CHECK_KEY,
+    TREASURY_MIRROR_HEAD_KEY,
     TREASURY_MIRROR_SOURCE_KEY,
 ]
 
@@ -509,6 +513,125 @@ async def test_incremental_adds_new_head_only(ton_mirror, monkeypatch) -> None:
             assert head == 21_000
     finally:
         await _wipe_mirror()
+
+
+async def _seed_bootstrapped_mirror(cursor: int, *, probe=None) -> None:
+    """Выстроенное зеркало с головой CURSOR и (необязательно) отпечатком."""
+    async with SessionLocal() as db:
+        db.add(WatcherState(key=TREASURY_MIRROR_BOOTSTRAP_KEY, value="1"))
+        db.add(WatcherState(key=TREASURY_MIRROR_CURSOR_KEY, value=str(cursor)))
+        await db.commit()
+        if probe is not None:
+            await ton_head.write_head(
+                db,
+                key=TREASURY_MIRROR_HEAD_KEY,
+                check_key=TREASURY_MIRROR_HEAD_CHECK_KEY,
+                lt=probe.lt,
+                head_hash=probe.hash,
+                source=probe.source,
+                cursor=0,
+            )
+
+
+async def test_increment_skips_history_page_when_head_unchanged(
+    ton_mirror, monkeypatch
+) -> None:
+    probe = ton_head.HeadProbe(lt=50_000, hash="mirror-head", source="tonapi", ok=True)
+    await _seed_bootstrapped_mirror(probe.lt, probe=probe)
+    monkeypatch.setattr(settings, "ton_head_probe_enabled", True)
+    monkeypatch.setattr(settings, "treasury_mirror_full_rescan_seconds", 3600)
+    monkeypatch.setattr(ton_head, "fetch_head_probe", AsyncMock(return_value=probe))
+    increment = AsyncMock(side_effect=AssertionError("страница истории не нужна"))
+    monkeypatch.setattr(treasury_mirror, "_increment_sync", increment)
+    import app.ton_pay
+
+    monkeypatch.setattr(app.ton_pay, "fetch_account_state", _fake_chain_balance_async(0))
+    try:
+        result = await treasury_mirror.sync_treasury_mirror()
+        assert result["skipped"] is True
+        assert result["pages"] == 0
+        assert result["bootstrapped"] is True
+        increment.assert_not_awaited()
+        # Тождество всё равно измерено: лёгкий баланс + сумма по БД.
+        assert result["exact"] is True
+    finally:
+        await _wipe_mirror()
+
+
+async def test_increment_records_head_only_after_complete_dogon(
+    ton_mirror, monkeypatch
+) -> None:
+    ledger = [_tonapi_item(f"n{i}", lt=60_000 + i) for i in range(3)]
+    probe = ton_head.HeadProbe(lt=60_002, hash="mirror-new-head", source="tonapi", ok=True)
+    await _seed_bootstrapped_mirror(59_999)
+    monkeypatch.setattr(settings, "ton_head_probe_enabled", True)
+    monkeypatch.setattr(ton_head, "fetch_head_probe", AsyncMock(return_value=probe))
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    import app.ton_pay
+
+    monkeypatch.setattr(
+        app.ton_pay,
+        "fetch_account_state",
+        _fake_chain_balance_async(_fake_chain_balance(ledger)),
+    )
+    try:
+        first = await treasury_mirror.sync_treasury_mirror()
+        assert first["added"] == 3 and first.get("skipped") is not True
+
+        async with SessionLocal() as db:
+            head = await ton_head.read_head(db, TREASURY_MIRROR_HEAD_KEY)
+        assert head is not None
+        assert head["lt"] == probe.lt and head["hash"] == probe.hash
+        assert head["source"] == probe.source
+
+        # Следующий цикл по той же голове страницу истории уже не читает.
+        page = AsyncMock(side_effect=AssertionError("история не нужна"))
+        monkeypatch.setattr(treasury_mirror, "_fetch_page", page)
+        second = await treasury_mirror.sync_treasury_mirror()
+        assert second["skipped"] is True
+        page.assert_not_awaited()
+    finally:
+        await _wipe_mirror()
+
+
+async def test_increment_truncated_by_page_budget_keeps_old_head(
+    ton_mirror, monkeypatch
+) -> None:
+    ledger = [_tonapi_item(f"t{i}", lt=70_000 + i) for i in range(300)]
+    probe = ton_head.HeadProbe(lt=70_299, hash="mirror-top", source="tonapi", ok=True)
+    await _seed_bootstrapped_mirror(0)
+    monkeypatch.setattr(settings, "ton_head_probe_enabled", True)
+    monkeypatch.setattr(settings, "treasury_mirror_max_pages_per_sync", 1)
+    monkeypatch.setattr(ton_head, "fetch_head_probe", AsyncMock(return_value=probe))
+    monkeypatch.setattr(treasury_mirror, "_fetch_page", _fake_page_serving(ledger))
+    import app.ton_pay
+
+    monkeypatch.setattr(
+        app.ton_pay,
+        "fetch_account_state",
+        _fake_chain_balance_async(_fake_chain_balance(ledger)),
+    )
+    try:
+        result = await treasury_mirror.sync_treasury_mirror()
+        assert result["pages"] == 1
+        async with SessionLocal() as db:
+            head = await ton_head.read_head(db, TREASURY_MIRROR_HEAD_KEY)
+        assert head is None, "неполный догон не имеет права записывать голову"
+    finally:
+        await _wipe_mirror()
+
+
+async def test_mirror_reset_clears_head_fingerprint(ton_mirror) -> None:
+    probe = ton_head.HeadProbe(lt=80_000, hash="reset-head", source="tonapi", ok=True)
+    await _seed_bootstrapped_mirror(probe.lt, probe=probe)
+    try:
+        await reset_treasury_mirror()
+        async with SessionLocal() as db:
+            assert await ton_head.read_head(db, TREASURY_MIRROR_HEAD_KEY) is None
+            assert await ton_head.read_check(db, TREASURY_MIRROR_HEAD_CHECK_KEY) is None
+    finally:
+        await _wipe_mirror()
+
 
 
 async def test_bootstrap_against_toncenter_fallback(ton_mirror, monkeypatch) -> None:

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 
 # Синглтон кошелька казначея: подключение к лайтсерверам дорогое, держим одно.
@@ -45,6 +46,14 @@ _DISPATCH_LOCK = asyncio.Lock()
 # сверка думает «перевода нет». Глубина покрытия задаётся настройками
 # payout_reconcile_history_seconds / payout_reconcile_max_pages.
 _RECONCILE_PAGE_LIMIT = 256
+# Узкое окно для ожидания memo после вещания: (лимит страницы, бюджет страниц)
+# или None — обычное глубокое окно сверки. ContextVar, а не временная подмена
+# константы: ожидание живёт в своей задаче и не сужает параллельную сверку
+# очереди (та по-прежнему обязана видеть всё окно). Мелкие страницы здесь
+# достаточны: только что отправленный перевод лежит на самой голове истории.
+RECONCILE_SCAN_OVERRIDE: ContextVar[tuple[int, int] | None] = ContextVar(
+    "reconcile_scan_override", default=None
+)
 # Шаг пагинации: страница шагает НЕ на весь лимит, а с перекрытием хвоста
 # (16 записей). В живой казне между двумя запросами может прийти новая
 # транзакция, и граница ровно «128...256» сползут: memo на стыке уедет за край

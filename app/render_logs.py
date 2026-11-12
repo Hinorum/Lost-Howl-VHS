@@ -101,39 +101,36 @@ def scan_messages(messages: list[str]) -> dict[str, Any]:
     Секреты в вердикт не попадают: в него идёт имя категории, число строк и
     номер первой найденной строки (без содержимого) — иначе проверка сама
     стала бы утечкой.
+
+    Текст строки приводится к нижнему регистру РОВНО один раз (раньше рядом
+    с исходным списком жил второй список `haystacks` — двойная память на
+    весь объём логов). Иглы тоже опускаются заранее, чтобы не делать это
+    на каждой строке.
     """
     hits: dict[str, int] = {}
     samples: dict[str, int] = {}
-    haystacks = [message.lower() for message in messages]
-    for label, secret in _secrets():
-        needle = secret.lower()
-        count = 0
-        first = 0
-        for index, text in enumerate(haystacks, 1):
-            if needle in text:
-                count += 1
-                if not first:
-                    first = index
-        if count:
-            hits[label] = count
-            samples[label] = first
-    # Мнемоника: кроме всей фразы — три слова подряд (частая утечка).
-    for label, field in (("treasury_mnemonic", "treasury_mnemonic"), ("treasury_testnet_mnemonic", "treasury_testnet_mnemonic")):
+    needles = [(label, secret.lower()) for label, secret in _secrets()]
+    fragments_by_label: dict[str, list[str]] = {}
+    for label, field in (
+        ("treasury_mnemonic", "treasury_mnemonic"),
+        ("treasury_testnet_mnemonic", "treasury_testnet_mnemonic"),
+    ):
         secret = str(getattr(settings, field, "") or "")
-        fragments = _mnemonic_fragments(secret)
-        if not fragments:
-            continue
-        count = 0
-        first = 0
-        for index, text in enumerate(haystacks, 1):
-            if any(fragment.lower() in text for fragment in fragments):
-                count += 1
-                if not first:
-                    first = index
-        if count:
-            # Считаем отдельно: полная фраза входит в подсчёт фрагментов.
-            hits[label] = hits.get(label, 0) + count
-            samples.setdefault(label, first)
+        fragments = [fragment.lower() for fragment in _mnemonic_fragments(secret)]
+        if fragments:
+            fragments_by_label[label] = fragments
+    for index, message in enumerate(messages, 1):
+        text = message.lower()
+        for label, needle in needles:
+            if needle in text:
+                hits[label] = hits.get(label, 0) + 1
+                samples.setdefault(label, index)
+        # Мнемоника: кроме всей фразы — три слова подряд (частая утечка).
+        # Полная фраза входит в подсчёт фрагментов, как и раньше.
+        for label, fragments in fragments_by_label.items():
+            if any(fragment in text for fragment in fragments):
+                hits[label] = hits.get(label, 0) + 1
+                samples.setdefault(label, index)
     return {"hits": hits, "samples": samples, "scanned": len(messages)}
 
 

@@ -23,6 +23,7 @@ from aiogram import Bot
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import ton_head as _head
 from app.config import settings
 from app.core.processed import KIND_REFUND, KIND_STAKE, transfer_claim_kind
 from app.core.registry import BEAT_KEY as BEAT_KEY
@@ -131,6 +132,8 @@ from app.ton_watch.state import (  # noqa: F401
     _load_stuck,
     _read_cursor,
     _read_cursor_raw,
+    _read_head,
+    _read_head_check,
     _read_scan_boost,
     _read_scan_gap,
     _read_stuck,
@@ -138,6 +141,7 @@ from app.ton_watch.state import (  # noqa: F401
     _reset_scan_state,
     _write_beat,
     _write_cursor,
+    _write_head,
     _write_scan_gap,
     _write_source,
     _write_stuck,
@@ -769,14 +773,24 @@ async def _heal_stuck_transfers(bot: Bot | None = None) -> int:
             await _write_stuck(session, stuck)
     return healed
 
-async def _watch_state_read(session: AsyncSession) -> tuple[int, int, dict, int]:
-    """Состояние цикла watcher'а: курсор, stuck-список, буст сканирования."""
+async def _watch_state_read(
+    session: AsyncSession,
+) -> tuple[int, int, dict, int, dict | None, str | None, dict | None]:
+    """Состояние цикла watcher'а: курсор, stuck, буст, голова и дыра.
+
+    Голова и её метка времени нужны дешёвому зонду: по ним решается, можно ли
+    пропустить полный проход истории. Дыра прошлого цикла (SCAN_GAP) — тоже
+    стоп-сигнал: пока окно не вычитано, пропускать нельзя.
+    """
     await _migrate_wallet_formats(session)
     since = await _read_cursor(session)
     raw_cursor = await _read_cursor_raw(session)
     stuck = await _read_stuck(session)
     scan_boost = await _read_scan_boost(session)
-    return since, raw_cursor, stuck, scan_boost
+    head = await _read_head(session)
+    head_check = await _read_head_check(session)
+    scan_gap = await _read_scan_gap(session)
+    return since, raw_cursor, stuck, scan_boost, head, head_check, scan_gap
 
 
 async def _watch_process_batch(
@@ -841,8 +855,13 @@ async def _watch_persist_cursor(
     raw_cursor: int,
     stuck: dict,
     processed_through: int,
-) -> None:
+) -> int:
     """Запись курсора цикла watcher'а с защитой от потери/залипания окна.
+
+    Возвращает эффективный курсор после цикла: его же запоминает отпечаток
+    головы. Без возврата отпечаток хранил бы предпроходное значение и каждый
+    следующий цикл видел бы «курсор изменился» — то есть пропуск не работал
+    бы никогда после первого же нового перевода.
 
     Курсор — нижняя граница окна, прочитанного ЦЕЛИКОМ. Полный проход даёт
     processed_through (самая свежая обработанная транзакция). Усечённый по
@@ -880,6 +899,8 @@ async def _watch_persist_cursor(
             for record in expired:
                 record["reported"] = True
         await _write_cursor(session, cursor_candidate)
+        return cursor_candidate
+    return raw_cursor
 
 
 async def _watch_persist_stuck(session: AsyncSession, *, api_ok: bool, stuck: dict) -> None:
@@ -933,9 +954,106 @@ async def _watch_heal_stuck(bot: Bot | None) -> int:
     return await _heal_stuck_transfers(bot)
 
 
+def _watch_probe_allowed(
+    *,
+    stuck: dict,
+    scan_boost: int,
+    scan_gap: dict | None,
+) -> bool:
+    """Стоит ли вообще тратить запрос на зонд головы в этом цикле.
+
+    Зонд нужен и для пропуска, и для записи отпечатка после полного прохода
+    (в том числе первого и страховочного). Поэтому он выполняется всегда,
+    когда контур здоров; при stuck/дыре/бусте полный проход и так неизбежен,
+    и лишний запрос не нужен.
+    """
+    if not settings.ton_head_probe_enabled:
+        return False
+    if stuck or scan_gap is not None or scan_boost != 1:
+        return False
+    return True
+
+
+def _watch_skip_by_head(
+    *,
+    head: dict | None,
+    head_check: str | None,
+    raw_cursor: int,
+    probe: _head.HeadProbe | None,
+) -> bool:
+    """Можно ли пропустить полный проход по неизменной голове.
+
+    Пропуск разрешён только в полностью здоровом простое: голова записана
+    после полного прохода того же курсора, ещё не устарела и совпала с
+    зондом. Любое отклонение — полный проход: экономия трафика не стоит
+    пропущенного перевода.
+    """
+    if probe is None or not probe.ok or head is None:
+        return False
+    if int(head.get("cursor") or 0) != raw_cursor:
+        # Ручной сброс/сдвиг курсора инвалидирует отпечаток: окно между
+        # старой головой и новым курсором ещё не прочитано.
+        return False
+    if not _head.head_is_fresh(head_check, settings.watch_full_rescan_seconds):
+        return False
+    return _head.same_head(head, probe)
+
+
+async def _watch_confirm_side_effects(bot: Bot | None) -> None:
+    """Слои, не зависящие от новых переводов: подтверждение отложенных ставок
+    и актуализация банка дня. Выполняются и в цикле-пропуске, чтобы дешёвый
+    простой не замедлял подтверждение ставок."""
+    try:
+        await confirm_aged_pending(bot)
+    except Exception:
+        logger.exception("Подтверждение отложенных ставок упало (не мешает циклу)")
+    # Свежие подтверждения выросли банк дня, а в постах-статусах он застыл:
+    # правим их актуальным банком, чтобы игроки не гоняли /today за цифрой.
+    # Необязательный слой: сбой правки не должен рвать цикл watcher'а.
+    try:
+        from app.broadcast import refresh_day_bank
+
+        await refresh_day_bank(bot)
+    except Exception:
+        logger.exception("Актуализация банка дня в постах упала (не мешает циклу)")
+
+
 async def watch_once(bot: Bot | None = None) -> None:
     async with SessionLocal() as session:
-        since, raw_cursor, stuck, scan_boost = await _watch_state_read(session)
+        (
+            since,
+            raw_cursor,
+            stuck,
+            scan_boost,
+            head,
+            head_check,
+            scan_gap,
+        ) = await _watch_state_read(session)
+    probe: _head.HeadProbe | None = None
+    if _watch_probe_allowed(
+        stuck=stuck,
+        scan_boost=scan_boost,
+        scan_gap=scan_gap,
+    ):
+        probe = await _head.fetch_head_probe()
+        if _watch_skip_by_head(
+            head=head,
+            head_check=head_check,
+            raw_cursor=raw_cursor,
+            probe=probe,
+        ):
+            # Голова та же, окно курсора не двигалось: сверху новых переводов
+            # нет, полная страница истории (≈70 КБ) не нужна. Сердцебиение и
+            # подтверждение ставок всё равно обновляем.
+            async with SessionLocal() as session:
+                await _watch_heartbeat(session, probe.source, api_ok=True)
+            await _watch_confirm_side_effects(bot)
+            logger.debug(
+                "Цикл watcher: голова не изменилась (lt %d, источник %s) — проход пропущен",
+                probe.lt,
+                probe.source,
+            )
+            return
     transfers, api_ok, source, gap_at, parse_fail_count = await _collect_transfers(
         since, _MAX_PAGES * scan_boost
     )
@@ -952,21 +1070,9 @@ async def watch_once(bot: Bot | None = None) -> None:
             parse_fail_count,
         )
     processed_through = await _watch_process_batch(transfers, bot, stuck, since)
-    try:
-        await confirm_aged_pending(bot)
-    except Exception:
-        logger.exception("Подтверждение отложенных ставок упало (не мешает циклу)")
-    # Свежие подтверждения выросли банк дня, а в постах-статусах он застыл:
-    # правим их актуальным банком, чтобы игроки не гоняли /today за цифрой.
-    # Необязательный слой: сбой правки не должен рвать цикл watcher'а.
-    try:
-        from app.broadcast import refresh_day_bank
-
-        await refresh_day_bank(bot)
-    except Exception:
-        logger.exception("Актуализация банка дня в постах упала (не мешает циклу)")
+    await _watch_confirm_side_effects(bot)
     async with SessionLocal() as session:
-        await _watch_persist_cursor(
+        effective_cursor = await _watch_persist_cursor(
             session,
             api_ok=api_ok,
             since=since,
@@ -977,6 +1083,26 @@ async def watch_once(bot: Bot | None = None) -> None:
         )
         await _watch_persist_stuck(session, api_ok=api_ok, stuck=stuck)
         await _watch_heartbeat(session, source, api_ok=api_ok)
+        # Отпечаток головы — только после полного здорового прохода, который
+        # читал тот же источник, что и зонд. Иначе следующий цикл мог бы
+        # пропустить окно, которое этот проход не видел (например, зонд по
+        # TonAPI, а страницы — по отстающему Toncenter).
+        if (
+            probe is not None
+            and probe.ok
+            and probe.source == source
+            and api_ok
+            and gap_at is None
+            and parse_fail_count == 0
+            and not stuck
+        ):
+            await _write_head(
+                session,
+                lt=probe.lt,
+                head_hash=probe.hash,
+                source=probe.source,
+                cursor=effective_cursor,
+            )
     await _watch_scan_gap(api_ok=api_ok, since=since, gap_at=gap_at, scan_boost=scan_boost)
     try:
         # Авто-лечение брошенных сбойных переводов: не даём деньгам зависать
