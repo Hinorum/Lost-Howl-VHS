@@ -257,154 +257,215 @@ def _scheduler_lock_held() -> bool:
         return False
 
 
+async def _snapshot_counts(
+    session,
+) -> tuple[int, int, dict, dict, int, datetime | None]:
+    """Очередь выплат и живые ставки из снимка /health.
+
+    Возвращает (queue_count, dead_count, pending_by_kind, dead_by_kind,
+    pending_stakes, oldest_pending): dead_letter_payouts — счётчик failed,
+    oldest_payout_age считается по oldest_pending в /health.
+    """
+    queue_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Payout)
+            .where(Payout.status.in_(["pending", "sending"]))
+        )
+    ).scalar_one()
+    oldest_pending = (
+        await session.execute(
+            select(func.min(Payout.created_at)).where(
+                Payout.status.in_(["pending", "sending"])
+            )
+        )
+    ).scalar_one()
+    dead_count = (
+        await session.execute(
+            select(func.count()).select_from(Payout).where(Payout.status == "failed")
+        )
+    ).scalar_one()
+    # Разбивка очереди по типу выплаты: призы игрокам против возвратов ставок
+    # и долей казны. Именно здесь видно, сколько игроков не получили ставку
+    # обратно, не ныряя в /payouts.
+    pending_by_kind = {
+        kind: count
+        for kind, count in (
+            await session.execute(
+                select(Payout.kind, func.count())
+                .where(Payout.status.in_(["pending", "sending"]))
+                .group_by(Payout.kind)
+            )
+        ).all()
+    }
+    dead_by_kind = {
+        kind: count
+        for kind, count in (
+            await session.execute(
+                select(Payout.kind, func.count())
+                .where(Payout.status == "failed")
+                .group_by(Payout.kind)
+            )
+        ).all()
+    }
+    # Необработанные переводы: ставки, что увидели в цепочке, но ещё не
+    # подтвердили по возрасту (или зависли). Прямой ответ на «сколько
+    # переводов висит в необработанных». Читаем из БД всегда: свёрка
+    # казны (/panel) обязана показывать правду и при выключенных деньгах.
+    pending_stakes = (
+        await session.execute(
+            select(func.count()).select_from(Stake).where(Stake.status == "pending")
+        )
+    ).scalar_one()
+    return queue_count, dead_count, pending_by_kind, dead_by_kind, pending_stakes, oldest_pending
+
+
+async def _snapshot_health_state(session) -> tuple[str, int, list[str], float | None, list[dict]]:
+    """Статус, счётчик тиковых падений и карта проблем для /health."""
+    # Счётчик падений главного тика: битие может быть свежим (сбой короче 5 минут),
+    # а цикл при этом не отработал ни разу. Текст последней ошибки в /health
+    # не отдаём — эндпоинт бывает без токена.
+    try:
+        tick_failures = int(await _get_state(session, TICK_FAIL_KEY) or "0")
+    except ValueError:
+        tick_failures = 0
+    # Вердикт последней проверки аномалий из кэша sweeper'а, а не результат
+    # опроса мониторинга: /health не должен сам ходить в сеть.
+    problems_raw = await _get_state(session, OPS_PROBLEMS_KEY)
+    problems = _parse_problems(problems_raw)
+    track = _load_track(await _get_state(session, OPS_ALERT_TRACK_KEY))
+    keys = {_problem_key(problem) for problem in problems}
+    # Честный статус: при живых проблемах (очередь выплат стоит, watcher
+    # молчит) или серии падений тика /health не притворяется «ok» — статус
+    # виден мониторингу и хранителю. HTTP-код остаётся 200: Render должен
+    # считать процесс живым (деградация лечится, а не рестартивается).
+    health_status = "degraded" if (problems or tick_failures > 0) else "ok"
+    return (
+        health_status,
+        tick_failures,
+        problems,
+        _age_seconds(await _get_state(session, OPS_PROBLEMS_AT_KEY)),
+        _detail([(key, track[key]) for key in sorted(track) if key in keys]),
+    )
+
+
+async def _snapshot_round(session) -> dict | None:
+    """Последний раунд для /health: id, день, статус, окно голосования."""
+    latest = (
+        await session.execute(select(Round).order_by(Round.day_index.desc()).limit(1))
+    ).scalar_one_or_none()
+    if latest is None:
+        return None
+    return {
+        "id": latest.id,
+        "day_index": latest.day_index,
+        "status": latest.status.value if isinstance(latest.status, RoundStatus) else str(latest.status),
+        "voting_ends_at": latest.voting_ends_at.isoformat(),
+    }
+
+
+async def _snapshot_announce(session) -> dict:
+    """Аудитория рассылки для /health: что должно было получить анонс дня.
+
+    «Новости дня некому показать» обязано быть видно в /health и /ops без
+    доступа к прод-базе: раньше единственный способ это узнать был
+    SQL-запрос к чужому Postgres'у, а молчание рассылки выглядело как
+    поломка кода.
+    """
+    from app.broadcast import announce_audience
+
+    audience = await announce_audience()
+    return {
+        **audience,
+        "total": audience["chats"] + audience["dm"],
+        # День, чей анонс ушёл в пустоту и ещё не снят тревогу; None —
+        # либо всё дошло, либо анонса ещё не было.
+        "empty_day": await _get_state(session, ANNOUNCE_EMPTY_DAY_KEY) or None,
+    }
+
+
+def _snapshot_env() -> dict:
+    """Диагностика окружения для /health: TON, сеть, кто ведёт игру."""
+    return {
+        "ton_enabled": bool(settings.ton_enabled),
+        "ton_network": settings.active_network,
+        # Кто ведёт игру: лок планировщик держит этот процесс или нет.
+        # Раньше состояние лока было видно только в коде: оператор видел
+        # «всё хорошо», а игру вёл второй инстанс.
+        "scheduler_lock": "held" if _scheduler_lock_held() else "lost",
+    }
+
+
 async def snapshot() -> dict:
     """Состояние игры одним словарём для /health (мониторинг Render/UptimeRobot)."""
     async with SessionLocal() as session:
-        latest = (
-            await session.execute(select(Round).order_by(Round.day_index.desc()).limit(1))
-        ).scalar_one_or_none()
-        queue_count = (
-            await session.execute(
-                select(func.count())
-                .select_from(Payout)
-                .where(Payout.status.in_(["pending", "sending"]))
-            )
-        ).scalar_one()
-        oldest_pending = (
-            await session.execute(
-                select(func.min(Payout.created_at)).where(
-                    Payout.status.in_(["pending", "sending"])
-                )
-            )
-        ).scalar_one()
-        dead_count = (
-            await session.execute(
-                select(func.count()).select_from(Payout).where(Payout.status == "failed")
-            )
-        ).scalar_one()
-        # Разбивка очереди по типу выплаты: призы игрокам против возвратов ставок
-        # и долей казны. Именно здесь видно, сколько игроков не получили ставку
-        # обратно, не ныряя в /payouts.
-        pending_by_kind = {
-            kind: count
-            for kind, count in (
-                await session.execute(
-                    select(Payout.kind, func.count())
-                    .where(Payout.status.in_(["pending", "sending"]))
-                    .group_by(Payout.kind)
-                )
-            ).all()
-        }
-        dead_by_kind = {
-            kind: count
-            for kind, count in (
-                await session.execute(
-                    select(Payout.kind, func.count())
-                    .where(Payout.status == "failed")
-                    .group_by(Payout.kind)
-                )
-            ).all()
-        }
-        # Необработанные переводы: ставки, что увидели в цепочке, но ещё не
-        # подтвердили по возрасту (или зависли). Прямой ответ на «сколько
-        # переводов висит в необработанных». Читаем из БД всегда: свёрка
-        # казны (/panel) обязана показывать правду и при выключенных деньгах.
-        pending_stakes = (
-            await session.execute(
-                select(func.count()).select_from(Stake).where(Stake.status == "pending")
-            )
-        ).scalar_one()
-        cursor_iso = await _get_state(session, BEAT_KEY)
-        # Счётчик падений главного тика: битие может быть свежим (сбой
-        # короче 5 минут), а цикл при этом не отработал ни разу. Текст
-        # последней ошибки в /health не отдаём — эндпоинт бывает без токена.
+        queue_count, dead_count, pending_by_kind, dead_by_kind, pending_stakes, oldest_pending = (
+            await _snapshot_counts(session)
+        )
+        health_status, tick_failures, problems, problems_age, problem_details = (
+            await _snapshot_health_state(session)
+        )
+        round_payload = await _snapshot_round(session)
+        announce = await _snapshot_announce(session)
+        env = _snapshot_env()
+
+        oldest_payout_age: float | None = None
+        if oldest_pending is not None:
+            moment = oldest_pending if oldest_pending.tzinfo else oldest_pending.replace(tzinfo=UTC)
+            oldest_payout_age = max(0.0, (_now() - moment).total_seconds())
+
+        watcher_beat_age: float | None = None
+        watcher_source: str | None = None
+        if settings.ton_enabled:
+            watcher_beat_age = _age_seconds(await _get_state(session, BEAT_KEY))
+            # Локальный импорт: ton_watch тянет ставки/выплаты, ops должен
+            # оставаться лёгким для /health при любых состояниях модулей.
+            from app.ton_watch import SOURCE_KEY
+
+            watcher_source = await _get_state(session, SOURCE_KEY)
+
+        log_scrub_failures = 0
+        # Счётчик сбоев краски: локальный импорт, чтобы ops не тянул модуль
+        # логирования при старте (он ставит хендлеры на logging).
         try:
-            tick_failures = int(await _get_state(session, TICK_FAIL_KEY) or "0")
-        except ValueError:
-            tick_failures = 0
-        # Вердикт последней проверки аномалий из кэша sweeper'а, а не
-        # результат опроса мониторинга: /health не должен сам ходить в сеть.
-        problems_raw = await _get_state(session, OPS_PROBLEMS_KEY)
-        problems = _parse_problems(problems_raw)
-        track = _load_track(await _get_state(session, OPS_ALERT_TRACK_KEY))
-        keys = {_problem_key(problem) for problem in problems}
-        # Честный статус: при живых проблемах (очередь выплат стоит, watcher
-        # молчит) или серии падений тика /health не притворяется «ok» — статус
-        # виден мониторингу и хранителю. HTTP-код остаётся 200: Render должен
-        # считать процесс живым (деградация лечится, а не рестартится).
-        health_status = "degraded" if (problems or tick_failures > 0) else "ok"
+            from app.log_scrub import scrub_failures
+
+            log_scrub_failures = int(scrub_failures())
+        except Exception:
+            log_scrub_failures = 0
+
         payload = {
             "status": health_status,
             "uptime_seconds": round(time.time() - PROCESS_START, 1),
             "last_tick_age": _age_seconds(await _get_state(session, TICK_KEY)),
             "tick_failures": tick_failures,
             "problems": problems,
-            "problems_age": _age_seconds(await _get_state(session, OPS_PROBLEMS_AT_KEY)),
+            "problems_age": problems_age,
             # Сколько проблема держится и сколько раз её видели: «очередь стоит»
             # и «очередь стоит третий час» — разная срочность разбора.
-            "problem_details": _detail(
-                [(key, track[key]) for key in sorted(track) if key in keys]
-            ),
-            "round": None,
-            "payout_queue": int(queue_count),
+            "problem_details": problem_details,
+            "round": round_payload,
+            "payout_queue": queue_count,
             "payout_pending_by_kind": pending_by_kind,
             "payout_dead_by_kind": dead_by_kind,
-            "pending_stakes": int(pending_stakes),
-            "oldest_payout_age": None,
-            "dead_letter_payouts": int(dead_count),
-            "watcher_beat_age": None,
-            "watcher_source": None,
-            # Счётчик сбоев краски секретов в логах (log_scrub): ненулевое
-            # значение означает, что запись лога не прошла через форматтер
-            # и могла унести мнемонику в текст записи. Ноль — единственное
-            # доказательство, доступное без доступа к логам Render.
-            "log_scrub_failures": 0,
+            "pending_stakes": pending_stakes,
+            "oldest_payout_age": oldest_payout_age,
+            "dead_letter_payouts": dead_count,
+            "watcher_beat_age": watcher_beat_age,
+            "watcher_source": watcher_source,
+            # Счётчик сбоев краски: ненулевое значение означает, что запись
+            # лога не прошла через форматтер и могла унести мнемонику в текст
+            # записи. Ноль — единственное доказательство, доступное без
+            # доступа к логам Render.
+            "log_scrub_failures": log_scrub_failures,
             # Диагностика окружения: видно, что реально дошло до процесса.
-            "ton_enabled": bool(settings.ton_enabled),
-            "ton_network": settings.active_network,
-            # Кто ведёт игру: лок планировщика держит этот процесс или нет.
-            # Раньше состояние лока было видно только в коде: оператор видел
-            # «всё хорошо», а игру вёл второй инстанс.
-            "scheduler_lock": "held" if _scheduler_lock_held() else "lost",
-        }
-        if oldest_pending is not None:
-            moment = oldest_pending if oldest_pending.tzinfo else oldest_pending.replace(tzinfo=UTC)
-            payload["oldest_payout_age"] = max(0.0, (_now() - moment).total_seconds())
-        if settings.ton_enabled:
-            payload["watcher_beat_age"] = _age_seconds(cursor_iso)
-            # Локальный импорт: ton_watch тянет ставки/выплаты, ops должен
-            # оставаться лёгким для /health при любых состояниях модулей.
-            from app.ton_watch import SOURCE_KEY
-
-            payload["watcher_source"] = await _get_state(session, SOURCE_KEY)
-        if latest is not None:
-            payload["round"] = {
-                "id": latest.id,
-                "day_index": latest.day_index,
-                "status": latest.status.value if isinstance(latest.status, RoundStatus) else str(latest.status),
-                "voting_ends_at": latest.voting_ends_at.isoformat(),
-            }
-        # Счётчик сбоев краски: локальный импорт, чтобы ops не тянул модуль
-        # логирования при старте (он ставит хендлеры на logging).
-        try:
-            from app.log_scrub import scrub_failures
-
-            payload["log_scrub_failures"] = int(scrub_failures())
-        except Exception:
-            payload["log_scrub_failures"] = 0
-        # Аудитория рассылки — прямо в снимке. «Новости дня некому показать»
-        # обязано быть видно в /health и /ops без доступа к прод-базе: раньше
-        # единственный способ это узнать был SQL-запрос к чужому Postgres'у,
-        # а молчание рассылки выглядело как поломка кода.
-        from app.broadcast import announce_audience
-
-        audience = await announce_audience()
-        payload["announce_audience"] = {
-            **audience,
-            "total": audience["chats"] + audience["dm"],
-            # День, чей анонс ушёл в пустоту и ещё не снят тревогой; None —
-            # либо всё дошло, либо анонса ещё не было.
-            "empty_day": await _get_state(session, ANNOUNCE_EMPTY_DAY_KEY) or None,
+            **env,
+            # Аудитория рассылки — прямо в снимке. «Новости дня некому
+            # показать» обязано быть видно в /health и /ops без доступа к
+            # прод-базе: раньше единственный способ это узнать был
+            # SQL-запрос к чужому Postgres'у, а молчание рассылки выглядело
+            # как поломка кода.
+            "announce_audience": announce,
         }
         return payload
 
