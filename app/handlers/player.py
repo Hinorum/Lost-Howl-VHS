@@ -633,62 +633,137 @@ async def _menu_invite(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("vote:"))
-async def on_vote(callback: CallbackQuery) -> None:
+async def _parse_vote_selection(callback: CallbackQuery) -> tuple[int, int] | None:
+    """Разбор и валидация callback_data голосования: (round_id, position).
+
+    None — ошибка уже отвечена игроку через callback.answer(...).
+    """
     parts = (callback.data or "").split(":")
     if len(parts) != 3:
         await callback.answer("Некорректный выбор.", show_alert=True)
-        return
+        return None
     _, raw_round_id, raw_position = parts
     try:
         round_id = int(raw_round_id)
         position = int(raw_position)
     except ValueError:
         await callback.answer("Некорректный выбор.", show_alert=True)
-        return
+        return None
     if position not in CARD_POSITIONS:
         # POSITIONS[position] ниже бросил бы IndexError (а отрицательный индекс
         # молча взял бы чужую сцену) и оставил кнопку со спиннером. cast_vote и
-        # change_vote такую позицию всё равно отвергают — отвечаем тем же.
+        # change_vote такие позиции всё равно отвергают — отвечаем тем же.
         await callback.answer(
             f"{warn_mark('invalid')} Такого варианта нет в кадре дня.",
             show_alert=True,
         )
+        return None
+    return round_id, position
+
+
+async def _vote_throttle_hold(session, user_id: int) -> bool:
+    """Голос игрока блокирует троттлинг (для админа bypass'а не нужен)."""
+    from app.handlers.wallet import _wallet_throttled
+
+    if user_id in settings.admin_id_set:
+        return False
+    return await _wallet_throttled(session, user_id, "vote_cd")
+
+
+async def _vote_throttle_reply(session, callback: CallbackQuery, round_id: int) -> None:
+    """Троттлинг голосования: отвечаем игроку его текущим (или отсутствующим) выбором."""
+    player = await upsert_player(session, callback.from_user)
+    round_row = await get_active_round(session)
+    if round_row is None or round_row.id != round_id:
+        await callback.answer("Этот день уже закрыт.", show_alert=True)
         return
+    current = await get_vote(session, round_row.id, player.id)
+    if current is None:
+        await callback.answer(
+            f"{hint_mark('wallet-throttle')} Голос ещё не принят — подожди немного.",
+            show_alert=True,
+        )
+        return
+    # Отвечаем тем, что игрок уже выбрал: троттлинг не должен
+    # выглядеть как «выбор потерялся».
+    held = scene_label(
+        {card.position: card.title for card in round_row.cards},
+        current.card_position,
+    )
+    await callback.answer(
+        f"{hint_mark('wallet-throttle')} Твой выбор: {held}. "
+        "Подожди немного, чтобы сменить.",
+        show_alert=True,
+    )
+
+
+async def _cast_player_vote(
+    session, round_row, player_id: int, position: int
+) -> tuple[str, str]:
+    """Кладёт голос игрока и возвращает (result, outcome).
+
+    outcome заполнен только при already+грант: списание и перемотка пути.
+    """
+    result = await cast_vote(session, round_row, player_id, position)
+    outcome = ""
+    if result == "already":
+        # Есть оплаченный грант — списываем и меняем путь прямо здесь.
+        # Флаг REVOTE_ENABLED закрывает ПРОДАЖУ перемотки, а не уже
+        # оплаченное право: игрок заплатил, и его грант не должен
+        # замерзать до закрытия дня (тогда он сгорает, а деньги остаются
+        # в казне без возврата).
+        vote = await get_vote(session, round_row.id, player_id)
+        current_position: int | None = vote.card_position if vote else None
+        if (
+            round_row.status == RoundStatus.OPEN
+            and current_position is not None
+            and current_position != position
+        ):
+            outcome = await change_vote(session, round_row, player_id, position)
+    return result, outcome
+
+
+async def _send_vote_dm(session, callback: CallbackQuery, player, round_row, label: str) -> None:
+    """Подтверждение выбора в личку отдельным сообщением: по кнопке (в группе или личке)
+    алерт исчезает, а «мой выбор дня» должно оставаться видимым до конца дня.
+
+    Молчим, если игрок ещё не открывал диалог с ботом — алерт был и так показан.
+    """
+    if not settings.player_dm:
+        return
+    try:
+        from app.handlers.wallet import _post_vote_stake_markup
+
+        text = f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены."
+        markup = await _post_vote_stake_markup(session, player, round_row)
+        if markup is not None:
+            text += (
+                "\n\n💳 Ставку на выбор вноси прямо здесь: кнопка кошелька "
+                "откроет перевод с подставленным адресом, а «Скопировать "
+                "адрес» пригодится для любого другого кошелька."
+            )
+        bot = callback.bot
+        if bot is not None:
+            await bot.send_message(
+                callback.from_user.id,
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+    except Exception as exc:
+        logger.debug("Личное подтверждение выбора игроку %s не доставлено: %s", callback.from_user.id, exc)
+
+
+async def on_vote(callback: CallbackQuery) -> None:
+    selection = await _parse_vote_selection(callback)
+    if selection is None:
+        return
+    round_id, position = selection
     label = POSITIONS[position]
     async with SessionLocal() as session:
-        # Кулдаун на нажатие. Голосование — основное действие игры, поэтому окно
-        # короткое (3 с): передумать и вернуться игрок должен успеть, а поток
-        # нажатий от скрипт-клиента (у него нет лимита на тапы, в отличие от
-        # обычного клиента) — нет. Повтор по тому же пути и так безопасен:
-        # cast_vote возвращает already, и второй голос не создаётся.
-        if callback.from_user.id not in settings.admin_id_set:
-            from app.handlers.wallet import _wallet_throttled
-
-            if await _wallet_throttled(session, callback.from_user.id, "vote_cd"):
-                player = await upsert_player(session, callback.from_user)
-                round_row = await get_active_round(session)
-                if round_row is None or round_row.id != round_id:
-                    await callback.answer("Этот день уже закрыт.", show_alert=True)
-                    return
-                current = await get_vote(session, round_row.id, player.id)
-                if current is None:
-                    await callback.answer(
-                        f"{hint_mark('wallet-throttle')} Голос ещё не принят — подожди немного.",
-                        show_alert=True,
-                    )
-                    return
-                # Отвечаем тем, что игрок уже выбрал: троттлинг не должен
-                # выглядеть как «выбор потерялся».
-                held = scene_label(
-                    {card.position: card.title for card in round_row.cards},
-                    current.card_position,
-                )
-                await callback.answer(
-                    f"{hint_mark('wallet-throttle')} Твой выбор: {held}. "
-                    "Подожди немного, чтобы сменить.",
-                    show_alert=True,
-                )
-                return
+        if await _vote_throttle_hold(session, callback.from_user.id):
+            await _vote_throttle_reply(session, callback, round_id)
+            return
         player = await upsert_player(session, callback.from_user)
         round_row = await get_active_round(session)
         if round_row is None or round_row.id != round_id:
@@ -699,79 +774,44 @@ async def on_vote(callback: CallbackQuery) -> None:
         label = scene_label(
             {card.position: card.title for card in round_row.cards}, position
         )
-        result = await cast_vote(session, round_row, player.id, position)
-        outcome = ""
-        if result == "already":
-            vote = await get_vote(session, round_row.id, player.id)
-            current_position: int | None = vote.card_position if vote else None
-            if (
-                round_row.status == RoundStatus.OPEN
-                and current_position is not None
-                and current_position != position
-            ):
-                # Есть оплаченный грант — списываем и меняем путь прямо здесь.
-                # Флаг REVOTE_ENABLED закрывает ПРОДАЖУ перемотки, а не уже
-                # оплаченное право: игрок заплатил, и его грант не должен
-                # замерзать до закрытия дня (тогда он сгорает, а деньги остаются
-                # в казне без возврата).
-                outcome = await change_vote(session, round_row, player.id, position)
-        elif result == "ok":
+        result, outcome = await _cast_player_vote(session, round_row, player.id, position)
+        if result == "ok":
             # Подтверждение выбора в личку отдельным сообщением: по кнопке
             # (в группе или личке) алерт исчезает, а «мой выбор дня» должно
             # оставаться видимым до конца дня. Молчим, если игрок ещё не
             # открывал диалог с ботом — алерт был и так показан.
-            if settings.player_dm:
-                try:
-                    from app.handlers.wallet import _post_vote_stake_markup
-
-                    text = f"Твой выбор этого дня: {label}. Итоги — после закрытия сцены."
-                    markup = await _post_vote_stake_markup(session, player, round_row)
-                    if markup is not None:
-                        text += (
-                            "\n\n💳 Ставку на выбор вноси прямо здесь: кнопка кошелька "
-                            "откроет перевод с подставленным адресом, а «Скопировать "
-                            "адрес» пригодится для любого другого кошелька."
+            await _send_vote_dm(session, callback, player, round_row, label)
+        if result == "already":
+            if outcome == "ok":
+                # Есть оплаченный грант — списываем и меняем путь прямо здесь.
+                await callback.answer(
+                    f"Грант списан. Выбор изменён на {label}.",
+                    show_alert=True,
+                )
+                return
+            if outcome == "no_grant":
+                # Обещаем /change только когда он реально продаётся: в бесплатной
+                # версии и в день без ставок команда безусловно отказывает.
+                hint = "Твой выбор уже записан."
+                if getattr(round_row, "money_mode", True) is False:
+                    hint += " Сегодня версия без ставок — кадр не перемотать."
+                elif settings.ton_enabled and settings.revote_enabled:
+                    if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
+                        hint = (
+                            "Твой выбор уже записан. Перемотка кадра платная — "
+                            "через личку бота: /change."
                         )
-                    bot = callback.bot
-                    if bot is not None:
-                        await bot.send_message(
-                            callback.from_user.id,
-                            text,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=markup,
+                    else:
+                        hint = (
+                            f"Твой выбор уже записан. Перемотать кадр — "
+                            f"{settings.revote_ton:g} Gram, команда /change."
                         )
-                except Exception as exc:
-                    logger.debug("Личное подтверждение выбора игроку %s не доставлено: %s", callback.from_user.id, exc)
-    if result == "already":
-        if outcome == "ok":
-            await callback.answer(
-                f"Грант списан. Выбор изменён на {label}.",
-                show_alert=True,
-            )
-            return
-        if outcome == "no_grant":
-            # Обещаем /change только когда он реально продаётся: в бесплатной
-            # версии и в день без ставок команда безусловно отказывает.
-            hint = "Твой выбор уже записан."
-            if getattr(round_row, "money_mode", True) is False:
-                hint += " Сегодня версия без ставок — кадр не перемотать."
-            elif settings.ton_enabled and settings.revote_enabled:
-                if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
-                    hint = (
-                        "Твой выбор уже записан. Перемотка кадра платная — "
-                        "через личку бота: /change."
-                    )
-                else:
-                    hint = (
-                        f"Твой выбор уже записан. Перемотать кадр — "
-                        f"{settings.revote_ton:g} Gram, команда /change."
-                    )
-            await callback.answer(hint[:200], show_alert=True)
-            return
-    texts = {
-        "ok": f"{ok_mark(str(round_id))} Выбор {label} принят. Итоги скрыты до конца дня.",
-        "already": f"{hint_mark('already')} Ты уже сделал выбор сегодня.",
-        "closed": f"{warn_mark('closed')} День закрыт — кадр фиксируется, итоги скоро.",
-        "invalid": f"{warn_mark('invalid')} Такого варианта нет в кадре дня.",
-    }
-    await callback.answer(texts.get(result, "Неизвестный ответ."), show_alert=True)
+                await callback.answer(hint[:200], show_alert=True)
+                return
+        texts = {
+            "ok": f"{ok_mark(str(round_id))} Выбор {label} принят. Итоги скрыты до конца дня.",
+            "already": f"{hint_mark('already')} Ты уже сделал выбор сегодня.",
+            "closed": f"{warn_mark('closed')} День закрыт — кадр фиксируется, итоги скоро.",
+            "invalid": f"{warn_mark('invalid')} Такого варианта нет в кадре дня.",
+        }
+        await callback.answer(texts.get(result, "Неизвестный ответ."), show_alert=True)
