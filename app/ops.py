@@ -1282,8 +1282,12 @@ async def _check_watcher(session, bot) -> None:
 
 
 
-async def _check_payouts(session, bot) -> None:
-    """Trevogi kassanevskogo kontura: ochered, dead-letter, vozvraty, stavki, stuck."""
+async def _check_queue_backlog(session, bot) -> None:
+    """Очередь выплат стоит дольше порога — тревога казначейскому контуру.
+
+    Самая частая причина «деньги в казне не уходят»: очередь не двигается.
+    Причина конкретнее, чем «стоит»: TON выключен или нет мнемоники казначея.
+    """
     oldest = (
         await session.execute(
             select(func.min(Payout.created_at)).where(
@@ -1308,7 +1312,11 @@ async def _check_payouts(session, bot) -> None:
                 f"очередь выплат стоит {age_min} мин",
                 f"⚠️ Очередь выплат не двигается {age_min} мин.{reason} Проверь казначея/сеть.",
             )
-    # 3. Dead-letter выплаты существуют — деньги ждут ручного разбора.
+
+
+# 3. Dead-letter выплаты существуют — деньги ждут ручного разбора.
+async def _check_dead_letter(session, bot) -> None:
+    """Dead-letter выплаты существуют — деньги ждут ручного разбора."""
     dead = (
         await session.execute(
             select(Payout.id, Payout.last_error).where(Payout.status == "failed").limit(20)
@@ -1326,8 +1334,12 @@ async def _check_payouts(session, bot) -> None:
             f"{', '.join(str(row_id) for row_id, _r in dead[:10])}{reason_note}. "
             "Разбор: /payouts → /payout <id> retry|spam перед сбросом игры.",
         )
-    # 3b. Возврат ставки (refund) висит неотправленным: игрок не получил
-    #     деньги обратно. Отдельный целевой алерт, а не общий «очередь стоит».
+
+
+# 3b. Возврат ставки (refund) висит неотправленным: игрок не получил
+#     деньги обратно. Отдельный целевой алерт, а не общий «очередь стоит».
+async def _check_refund_backlog(session, bot) -> None:
+    """Возврат ставки (refund) висит неотправленным: игрок не получил деньги обратно."""
     oldest_refund = (
         await session.execute(
             select(func.min(Payout.created_at)).where(
@@ -1363,9 +1375,13 @@ async def _check_payouts(session, bot) -> None:
                 "⚠️ Возврат ставки не доставлен: игрок не получил деньги "
                 f"обратно уже {age_min} мин.{tail} Разбор: /payouts",
             )
-    # 3c. Необработанные переводы-ставки висят дольше двойного окна
-    #     подтверждения — ставки копятся, никто не получает ни статус, ни
-    #     возврат. Прямой ответ на «сколько переводов не обработано».
+
+
+# 3c. Необработанные переводы-ставки висят дольше двойного окна
+#     подтверждения — ставки копятся, никто не получает ни статус, ни
+#     возврат. Прямой ответ на «сколько переводов не обработано».
+async def _check_stale_stakes(session, bot) -> None:
+    """Необработанные переводы-ставки висят дольше двойного окна подтверждения."""
     if settings.ton_enabled:
         stale_threshold = settings.stake_confirm_seconds * _STAKE_CONFIRM_STALE_MULT
         oldest_stake = (
@@ -1396,10 +1412,14 @@ async def _check_payouts(session, bot) -> None:
                     f"{pending_stakes_count} висят без подтверждения дольше "
                     "положенного. /stakes",
                 )
-    # 3d. Stuck-список watcher'а непуст — сбойные переводы зависли в казне.
-    #     Авто-лечение точит их само, но пока запись живёт, админ должен
-    #     видеть, что деньги не затерялись молча (инцидент Kote: 1 G казны
-    #     висел из-за схема-бага, а сообщения не приходило).
+
+
+# 3d. Stuck-список watcher'а непуст — сбойные переводы зависли в казне.
+#     Авто-лечение точит их само, но пока запись живёт, админ должен
+#     видеть, что деньги не затерялись молча (инцидент Kote: 1 G казны
+#     висел из-за схема-бага, а сообщения не приходило).
+async def _check_stuck_transfers(session, bot) -> None:
+    """Stuck-список watcher'а непуст — сбойные переводы зависли в казне."""
     if settings.ton_enabled:
         stuck_row = await session.get(WatcherState, STUCK_TX_KEY)
         stuck = _load_only_stuck(stuck_row.value if stuck_row is not None else None)
@@ -1416,6 +1436,17 @@ async def _check_payouts(session, bot) -> None:
                 "Авто-лечение запущено, но записи дольше часа требуют "
                 "взгляда: /blockchain",
             )
+
+
+async def _check_payouts(session, bot) -> None:
+    """Тревоги казначейского контура: очередь, dead-letter, возвраты, ставки, stuck."""
+    await _check_queue_backlog(session, bot)
+    await _check_dead_letter(session, bot)
+    await _check_refund_backlog(session, bot)
+    await _check_stale_stakes(session, bot)
+    await _check_stuck_transfers(session, bot)
+
+
 # 4. Сверка баланса казначея с учётом БД. Две беды разного рода:
 #    дефицит под очередь (пополни — и всё уйдёт само) и расхождение
 #    с ожиданиями (ручной вывод, потерянные средства, чужой доступ).
@@ -1427,8 +1458,6 @@ async def _check_payouts(session, bot) -> None:
 #      Почему не доставлено — в delivery_reason:* (кладётся только вместе
 #      с нулём): факт «не дошло» по логам не разобрать, а причина
 #      (kicked против сети на Render) решает, куда идти.
-
-
 
 
 async def _check_delivery(session, bot) -> None:
