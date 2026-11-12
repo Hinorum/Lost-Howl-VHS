@@ -220,11 +220,10 @@ def _wallet_verify_code() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
-async def _bind_wallet(message: Message, address: str) -> bool:
-    """Общая привязка адреса: для «/wallet и адрес одной строкой» и для
-    диалогового режима («пришли адрес следующим сообщением»).
+async def _bind_wallet_valid(message: Message, address: str) -> bool:
+    """Адрес проходит валидацию: похоже на Gram-кошелёк и из той же сети, что игра.
 
-    False — адрес не распознан и можно попробовать снова (диалог открыт).
+    False — адрес не подошёл, игроку можно повторить попытку (диалог открыт).
     """
     if not is_valid_ton_address(address):
         await message.answer(
@@ -248,70 +247,101 @@ async def _bind_wallet(message: Message, address: str) -> bool:
             parse_mode=ParseMode.HTML,
         )
         return False
+    return True
+
+
+async def _bind_wallet_locked(session, uid: int, player, message: Message) -> bool:
+    """Ставка игрока в незакрытом дне: кошелёк нельзя менять.
+
+    True — заблокировано (диалог закрыт ответом об ограничении).
+    """
+    locked = await session.execute(
+        select(Stake.id)
+        .join(Round, Round.id == Stake.round_id)
+        .where(
+            Stake.player_id == player.id,
+            Stake.status.in_(["pending", "confirmed"]),
+            Round.payouts_finalized.is_(False),
+        )
+        .limit(1)
+    )
+    if locked.scalar_one_or_none() is not None:
+        await _dialog_close(uid)
+        await message.answer(f"{warn_mark('locked')} У тебя ставка в игре — кошелёк закреплён до итогов дня.")
+        return True
+    return False
+
+
+async def _bind_wallet_persist(
+    session, uid: int, player, address: str, message: Message
+) -> bool:
+    """Привязка адреса: снимает чужую привязку, ставит verified-флаги.
+
+    True — привязка сохранена; False — адрес уже был занят другим игроком
+    (ответ уже отправлен, диалог закрыт).
+    """
+    already = (
+        await session.execute(
+            select(Player.id).where(
+                Player.wallet_address == normalize_address(address),
+                Player.id != player.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if already is not None:
+        await session.rollback()
+        await _dialog_close(uid)
+        await message.answer(
+            f"{warn_mark('dupwallet')} Этот кошелёк уже привязан к другому игроку. "
+            "С одного адреса ставки считает только один участник."
+        )
+        return False
+    player.wallet_address = normalize_address(address)
+    player.wallet_linked_at = datetime.now(UTC)
+    if settings.ton_enabled:
+        # Деньги включены: привязка не доверяется сразу — иначе любой мог бы
+        # присвоить публичный адрес чужого кошелька (их видно в постах дня) и
+        # ловить на него чужие ставки и призы. Владелец доказывает контроль
+        # микро-переводом с адреса с мемо bv:<код>: код знает только владелец
+        # телеграм-аккаунта, а перевести с адреса может только владелец кошелька.
+        player.wallet_verified = False
+        player.wallet_verify_code = _wallet_verify_code()
+        player.wallet_verify_created = datetime.now(UTC)
+    else:
+        # Бесплатная версия без ставок и призов: доказывать нечего.
+        player.wallet_verified = True
+        player.wallet_verify_code = None
+        player.wallet_verify_created = None
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Гонка с другой привязкой того же адреса: перехватываем барьер
+        # уникальности и даём вежливо-определённый ответ вместо падения.
+        await session.rollback()
+        await _dialog_close(uid)
+        await message.answer(
+            f"{warn_mark('dupwallet')} Этот кошелёк уже привязан к другому игроку."
+        )
+        return False
+    return True
+
+
+async def _bind_wallet(message: Message, address: str) -> bool:
+    """Общая привязка адреса: для «/wallet и адрес одной строкой» и для
+    диалогового режима («пришли адрес следующим сообщением»).
+
+    False — адрес не распознан и можно попробовать снова (диалог открыт).
+    """
+    if not await _bind_wallet_valid(message, address):
+        return False
     uid = message.from_user.id if message.from_user else 0
     async with SessionLocal() as session:
         player = await upsert_player(session, message.from_user)
         # Защита от угона выплат: пока ставка в незакрытом дне, кошелёк менять нельзя.
-        locked = await session.execute(
-            select(Stake.id)
-            .join(Round, Round.id == Stake.round_id)
-            .where(
-                Stake.player_id == player.id,
-                Stake.status.in_(["pending", "confirmed"]),
-                Round.payouts_finalized.is_(False),
-            )
-            .limit(1)
-        )
-        if locked.scalar_one_or_none() is not None:
-            await _dialog_close(uid)
-            await message.answer(f"{warn_mark('locked')} У тебя ставка в игре — кошелёк закреплён до итогов дня.")
+        if await _bind_wallet_locked(session, uid, player, message):
             return True
-        # Храним канонический raw-hex: watcher сопоставляет отправителя
-        # транзакции именно с ним, а UQ/EQ-формы разных кошельков дают один raw.
-        # Сначала проверяем, не привязан ли адрес к другому игроку — уникальность
-        # в БД, но необработанный IntegrityError превращался бы в «краш» хендлера.
-        already = (
-            await session.execute(
-                select(Player.id).where(
-                    Player.wallet_address == normalize_address(address),
-                    Player.id != player.id,
-                )
-            )
-        ).scalar_one_or_none()
-        if already is not None:
-            await session.rollback()
-            await _dialog_close(uid)
-            await message.answer(
-                f"{warn_mark('dupwallet')} Этот кошелёк уже привязан к другому игроку. "
-                "С одного адреса ставки считает только один участник."
-            )
-            return True
-        player.wallet_address = normalize_address(address)
-        player.wallet_linked_at = datetime.now(UTC)
-        if settings.ton_enabled:
-            # Деньги включены: привязка не доверяется сразу — иначе любой мог бы
-            # присвоить публичный адрес чужого кошелька (их видно в постах дня) и
-            # ловить на него чужие ставки и призы. Владелец доказывает контроль
-            # микро-переводом с адреса с мемо bv:<код>: код знает только владелец
-            # телеграм-аккаунта, а перевести с адреса может только владелец кошелька.
-            player.wallet_verified = False
-            player.wallet_verify_code = _wallet_verify_code()
-            player.wallet_verify_created = datetime.now(UTC)
-        else:
-            # Бесплатная версия без ставок и призов: доказывать нечего.
-            player.wallet_verified = True
-            player.wallet_verify_code = None
-            player.wallet_verify_created = None
-        try:
-            await session.commit()
-        except IntegrityError:
-            # Гонка с другой привязкой того же адреса: перехватываем барьер
-            # уникальности и даём вежливо-определённый ответ вместо падения.
-            await session.rollback()
-            await _dialog_close(uid)
-            await message.answer(
-                f"{warn_mark('dupwallet')} Этот кошелёк уже привязан к другому игроку."
-            )
+        if not await _bind_wallet_persist(session, uid, player, address, message):
+            # Адрес уже занят другим игроком — ответ уже ушёл вместе с закрытием.
             return True
     await _dialog_close(uid)
     if settings.ton_enabled:
@@ -334,6 +364,7 @@ async def _bind_wallet(message: Message, address: str) -> bool:
         # Без деталей: сам адрес уже засветился в сообщении группы.
         await message.answer(f"{ok_mark('group')} Кошелёк привязан (детали — в личке у бота).")
     return True
+
 
 
 _WALLET_COOLDOWN = 30.0
