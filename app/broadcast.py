@@ -421,7 +421,7 @@ async def _fanout(
 
     Возвращает (доставлено, причины отказов).
 
-    Общий помощник для всех рассылок. Копии этого кода разъехались, и в двух
+    Общий помощник для всех рассылок. Копии этого кода разъехали, и в двух
     из них ретрай после флуд-контроля глушил TelegramForbiddenError в общем
     except: получатель, заблокировавший бота МЕЖДУ ретраем, оставался в базе
     навсегда — его пробовали доставить в каждой рассылке. В личных итогах
@@ -431,94 +431,126 @@ async def _fanout(
     semaphore = asyncio.Semaphore(_BROADCAST_PARALLELISM)
     reasons: Counter[str] = Counter()
 
-    async def _deactivate(target: int) -> None:
-        """Отключить получателя. Сбой хука не должен ронять рассылку.
-
-        Отключение — это запись в БД; если она падает (БД качнулась, таймаут),
-        получатель просто останется в списке и получит попытку в следующей
-        рассылке. Но если бы исключение вылетело из хука, asyncio.gather
-        прервал бы ВСЮ рассылку: один непрописанный чат отозвал бы отправку
-        всем остальным.
-        """
-        if on_forbidden is None:
-            return
-        try:
-            await on_forbidden(target)
-        except Exception:
-            logger.warning(
-                "%s: получатель %s не отключён (сбой записи) — вернёмся к нему "
-                "в следующей рассылке",
-                label,
+    outcomes = await asyncio.gather(
+        *(
+            _fanout_worker(
                 target,
-                exc_info=True,
+                deliver,
+                semaphore,
+                reasons,
+                on_forbidden=on_forbidden,
+                on_failed=on_failed,
+                forbidden_reason=forbidden_reason,
+                label=label,
             )
+            for target in targets
+        )
+    )
+    return sum(1 for ok in outcomes if ok), reasons
 
-    async def worker(target: int) -> bool:
-        async with semaphore:
+
+async def _fanout_deactivate(
+    target: int,
+    on_forbidden: Callable[[int], Awaitable[Any]] | None,
+    *,
+    label: str = "рассылка",
+) -> None:
+    """Отключить получателя. Сбой хука не должен ронять рассылку.
+
+    Отключение — это запись в БД; если она падает (БД качнулась, таймаут),
+    получатель просто останется в списке и получит попытку в следующей
+    рассылке. Но если бы исключение вылетело из хука, asyncio.gather
+    прервал бы ВСЮ рассылку: один непрописанный чат отозвал бы отправку
+    всем остальным.
+    """
+    if on_forbidden is None:
+        return
+    try:
+        await on_forbidden(target)
+    except Exception:
+        logger.warning(
+            "%s: получатель %s не отключён (сбой записи) — вернёмся к нему "
+            "в следующей рассылке",
+            label,
+            target,
+            exc_info=True,
+        )
+
+
+async def _fanout_worker(
+    target: int,
+    deliver: Callable[[int], Awaitable[Any]],
+    semaphore: asyncio.Semaphore,
+    reasons: Counter[str],
+    *,
+    on_forbidden: Callable[[int], Awaitable[Any]] | None = None,
+    on_failed: Callable[[int, Exception], Awaitable[Any]] | None = None,
+    forbidden_reason: str = "доступ закрыт (kicked/бот заблокирован)",
+    label: str = "рассылка",
+) -> bool:
+    """Один получатель: одна попытка по цепочке retry → forbidden → error."""
+    async with semaphore:
+        try:
+            await deliver(target)
+            return True
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
             try:
                 await deliver(target)
                 return True
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 1)
-                try:
-                    await deliver(target)
-                    return True
-                except TelegramForbiddenError:
-                    # Заблокировали МЕЖДУ флуд-ретраем: раньше этот случай
-                    # тонул в общем except, и получатель оставался в базе
-                    # навсегда.
-                    reasons[forbidden_reason] += 1
-                    await _deactivate(target)
-                    return False
-                except Exception as exc2:
-                    logger.warning(
-                        "%s не доставлен %s (после ретрая): %s: %s",
-                        label,
-                        target,
-                        type(exc2).__name__,
-                        exc2,
-                    )
-                    reasons[failure_reason(exc2)] += 1
-                    if on_failed is not None:
-                        await on_failed(target, exc2)
-                    return False
             except TelegramForbiddenError:
+                # Заблокировали МЕЖДУ флуд-ретраем: раньше этот случай
+                # тонул в общем except, и получатель оставался в базе
+                # навсегда.
                 reasons[forbidden_reason] += 1
-                await _deactivate(target)
+                await _fanout_deactivate(target, on_forbidden, label=label)
                 return False
-            except TelegramBadRequest as exc:
-                if "USER_BOT_TO_BOT_DISABLED" in str(exc):
-                    # Аккаунт-бот: Telegram запрещает боту писать боту в ЛС.
-                    # Деактивируем — доставка невозможна в принципе.
-                    reasons["аккаунт-бот (нельзя писать боту)"] += 1
-                    await _deactivate(target)
-                    return False
+            except Exception as exc2:
                 logger.warning(
-                    "%s не доставлен %s: %s: %s",
+                    "%s не доставлен %s (после ретрая): %s: %s",
                     label,
                     target,
-                    type(exc).__name__,
-                    exc,
+                    type(exc2).__name__,
+                    exc2,
                 )
-                reasons[failure_reason(exc)] += 1
+                reasons[failure_reason(exc2)] += 1
                 if on_failed is not None:
-                    await on_failed(target, exc)
+                    await on_failed(target, exc2)
                 return False
-            except Exception as exc:
-                logger.warning(
-                    "%s не доставлен %s: %s: %s",
-                    label,
-                    target,
-                    type(exc).__name__,
-                    exc,
-                )
-                reasons[failure_reason(exc)] += 1
-                if on_failed is not None:
-                    await on_failed(target, exc)
+        except TelegramForbiddenError:
+            reasons[forbidden_reason] += 1
+            await _fanout_deactivate(target, on_forbidden, label=label)
+            return False
+        except TelegramBadRequest as exc:
+            if "USER_BOT_TO_BOT_DISABLED" in str(exc):
+                # Аккаунт-бот: Telegram запрещает боту писать боту в ЛС.
+                # Деактивируем — доставка невозможна в принципе.
+                reasons["аккаунт-бот (нельзя писать боту)"] += 1
+                await _fanout_deactivate(target, on_forbidden, label=label)
                 return False
-
-    outcomes = await asyncio.gather(*(worker(target) for target in targets))
-    return sum(1 for ok in outcomes if ok), reasons
+            logger.warning(
+                "%s не доставлен %s: %s: %s",
+                label,
+                target,
+                type(exc).__name__,
+                exc,
+            )
+            reasons[failure_reason(exc)] += 1
+            if on_failed is not None:
+                await on_failed(target, exc)
+            return False
+        except Exception as exc:
+            logger.warning(
+                "%s не доставлен %s: %s: %s",
+                label,
+                target,
+                type(exc).__name__,
+                exc,
+            )
+            reasons[failure_reason(exc)] += 1
+            if on_failed is not None:
+                await on_failed(target, exc)
+            return False
 
 
 def _reasons_text(reasons: dict[str, int], limit: int = 3) -> str:
