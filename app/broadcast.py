@@ -88,7 +88,8 @@ def _utc(value: datetime) -> datetime:
     return value if getattr(value, "tzinfo", None) else value.replace(tzinfo=UTC)
 
 
-async def status_text(round_row: Round, *, show_title: bool = True) -> str:
+def _phase_text(round_row: Round) -> str:
+    """Фаза дня: сцена/подсчёт/закрыт + текст правила и режима ставок."""
     from app.models import RULE_PHRASES, VOTE_RULE_PHRASES
 
     if round_row.status == RoundStatus.OPEN:
@@ -97,70 +98,66 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
             and getattr(round_row, "money_mode", True) is not False
         )
         if stake_mode:
-            phase = (
+            return (
                 f"🎬 Сцена дня: {RULE_PHRASES[round_row.win_rule]}. "
                 "Кадр дня решает счёт Gram — банки сцен скрыты до конца сцены. "
                 "Голос без ставки ведёт только лидерборд."
             )
-        else:
-            phase = (
-                f"🎬 Сцена дня: {VOTE_RULE_PHRASES[round_row.win_rule]}. "
-                "Счёт сцен скрыт до конца сцены."
-            )
-    elif round_row.status == RoundStatus.TALLYING:
-        phase = "⏳ Подсчёт: итоги через мгновение."
-    else:
-        phase = "🌙 День закрыт."
-    # Экранирование — ПОСЛЕ обрезки, а не до: сущность (&amp;) нельзя рвать,
-    # а кламп режет по словам. Разметку ждут все вызывающие status_text
-    # (везде parse_mode=HTML), а текст кассеты — не наш: сырой `<` или `&`
-    # из правки в /panel Telegram отвергает ЦЕЛИКОМ, и пакет дня не доходит
-    # ни в один чат, ни в одну личку — «0 из N» без единого виноватого
-    # получателя. Ровно это уже чинили в tally._tg_escape.
-    #
-    # Единственная структура дня: эхо вчерашнего выбора (в начале главы) →
-    # сюжет → блок «что предстоит решить». Три варианта живут только
-    # в кнопках (их подписи — названия карт, см. cards_keyboard) — витрины
-    # в тексте больше нет. NULL дилеммы — переходные строки, созданные до
-    # миграции c4e8a1b7d9f2: пост остаётся читаемым, блок появится
-    # со следующего открытого дня.
-    dilemma = getattr(round_row, "dilemma", None) or ""
-    bank_line = ""
-    if settings.ton_enabled and getattr(round_row, "money_mode", True) is not False:
-        from app.db import SessionLocal
-        from app.rounds import round_pot
+        return (
+            f"🎬 Сцена дня: {VOTE_RULE_PHRASES[round_row.win_rule]}. "
+            "Счёт сцен скрыт до конца сцены."
+        )
+    if round_row.status == RoundStatus.TALLYING:
+        return "⏳ Подсчёт: итоги через мгновение."
+    return "🌙 День закрыт."
 
-        async with SessionLocal() as db:
-            nano, _bets = await round_pot(db, round_row.id)
-        bank_line = f"\n💰 Банк дня: {nano / 1e9:.2f} Gram"
-    # Бесшовные сутки: подсчёт мгновенный, оба времени совпадают — хватит
-    # одного дедлайна. Легаси-раунды с зазором показывают обе строки.
+
+async def _bank_line(round_row: Round) -> str:
+    """Банк дня в посте: сумма живым текстом через round_pot.
+
+    День без ставок (money_mode=False) банком не живёт — строка не пишется,
+    даже при включённом TON.
+    """
+    if not (settings.ton_enabled and getattr(round_row, "money_mode", True) is not False):
+        return ""
+    from app.db import SessionLocal
+    from app.rounds import round_pot
+
+    async with SessionLocal() as db:
+        nano, _bets = await round_pot(db, round_row.id)
+    return f"\n💰 Банк дня: {nano / 1e9:.2f} Gram"
+
+
+def _deadline_line(round_row: Round) -> str:
+    """Дедлайн: оба времени совпадают — бесшовные сутки, одна строка; иначе обе."""
     voting_at = _utc(round_row.voting_ends_at)
     tally_at = _utc(round_row.tally_ends_at)
     if tally_at - voting_at > timedelta(minutes=5):
-        deadline = (
+        return (
             f"🗳 Голосование до: {voting_at:%H:%M} UTC · "
             f"🏁 Итоги и новый день: {tally_at:%H:%M} UTC"
         )
-    else:
-        deadline = f"🗳 Голосование до {voting_at:%H:%M} UTC — итоги и новый день придут сразу после"
+    return f"🗳 Голосование до {voting_at:%H:%M} UTC — итоги и новый день придут сразу после"
+
+
+def _head_line(round_row: Round, *, show_title: bool) -> str:
+    """Заголовок дня: день-метка + глава; без заголовка — пустая строка."""
     head = ""
     if show_title:
         title = html.escape(_clamp(round_row.chapter_title, _TITLE_CLAMP), quote=False)
         head += f"{day_mark(str(round_row.id))} {title}\n\n"
-    # Глава кассеты живым текстом между заголовком и развилкой: сначала стая
-    # слышит день, потом видит три сцены. Жёсткий потолок кассеты — 900 знаков
-    # (schema.py), обрезка по словам ниже лишь страхует легаси-раунды без кассеты.
-    story_raw = (getattr(round_row, "chapter_text", "") or "").strip()
-    dilemma_html = html.escape(_clamp(dilemma, _DILEMMA_CLAMP), quote=False)
-    # Хвост поста (правило дня, банк, дедлайн) неприкосновенен: при упоре в
-    # потолок режется «верх», а не обещание игроку сроков исхода голосования.
-    tail = f"\n\n{phase}{bank_line}\n{deadline}"
-    budget = _MAX_TEXT_LEN - len(tail)
-    # Вопрос — точка выбора, поэтому он важнее главы. Если места не хватает,
-    # сначала режем главу; вопрос трогаем только когда не помещается даже он.
+    return head
+
+
+def _fit_dilemma(head: str, dilemma: str, dilemma_html: str, budget: int) -> str:
+    """Дилемма — точка выбора, поэтому важнее главы: под бюджет подбираем её первой.
+
+    Хвост (фаза/банк/дедлайн) неприкосновен: при упоре в потолок режется
+    «верх», а не обещание игроку сроков исхода голосования. Возвращает html
+    дилеммы; подбор ведётся по фактической длине после экранирования.
+    """
+    dilemma_raw = dilemma
     if len(head) + len(dilemma_html) > budget:
-        dilemma_raw = dilemma
         dilemma_limit = budget - len(head) - 1
         if dilemma_limit >= 1:
             dilemma_raw = _clamp(dilemma_raw, dilemma_limit)
@@ -176,26 +173,54 @@ async def status_text(round_row: Round, *, show_title: bool = True) -> str:
                 break
             dilemma_raw = _clamp(dilemma_raw, next_limit)
             dilemma_html = html.escape(dilemma_raw, quote=False)
-    story_html = ""
-    if story_raw:
-        allowed = budget - len(head) - len(dilemma_html) - 2
-        if allowed >= 2:
-            story_raw = _clamp(story_raw, min(1500, allowed))
-            story_html = f"{html.escape(story_raw, quote=False)}\n\n"
-            # Экранирование (`&` → `&amp;`) может удлинить строку: добираем
-            # остаток уже по фактической длине, не разрывая сущности.
-            while (
-                story_raw
-                and len(head) + len(story_html) + len(dilemma_html) > budget
-            ):
-                overflow = len(head) + len(story_html) + len(dilemma_html) - budget
-                next_limit = len(story_raw) - overflow - 1
-                if next_limit < 2:
-                    story_raw = ""
-                    story_html = ""
-                    break
-                story_raw = _clamp(story_raw, next_limit)
-                story_html = f"{html.escape(story_raw, quote=False)}\n\n"
+    return dilemma_html
+
+
+def _fit_story(head: str, story_raw: str, budget: int, dilemma_html: str) -> str:
+    """Глава кассеты между заголовком и развилкой: под бюджет подбираем её.
+
+    Хвост (дилемма/фаза/банк/дедлайн) уже учтён в бюджете. При упоре режется
+    глава — «верх», а не обещание; дилемма при этом остаётся целой. Экранирование
+    (`&` → `&amp;`) может удлинить строку: добираем остаток по фактической
+    длине, не разрывая сущности.
+    """
+    if not story_raw:
+        return ""
+    allowed = budget - len(head) - len(dilemma_html) - 2
+    if allowed < 2:
+        return ""
+    story_raw = _clamp(story_raw, min(1500, allowed))
+    story_html = f"{html.escape(story_raw, quote=False)}\n\n"
+    while story_raw and len(head) + len(story_html) + len(dilemma_html) > budget:
+        overflow = len(head) + len(story_html) + len(dilemma_html) - budget
+        next_limit = len(story_raw) - overflow - 1
+        if next_limit < 2:
+            story_raw = ""
+            story_html = ""
+            break
+        story_raw = _clamp(story_raw, next_limit)
+        story_html = f"{html.escape(story_raw, quote=False)}\n\n"
+    return story_html
+
+
+async def status_text(round_row: Round, *, show_title: bool = True) -> str:
+    phase = _phase_text(round_row)
+    bank_line = await _bank_line(round_row)
+    deadline = _deadline_line(round_row)
+    # Бесшовные сутки: подсчёт мгновенный, оба времени совпадают — хватит
+    # одного дедлайна. Легаси-раунды с зазором показывают обе строки.
+    tail = f"\n\n{phase}{bank_line}\n{deadline}"
+    budget = _MAX_TEXT_LEN - len(tail)
+    head = _head_line(round_row, show_title=show_title)
+    dilemma = getattr(round_row, "dilemma", None) or ""
+    dilemma_html = html.escape(_clamp(dilemma, _DILEMMA_CLAMP), quote=False)
+    dilemma_html = _fit_dilemma(head, dilemma, dilemma_html, budget)
+    story_html = _fit_story(
+        head,
+        (getattr(round_row, "chapter_text", "") or "").strip(),
+        budget,
+        dilemma_html,
+    )
     return f"{head}{story_html}{dilemma_html}{tail}"
 
 
