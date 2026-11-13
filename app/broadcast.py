@@ -321,6 +321,34 @@ async def _dm_send_all(
     return delivered
 
 
+async def _load_finished_round(session, finished: Round) -> Round:
+    """Карты дня для итогов: грузим заранее (selectinload), из своей сессии,
+    если не передали.
+
+    format_results читает .cards синхронно; асинхронная ленивая подгрузка вне
+    greenlet-контекста дала бы MissingGreenlet и сорвала бы весь пост итогов.
+    """
+    _stmt = select(Round).where(Round.id == finished.id).options(selectinload(Round.cards))
+    if session is None:
+        async with SessionLocal() as _own:
+            _loaded = (await _own.execute(_stmt)).scalar_one_or_none()
+    else:
+        _loaded = (await session.execute(_stmt)).scalar_one_or_none()
+    if _loaded is not None:
+        return _loaded
+    return finished
+
+
+async def _economics(finished: Round, session) -> dict | None:
+    """Экономика дня (коэффициент и ставки по путям): своя сессия, если не передали."""
+    from app.tally import day_economics
+
+    if session is not None:
+        return await day_economics(session, finished)
+    async with SessionLocal() as own:
+        return await day_economics(own, finished)
+
+
 async def results_body(finished: Round, session=None) -> str:
     """Сухие итоги + экономика дня + плагины.
 
@@ -329,39 +357,29 @@ async def results_body(finished: Round, session=None) -> str:
     хранится в StoryBeat и в пост не идёт. Быстрая, только БД — это то, что
     уходит пользователям СРАЗУ после вскрытия. session можно передать готовую.
     """
-    from app.tally import day_economics, format_economics, format_plugin_results
+    from app.tally import format_economics, format_plugin_results
 
-    # format_results читает .cards синхронно; асинхронная ленивая подгрузка вне
-    # greenlet-контекста дала бы MissingGreenlet и сорвала бы весь пост итогов.
-    # Грузим карты заранее (selectinload), из своей сессии, если её не передали.
     try:
-        _stmt = select(Round).where(Round.id == finished.id).options(selectinload(Round.cards))
-        if session is None:
-            async with SessionLocal() as _own:
-                _loaded = (await _own.execute(_stmt)).scalar_one_or_none()
-        else:
-            _loaded = (await session.execute(_stmt)).scalar_one_or_none()
-        if _loaded is not None:
-            finished = _loaded
+        loaded = await _load_finished_round(session, finished)
     except Exception:
-        logger.warning("Карты дня %s не подгружены для итогов", getattr(finished, "day_index", "?"), exc_info=True)
-
-    # Ставки по путям и коэффициент считается один раз — и в реальной рассылке
-    # (announce_new_day зовёт results_body БЕЗ сессии), поэтому открываем свою.
-    # Без этого пути и коэффициент в итогах просто не появлялись.
+        logger.warning(
+            "Карты дня %s не подгружены для итогов", getattr(finished, "day_index", "?"), exc_info=True
+        )
+        loaded = finished
     economics_stats: dict | None = None
     try:
-        if session is not None:
-            economics_stats = await day_economics(session, finished)
-        else:
-            economics_stats = await _economics_own_session(finished)
+        economics_stats = await _economics(finished, session)
     except Exception:
-        logger.warning("Экономика дня %s не собрана — пост без коэффициента", getattr(finished, "day_index", "?"), exc_info=True)
+        logger.warning(
+            "Экономика дня %s не собрана — пост без коэффициента",
+            getattr(finished, "day_index", "?"),
+            exc_info=True,
+        )
 
     path_stakes = (economics_stats or {}).get("path_stakes", {})
     multiplier = (economics_stats or {}).get("multiplier")
 
-    text = format_results(finished, path_stakes, multiplier)
+    text = format_results(loaded, path_stakes, multiplier)
     if economics_stats is not None:
         try:
             economics = format_economics(economics_stats)
@@ -373,7 +391,7 @@ async def results_body(finished: Round, session=None) -> str:
     # рассылкой в 17:00 UTC (джоба story-diary → announce_day_diary).
     # Плагиновые строки итогов (echoes, relations, bestiary и т.д.)
     try:
-        plugin_text = await format_plugin_results(finished, session)
+        plugin_text = await format_plugin_results(loaded, session)
         if plugin_text:
             text += f"\n\n{plugin_text}"
     except Exception:
