@@ -463,69 +463,71 @@ async def _handle_auto_grant(
     return None
 
 
-async def _finalize_stake(
-    session, transfer: Transfer, bot: Bot | None, player: Player, round_row: Round, result: str
-) -> str:
-    """Доводит ставку до уведомления/возврата и запись в ledger.
+async def _finalize_stake_refund(
+    session, transfer, round_row, player, bot, result: str, amount: str
+) -> None:
+    """Возврат ставки: payout-строка в очередь + персональное уведомление.
 
-    result — статус register_stake: ok / already_staked / closed / money_off /
-    too_small / too_big / wallet_unverified / duplicate_tx.
+    already_staked / closed / money_off: ставка не была принята (день уже
+    закрылся, ставка уже стоит или день живёт без ставок) — перевод возвращаем.
     """
-    amount = f"{from_nano(transfer.value_nanotons):g}"
-    if result in ("already_staked", "closed", "money_off"):
-        refund_status = await _stash_refund(
-            session,
-            transfer,
-            round_row.id,
-            ledger_result=f"stake:{result}",
-            ledger_player_id=player.id,
-        )
+    refund_status = await _stash_refund(
+        session,
+        transfer,
+        round_row.id,
+        ledger_result=f"stake:{result}",
+        ledger_player_id=player.id,
+    )
+    suspected_revote = (
+        result == "already_staked"
+        and transfer.value_nanotons < to_nano(settings.stake_min_ton)
+    )
+    if suspected_revote:
         # Ставка — от stake_min_ton, а плата за смену пути (revote_ton) —
         # ниже минимума. Значит повторный «ставкоподобный» перевод за того,
         # кто уже поставил и чья сумма не дотягивает до минимума, — это
         # почти наверняка «недоехавший» revote: кошелёк не приложил rv:-мемо
         # или исказил его. Объясняем внятно, а не путанным «ставка уже есть».
-        suspected_revote = (
-            result == "already_staked"
-            and transfer.value_nanotons < to_nano(settings.stake_min_ton)
+        await _dm_refund_queued(
+            bot,
+            player.id,
+            refund_status,
+            f"↩️ Перевод {amount} Gram возвращается: эта сумма ниже минимума "
+            f"ставки ({settings.stake_min_ton:g} Gram). Если ты менял путь — "
+            "бот не распознал комментарий rv:… за переводом. Переведи снова "
+            "без мемо (сумма из вилки зачтётся автоматически) либо с "
+            "<code>rv:день</code> в комментарии.",
         )
-        if suspected_revote:
-            await _dm_refund_queued(
-                bot,
-                player.id,
-                refund_status,
-                f"↩️ Перевод {amount} Gram возвращается: эта сумма ниже минимума "
-                f"ставки ({settings.stake_min_ton:g} Gram). Если ты менял путь — "
-                "бот не распознал комментарий rv:… за переводом. Переведи снова "
-                "без мемо (сумма из вилки зачтётся автоматически) либо с "
-                "<code>rv:день</code> в комментарии.",
-            )
-        elif result == "money_off":
-            await _dm_refund_queued(
-                bot,
-                player.id,
-                refund_status,
-                f"↩️ Перевод {amount} Gram возвращается: сегодня версия без ставок — "
-                "ставки не принимаются. Поставить можно в день со ставками.",
-            )
-        else:
-            reason = "ставка на этот день уже есть" if result == "already_staked" else "день уже закрылся"
-            await _dm_refund_queued(
-                bot,
-                player.id,
-                refund_status,
-                f"↩️ Перевод {amount} Gram возвращается: {reason}.",
-            )
-    elif result == "too_small":
+    elif result == "money_off":
+        await _dm_refund_queued(
+            bot,
+            player.id,
+            refund_status,
+            f"↩️ Перевод {amount} Gram возвращается: сегодня версия без ставок — "
+            "ставки не принимаются. Поставить можно в день со ставками.",
+        )
+    else:
+        reason = "ставка на этот день уже есть" if result == "already_staked" else "день уже закрылся"
+        await _dm_refund_queued(
+            bot,
+            player.id,
+            refund_status,
+            f"↩️ Перевод {amount} Gram возвращается: {reason}.",
+        )
+
+
+async def _finalize_stake_rejected(bot, player, result: str, amount: str) -> None:
+    """Ставка отклонена (too_small / too_big): персональное сообщение + возврат.
+
+    too_small — ниже stake_min_ton; too_big — выше stake_max_ton (потолок).
+    """
+    if result == "too_small":
         await _dm_stake(
             bot,
             player.id,
             f"↩️ Ставка {amount} Gram не принята (меньше минимума) — вернём после закрытия дня.",
         )
-        await _ledger_incoming(
-            session, transfer, player.id, round_row.id, f"stake:{result}"
-        )
-    elif result == "too_big":
+    else:
         await _dm_stake(
             bot,
             player.id,
@@ -533,37 +535,67 @@ async def _finalize_stake(
             f"{settings.stake_max_ton:g} Gram) — вернём после закрытия дня. "
             "Поставить можно сумму в пределах потолка.",
         )
-        await _ledger_incoming(
-            session, transfer, player.id, round_row.id, f"stake:{result}"
-        )
+
+
+async def _finalize_stake_unverified(
+    session, transfer, round_row, player, bot, result: str, amount: str
+) -> None:
+    """Кошелёк игрока не подтверждён: возврат + инструкция по доказыванию."""
+    refund_status = await _stash_refund(
+        session,
+        transfer,
+        round_row.id,
+        ledger_result=f"stake:{result}",
+        ledger_player_id=player.id,
+    )
+    await _dm_refund_queued(
+        bot,
+        player.id,
+        refund_status,
+        f"↩️ Перевод {amount} Gram возвращается: кошелёк ещё не подтверждён — "
+        "ставки с него не принимаются.\n\n"
+        "Отправь с него микро-перевод казначею и <b>обязательно укажи "
+        f"комментарий</b> <b><code>bv:{player.wallet_verify_code}</code></b> "
+        "(код виден в /wallet), затем повтори ставку.",
+    )
+
+
+async def _finalize_stake_ok(
+    session, transfer, bot, player, round_row, result: str, amount: str
+) -> None:
+    """Принята ставка: ожидание подтверждения перевода, уведомление, ledger."""
+    age = datetime.now(UTC).timestamp() - transfer.utime
+    if age >= settings.stake_confirm_seconds:
+        if await confirm_stake(session, transfer.tx_hash):
+            await _dm_stake(
+                bot,
+                player.id,
+                f"✅ Ставка {amount} Gram на день {round_row.day_index} принята.",
+            )
+    await _ledger_incoming(
+        session, transfer, player.id, round_row.id, f"stake:{result}"
+    )
+
+
+async def _finalize_stake(session, transfer: Transfer, bot: Bot | None, player: Player, round_row: Round, result: str) -> str:
+    """Доводит ставку до уведомления/возврата и запись в ledger.
+
+    result — статус register_stake: ok / already_staked / closed / money_off /
+    too_small / too_big / wallet_unverified / duplicate_tx.
+    """
+    amount = f"{from_nano(transfer.value_nanotons):g}"
+    if result in ("already_staked", "closed", "money_off"):
+        await _finalize_stake_refund(session, transfer, round_row, player, bot, result, amount)
+    elif result == "too_small":
+        await _finalize_stake_rejected(bot, player, result, amount)
+        await _ledger_incoming(session, transfer, player.id, round_row.id, f"stake:{result}")
+    elif result == "too_big":
+        await _finalize_stake_rejected(bot, player, result, amount)
+        await _ledger_incoming(session, transfer, player.id, round_row.id, f"stake:{result}")
     elif result == "wallet_unverified":
-        refund_status = await _stash_refund(
-            session,
-            transfer,
-            round_row.id,
-            ledger_result=f"stake:{result}",
-            ledger_player_id=player.id,
-        )
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {amount} Gram возвращается: кошелёк ещё не подтверждён — "
-            "ставки с него не принимаются.\n\n"
-            "Отправь с него микро-перевод казначею и <b>обязательно укажи "
-            f"комментарий</b> <b><code>bv:{player.wallet_verify_code}</code></b> "
-            "(код виден в /wallet), затем повтори ставку.",
-        )
+        await _finalize_stake_unverified(session, transfer, round_row, player, bot, result, amount)
     elif result == "ok":
-        age = datetime.now(UTC).timestamp() - transfer.utime
-        if age >= settings.stake_confirm_seconds:
-            if await confirm_stake(session, transfer.tx_hash):
-                await _dm_stake(
-                    bot, player.id, f"✅ Ставка {amount} Gram на день {round_row.day_index} принята."
-                )
-        await _ledger_incoming(
-            session, transfer, player.id, round_row.id, f"stake:{result}"
-        )
+        await _finalize_stake_ok(session, transfer, bot, player, round_row, result, amount)
     elif result == "duplicate_tx":
         # Перевод уже разобран. Если это была ставка, строка дохода
         # обязана быть в журнале: без неё перевод невидим для сверки
