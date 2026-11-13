@@ -433,36 +433,48 @@ async def test_short_raw_page_ends_history(monkeypatch: pytest.MonkeyPatch) -> N
     assert len([p for url, p in calls if "/v2/blockchain/" in url]) == 1
 
 
-async def test_page_eaten_by_filters_is_not_a_complete_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Полная страница, съеденная фильтрами целиком, проходом полным не считается.
+async def test_page_eaten_by_filters_continues_to_next_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Полная страница, съеденная фильтрами целиком, не обрывает проход.
 
-    Курсор вглубь вывести не из чего: продолжать нельзя, а объявлять проход
-    полным нельзя тем более. Держим дыру — курсор встанет на её дно, и
-    бэклог догонится следующим циклом.
+    Курсор вглубь ведёт next_cursor провайдера (он считается по сырым
+    строкам), поэтому проход обязан продолжиться и дойти до курсора, а не
+    застрять в SCAN_GAP навсегда.
     """
     limit = ton_watch._PAGE_LIMIT
     _fast_pace(monkeypatch)
     eaten = [_api_jetton_tx(3000 - index) for index in range(limit)]
-    calls = install_http(monkeypatch, {_HISTORY: [_Response(200, {"transactions": eaten})]})
+    tail = [_api_jetton_tx(900)]
+    calls = install_http(
+        monkeypatch,
+        {
+            _HISTORY: [
+                _Response(200, {"transactions": eaten}),
+                _Response(200, {"transactions": tail}),
+            ]
+        },
+    )
 
     result = await ton_watch._deep_collect(
         ton_watch._tonapi_page,
         1000,
     )
 
-    assert result.complete is False
+    assert result.complete is True and result.reliable is True
     assert result.transfers == []
-    # Одна страница прочитана и сразу отброшена — курсор не уводим вглубь
-    assert len([p for url, p in calls if "/v2/blockchain/" in url]) == 1
+    assert result.floor_utime == 900
+    assert len([p for url, p in calls if "/v2/blockchain/" in url]) == 2
 
 
 async def test_page_eaten_by_filters_without_floor_is_unreliable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Съеденная страница безо всякого дна — проход ненадёжен, цикл не встанет."""
+    """Съеденная страница без дна и без курсора — проход ненадёжен, цикл не встанет."""
     limit = ton_watch._PAGE_LIMIT
     _fast_pace(monkeypatch)
     eaten = [_api_jetton_tx(3000 - index) for index in range(limit)]
+    for item in eaten:
+        item.pop("utime", None)
+        item.pop("lt", None)
     install_http(monkeypatch, {_HISTORY: [_Response(200, {"transactions": eaten})]})
 
     result = await ton_watch._deep_collect(
@@ -540,6 +552,22 @@ async def test_toncenter_pagination_walks_by_offset(monkeypatch: pytest.MonkeyPa
     assert v3_calls[1]["offset"] == limit
 
 
+async def test_toncenter_page_reports_raw_oldest_from_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Сырая граница страницы Toncenter считается по полю now.
+
+    Toncenter v3 кладёт время в «now», а не в «utime». Если _safe_utime снова
+    начнёт читать только utime, oldest_utime станет None, и проход опять
+    застрянет на полностью отфильтрованной странице — ровно прод-инцидент.
+    """
+    _fast_pace(monkeypatch)
+    items = [_v3_tx(2000, to_nano(0.01)), _v3_tx(1500, 0)]
+    install_http(monkeypatch, {_V3: [_Response(200, {"transactions": items})]})
+
+    page = await ton_watch._toncenter_page(1000)
+
+    assert page.oldest_utime == 1500
+
+
 async def test_toncenter_fallback_reads_deep_before_cursor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -587,6 +615,68 @@ async def test_provider_ignoring_cursor_is_unreliable(monkeypatch: pytest.Monkey
 
     assert result.reliable is False
     assert result.complete is False
+
+
+async def test_filtered_page_advances_pagination_instead_of_breaking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Полная страница из одних исходящих не рвёт проход.
+
+    Реальный инцидент: фильтры съедали страницу целиком, проход обрывался,
+    хотя next_cursor провайдера вёл вглубь. Watcher навсегда застревал в
+    SCAN_GAP и не доходил до дешёвого зонда головы.
+    """
+    _fast_pace(monkeypatch)
+    calls: list[str | None] = []
+    pages = [
+        ton_watch.Page([], ton_watch._PAGE_OK, 25, 25, "100", 0, 2500),
+        ton_watch.Page([], ton_watch._PAGE_OK, 25, 25, "200", 0, 1500),
+        ton_watch.Page([], ton_watch._PAGE_OK, 10, 25, "210", 0, 500),
+    ]
+
+    async def fetch(since: int, before: str | None):
+        assert since == 1000
+        calls.append(before)
+        return pages.pop(0)
+
+    result = await ton_watch._deep_collect(fetch, 1000)
+
+    assert calls == [None, "100", "200"], "фильтры не должны останавливать пагинацию"
+    assert result.reliable is True and result.complete is True
+    assert result.floor_utime == 500
+
+
+async def test_raw_page_floor_closes_window_without_extra_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Граница покрытия считается по сырым строкам, а не по отфильтрованным.
+
+    Если самая старая сырая строка страницы уже ниже курсора, всё, что выше,
+    прочитано: даже сплошные исходящие ниже курсора не требуют ещё страниц.
+    """
+    _fast_pace(monkeypatch)
+    transfer = ton_watch.Transfer("h1", "0:" + "ab" * 32, 1, "", 2000)
+    page = ton_watch.Page([transfer], ton_watch._PAGE_OK, 25, 25, "100", 0, 900)
+    calls: list[str | None] = []
+
+    async def fetch(since: int, before: str | None):
+        calls.append(before)
+        return page
+
+    result = await ton_watch._deep_collect(fetch, 1000)
+
+    assert calls == [None], "курсор накрыт первой же страницей — вглубь не идём"
+    assert result.complete is True and len(result.transfers) == 1
+    assert result.floor_utime == 900
+
+
+async def test_filtered_page_with_stuck_cursor_is_not_complete() -> None:
+    """Провайдер отдал полную пустую страницу без сдвига курсора — не успех."""
+    page = ton_watch.Page([], ton_watch._PAGE_OK, 25, 25, "100", 0, 2500)
+
+    async def fetch(since: int, before: str | None):
+        return page
+
+    result = await ton_watch._deep_collect(fetch, 1000)
+
+    assert result.reliable is False and result.complete is False
+    assert result.floor_utime == 2500
 
 
 # ---------- Parse-failure tracking (P0 #4) ----------

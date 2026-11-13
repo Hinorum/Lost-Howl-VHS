@@ -97,7 +97,6 @@ from app.ton_watch.revote import (  # noqa: F401
 # transfer, watch_once) живёт в этом файле, поэтому её глобалы -- это
 # namespace пакета, и monkeypatch.setattr(ton_watch, ...) доходит до неё.
 from app.ton_watch.sources import (  # noqa: F401
-    _EMPTY_STOP,
     _FALLBACK_WARN_EVERY_SECONDS,
     _JETTON_OPCODES,
     _MAX_PAGES,
