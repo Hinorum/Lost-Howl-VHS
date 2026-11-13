@@ -875,6 +875,93 @@ async def remember_day_post(round_id: int, chat_id: int, message_id: int, *, is_
         )
 
 
+async def _pending_bank_posts(session, current, nano: int) -> list[StatusPost]:
+    """Посты открытого дня, чей last_pot_nanotons устарел относительно банка."""
+    return (
+        (
+            await session.execute(
+                select(StatusPost).where(
+                    StatusPost.round_id == current.id,
+                    (
+                        (StatusPost.last_pot_nanotons.is_(None))
+                        | (StatusPost.last_pot_nanotons != nano)
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _edit_day_bank_post(
+    bot: Bot,
+    session,
+    row: StatusPost,
+    text: str,
+    keyboard,
+    nano: int,
+) -> None:
+    """Правка поста банка: ретраи по TelegramRetryAfter, мёртвые точки — удаление."""
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=row.chat_id,
+            message_id=row.message_id,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        row.last_pot_nanotons = nano
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(exc.retry_after + 1)
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=row.chat_id,
+                message_id=row.message_id,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+            row.last_pot_nanotons = nano
+        except Exception as exc2:
+            logger.warning(
+                "Правка банка дня не удалась после ретрая (chat=%s): %s",
+                row.chat_id,
+                exc2,
+            )
+    except TelegramBadRequest as exc:
+        lowered = str(exc).lower()
+        if "not modified" in lowered:
+            # Текст совпал (пост уже с этим банком) — фиксируем счёт.
+            row.last_pot_nanotons = nano
+        elif (
+            "message to edit not found" in lowered
+            or "message is too old" in lowered
+            or "chat not found" in lowered
+        ):
+            # Сообщение удалено, старше 48 ч или чат не существует —
+            # точка доставки мертва, повторные попытки бессмысленны.
+            await session.delete(row)
+        else:
+            # Временная ошибка Telegram (флуд-контроль, лаг API):
+            # строку НЕ удаляем, попробуем в следующем цикле.
+            logger.warning(
+                "Правка банка дня: временная ошибка (chat=%s): %s",
+                row.chat_id,
+                exc,
+            )
+    except TelegramForbiddenError:
+        # Бот выгнан из чата: точка доставки мертва, дедуп не спасёт.
+        await session.delete(row)
+    except Exception as exc:
+        logger.warning(
+            "Правка банка дня не удалась (round=%s chat=%s): %s",
+            row.round_id,
+            row.chat_id,
+            exc,
+        )
+
+
 async def refresh_day_bank(bot: Bot | None = None) -> None:
     """Актуализировать банк дня в УЖЕ отправленных постах-статусах.
 
@@ -897,21 +984,7 @@ async def refresh_day_bank(bot: Bot | None = None) -> None:
         if not (settings.ton_enabled and getattr(current, "money_mode", True) is not False):
             return
         nano, _bets = await round_pot(session, current.id)
-        rows = (
-            (
-                await session.execute(
-                    select(StatusPost).where(
-                        StatusPost.round_id == current.id,
-                        (
-                            (StatusPost.last_pot_nanotons.is_(None))
-                            | (StatusPost.last_pot_nanotons != nano)
-                        ),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        rows = await _pending_bank_posts(session, current, nano)
         if not rows:
             return
         loaded = (
@@ -925,63 +998,7 @@ async def refresh_day_bank(bot: Bot | None = None) -> None:
         keyboard = cards_keyboard(loaded.id, cards=loaded.cards)
 
         for row in rows:
-            try:
-                await bot.edit_message_text(
-                    text,
-                    chat_id=row.chat_id,
-                    message_id=row.message_id,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                )
-                row.last_pot_nanotons = nano
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 1)
-                try:
-                    await bot.edit_message_text(
-                        text,
-                        chat_id=row.chat_id,
-                        message_id=row.message_id,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=keyboard,
-                    )
-                    row.last_pot_nanotons = nano
-                except Exception as exc2:
-                    logger.warning(
-                        "Правка банка дня не удалась после ретрая (chat=%s): %s",
-                        row.chat_id,
-                        exc2,
-                    )
-            except TelegramBadRequest as exc:
-                lowered = str(exc).lower()
-                if "not modified" in lowered:
-                    # Текст совпал (пост уже с этим банком) — фиксируем счёт.
-                    row.last_pot_nanotons = nano
-                elif (
-                    "message to edit not found" in lowered
-                    or "message is too old" in lowered
-                    or "chat not found" in lowered
-                ):
-                    # Сообщение удалено, старше 48 ч или чат не существует —
-                    # точка доставки мертва, повторные попытки бессмысленны.
-                    await session.delete(row)
-                else:
-                    # Временная ошибка Telegram (флуд-контроль, лаг API):
-                    # строку НЕ удаляем, попробуем в следующем цикле.
-                    logger.warning(
-                        "Правка банка дня: временная ошибка (chat=%s): %s",
-                        row.chat_id,
-                        exc,
-                    )
-            except TelegramForbiddenError:
-                # Бот выгнан из чата: точка доставки мертва, дедуп не спасёт.
-                await session.delete(row)
-            except Exception as exc:
-                logger.warning(
-                    "Правка банка дня не удалась (round=%s chat=%s): %s",
-                    current.id,
-                    row.chat_id,
-                    exc,
-                )
+            await _edit_day_bank_post(bot, session, row, text, keyboard, nano)
         await session.commit()
 
 
