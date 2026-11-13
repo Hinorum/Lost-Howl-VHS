@@ -1460,83 +1460,90 @@ async def _check_payouts(session, bot) -> None:
 #      (kicked против сети на Render) решает, куда идти.
 
 
-async def _check_delivery(session, bot) -> None:
-    """Trevogi: rassylka ne dostala; u zakrytykh dnya net marki dostavki."""
-    if bot is not None:
-        from app.rounds import utc_aware
+async def _lost_deliveries(session) -> dict[str, datetime]:
+    """Дни, для которых рассылка обещана, но не дошла: lost deliveries.
 
-        rows = (
-            await session.execute(
-                select(WatcherState).where(WatcherState.key.like("delivery:%"))
-            )
-        ).scalars().all()
-        lost: dict[str, datetime] = {}
-        for row in rows:
-            head, _, tail = (row.value or "").partition("/")
-            try:
-                if int(tail) > 0 and int(head) == 0:
-                    lost[row.key.removeprefix("delivery:")] = utc_aware(row.updated_at)
-            except ValueError:
-                logger.debug("Метка доставки %s не разобрана: %r", row.key, row.value)
-        if lost:
-            # День старше окна догона из тревоги уходит: дослать его нельзя,
-            # а метка живёт вечно — см. _drop_exhausted_days.
-            lost = {
-                kind: lost[kind]
-                for kind in await _drop_exhausted_days(session, list(lost))
-            }
-            # Недневный вид (суффикс после «:» — не day_index) старше окна:
-            # тревогу несёт уже одна память строки. Переписывает такую метку
-            # только сама рассылка, а та проходит лишь при живой аудитории
-            # (все проголосовали, личка выключена, вид снят) — так застрял
-            # dm:vote-reminder = 0/1 и орал каждый час. Дни судит catchup
-            # в _drop_exhausted_days: у них своё, более долгое окно жизни.
-            stale_before = _now() - _DELIVERY_STALE_AFTER
-            lost = {
-                kind: stamp
-                for kind, stamp in lost.items()
-                if kind.rpartition(":")[2].isdigit() or stamp >= stale_before
-            }
-        if lost:
-            shown = sorted(lost)[:4]
-            note = "ни одно сообщение не доставлено: " + ", ".join(shown)
-            from app.broadcast import DELIVERY_REASON_KEY_PREFIX
+    Метка delivery:<kind>:<day> = «отправлено/попыток»; нулевой «отправлено»
+    с ненулевой «попыток» — день, где доставка не прошла. Дни стареют из
+    тревоги (окно догона) и выпадают из lost; не-дневные метки живут дольше.
+    """
+    from app.rounds import utc_aware
+    rows = (
+        await session.execute(
+            select(WatcherState).where(WatcherState.key.like("delivery:%"))
+        )
+    ).scalars().all()
+    lost: dict[str, datetime] = {}
+    for row in rows:
+        head, _, tail = (row.value or "").partition("/")
+        try:
+            if int(tail) > 0 and int(head) == 0:
+                lost[row.key.removeprefix("delivery:")] = utc_aware(row.updated_at)
+        except ValueError:
+            logger.debug("Метка доставки %s не разобрана: %r", row.key, row.value)
+    if lost:
+        # День старше окна догона из тревоги уходит: дослать его нельзя,
+        # а метка живёт вечно — см. _drop_exhausted_days.
+        lost = {
+            kind: lost[kind]
+            for kind in await _drop_exhausted_days(session, list(lost))
+        }
+        # Недневный вид (суффикс после «:» — не day_index) старше окна:
+        # тревогу несёт уже одна память строки. Переписывает такую метку
+        # только сама рассылка, а та проходит лишь при живой аудитории
+        # (все проголосовали, личка выключена, вид снят) — так застрял
+        # dm:vote-reminder = 0/1 и орал каждый час. Дни судит catchup
+        # в _drop_exhausted_days: у них своё, более долгое окно жизни.
+        stale_before = _now() - _DELIVERY_STALE_AFTER
+        lost = {
+            kind: stamp
+            for kind, stamp in lost.items()
+            if kind.rpartition(":")[2].isdigit() or stamp >= stale_before
+        }
 
-            cause_rows = (
-                await session.execute(
-                    select(WatcherState).where(
-                        WatcherState.key.in_(
-                            [f"{DELIVERY_REASON_KEY_PREFIX}{kind}" for kind in shown]
-                        )
-                    )
+    return lost
+
+
+async def _delivery_lost_alert(session, bot, lost) -> None:
+    """Рассылка не дошла: тревога по lost-дням и причины из delivery_reason:*."""
+    if not lost or bot is None:
+        return
+    shown = sorted(lost)[:4]
+    note = "ни одно сообщение не доставлено: " + ", ".join(shown)
+    from app.broadcast import DELIVERY_REASON_KEY_PREFIX
+
+    cause_rows = (
+        await session.execute(
+            select(WatcherState).where(
+                WatcherState.key.in_(
+                    [f"{DELIVERY_REASON_KEY_PREFIX}{kind}" for kind in shown]
                 )
-            ).scalars().all()
-            causes = {
-                row.key.removeprefix(DELIVERY_REASON_KEY_PREFIX): (row.value or "")
-                for row in cause_rows
-            }
-            with_cause = [kind for kind in shown if causes.get(kind)]
-            cause_line = ""
-            if with_cause:
-                cause_line = "Причины последнего прохода:\n" + "\n".join(
-                    f"• {kind} — {causes[kind]}" for kind in with_cause
-                ) + "\n"
-            await _raise(
-                session,
-                bot,
-                ALERT_DELIVERY_KEY,
-                note,
-                f"⚠️ Рассылка не дошла: {note}.\n{cause_line}"
-                "Проверьте права бота в чатах и /health.",
             )
+        )
+    ).scalars().all()
+    causes = {
+        row.key.removeprefix(DELIVERY_REASON_KEY_PREFIX): (row.value or "")
+        for row in cause_rows
+    }
+    with_cause = [kind for kind in shown if causes.get(kind)]
+    cause_line = ""
+    if with_cause:
+        cause_line = "Причины последнего прохода:\n" + "\n".join(
+            f"• {kind} — {causes[kind]}" for kind in with_cause
+        ) + "\n"
+    await _raise(
+        session,
+        bot,
+        ALERT_DELIVERY_KEY,
+        note,
+        f"⚠️ Рассылка не дошла: {note}.\n{cause_line}"
+        "Проверьте права бота в чатах и /health.",
+    )
 
-    # 3.10. День закрыт и итоги помечены отправленными, а метки доставки нет.
-    #       Значит проход рассылки умер ДО записи метки — или запись не удалась.
-    #       Раньше это была тишина: «разосланы» в логе и results_at в БД, а
-    #       что сообщение дошло — неизвестно. Молчание тут хуже нуля: ноль хотя
-    #       бы означает «дошло немного», а отсутствие метки означает «не знаем».
-    #       Проверяем последний закрытый день, у которого рассылка уже была
-    #       обязана состояться; свежая база без меток тревогу не поднимает.
+
+
+async def _delivery_missing_alert(session, bot) -> None:
+    """Последний закрытый день без метки доставки: рассылка могла не дойти."""
     if bot is not None:
         last_closed = (
             await session.execute(
@@ -1566,17 +1573,14 @@ async def _check_delivery(session, bot) -> None:
                     "смотрите логи и права бота в чатах.",
                 )
 
-    # 3.11. Анонс нового дня ушёл в пустоту: нет ни активного чата, ни игрока
-    #       с личной рассылкой. Метрика delivery:* здесь не помощник: «0 из 0»
-    #       не считается доставкой и метку не оставляет (record_delivery), а
-    #       claim дня уже стоит — без этой проверки пустая аудитория
-    #       неотличима от «новость дня увидели все».
-    #       Маркер пишет announce_new_day; здесь он снимается сам, как только
-    #       получатель появился: первое сообщение в чате (авто-привязка),
-    #       вернувшийся игрок, заново добавленный бот. Иначе тревога
-    #       висела бы до следующего анонса.
 
-
+async def _check_delivery(session, bot) -> None:
+    """Тревоги доставки: рассылка не дошла; у закрытого дня нет метки."""
+    if bot is not None:
+        lost = await _lost_deliveries(session)
+        if lost:
+            await _delivery_lost_alert(session, bot, lost)
+        await _delivery_missing_alert(session, bot)
 
 
 async def _check_announce_empty(session, bot) -> None:
