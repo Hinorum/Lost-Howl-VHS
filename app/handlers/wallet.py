@@ -519,60 +519,80 @@ def _stake_bounds_text() -> str:
     return f"от {settings.stake_min_ton:g} Gram"
 
 
-async def _stake_view_text(user) -> str:
-    if not settings.ton_enabled:
-        return "Приём ставок сейчас выключен. Игра бесплатна: просто выбирай вариант кнопкой."
-    # Версия без ставок (день в снимке режима): приём ставок закрыт для игроков.
-    if await _active_round_money_mode() is False:
-        return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
-    if await _active_round_money_mode() is None:
-        from app.ops import money_mode_enabled as _pending_mode
-
-        async with SessionLocal() as session:
-            if not await _pending_mode(session):
-                return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
-    # Перемотку рекламируем только когда она действительно продаётся: иначе
-    # игрок платит по инструкции, а перевод возвращается с газом казны.
-    # Без адреса казначея платить некуда, даже когда флаг включён.
+def _stake_head(user) -> str:
+    """Как объяснить ставку: шаги, лимиты, казначей, заметка про ревоту."""
     revote_note = (
         f" Сумма {settings.revote_ton:g}–{settings.stake_min_ton:g} Gram при уже "
         "выбранном сегодня кадре зачтётся как оплата перемотки — и без мемо."
         if settings.revote_enabled and settings.active_treasury_address
         else ""
     )
-    head = _STAKE_HOWTO.format(
+    return _STAKE_HOWTO.format(
         mark=money_mark(str(user.id)),
         limits=_stake_bounds_text(),
         rmin=settings.refund_min_gram,
         revote_note=revote_note,
         treasury=settings.active_treasury_address or "(адрес казначея ещё не настроен)",
     )
-    status = ""
+
+
+async def _stake_status(session, user) -> str:
+    """Персональный блок статуса ставки: кошелёк/ставка/голос/день.
+
+    Пусто — приём открыт, и личного блока не нужно. Любой сбой внутри
+    не должен хоронить весь вид: исключения пробрасываем наверх (вид
+    защищён _stake_view_safe статикой).
+    """
+    player = await upsert_player(session, user)
+    if not player.wallet_address:
+        return f"\n\n{hint_mark('stake-nowallet')} Кошелёк пока не привязан — начни с шага 1: /wallet"
+    round_row = await get_active_round(session)
+    if round_row is None:
+        return ""
+    stake = (
+        await session.execute(
+            select(Stake).where(Stake.player_id == player.id, Stake.round_id == round_row.id)
+        )
+    ).scalar_one_or_none()
+    if stake is not None:
+        line = await _today_stake_line(session, player.id)
+        return (
+            f"\n\n{money_mark(str(round_row.id))} 💸 {line}\n"
+            "Выигрыш придёт, если ты поставил на победивший путь."
+        )
+    if await get_vote(session, round_row.id, player.id) is not None:
+        return (
+            f"\n\n{hint_mark('vote-first')} Ставки нет: голос ведёт только "
+            "лидерборд. Перевод, успевший до закрытия, добавит твой Gram "
+            "к выбору пути — и к выигрышу при победе."
+        )
+    return ""
+
+
+async def _stake_acceptance(session, user) -> str:
+    """Вид /stake целиком: принимать ли ставку сейчас и как это объяснить.
+
+    Возвращает полный текст: инструкция (head) + персональный статус + блок
+    экономики и формула выигрыша. При выключенном TON или в версии без ставок
+    возвращается только короткий отказ: инструкция игроку не нужна.
+    """
+    if not settings.ton_enabled:
+        return "Приём ставок сейчас выключен. Игра бесплатна: просто выбирай вариант кнопкой."
+    if await _active_round_money_mode() is False:
+        return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
+    if await _active_round_money_mode() is None:
+        from app.ops import money_mode_enabled as _pending_mode
+
+        async with SessionLocal() as pending_session:
+            if not await _pending_mode(pending_session):
+                return "Игра идёт в версии без ставок: приём ставок выключен. Просто выбирай вариант кнопкой."
+    status = await _stake_status(session, user)
+    return f"{_stake_head(user)}{status}{_economy_text()}{_win_calc_text()}\n\n{_DYOR_TEXT}"
+
+
+async def _stake_view_text(user) -> str:
     async with SessionLocal() as session:
-        player = await upsert_player(session, user)
-        if not player.wallet_address:
-            status = f"\n\n{hint_mark('stake-nowallet')} Кошелёк пока не привязан — начни с шага 1: /wallet"
-        else:
-            round_row = await get_active_round(session)
-            if round_row is not None:
-                stake = (
-                    await session.execute(
-                        select(Stake).where(Stake.player_id == player.id, Stake.round_id == round_row.id)
-                    )
-                ).scalar_one_or_none()
-                if stake is not None:
-                    line = await _today_stake_line(session, player.id)
-                    status = (
-                        f"\n\n{money_mark(str(round_row.id))} 💸 {line}\n"
-                        "Выигрыш придёт, если ты поставил на победивший путь."
-                    )
-                elif await get_vote(session, round_row.id, player.id) is not None:
-                    status = (
-                        f"\n\n{hint_mark('vote-first')} Ставки нет: голос ведёт только "
-                        "лидерборд. Перевод, успевший до закрытия, добавит твой Gram "
-                        "к выбору пути — и к выигрышу при победе."
-                    )
-    return f"{head}{status}{_economy_text()}{_win_calc_text()}\n\n{_DYOR_TEXT}"
+        return await _stake_acceptance(session, user)
 
 
 def _stake_pay_keyboard() -> InlineKeyboardMarkup | None:
