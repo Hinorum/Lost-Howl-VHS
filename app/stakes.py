@@ -147,15 +147,12 @@ def split_equal(total_nanotons: int, player_ids: list[int]) -> dict[int, int]:
     return shares
 
 
-async def register_stake(
-    session: AsyncSession,
-    round_row: Round,
-    player: Player,
-    amount_nanotons: int,
-    tx_hash: str,
-    memo: str = "",
-) -> str:
-    """Проверяет и записывает ставку. Возвращает статус для логов/ответа."""
+async def _stake_gate(session, round_row: Round, player: Player, tx_hash: str) -> str:
+    """Статус блокировки ставки: '' — свободна, иначе причина (см. register_stake).
+
+    Гейты выдают статус рантайма: TON выключен, день не открыт/без ставок,
+    стоп-кран, дубль перевода, кошелёк игрока не подтверждён.
+    """
     if not settings.ton_enabled:
         return "disabled"
     if round_row.status != RoundStatus.OPEN:
@@ -189,10 +186,14 @@ async def register_stake(
     )
     if duplicate.scalar_one_or_none() is not None:
         return "duplicate_tx"
-    existing = await session.execute(
-        select(Stake).where(Stake.round_id == round_row.id, Stake.player_id == player.id)
-    )
-    previous = existing.scalar_one_or_none()
+    return ""
+
+
+def _stake_amount_status(amount_nanotons: int) -> tuple[str, str]:
+    """Проверка суммы ставки: (status, reason).
+
+    status — pending (ставка уходит в очередь) или rejected (too_small/too_big).
+    """
     min_nano = to_nano(settings.stake_min_ton)
     max_nano = to_nano(settings.stake_max_ton) if settings.stake_max_ton > 0 else 0
     status = "pending"
@@ -200,10 +201,28 @@ async def register_stake(
     if amount_nanotons < min_nano:
         status, reason = "rejected", "too_small"
     elif max_nano and amount_nanotons > max_nano:
-        # Потолок (stake_max_ton): перевод выше отклоняется тем же контуром,
-        # что и пыль ниже минимума — деньги возвращаются после итогов дня
-        # (или сразу, когда валидная ставка вытеснит отклонённую строку).
         status, reason = "rejected", "too_big"
+    return status, reason
+
+
+async def register_stake(
+    session: AsyncSession,
+    round_row: Round,
+    player: Player,
+    amount_nanotons: int,
+    tx_hash: str,
+    memo: str = "",
+) -> str:
+    """Проверяет и записывает ставку. Возвращает статус для логов/ответа."""
+    gate = await _stake_gate(session, round_row, player, tx_hash)
+    if gate:
+        return gate
+    status, reason = _stake_amount_status(amount_nanotons)
+    previous = (
+        await session.execute(
+            select(Stake).where(Stake.round_id == round_row.id, Stake.player_id == player.id)
+        )
+    ).scalar_one_or_none()
     if previous is not None and (previous.status != "rejected" or status == "rejected"):
         # Повтор неотклонённой ставки (confirmed/pending) — уже_staked; пылевая
         # ставка поверх пылевой тоже не валидная замена — как вторая ставка дня.
