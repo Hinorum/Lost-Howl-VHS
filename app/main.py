@@ -590,7 +590,13 @@ async def _dispose_db_pool() -> None:
         log.warning("Пул соединений БД не закрыт — освободится по таймауту", exc_info=True)
 
 
-async def run_webhook(bot, dispatcher) -> None:
+def _configure_webhook(bot, dispatcher) -> web.AppRunner:
+    """Поднимает aiohttp-приложение с эндпоинтами бота и регистрирует роут.
+
+    Сам webhook (set_webhook) здесь не живёт: решение о публичном URL —
+    настройка инстанса, а не кода. Runner возвращаем, чтобы запуск и остановка
+    остались разными шагами с разными обязанностями.
+    """
     path = "/webhook"
     secret = settings.webhook_secret or None
     app = web.Application()
@@ -601,25 +607,30 @@ async def run_webhook(bot, dispatcher) -> None:
     app.router.add_get("/metrics", metrics)
     SimpleRequestHandler(dispatcher=dispatcher, bot=bot, secret_token=secret).register(app, path=path)
     setup_application(app, dispatcher, bot=bot)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", settings.port)
-    await site.start()
-    if settings.public_base_url:
-        # drop_pending_updates=False: накопленные за сон апдейты (голоса
-        # кнопками и прочие действия) должны обработаться, а не выброситься.
-        await bot.set_webhook(
-            f"{settings.public_base_url}{path}",
-            secret_token=secret,
-            drop_pending_updates=False,
-        )
+    return web.AppRunner(app)
+
+
+def _start_background_tasks(bot, stop: asyncio.Event) -> tuple[asyncio.Task, asyncio.Task]:
+    """Boot-задача (done-callback ловит падение bootstrap) + self-ping.
+
+    Сам цикл жизни задачи — ждать выставленный stop; установка стопа —
+    из _install_stop_handlers (сигналы или тестовый хук).
+    """
     boot_task = asyncio.create_task(boot_game(bot), name="boot-game")
     boot_task.add_done_callback(_boot_task_done)
-    stop = asyncio.Event()
     ping_task = asyncio.create_task(_self_ping_loop(stop))
     _install_stop_handlers(stop)
-    await stop.wait()
-    log.info("Остановка: глушим планировщик и веб-сервер")
+    return boot_task, ping_task
+
+
+async def _shutdown_webhook(
+    bot,
+    runner: web.AppRunner,
+    stop: asyncio.Event,
+    boot_task: asyncio.Task,
+    ping_task: asyncio.Task,
+) -> None:
+    """Глушение webhook-инстанса: планировщик, лок, задачи, соединения, пул БД."""
     from app.scheduler import shutdown_scheduler
 
     shutdown_scheduler()
@@ -651,6 +662,30 @@ async def run_webhook(bot, dispatcher) -> None:
     # Пул БД закрываем явно: иначе соединения умирающего процесса остаются
     # на пулере сиротами до таймаута и занимают слот лимита проекта.
     await _dispose_db_pool()
+
+
+async def run_webhook(bot, dispatcher) -> None:
+    """Запуск webhook-контура: подъём сервера, регистрация роутов, подписка
+    апдейтов, фон бутстрапа, self-ping; по stop — глушение в чистом порядке.
+
+    drop_pending_updates=False: накопленные за сон апдейты (голоса кнопками и
+    прочие действия) должны обработаться, а не выброситься.
+    """
+    runner = _configure_webhook(bot, dispatcher)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", settings.port)
+    await site.start()
+    if settings.public_base_url:
+        await bot.set_webhook(
+            f"{settings.public_base_url}/webhook",
+            secret_token=settings.webhook_secret or None,
+            drop_pending_updates=False,
+        )
+    stop = asyncio.Event()
+    boot_task, ping_task = _start_background_tasks(bot, stop)
+    await stop.wait()
+    log.info("Остановка: глушим планировщик и веб-сервер")
+    await _shutdown_webhook(bot, runner, stop, boot_task, ping_task)
 
 
 def ensure_webhook_secret() -> None:
