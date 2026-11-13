@@ -632,7 +632,6 @@ async def _menu_invite(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("vote:"))
 async def _parse_vote_selection(callback: CallbackQuery) -> tuple[int, int] | None:
     """Разбор и валидация callback_data голосования: (round_id, position).
 
@@ -754,7 +753,15 @@ async def _send_vote_dm(session, callback: CallbackQuery, player, round_row, lab
         logger.debug("Личное подтверждение выбора игроку %s не доставлено: %s", callback.from_user.id, exc)
 
 
+@router.callback_query(F.data.startswith("vote:"))
 async def on_vote(callback: CallbackQuery) -> None:
+    """Голос игрока по кнопке дня.
+
+    Декоратор обязан стоять здесь, а не на _parse_vote_selection: иначе
+    роутер зовёт парсер, тот возвращает кортеж и голос молча не записывается.
+    Регрессия уже случалась при выносе хелперов — кнопки переставали
+    фиксировать выбор.
+    """
     selection = await _parse_vote_selection(callback)
     if selection is None:
         return

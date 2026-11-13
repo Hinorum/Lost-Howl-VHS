@@ -361,8 +361,6 @@ async def cmd_panel(message: Message) -> None:
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=await _panel_keyboard())
 
 
-@router.callback_query(F.data.startswith("panel:"))
-@require_admin("Пульт только для хранителя.")
 async def _panel_refresh(callback: CallbackQuery, message: Message) -> None:
     """Обновление текста панели (кнопка «Обновить» / возврат к /panel)."""
     async with SessionLocal() as session:
@@ -581,8 +579,16 @@ async def _panel_advance(callback: CallbackQuery, message: Message, action: str)
     await callback.answer("День переключён.")
 
 
+@router.callback_query(F.data.startswith("panel:"))
+@require_admin("Пульт только для хранителя.")
 async def on_panel_action(callback: CallbackQuery) -> None:
-    """Единая точка кнопок пульта: гейт хранителя + маршрутизация действий."""
+    """Единая точка кнопок пульта: гейт хранителя + маршрутизация действий.
+
+    Декораторы живут ИМЕННО здесь: при рефакторинге их однажды оставили на
+    _panel_refresh, и роутер звал помощник напрямую. Аргумент message aiogram
+    колбэку не подставляет — каждая кнопка пульта падала с TypeError и
+    отвечала «Плёнка заело», а остальные действия были недоступны.
+    """
     data = callback.data or ""
     action = data.split(":", 1)[1] if ":" in data else ""
     message = callback_message(callback)
