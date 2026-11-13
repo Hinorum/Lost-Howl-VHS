@@ -122,6 +122,63 @@ async def auto_bind_chat(message: Message) -> None:
         )
 
 
+async def _heal_stale_rounds_quietly(session) -> None:
+    """Лечение застрявших дней перед /advance: сбой лечения — не должен
+    останавливать закрытие (логируем, идём дальше)."""
+    try:
+        from app.rounds import heal_stale_rounds
+
+        await heal_stale_rounds(session)
+    except Exception:
+        logger.warning("Лечение застрявших дней перед /advance не удалось", exc_info=True)
+
+
+def _voting_window_open(round_row) -> bool:
+    """Свежеоткрытый день не трогаем: окно голосования ещё не истекло.
+
+    Инцидент: тик уже закрыл N и открыл N+1, а /advance брал свежий день как
+    «актуальный» и закрывал его с нулём голосов и жребием, плодя затем N+2 по
+    latest+1. Свежеоткрытый день не трогаем: если день действительно застрял,
+    его окно голосования уже истекло.
+    """
+    return utc_aware(round_row.voting_ends_at) > _now()
+
+
+async def _finalize_after_tally(session, round_row) -> None:
+    """День закрыт и посчитан: выплаты и лидерборды — финал дня."""
+    await award_points(session, round_row)
+    from app.stakes import finalize_day_payouts
+
+    await finalize_day_payouts(session, round_row)
+    from app.leaderboard import mark_leaderboards_for_finished
+
+    await mark_leaderboards_for_finished(session, round_row)
+
+
+async def _advance_current(session, round_row) -> tuple[Round, bool] | None:
+    """Закрывает текущий день /advance и готовит следующий за цикл закрытия.
+
+    Возвращает (round_row, closed_here) — актуальный день и закрыли ли его тут;
+    либо None, если статус не из обрабатываемых (open/tallying): закрывать нечего,
+    следующий день не трогаем.
+
+    closed_here — закрыли ли этот день здесь: финализация (выплаты) и создание
+    следующего идут только при нём, иначе игру двинем дважды за один /advance.
+    """
+    if round_row.status.value == "open":
+        await close_voting(session, round_row)
+        round_row, closed_here = await finish_tally(session, round_row)
+        if closed_here:
+            await _finalize_after_tally(session, round_row)
+    elif round_row.status.value == "tallying":
+        round_row, closed_here = await finish_tally(session, round_row)
+        if closed_here:
+            await _finalize_after_tally(session, round_row)
+    else:
+        return None
+    return round_row, closed_here
+
+
 @router.message(Command("advance"), F.chat.type == ChatType.PRIVATE)
 @require_admin("Команда только для хранителя игры.")
 async def cmd_advance(message: Message) -> None:
@@ -133,14 +190,9 @@ async def cmd_advance(message: Message) -> None:
     closed_here = False
     claimed = False
     async with SessionLocal() as session:
-        # Сначала дочитываем дни, застрявшие позади актуального (инцидент:
+        # Сначала дочитаем дни, застрявшие позади актуального (инцидент:
         # сбой анонса оставлял день в TALLYING навсегда).
-        try:
-            from app.rounds import heal_stale_rounds
-
-            await heal_stale_rounds(session)
-        except Exception:
-            logger.warning("Лечение застрявших дней перед /advance не удалось", exc_info=True)
+        await _heal_stale_rounds_quietly(session)
         round_row = await get_active_round(session)
         if round_row is None:
             round_row = await ensure_current_round(session)
@@ -150,7 +202,7 @@ async def cmd_advance(message: Message) -> None:
             else:
                 await message.answer(f"День {round_row.day_index} уже объявлен.")
             return
-        if utc_aware(round_row.voting_ends_at) > _now():
+        if _voting_window_open(round_row):
             # Инцидент: тик уже закрыл N и открыл N+1, а /advance брал свежий
             # день как «актуальный» и закрывал его с нулём голосов и жребием,
             # плодя затем N+2 по latest+1. Свежеоткрытый день не трогаем: если
@@ -161,31 +213,14 @@ async def cmd_advance(message: Message) -> None:
                 "Свежий день не закрываю — /advance нужен застрявшим дням."
             )
             return
-        if round_row.status.value == "open":
-            await close_voting(session, round_row)
-            round_row, closed_here = await finish_tally(session, round_row)
-            if closed_here:
-                await award_points(session, round_row)
-                from app.stakes import finalize_day_payouts
-                await finalize_day_payouts(session, round_row)
-                from app.leaderboard import mark_leaderboards_for_finished
-                await mark_leaderboards_for_finished(session, round_row)
-            nxt, created = await create_next_round_detailed(
-                session, base_day_index=round_row.day_index
-            )
-        elif round_row.status.value == "tallying":
-            round_row, closed_here = await finish_tally(session, round_row)
-            if closed_here:
-                await award_points(session, round_row)
-                from app.stakes import finalize_day_payouts
-                await finalize_day_payouts(session, round_row)
-                from app.leaderboard import mark_leaderboards_for_finished
-                await mark_leaderboards_for_finished(session, round_row)
-            nxt, created = await create_next_round_detailed(
-                session, base_day_index=round_row.day_index
-            )
-        else:
+        finalized = await _advance_current(session, round_row)
+        if finalized is None:
+            # Ничего не закрывали: статус не из {open, tallying}.
             return
+        round_row, closed_here = finalized
+        nxt, created = await create_next_round_detailed(
+            session, base_day_index=round_row.day_index
+        )
         if created:
             claimed = await claim_announcement(session, nxt)
     if not created or not claimed:
