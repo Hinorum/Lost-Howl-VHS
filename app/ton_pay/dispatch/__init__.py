@@ -141,6 +141,81 @@ async def _wait_for_batch_memos(
         _state._RECONCILE_WINDOW_COMPLETE = saved_window
 
 
+def _batch_rows(
+    payouts: list[Payout], markers: set[str]
+) -> list[tuple[Payout, tuple[str, ...]]]:
+    """Строки пачки: не в маркерах и не требующие поштучного прохода.
+
+    Маркеры покрывают строки, уже найденные в истории казначея (поштучный
+    проход пометит их sent без повтора); строки с попытками > 1 и без доверия
+    к полноте истории уходят в поштучный fallback.
+    """
+    history_trusted = _state._RECONCILE_HISTORY_OK and _state._RECONCILE_WINDOW_COMPLETE
+    selected: list[tuple[Payout, tuple[str, ...]]] = []
+    for payout in payouts:
+        candidates = tuple(_payout_comment_candidates(payout))
+        if any(candidate in markers for candidate in candidates):
+            continue
+        if payout.attempts > 1 and not history_trusted:
+            continue
+        selected.append((payout, candidates))
+    return selected
+
+
+def _mark_batch_sent(
+    batch_rows: list[tuple[Payout, tuple[str, ...]]], marker: str
+) -> int:
+    """Пачка разошлась: tx_hash=marker, все строки пачки помечены sent."""
+    for payout, _candidates in batch_rows:
+        payout.tx_hash = marker
+        payout.status = "sent"
+        payout.sent_at = datetime.now(UTC)
+        payout.attempts = 0
+        payout.last_error = None
+    return len(batch_rows)
+
+
+async def _settle_batch_uncertain(
+    batch_rows: list[tuple[Payout, tuple[str, ...]]]
+) -> tuple[int, set[int]]:
+    """Вещание не подтвердилось: судьба пачки неясна — решаем по memo.
+
+    Таймаут вещания (asyncio.wait_for), сбой обоих каналов после таймаута
+    лайтсерверов (BatchUncertain) и прочие ошибки. Внешка могла уйти в сеть —
+    повтор в этом цикле рискнул бы двойным платежом: решаем по memo, как и
+    в одиночном пути при таймауте. Транзакция v5r1 атомарна, поэтому частично
+    найденное — рассинхрон индексации провайдера, а не «половина ушла».
+
+    Возвращает (сколько строк подтверждено sent, id строк, не подтверждённых
+    для повторного поштучного прохода в этом цикле).
+    """
+    found = await _wait_for_batch_memos(batch_rows, settings.payout_batch_confirm_seconds)
+    confirmed = 0
+    for payout, _candidates in batch_rows:
+        if payout.id in found:
+            payout.tx_hash = None
+            payout.status = "sent"
+            payout.sent_at = datetime.now(UTC)
+            payout.attempts = 0
+            payout.last_error = None
+            confirmed += 1
+            continue
+        payout.last_error = (
+            "судьба пачки неясна (таймаут вещания или сбой канала) — "
+            "повтор отложен до сверки по memo"
+        )[:200]
+        if payout.attempts >= settings.payout_max_attempts:
+            payout.status = "failed"
+        else:
+            payout.status = "pending"
+    logger.warning(
+        "Пачка: вещание неясно — memo найдено у %d из %d, остальные ждут сверки",
+        confirmed,
+        len(batch_rows),
+    )
+    return confirmed, {payout.id for payout, _candidates in batch_rows}
+
+
 async def _try_send_batch_v5(
     payouts: list[Payout], markers: set[str]
 ) -> tuple[int, set[int]]:
@@ -152,7 +227,7 @@ async def _try_send_batch_v5(
         пометит их sent без повтора), и повторы с недоступной/неполной
         историей казначея (поштучный проход заморозит их с видимой причиной);
       • BatchRejected (ошибка сборки/явный отказ лайтсерверов) — ничего не
-        помечаем и не держим: поштучный проход отправит строки как раньше.
+        помечаем и не держаем: поштучный проход отправит строки как раньше.
         Транзакция v5r1 атомарна (одно плохое действие отменяет всю пачку),
         поэтому поштучный фолбэк — не опция, а требование корректности;
       • всё прочее (таймаут вещания, сбой обоих каналов, неклассифицированные
@@ -162,15 +237,7 @@ async def _try_send_batch_v5(
         не возвращаем: вещание могло уйти); следующий цикл начнёт с
         анти-дубля.
     """
-    history_trusted = _state._RECONCILE_HISTORY_OK and _state._RECONCILE_WINDOW_COMPLETE
-    batch_rows: list[tuple[Payout, tuple[str, ...]]] = []
-    for payout in payouts:
-        candidates = tuple(_payout_comment_candidates(payout))
-        if any(candidate in markers for candidate in candidates):
-            continue
-        if payout.attempts > 1 and not history_trusted:
-            continue
-        batch_rows.append((payout, candidates))
+    batch_rows = _batch_rows(payouts, markers)
     if not batch_rows:
         return 0, set()
 
@@ -211,46 +278,16 @@ async def _try_send_batch_v5(
                 len(batch_rows),
                 exc,
             )
-        found = await _wait_for_batch_memos(
-            batch_rows, settings.payout_batch_confirm_seconds
-        )
-        confirmed = 0
-        for payout, _candidates in batch_rows:
-            if payout.id in found:
-                payout.tx_hash = None
-                payout.status = "sent"
-                payout.sent_at = datetime.now(UTC)
-                payout.attempts = 0
-                payout.last_error = None
-                confirmed += 1
-                continue
-            payout.last_error = (
-                "судьба пачки неясна (таймаут вещания или сбой канала) — "
-                "повтор отложен до сверки по memo"
-            )[:200]
-            if payout.attempts >= settings.payout_max_attempts:
-                payout.status = "failed"
-            else:
-                payout.status = "pending"
-        logger.warning(
-            "Пачка: вещание неясно — memo найдено у %d из %d, остальные ждут сверки",
-            confirmed,
-            len(batch_rows),
-        )
-        return confirmed, {payout.id for payout, _candidates in batch_rows}
+        confirmed, pending_ids = await _settle_batch_uncertain(batch_rows)
+        return confirmed, pending_ids
 
     if marker is None:
         # TON выключен или нет мнемоники: причина строк пишется поштучным
         # проходом ниже (он единственный путь с видимым last_error).
         return 0, set()
-    for payout, _candidates in batch_rows:
-        payout.tx_hash = marker
-        payout.status = "sent"
-        payout.sent_at = datetime.now(UTC)
-        payout.attempts = 0
-        payout.last_error = None
-    logger.info("Пачка: %d переводов разошлись одним внешним сообщением", len(batch_rows))
-    return len(batch_rows), {payout.id for payout, _candidates in batch_rows}
+    sent_count = _mark_batch_sent(batch_rows, marker)
+    logger.info("Пачка: %d переводов разошлись одним внешним сообщением", sent_count)
+    return sent_count, {payout.id for payout, _candidates in batch_rows}
 
 
 async def dispatch_pending_payouts(limit: int = 50, bot: Bot | None = None) -> int:
