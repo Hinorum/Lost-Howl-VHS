@@ -154,58 +154,57 @@ async def on_change_view(callback: CallbackQuery) -> None:
     await callback.answer(f"{status} Открой бота в личке: /change"[:200], show_alert=True)
 
 
-@router.callback_query(F.data.startswith("payton:"))
-async def on_payton(callback: CallbackQuery) -> None:
-    raw = (callback.data or "").split(":")[1] if ":" in (callback.data or "") else ""
+def _payton_round_id(data: str) -> int | None:
+    """Счёт из data:payton:<round_id>: цифры — id раунда, иначе None."""
+    raw = data.split(":", 1)[1] if ":" in data else ""
+    return int(raw) if raw.isdigit() else None
+
+
+async def _payton_guard(callback: CallbackQuery) -> str | None:
+    """Текущий статус кнопки оплаты перемотки: текст отказа или None, если кнопка жива.
+
+    Проверки по порядку: личка → фича → стоп-кран → версия без ставок → казначей →
+    валидность счёта → сверка счёт ↔ активный день → cooldown для неадмина.
+    Любой отказ молча не открывает инструкцию: игрок не должен платить за
+    несуществующий кадр.
+    """
     if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
-        await callback.answer("Оплата — только в личке у бота (/change).", show_alert=True)
-        return
+        return "Оплата — только в личке у бота (/change)."
     if not settings.revote_enabled:
-        await callback.answer("Перемотка кадра сейчас недоступна.", show_alert=True)
-        return
+        return "Перемотка кадра сейчас недоступна."
     # Стоп-кран: во время техработ реквизиты не выдаём, чтобы игрок не
     # отправил деньги за смену пути в замороженной игре.
     if await _game_paused_now():
-        await callback.answer(
-            "⏸ Идут технические работы — оплата временно недоступна. Попробуй позже.",
-            show_alert=True,
-        )
-        return
+        return "⏸ Идут технические работы — оплата временно недоступна. Попробуй позже."
     # Версия без ставок: платная смена выбора не продаётся вовсе.
     if await _active_round_money_mode() is False:
-        await callback.answer(
-            "Игра идёт в версии без ставок: перемотка кадра недоступна.",
-            show_alert=True,
-        )
-        return
+        return "Игра идёт в версии без ставок: перемотка кадра недоступна."
     if not settings.ton_enabled or not settings.active_treasury_address:
-        await callback.answer(
-            "Приём Gram ещё не включён — оплата перемотки временно недоступна.",
-            show_alert=True,
-        )
-        return
-    if not raw.isdigit():
-        await callback.answer("Некорректный счёт.", show_alert=True)
-        return
+        return "Приём Gram ещё не включён — оплата перемотки временно недоступна."
+    round_id = _payton_round_id(callback.data or "")
+    if round_id is None:
+        return "Некорректный счёт."
     # Счёт мог устареть: показываем реквизиты только для активного дня и
     # только тому, кто уже сделал первый выбор.
     status, active_id = await _revote_status(callback.from_user)
-    if active_id != int(raw):
-        await callback.answer(status[:200], show_alert=True)
-        return
+    if active_id != round_id:
+        return status[:200]
     if callback.from_user.id not in settings.admin_id_set:
         from app.handlers.wallet import _wallet_throttled
 
         async with SessionLocal() as session:
             if await _wallet_throttled(session, callback.from_user.id, "payton_cd"):
-                await callback.answer(
+                return (
                     f"{hint_mark('wallet-throttle')} Инструкция только что отправлена — "
-                    "подожди полминуты.",
-                    show_alert=True,
+                    "подожди полминуты."
                 )
-                return
-    address = settings.active_treasury_address
-    await callback.message.answer(
+    return None
+
+
+def _payton_payment_text(raw: str, address: str) -> str:
+    """Инструкция по Gram: вилка, потолок ниже ставки, memo и предупреждение,
+    что ровно минимальная ставка — это ставка дня, а не оплата перемотки."""
+    return (
         f"{money_mark(raw)} Перемотка кадра — оплата Gram.\n"
         f"Переведи <b>{settings.revote_ton:g}–{_revote_gram_ceiling():g} Gram</b> "
         f"(строго меньше минимума ставки {settings.stake_min_ton:g} Gram) на казначея:\n"
@@ -214,7 +213,20 @@ async def on_payton(callback: CallbackQuery) -> None:
         f"<code>{revote_memo(int(raw))}</code> в любой части комментария.\n\n"
         "Грант придёт в течение минуты и живёт до конца дня. "
         f"Ровно {settings.stake_min_ton:g} Gram — уже минимальная ставка, не оплата перемотки.\n"
-        "Для оплаты кошелёк должен быть привязан: /wallet.",
-        parse_mode=ParseMode.HTML,
+        "Для оплаты кошелёк должен быть привязан: /wallet."
     )
+
+
+@router.callback_query(F.data.startswith("payton:"))
+async def on_payton(callback: CallbackQuery) -> None:
+    error = await _payton_guard(callback)
+    if error is not None:
+        await callback.answer(error, show_alert=True)
+        return
+    round_id = _payton_round_id(callback.data or "")
+    message = callback.message
+    if message is None:
+        # Guard уже отвечает в личке; защита от None — для типов.
+        return
+    await message.answer(_payton_payment_text(str(round_id), settings.active_treasury_address))
     await callback.answer()
