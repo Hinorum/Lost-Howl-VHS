@@ -918,6 +918,64 @@ def _reminder_text(stake_mode: bool, rule_phrase: str, stakes: tuple[int, int]) 
     return f"{body}\n{words}"
 
 
+async def _vote_reminder_unvoted(session, round_id: int) -> set[int]:
+    """Идентификаторы игроков, не сделавших выбор в этот открытый день.
+
+    Аудитория напоминания — только те, кто ещё не голосовал. «Пустая
+    аудитория» (все уже выбрали или подписчиков нет) — не сбой: джоба молчит
+    через пустой набор, а не падает.
+    """
+    from app.models import Player, Vote
+
+    voted_result = await session.execute(
+        select(Vote.player_id).where(Vote.round_id == round_id)
+    )
+    voted_ids = {row[0] for row in voted_result.all()}
+    all_players = await session.execute(
+        select(Player).where(Player.dm_subscribed == True)
+    )
+    unbotted = [p for p in all_players.scalars().all() if p.id not in voted_ids]
+    return {p.id for p in unbotted}
+
+
+async def _vote_reminder_stake_totals(
+    session, round_id: int, stake_mode: bool
+) -> dict[int, tuple[int, int]]:
+    """Суммы ставок по игрокам дня: (подтверждено, в пути) — одна ставка на игрок.
+
+    Без стейта (бесплатный день) — пустой словарь: строка напоминания апеллирует
+    к голосам, а не к Gram.
+    """
+    totals: dict[int, tuple[int, int]] = {}
+    if not stake_mode:
+        return totals
+    from app.models import Stake
+
+    stake_rows = await session.execute(
+        select(Stake.player_id, Stake.amount_nanotons, Stake.status).where(
+            Stake.round_id == round_id
+        )
+    )
+    for pid, amount, status in stake_rows.all():
+        confirmed, pending = totals.get(pid, (0, 0))
+        if status == "confirmed":
+            totals[pid] = (confirmed + int(amount), pending)
+        else:
+            totals[pid] = (confirmed, pending + int(amount))
+    return totals
+
+
+async def _vote_reminder_deliver(
+    bot, pid: int, stake_mode: bool, rule_phrase: str, stake_total: tuple[int, int]
+) -> None:
+    """Личное напоминание игроку: текст с персональной ставкой."""
+    await bot.send_message(
+        pid,
+        _reminder_text(stake_mode, rule_phrase, stake_total),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def _vote_reminder_job() -> None:
     """Напоминание за час до конца: DM ТОЛЬКО тем, кто ещё не выбрал путь.
 
@@ -939,35 +997,13 @@ async def _vote_reminder_job() -> None:
 
             if not await claim_once(session, f"job:vote-reminder:{_now().strftime('%Y-%m-%d')}"):
                 return
-            # Закрепляем маркер даты отдельным COMMIT: рассылка — не то, что
+            # Закрепляем маркер дата отдельным COMMIT: рассылка — не то, что
             # нужно откатывать вместе с транзакцией чтения. Без COMMIT сессия
             # закроется откатом, маркер исчезнет, и «раз в день» превратится
             # в «каждый тик в 10:00» после каждого рестарта.
             await session.commit()
             # Получаем всех игроков, которые ещё не голосовали
-            from sqlalchemy import select as _select
-
-            from app.models import Vote
-
-            voted_result = await session.execute(
-                _select(Vote.player_id).where(Vote.round_id == current.id)
-            )
-            voted_ids = {row[0] for row in voted_result.all()}
-
-            from app.models import Player
-
-            all_players = await session.execute(
-                _select(Player).where(Player.dm_subscribed == True)
-            )
-            unbotted = [p for p in all_players.scalars().all() if p.id not in voted_ids]
-            # Пустая аудитория (все уже проголосовали или подписчиков нет) —
-            # это НЕ ранний return. Раньше джоба здесь обрывалась, и
-            # _dm_send_all(only=set()), который снимает застрявшую метку
-            # delivery:dm:vote-reminder прошлого прохода, не вызывался:
-            # «0 из N», оставшийся со вчерашнего сбоя, орал бы тревогой
-            # каждый час вечно (инцидент 14.10). Нечего отправлять — это
-            # не сбой; считает ноль и честно пишет об этом в лог ниже.
-            unbotted_ids = {p.id for p in unbotted}
+            unbotted_ids = await _vote_reminder_unvoted(session, current.id)
 
             stake_mode = (
                 settings.ton_enabled
@@ -980,47 +1016,17 @@ async def _vote_reminder_job() -> None:
             ]
             # Суммы ставок по игрокам дня — одно чтение на всю рассылку:
             # правим язык напоминания под фактическое состояние игрока.
-            stake_totals: dict[int, tuple[int, int]] = {}
-            if stake_mode:
-                from app.models import Stake
-
-                stake_rows = await session.execute(
-                    _select(Stake.player_id, Stake.amount_nanotons, Stake.status).where(
-                        Stake.round_id == current.id
-                    )
-                )
-                for pid, amount, status in stake_rows.all():
-                    confirmed, pending = stake_totals.get(pid, (0, 0))
-                    if status == "confirmed":
-                        stake_totals[pid] = (confirmed + int(amount), pending)
-                    else:
-                        stake_totals[pid] = (confirmed, pending + int(amount))
+            stake_totals = await _vote_reminder_stake_totals(session, current.id, stake_mode)
 
             from app.broadcast import _dm_send_all
 
-            async def _deliver(pid: int) -> None:
-                # Аудитория сужена до не проголосовавших (only=), поэтому и
-                # фильтровать внутри не нужно.
-                #
-                # СБОЙ ОТПРАВКИ НЕ ГЛОТАЕТСЯ. Раньше здесь стоял
-                # except Exception -> logger.debug, из-за чего _dm_send_all
-                # (он считает успехом любой вызов без исключения) записывал
-                # неп��ставленное сообщение как доставленное, и в лог уходило
-                # «Напоминание о голосовании отправлено: N сообщений» с
-                # завышенным N. Теперь промах считается промахом, ретрай
-                # Telegram отрабатывает, а причина видна на уровне warning.
-                await bot.send_message(
-                    pid,
-                    _reminder_text(
-                        stake_mode,
-                        rule_phrase,
-                        stake_totals.get(pid, (0, 0)),
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-
             sent = await _dm_send_all(
-                bot, _deliver, "vote-reminder", only=unbotted_ids
+                bot,
+                lambda pid: _vote_reminder_deliver(
+                    bot, pid, stake_mode, rule_phrase, stake_totals.get(pid, (0, 0))
+                ),
+                "vote-reminder",
+                only=unbotted_ids,
             )
             logger.info(
                 "Напоминание о голосовании: доставлено %d из %d не проголосовавших",
