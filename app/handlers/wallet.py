@@ -818,99 +818,121 @@ async def cmd_fund(message: Message) -> None:
     await message.answer(await _fund_text(), parse_mode=ParseMode.HTML)
 
 
+async def _top_names(session, rows: list[tuple[int, ...]]) -> dict[int, str]:
+    """Имена игроков для строк лидерборда; незнакомцы станут «игрок N»."""
+    names: dict[int, str] = {}
+    if rows:
+        pids = [row[0] for row in rows]
+        players = (
+            await session.execute(select(Player).where(Player.id.in_(pids)))
+        ).scalars().all()
+        names = {
+            player.id: player.username or player.first_name or f"игрок {player.id}"
+            for player in players
+        }
+    return names
+
+
+async def _top_week_rows(session, week_start, week_end) -> list[tuple[str, int, bool]]:
+    """Строки недели: имя, верных выборов, право на приз (кошелёк + ставка)."""
+    from app.leaderboard import _players_with_stake, _rank_window
+
+    week_raw = await _rank_window(session, week_start, week_end, by="opens_at", limit=10)
+    week_names = await _top_names(session, week_raw)
+    wallets: set[int] = set()
+    if week_raw:
+        wallet_rows = (
+            await session.execute(
+                select(Player.id).where(
+                    Player.id.in_([pid for pid, _c, _d, _g in week_raw]),
+                    Player.wallet_address.is_not(None),
+                    Player.wallet_verified.is_(True),
+                )
+            )
+        ).scalars().all()
+        wallets = set(wallet_rows)
+    week_staked = await _players_with_stake(session, week_start, week_end, by="opens_at")
+    return [
+        (
+            week_names.get(pid, f"игрок {pid}"),
+            correct,
+            pid in wallets
+            and pid in week_staked
+            and correct > 0
+            and days >= max(1, settings.weekly_min_days),
+        )
+        for pid, correct, days, _gram in week_raw
+    ]
+
+
+async def _top_month_rows(session, month_start, next_month) -> list[tuple[str, int, bool]]:
+    """Строки месяца: имя, верных выборов, право на приз (кошелёк + ставка)."""
+    from app.leaderboard import _players_with_stake, _rank_window
+
+    month_raw = await _rank_window(
+        session, month_start, next_month, by="tally_ends_at", limit=10
+    )
+    month_names = await _top_names(session, month_raw)
+    month_pids = [pid for pid, _c, _d, _g in month_raw]
+    month_wallets: set[int] = set()
+    if month_pids:
+        month_wallet_rows = (
+            await session.execute(
+                select(Player.id).where(
+                    Player.id.in_(month_pids),
+                    Player.wallet_address.is_not(None),
+                    Player.wallet_verified.is_(True),
+                )
+            )
+        ).scalars().all()
+        month_wallets = set(month_wallet_rows)
+    month_staked = await _players_with_stake(
+        session, month_start, next_month, by="tally_ends_at"
+    )
+    return [
+        (
+            month_names.get(pid, f"игрок {pid}"),
+            count,
+            pid in month_wallets and pid in month_staked,
+        )
+        for pid, count, _days, _gram in month_raw
+    ]
+
+
+async def _top_pots(session, now, month: str) -> tuple[float, float]:
+    """Копилки месяца и текущей недели в Gram."""
+    from app.models import WeeklyPot
+    from app.weeks import iso_week_key
+
+    pot_row = (
+        await session.execute(select(LeaderboardPot).where(LeaderboardPot.month == month))
+    ).scalar_one_or_none()
+    week_pot_row = (
+        await session.execute(select(WeeklyPot).where(WeeklyPot.week == iso_week_key(now)))
+    ).scalar_one_or_none()
+    month_pot_ton = from_nano(pot_row.nanotons) if pot_row is not None else 0.0
+    week_pot_ton = from_nano(week_pot_row.nanotons) if week_pot_row is not None else 0.0
+    return month_pot_ton, week_pot_ton
+
+
 async def _top_text() -> str:
     """Копилки недели и месяца с лидерами (текст; публичный, можно в группе)."""
     from datetime import timedelta
 
-    from app.leaderboard import _players_with_stake, _rank_window
-    from app.models import WeeklyPot
     from app.weeks import iso_week_key, week_bounds
 
     now = datetime.now(UTC)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     week_start, week_end = week_bounds(iso_week_key(now))
+    next_month = (month_start + timedelta(days=35)).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
     async with SessionLocal() as session:
-        async def named(rows: list[tuple[int, ...]]) -> dict[int, str]:
-            names: dict[int, str] = {}
-            if rows:
-                pids = [row[0] for row in rows]
-                players = (
-                    await session.execute(select(Player).where(Player.id.in_(pids)))
-                ).scalars().all()
-                names = {
-                    player.id: player.username or player.first_name or f"игрок {player.id}"
-                    for player in players
-                }
-            return names
-
-        week_raw = await _rank_window(session, week_start, week_end, by="opens_at", limit=10)
-        week_names = await named(week_raw)
-        wallets: set[int] = set()
-        if week_raw:
-            wallet_rows = (
-                await session.execute(
-                    select(Player.id).where(
-                        Player.id.in_([pid for pid, _c, _d, _g in week_raw]),
-                        Player.wallet_address.is_not(None),
-                        Player.wallet_verified.is_(True),
-                    )
-                )
-            ).scalars().all()
-            wallets = set(wallet_rows)
-        week_staked = await _players_with_stake(session, week_start, week_end, by="opens_at")
-        week_rows = [
-            (
-                week_names.get(pid, f"игрок {pid}"),
-                correct,
-                pid in wallets
-                and pid in week_staked
-                and correct > 0
-                and days >= max(1, settings.weekly_min_days),
-            )
-            for pid, correct, days, _gram in week_raw
-        ]
-
-        next_month = (month_start + timedelta(days=35)).replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0
+        week_rows = await _top_week_rows(session, week_start, week_end)
+        month_rows = await _top_month_rows(session, month_start, next_month)
+        month_pot_ton, week_pot_ton = await _top_pots(
+            session, now, now.strftime("%Y-%m")
         )
-        month_raw = await _rank_window(
-            session, month_start, next_month, by="tally_ends_at", limit=10
-        )
-        month_names = await named(month_raw)
-        month_pids = [pid for pid, _c, _d, _g in month_raw]
-        month_wallets: set[int] = set()
-        if month_pids:
-            month_wallet_rows = (
-                await session.execute(
-                    select(Player.id).where(
-                        Player.id.in_(month_pids),
-                        Player.wallet_address.is_not(None),
-                        Player.wallet_verified.is_(True),
-                    )
-                )
-            ).scalars().all()
-            month_wallets = set(month_wallet_rows)
-        month_staked = await _players_with_stake(
-            session, month_start, next_month, by="tally_ends_at"
-        )
-        month_rows = [
-            (
-                month_names.get(pid, f"игрок {pid}"),
-                count,
-                pid in month_wallets and pid in month_staked,
-            )
-            for pid, count, _days, _gram in month_raw
-        ]
-
-        month = now.strftime("%Y-%m")
-        pot_row = (
-            await session.execute(select(LeaderboardPot).where(LeaderboardPot.month == month))
-        ).scalar_one_or_none()
-        week_pot_row = (
-            await session.execute(select(WeeklyPot).where(WeeklyPot.week == iso_week_key(now)))
-        ).scalar_one_or_none()
-    month_pot_ton = from_nano(pot_row.nanotons) if pot_row is not None else 0.0
-    week_pot_ton = from_nano(week_pot_row.nanotons) if week_pot_row is not None else 0.0
     return _format_top(week_rows, week_pot_ton, month_rows, month_pot_ton)
 
 
