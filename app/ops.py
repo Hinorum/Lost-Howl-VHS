@@ -1685,19 +1685,8 @@ class TreasuryDrift(NamedTuple):
         return abs(self.drift_nanotons) > self.tolerance_nanotons
 
 
-async def treasury_expected_state(session) -> TreasuryDrift | None:
-    """Баланс цепочки против ожиданий БД; None — баланс недоступен.
-
-    Ожидаемый остаток = все входящие переводы казны (ставки и revote-оплата,
-    это строки Income kind="ton") + ручные пополнения − ручные выводы − все
-    выплаты (sent уже ушли, pending/sending ещё уйдут). Допуск покрывает
-    сгоревший газ исходящих переводов.
-
-    ВАЖНО: подтверждённые ставки отдельно НЕ суммируем — каждый входящий
-    перевод уже создаёт строку Income kind="ton" (ton_watch._ledger_incoming /
-    _process_revote), и ставка дважды посчиталась бы (двойной учёт 1 Gram —
-    неправдоподобные «пропажи» на ровном месте).
-    """
+async def _treasury_balance() -> int | None:
+    """Баланс казначея в нанотонах; None — оба индексатора молчат."""
     from app.ton_pay import fetch_account_state
 
     try:
@@ -1705,9 +1694,11 @@ async def treasury_expected_state(session) -> TreasuryDrift | None:
     except Exception as exc:
         logger.warning("Баланс казначея для сверки не прочитан: %s", exc)
         return None
-    if balance is None:
-        return None
-    network = settings.active_network
+    return balance
+
+
+async def _treasury_payout_sums(session, network: str) -> tuple[int, int, int]:
+    """Сумма очереди, сумма и число уже отправленных выплат."""
     unpaid = int(
         (
             await session.execute(
@@ -1736,6 +1727,11 @@ async def treasury_expected_state(session) -> TreasuryDrift | None:
             )
         ).scalar_one()
     )
+    return unpaid, sent, sent_count
+
+
+async def _treasury_income_sums(session, network: str) -> tuple[int, int, int]:
+    """Входящие казны: ставки/revote, ручные пополнения, ручные выводы."""
     revotes = int(
         (
             await session.execute(
@@ -1766,6 +1762,28 @@ async def treasury_expected_state(session) -> TreasuryDrift | None:
             )
         ).scalar_one()
     )
+    return revotes, manual_in, manual_out
+
+
+async def treasury_expected_state(session) -> TreasuryDrift | None:
+    """Баланс цепочки против ожиданий БД; None — баланс недоступен.
+
+    Ожидаемый остаток = все входящие переводы казны (ставки и revote-оплата,
+    это строки Income kind="ton") + ручные пополнения − ручные выводы − все
+    выплаты (sent уже ушли, pending/sending ещё уйдут). Допуск покрывает
+    сгоревший газ исходящих переводов.
+
+    ВАЖНО: подтверждённые ставки отдельно НЕ суммируем — каждый входящий
+    перевод уже создаёт строку Income kind="ton" (ton_watch._ledger_incoming /
+    _process_revote), и ставка дважды посчиталась бы (двойной учёт 1 Gram —
+    неправдоподобные «пропажи» на ровном месте).
+    """
+    balance = await _treasury_balance()
+    if balance is None:
+        return None
+    network = settings.active_network
+    unpaid, sent, sent_count = await _treasury_payout_sums(session, network)
+    revotes, manual_in, manual_out = await _treasury_income_sums(session, network)
     expected = revotes + manual_in - manual_out - sent - unpaid
     # Газ сгорает на каждом исходящем переводе; допуск = база + запас по числу.
     from app.ton_utils import to_nano
