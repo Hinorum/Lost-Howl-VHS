@@ -894,6 +894,62 @@ def _month_dust_allocation(
     return payable, total - allocated + dust
 
 
+async def _month_carry_remainder(
+    session, now: datetime, recarry: int
+) -> None:
+    """Незаполненные доли и пыль возвращаются в копилку текущего месяца."""
+    if recarry <= 0:
+        return
+    current_month = now.strftime("%Y-%m")
+    pot_row = (
+        await session.execute(
+            select(LeaderboardPot).where(LeaderboardPot.month == current_month)
+        )
+    ).scalar_one_or_none()
+    if pot_row is None:
+        session.add(LeaderboardPot(month=current_month, nanotons=recarry))
+    else:
+        pot_row.nanotons += recarry
+
+
+def _month_add_payouts(
+    session: AsyncSession, payments: list[tuple[int, str, int]], network: str
+) -> None:
+    """Строки выплат месячной копилки (отправка — обычный диспетчер)."""
+    for player_id, wallet, amount in payments:
+        session.add(
+            Payout(
+                round_id=None,
+                player_id=player_id,
+                kind="leaderboard",
+                amount_nanotons=amount,
+                dest_address=wallet,
+                network=network,
+            )
+        )
+
+
+async def _notify_month_admins(
+    bot: Bot | None,
+    prev_key: str,
+    payments: list[tuple[int, str, int]],
+    fee_nano: int,
+) -> None:
+    """Сводка отправленных выплат месяца администраторам."""
+    if bot is not None and settings.admin_id_set:
+        paid_total = sum(amount for _pid, _wallet, amount in payments)
+        text = (
+            f"🏆 Копилка лидерборда за {prev_key} отправлена: "
+            f"{paid_total / 1e9:.2f} Gram между {len(payments)} лидером(ами) "
+            f"(газ {fee_nano * len(payments) / 1e9:.4f} Gram платит копилка)."
+        )
+        for admin_id in settings.admin_id_set:
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception as exc:
+                logger.warning("Алерт админу %s не доставлен: %s", admin_id, exc)
+
+
 async def _settle_month_locked(bot: Bot | None = None) -> bool:
     """Выплачивает копилку прошедших месяцев, если последний день месяца закрыт.
 
@@ -931,8 +987,6 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
         resolved = await _resolve_month_winners(
             session, bot, period_start, month_start, top_k, prev_key, now, total,
         )
-        payments: list[tuple[int, str, int]] = []
-        skipped = 0
         if resolved is None:
             # Хелпер уже залогировал причину отказа; метку двигать нельзя —
             # копилка ждёт следующего цикла.
@@ -957,30 +1011,10 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
             )
             return False
         payments = payable
-        if recarry > 0:
-            current_month = now.strftime("%Y-%m")
-            pot_row = (
-                await session.execute(
-                    select(LeaderboardPot).where(LeaderboardPot.month == current_month)
-                )
-            ).scalar_one_or_none()
-            if pot_row is None:
-                session.add(LeaderboardPot(month=current_month, nanotons=recarry))
-            else:
-                pot_row.nanotons += recarry
+        await _month_carry_remainder(session, now, recarry)
 
         network = settings.active_network
-        for player_id, wallet, amount in payments:
-            session.add(
-                Payout(
-                    round_id=None,
-                    player_id=player_id,
-                    kind="leaderboard",
-                    amount_nanotons=amount,
-                    dest_address=wallet,
-                    network=network,
-                )
-            )
+        _month_add_payouts(session, payments, network)
         await session.execute(
             delete(LeaderboardPot).where(LeaderboardPot.month <= prev_key)
         )
@@ -997,18 +1031,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
         payments,
         f" (без кошелька пропущены: {skipped})" if skipped else "",
     )
-    if bot is not None and settings.admin_id_set:
-        paid_total = sum(amount for _pid, _wallet, amount in payments)
-        text = (
-            f"🏆 Копилка лидерборда за {prev_key} отправлена: "
-            f"{paid_total / 1e9:.2f} Gram между {len(payments)} лидером(ами) "
-            f"(газ {fee_nano * len(payments) / 1e9:.4f} Gram платит копилка)."
-        )
-        for admin_id in settings.admin_id_set:
-            try:
-                await bot.send_message(admin_id, text)
-            except Exception as exc:
-                logger.warning("Алерт админу %s не доставлен: %s", admin_id, exc)
+    await _notify_month_admins(bot, prev_key, payments, fee_nano)
     return True
 
 
