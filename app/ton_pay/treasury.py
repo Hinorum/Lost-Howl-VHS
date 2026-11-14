@@ -377,13 +377,10 @@ def _cold_start_lines(raw: str | None) -> list[str]:
     return [f"  холодный старт: seqno совпал ({lite}){stamp}"]
 
 
-async def _blockchain_watcher_lines(session: AsyncSession, network: str) -> list[str]:
-    """Строки блока «watcher → очередь выплат → казначей» для /blockchain.
-
-    Глазами всей внешней части контура: курсор и источник, stuck-список
-    сбойных входящих, очередь по статусам, неопознанные «sent».
-    """
-    # Watcher-состояние одним запросом (курсор, источник, сердцебиение, stuck).
+async def _blockchain_watcher_state(
+    session: AsyncSession,
+) -> tuple[str | None, str | None, str | None, dict]:
+    """Watcher-состояние одним заходом: курсор, источник, сердцебиение, stuck."""
     from app.ton_watch import (  # локально: ton_watch не импортируется сверху
         BEAT_KEY,
         CURSOR_KEY,
@@ -397,10 +394,6 @@ async def _blockchain_watcher_lines(session: AsyncSession, network: str) -> list
     source: str | None = None
     beat_iso: str | None = None
     stuck: dict = {}
-    queue: dict[str, int] = {}
-    sent_unconfirmed = 0
-    waiting_dest = 0
-    verified_wallets = 0
     for key, slot in ((BEAT_KEY, "b"), (SOURCE_KEY, "s"), (CURSOR_KEY, "c")):
         row = await session.get(WatcherState, key)
         if row is None:
@@ -419,6 +412,14 @@ async def _blockchain_watcher_lines(session: AsyncSession, network: str) -> list
             stuck = {}
         if not isinstance(stuck, dict):
             stuck = {}
+    return cursor_raw, source, beat_iso, stuck
+
+
+async def _blockchain_queue_counts(
+    session: AsyncSession, network: str
+) -> tuple[dict[str, int], int, int, int]:
+    """Счётчики очереди выплат: по статусам, без хеша, без dest, verified."""
+    queue: dict[str, int] = {}
     for status in ("pending", "sending", "sent", "failed"):
         n = (
             await session.execute(
@@ -449,6 +450,20 @@ async def _blockchain_watcher_lines(session: AsyncSession, network: str) -> list
             select(func.count()).select_from(Player).where(Player.wallet_verified.is_(True))
         )
     ).scalar_one()
+    return queue, sent_unconfirmed, waiting_dest, verified_wallets
+
+
+def _watcher_state_lines(
+    cursor_raw: str | None,
+    source: str | None,
+    beat_iso: str | None,
+    stuck: dict,
+) -> list[str]:
+    """Курсор, сердцебиение и stuck-входящие для /blockchain."""
+    from app.ton_watch import (
+        STUCK_TX_KEY as STUCK_KEY,
+    )
+
     lines: list[str] = []
     now = datetime.now(UTC)
     if cursor_raw and cursor_raw.isdigit():
@@ -478,14 +493,40 @@ async def _blockchain_watcher_lines(session: AsyncSession, network: str) -> list
         hashes = [h[:10] for h in list(stuck.keys())[:3]]
         stuck_sample = "· " + ", ".join(hashes) + ("…" if stuck_entries > 3 else "")
     lines.append(f"Stuck-входящих: {stuck_entries} {stuck_sample} (ключ watcher_state[{STUCK_KEY}])")
-    lines.append(
+    return lines
+
+
+def _watcher_queue_lines(
+    queue: dict[str, int],
+    sent_unconfirmed: int,
+    waiting_dest: int,
+    verified_wallets: int,
+) -> list[str]:
+    """Очередь выплат по статусам и счётчик verified-кошельков."""
+    lines = [
         f"Очередь выплат: pending {queue.get('pending', 0)} · sending {queue.get('sending', 0)} · "
         f"sent {queue.get('sent', 0)} (сверки ждут {sent_unconfirmed}) · failed {queue.get('failed', 0)}"
-    )
+    ]
     if waiting_dest:
         lines.append(f"  {waiting_dest} строк ждут кошелёк игрока (dest пустой) — уйдут после /wallet")
     lines.append(f"Кошельков verified: {verified_wallets}")
     return lines
+
+
+async def _blockchain_watcher_lines(session: AsyncSession, network: str) -> list[str]:
+    """Строки блока «watcher → очередь выплат → казначей» для /blockchain.
+
+    Глазами всей внешней части контура: курсор и источник, stuck-список
+    сбойных входящих, очередь по статусам, неопознанные «sent».
+    """
+    cursor_raw, source, beat_iso, stuck = await _blockchain_watcher_state(session)
+    queue, sent_unconfirmed, waiting_dest, verified_wallets = (
+        await _blockchain_queue_counts(session, network)
+    )
+    return [
+        *_watcher_state_lines(cursor_raw, source, beat_iso, stuck),
+        *_watcher_queue_lines(queue, sent_unconfirmed, waiting_dest, verified_wallets),
+    ]
 
 
 async def _blockchain_runtime_lines() -> list[str]:
