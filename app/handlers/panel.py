@@ -135,17 +135,14 @@ async def _admin_panel_text(session=None) -> str:
             await session.__aexit__(None, None, None)
 
 
-async def _build_panel_text(session) -> str:
-    """Внутренняя логика сборки текста пульта."""
+async def _panel_pause_line(session) -> str | None:
+    """Строка паузы или None, если игра идёт либо статус не прочитался."""
     from app.ops import is_game_paused as _paused_flag
     from app.ops import paused_reason as _pause_reason
-    from app.ops import snapshot
 
-    snap = await snapshot()
-    lines = ["🎛 <b>ПУЛЬТ ХРАНИТЕЛЯ</b>"]
     try:
         if await _paused_flag(session):
-            lines.append(
+            return (
                 f"⏸ ИГРА НА ПАУЗЕ ({await _pause_reason(session) or 'техработы'}) "
                 "— снять: /resume. Входящие переводы возвращаются автоматически."
             )
@@ -153,69 +150,130 @@ async def _build_panel_text(session) -> str:
         # Молчание здесь врало бы: пульт без строки «ИГРА НА ПАУЗЕ» выглядит
         # как работающая игра. Строка не показана — говорим в лог.
         logger.warning("Пульт: не удалось прочитать паузу — строка не показана", exc_info=True)
+    return None
+
+
+async def _panel_mode_line(session) -> str | None:
+    """Строка режима ставок или None, если режим прочитать не удалось."""
     try:
         from app.ops import money_mode_enabled
 
         money_on = await money_mode_enabled(session)
-        lines.append(
-            "💰 Версия: <b>со ставками</b> и платной сменой выбора."
-            if money_on
-            else "🔰 Версия: <b>без ставок</b> (игра бесплатна, смена выбора закрыта)."
-        )
     except Exception:
         logger.warning("Пульт: не удалось прочитать режим ставок", exc_info=True)
-    rnd = snap.get("round") or {}
-    closing = str(rnd.get("voting_ends_at", ""))[11:16]
-    lines.append(
-        f"День {rnd.get('day_index')} · {rnd.get('status')} · закрытие {closing} UTC"
+        return None
+    return (
+        "💰 Версия: <b>со ставками</b> и платной сменой выбора."
+        if money_on
+        else "🔰 Версия: <b>без ставок</b> (игра бесплатна, смена выбора закрыта)."
     )
-    if settings.ton_enabled:
-        from app.rounds import round_pot
 
-        nano, bets = await round_pot(session, int(rnd.get("id") or 0))
-        lines.append(f"💰 Банк дня: {nano / 1e9:.2f} Gram · ставок {bets}")
-        # Фонд Стаи: накопление хранителя, раздача вручную.
-        try:
-            from app.models import PackFund as _Fund
 
-            fund_nano = (
+def _panel_day_line(rnd: dict) -> str:
+    closing = str(rnd.get("voting_ends_at", ""))[11:16]
+    return f"День {rnd.get('day_index')} · {rnd.get('status')} · закрытие {closing} UTC"
+
+
+async def _panel_bank_line(session, rnd: dict) -> str:
+    from app.rounds import round_pot
+
+    nano, bets = await round_pot(session, int(rnd.get("id") or 0))
+    return f"💰 Банк дня: {nano / 1e9:.2f} Gram · ставок {bets}"
+
+
+async def _panel_fund_line(session) -> str | None:
+    """Строка Фонда Стаи: накопление хранителя, раздача вручную."""
+    try:
+        from app.models import PackFund as _Fund
+
+        fund_nano = (
+            await session.execute(
+                select(func.coalesce(func.sum(_Fund.nanotons), 0))
+            )
+        ).scalar_one()
+        # SUM(BigInteger) на Postgres приходит Decimal — приводим к int.
+        return f"🐾 Фонд Стаи: {int(fund_nano or 0) / 1e9:.2f} Gram"
+    except Exception:
+        logger.warning("Строка Фонда Стаи в панели не собралась", exc_info=True)
+        return None
+
+
+async def _panel_votes_line(session) -> str | None:
+    """Явка последнего закрытого дня; None — метрику собрать не удалось."""
+    try:
+        from app.models import Vote as _Vote
+
+        last_closed = (
+            await session.execute(
+                select(Round.id)
+                .where(Round.status == RoundStatus.CLOSED)
+                .order_by(Round.day_index.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        votes_yesterday = 0
+        if last_closed is not None:
+            votes_yesterday = (
                 await session.execute(
-                    select(func.coalesce(func.sum(_Fund.nanotons), 0))
+                    select(func.count())
+                    .select_from(_Vote)
+                    .where(_Vote.round_id == last_closed)
                 )
             ).scalar_one()
-            # SUM(BigInteger) на Postgres приходит Decimal — приводим к int.
-            lines.append(f"🐾 Фонд Стаи: {int(fund_nano or 0) / 1e9:.2f} Gram")
-        except Exception:
-            logger.warning("Строка Фонда Стаи в панели не собралась", exc_info=True)
-        # Метрики суток: явка вчера, всплывшие эха, оставшиеся заглушки.
-        try:
-            from app.models import Vote as _Vote
+        return f"📈 Вчера голосов: {votes_yesterday}"
+    except Exception:
+        logger.warning("Метрики суток для пульта не собраны", exc_info=True)
+        return None
 
-            last_closed = (
-                await session.execute(
-                    select(Round.id)
-                    .where(Round.status == RoundStatus.CLOSED)
-                    .order_by(Round.day_index.desc())
-                    .limit(1)
+
+async def _panel_round_lines(session, rnd: dict) -> list[str]:
+    """Строки дня и денег: день, банк, фонд, явка (только при включённом TON)."""
+    lines = [_panel_day_line(rnd)]
+    if not settings.ton_enabled:
+        return lines
+    lines.append(await _panel_bank_line(session, rnd))
+    fund_line = await _panel_fund_line(session)
+    if fund_line:
+        lines.append(fund_line)
+    votes_line = await _panel_votes_line(session)
+    if votes_line:
+        lines.append(votes_line)
+    return lines
+
+
+async def _panel_no_wallet_line(session) -> str | None:
+    """Призы, ждущие кошелька игрока: диспетчер оживит их сам после /wallet."""
+    try:
+        no_wallet_count = (
+            await session.execute(
+                select(func.count()).select_from(Payout).where(
+                    Payout.dest_address == "",
+                    Payout.kind.in_(["prize", "refund"]),
+                    Payout.player_id.isnot(None),
+                    Payout.status.notin_(["sent", "dismissed"]),
                 )
-            ).scalar_one_or_none()
-            votes_yesterday = 0
-            if last_closed is not None:
-                votes_yesterday = (
-                    await session.execute(
-                        select(func.count())
-                        .select_from(_Vote)
-                        .where(_Vote.round_id == last_closed)
-                    )
-                ).scalar_one()
-            lines.append(f"📈 Вчера голосов: {votes_yesterday}")
-        except Exception:
-            logger.warning("Метрики суток для пульта не собраны", exc_info=True)
+            )
+        ).scalar_one()
+    except Exception:
+        # Счётчик исчез бы из пульта вместе с предупреждением о призах, которые
+        # не уйдут: молчащий пульт в этом месте опаснее шумного.
+        logger.warning("Пульт: не удалось посчитать призы без кошелька", exc_info=True)
+        return None
+    if not no_wallet_count:
+        return None
+    return (
+        f"🪙 Призов без кошелька: {no_wallet_count} — уйдут сами, "
+        "когда игрок привяжет адрес. Разбор: /payouts."
+    )
+
+
+async def _panel_payout_lines(session, snap: dict) -> list[str]:
+    """Очередь выплат: сводка, разбивка по типу и призы без кошелька."""
     queue = snap.get("payout_queue")
     oldest = snap.get("oldest_payout_age")
     dead = snap.get("dead_letter_payouts")
     oldest_note = f", старейшая {int(oldest // 60)} мин" if oldest else ""
-    lines.append(f"💸 Выплаты: в очереди {queue}{oldest_note} · failed {dead}")
+    lines = [f"💸 Выплаты: в очереди {queue}{oldest_note} · failed {dead}"]
     # Разбивка по типу: сколько игроков ждут приз, сколько — возврат ставки.
     pending_by_kind = snap.get("payout_pending_by_kind") or {}
     dead_by_kind = snap.get("payout_dead_by_kind") or {}
@@ -234,40 +292,33 @@ async def _build_panel_text(session) -> str:
         parts.append(f"failed-возвратов {d_refund}")
     if parts:
         lines.append(f"  · {', '.join(parts)}")
-    # Призы, ждущие кошелька игрока: финализация не знала адреса, диспетчер
-    # оживит строку сам, как только игрок привяжет /wallet (retry не нужен).
-    try:
-        no_wallet_count = (
-            await session.execute(
-                select(func.count()).select_from(Payout).where(
-                    Payout.dest_address == "",
-                    Payout.kind.in_(["prize", "refund"]),
-                    Payout.player_id.isnot(None),
-                    Payout.status.notin_(["sent", "dismissed"]),
-                )
-            )
-        ).scalar_one()
-        if no_wallet_count:
-            lines.append(
-                f"🪙 Призов без кошелька: {no_wallet_count} — уйдут сами, "
-                "когда игрок привяжет адрес. Разбор: /payouts."
-            )
-    except Exception:
-        # Счётчик исчез бы из пульта вместе с предупреждением о призах, которые
-        # не уйдут: молчащий пульт в этом месте опаснее шумного.
-        logger.warning("Пульт: не удалось посчитать призы без кошелька", exc_info=True)
+    no_wallet_line = await _panel_no_wallet_line(session)
+    if no_wallet_line:
+        lines.append(no_wallet_line)
+    return lines
+
+
+def _panel_stake_lines(snap: dict) -> list[str]:
+    if not settings.ton_enabled:
+        return []
     pending_stakes = snap.get("pending_stakes") or 0
-    if settings.ton_enabled:
-        stakes_note = f"⏳ Переводов не обработано: {pending_stakes}"
-        if not pending_stakes:
-            stakes_note += " · всё обработано"
-        lines.append(stakes_note)
-    if settings.ton_enabled:
-        lines.append(
-            f"👀 Watcher: {snap.get('watcher_source') or '—'}, "
-            f"пульс {int(snap.get('watcher_beat_age') or 0)} с"
-        )
-    # Топ неотправленного — прямо сюда, чтобы не ходить в /payouts за мелочами.
+    stakes_note = f"⏳ Переводов не обработано: {pending_stakes}"
+    if not pending_stakes:
+        stakes_note += " · всё обработано"
+    return [stakes_note]
+
+
+def _panel_watcher_line(snap: dict) -> str | None:
+    if not settings.ton_enabled:
+        return None
+    return (
+        f"👀 Watcher: {snap.get('watcher_source') or '—'}, "
+        f"пульс {int(snap.get('watcher_beat_age') or 0)} с"
+    )
+
+
+async def _panel_pending_rows(session) -> list[str]:
+    """Топ неотправленного — прямо в пульт, чтобы не ходить в /payouts за мелочами."""
     try:
         rows = (
             await session.execute(
@@ -277,16 +328,24 @@ async def _build_panel_text(session) -> str:
                 .limit(3)
             )
         ).scalars().all() if session is not None else []
+        lines: list[str] = []
         for row in rows:
             reason = f" — {row.last_error[:60]}" if getattr(row, "last_error", None) else ""
             lines.append(
                 f"  #{row.id} {row.kind} {from_nano(row.amount_nanotons):.2f} G "
                 f"{row.status}{reason}"
             )
+        return lines
     except Exception:
         # Застрявшие выплаты должны быть видны и когда запрос к ним сорвался:
         # «пульт ничего не показал» здесь читается как «всё разослано».
         logger.warning("Пульт: не удалось показать зависшие выплаты", exc_info=True)
+        return []
+
+
+def _panel_alert_lines(snap: dict) -> list[str]:
+    """Тик, падения и живые тревоги — то же, что видит /health."""
+    lines: list[str] = []
     tick_age = snap.get("last_tick_age")
     if tick_age is not None and tick_age > 120:
         lines.append(f"⚠️ Тик отстаёт: {int(tick_age)} с — проверь логи.")
@@ -305,6 +364,30 @@ async def _build_panel_text(session) -> str:
         lines.append("🚨 Тревоги: " + " · ".join(shown))
         if len(problems) > len(shown):
             lines.append(f"…и ещё {len(problems) - len(shown)} — полный список в /ops.")
+    return lines
+
+
+async def _build_panel_text(session) -> str:
+    """Внутренняя логика сборки текста пульта."""
+    from app.ops import snapshot
+
+    snap = await snapshot()
+    lines = ["🎛 <b>ПУЛЬТ ХРАНИТЕЛЯ</b>"]
+    pause_line = await _panel_pause_line(session)
+    if pause_line:
+        lines.append(pause_line)
+    mode_line = await _panel_mode_line(session)
+    if mode_line:
+        lines.append(mode_line)
+    rnd = snap.get("round") or {}
+    lines.extend(await _panel_round_lines(session, rnd))
+    lines.extend(await _panel_payout_lines(session, snap))
+    lines.extend(_panel_stake_lines(snap))
+    watcher_line = _panel_watcher_line(snap)
+    if watcher_line:
+        lines.append(watcher_line)
+    lines.extend(await _panel_pending_rows(session))
+    lines.extend(_panel_alert_lines(snap))
     return "\n".join(lines) + _PANEL_FOOTER
 
 
