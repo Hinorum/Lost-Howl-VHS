@@ -139,20 +139,29 @@ async def tick(bot: Bot | None = None) -> None:
         await _tick_body(bot, span)
 
 
-async def _tick_body(bot: Bot | None, span) -> None:
-    """Одно тело тика. Вынесено из tick(), чтобы обернуть его учётом времени."""
-    from app.ops import is_game_paused, mark_tick, mark_tick_failed
+async def _tick_lock_ready() -> bool:
+    """Лок планировщика наш? При потере обновляет сердцебиение и уступает игру.
 
-    # Лок планировщика — не формальность: второй инстанс, взяв лок, тикает
-    # параллельно (двойные анонсы, двойные выплаты). Пока лок наш — работаем;
-    # потерян — замираем, оставив игру тому, кто лок держит.
-    if not await _ensure_scheduler_lock():
-        # Сердцебиение обновляем: процесс жив и ведёт себя правильно (стоит
-        # на стороне, уступая игру лидеру). Тревога «лок потерян» идёт из
-        # аномаль-скана по метке, а не отсюда.
-        async with SessionLocal() as session:
-            await mark_tick()
-        return
+    Лок — не формальность: второй инстанс, взяв лок, тикает параллельно
+    (двойные анонсы, двойные выплаты). Пока лок наш — работаем; потерян —
+    замираем, оставив игру тому, кто лок держит.
+    """
+    from app.ops import mark_tick
+
+    if await _ensure_scheduler_lock():
+        return True
+    # Сердцебиение обновляем: процесс жив и ведёт себя правильно (стоит
+    # на стороне, уступая игру лидеру). Тревога «лок потерян» идёт из
+    # аномаль-скана по метке, а не отсюда.
+    async with SessionLocal():
+        await mark_tick()
+    return False
+
+
+async def _tick_paused() -> bool:
+    """Игра на паузе? Тогда тик только отмечает сердцебиение."""
+    from app.ops import is_game_paused, mark_tick
+
     # Стоп-кран: дни не открываются и не закрываются, анонсы молчат.
     # Watcher (отдельная джоба) продолжает возвращать входящие переводы,
     # а очередь выплат — разгребаться: чужие деньги зависнуть не должны.
@@ -160,68 +169,93 @@ async def _tick_body(bot: Bot | None, span) -> None:
     async with SessionLocal() as session:
         if await is_game_paused(session):
             await mark_tick()
-            return
+            return True
+    return False
+
+
+async def _tick_heal_stale(session: AsyncSession) -> None:
+    """Самолечение: дни, застрявшие не-закрытыми позади актуального."""
+    from app.rounds import heal_stale_rounds
+
+    healed = await heal_stale_rounds(session)
+    if healed:
+        logger.warning("Вылечено застрявших дней: %d", healed)
+
+
+async def _tick_warm_anchor(session: AsyncSession) -> None:
+    """Прогрев кэшей для синхронных постов: якорь забега."""
+    from app.rounds import get_run_anchor
+
+    await get_run_anchor(session)
+
+
+async def _tick_close_if_due(session: AsyncSession, current, bot: Bot | None) -> None:
+    """Закрыть голосование/подсчёт, если срок пришёл; финализировать день."""
+    now = _now()
+    if current.status == RoundStatus.OPEN and now >= utc_aware(current.voting_ends_at):
+        await close_voting(session, current)
+    if current.status == RoundStatus.TALLYING and now >= utc_aware(current.tally_ends_at):
+        finished, closed_here = await finish_tally(session, current)
+        if closed_here:
+            await award_points(session, finished)
+            from app.stakes import finalize_day_payouts
+
+            await finalize_day_payouts(session, finished)
+            spawn(_payout_dispatch_job(), "payout_dispatch")
+            results_task = spawn(_announce_results_job(finished.id), "announce_results")
+            # Новый день ждёт рассылку итогов: без ожидания финализация
+            # с нейро-контентом обгоняла итоги (флуд-паузы по retry_after)
+            # и хронология в чатах ломалась.
+            spawn(
+                _finalize_new_day_job(finished.id, wait_results=results_task),
+                "finalize_new_day",
+            )
+
+
+async def _tick_catch_up(session: AsyncSession) -> None:
+    """Догнать очки/выплаты после краха и запустить восстановители постов."""
+    # Краш между коммитом finish_tally и award_points оставляет день
+    # CLOSED без очков, а heal_stale_rounds лечит только OPEN/TALLYING:
+    # маркер awards_at догоняет такие дни идемпотентно (claim отсекает
+    # двойное списание и параллельных финализаторов).
+    await award_pending_points(session)
+    # То же для выплат: краш между коммитом finish_tally и
+    # finalize_day_payouts оставляет CLOSED-день без призов, и копилки
+    # недели/месяца ждут его вечно (leaderboard читает
+    # payouts_finalized). Догон идемпотентен — claim финализации
+    # пускает одного.
+    from app.stakes import finalize_pending_payouts
+
+    await finalize_pending_payouts(session)
+    # Достраховка итогов: CLOSED-день без маркера results_at (краш между
+    # коммитом закрытия и джобой рассылки, вылеченные дни тоже сюда) —
+    # досылается фоном, claim-метка не даёт дублей.
+    spawn(_retry_results_job(), "retry_results")
+    # Достраховка анонса нового дня: OPEN-день без метки announced_at
+    # (краш/сбой сети между claim_announcement и вещанием) объявляется
+    # восстановителем — новый день не теряется молча.
+    spawn(_retry_new_day_job(), "retry_new_day")
+
+
+async def _tick_body(bot: Bot | None, span) -> None:
+    """Одно тело тика. Вынесено из tick(), чтобы обернуть его учётом времени."""
+    from app.ops import mark_tick, mark_tick_failed
+
+    if not await _tick_lock_ready():
+        return
+    if await _tick_paused():
+        return
     async with SessionLocal() as session:
         try:
             previous = await get_latest_round(session)
             current = await ensure_current_round(session)
-
-            # Самолечение: дни, застрявшие не-закрытыми позади актуального
-            from app.rounds import heal_stale_rounds
-
-            healed = await heal_stale_rounds(session)
-            if healed:
-                logger.warning("Вылечено застрявших дней: %d", healed)
-
-            # Прогрев кэшей для синхронных постов: якорь забега.
-            from app.rounds import get_run_anchor
-
-            await get_run_anchor(session)
-
+            await _tick_heal_stale(session)
+            await _tick_warm_anchor(session)
             # Первый запуск или только что созданный день — анонсим без итогов.
             if previous is None or current.id > previous.id:
                 await _announce_round(session, current, bot)
-
-            now = _now()
-            if current.status == RoundStatus.OPEN and now >= utc_aware(current.voting_ends_at):
-                await close_voting(session, current)
-            if current.status == RoundStatus.TALLYING and now >= utc_aware(current.tally_ends_at):
-                finished, closed_here = await finish_tally(session, current)
-                if closed_here:
-                    await award_points(session, finished)
-                    from app.stakes import finalize_day_payouts
-
-                    await finalize_day_payouts(session, finished)
-                    spawn(_payout_dispatch_job(), "payout_dispatch")
-                    results_task = spawn(_announce_results_job(finished.id), "announce_results")
-                    # Новый день ждёт рассылку итогов: без ожидания финализация
-                    # с нейро-контентом обгоняла итоги (флуд-паузы по retry_after)
-                    # и хронология в чатах ломалась.
-                    spawn(
-                        _finalize_new_day_job(finished.id, wait_results=results_task),
-                        "finalize_new_day",
-                    )
-            # Краш между коммитом finish_tally и award_points оставляет день
-            # CLOSED без очков, а heal_stale_rounds лечит только OPEN/TALLYING:
-            # маркер awards_at догоняет такие дни идемпотентно (claim отсекает
-            # двойное списание и параллельных финализаторов).
-            await award_pending_points(session)
-            # То же для выплат: краш между коммитом finish_tally и
-            # finalize_day_payouts оставляет CLOSED-день без призов, и копилки
-            # недели/месяца ждут его вечно (leaderboard читает
-            # payouts_finalized). Догон идемпотентен — claim финализации
-            # пускает одного.
-            from app.stakes import finalize_pending_payouts
-
-            await finalize_pending_payouts(session)
-            # Достраховка итогов: CLOSED-день без маркера results_at (краш между
-            # коммитом закрытия и джобой рассылки, вылеченные дни тоже сюда) —
-            # досылается фоном, claim-метка не даёт дублей.
-            spawn(_retry_results_job(), "retry_results")
-            # Достраховка анонса нового дня: OPEN-день без метки announced_at
-            # (краш/сбой сети между claim_announcement и вещанием) объявляется
-            # восстановителем — новый день не теряется молча.
-            spawn(_retry_new_day_job(), "retry_new_day")
+            await _tick_close_if_due(session, current, bot)
+            await _tick_catch_up(session)
         except Exception as exc:
             logger.exception("тик закрытия дня упал — откат транзакции")
             await session.rollback()
