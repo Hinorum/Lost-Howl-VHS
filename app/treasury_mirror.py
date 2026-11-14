@@ -1194,20 +1194,9 @@ def _epoch(moment: datetime | None) -> float | None:
     return moment.timestamp()
 
 
-async def unknown_moves_balance(session, network: str, address: str) -> dict[str, int]:
-    """Сколько «непонятых» переводов ещё открыто, а сколько уже закрыто.
-
-    Трафик в отчёте валовый (сколько всего прошло мимо бота), а тревога —
-    только по остатку:
-
-    * unknown_in закрывается отправленным возвратом тому же отправителю на ту
-      же сумму. Возвраты сопоставляются один к одному и не раньше прихода:
-      иначе один возврат закрыл бы два одинаковых перевода;
-    * unknown_out закрывается ручной корректировкой manual_out, если она
-      заведена после вывода и покрывает его сумму. Такой строкой хранитель
-      сам объясняет «деньги ушли мимо бота, причина известна» (/adjust).
-    """
-    unknown_in = (
+async def _unknown_in_rows(session, network: str, address: str) -> Any:
+    """Все «непонятые» входящие активного кошелька в порядке времени."""
+    return (
         await session.execute(
             select(
                 TreasuryMove.counterparty,
@@ -1222,7 +1211,11 @@ async def unknown_moves_balance(session, network: str, address: str) -> dict[str
             .order_by(TreasuryMove.utime, TreasuryMove.id)
         )
     ).all()
-    refunds = [
+
+
+async def _sent_refunds(session, network: str) -> list[tuple[int, str, float | None]]:
+    """Отправленные возвраты в порядке создания: сумма, адрес, время."""
+    return [
         (int(amount), dest or "", _epoch(created_at))
         for amount, dest, created_at in (
             await session.execute(
@@ -1236,6 +1229,12 @@ async def unknown_moves_balance(session, network: str, address: str) -> dict[str
             )
         ).all()
     ]
+
+
+def _match_unknown_in(
+    unknown_in: Any, refunds: list[tuple[int, str, float | None]]
+) -> tuple[int, int]:
+    """Валовый приход мимо бота и его часть, закрытая возвратами один к одному."""
     refund_pool = list(refunds)
     gross_in = 0
     resolved_in = 0
@@ -1246,12 +1245,20 @@ async def unknown_moves_balance(session, network: str, address: str) -> dict[str
         for idx, (refund_amount, dest, created_at) in enumerate(refund_pool):
             if refund_amount != amount or normalize_address(dest) != sender:
                 continue
+            # Возврат не может закрыть приход, случившийся позже него: иначе
+            # один возврат закрыл бы два одинаковых перевода.
             if created_at is not None and created_at < int(utime or 0):
                 continue
             refund_pool.pop(idx)
             resolved_in += amount
             break
+    return gross_in, resolved_in
 
+
+async def _unknown_out_totals(
+    session, network: str, address: str
+) -> tuple[int, int | None]:
+    """Валовый вывод мимо бота и время последнего такого вывода."""
     gross_out_raw, last_out_utime = (
         await session.execute(
             select(
@@ -1264,7 +1271,11 @@ async def unknown_moves_balance(session, network: str, address: str) -> dict[str
             )
         )
     ).one()
-    gross_out = int(gross_out_raw or 0)
+    return int(gross_out_raw or 0), last_out_utime
+
+
+async def _manual_out_total(session, network: str) -> tuple[int, float | None]:
+    """Сумма ручных корректировок manual_out и время последней."""
     manual_out_raw, last_adjust_at = (
         await session.execute(
             select(
@@ -1276,14 +1287,45 @@ async def unknown_moves_balance(session, network: str, address: str) -> dict[str
             )
         )
     ).one()
-    resolved_out = 0
-    adjusted_at = _epoch(last_adjust_at)
+    return int(manual_out_raw or 0), _epoch(last_adjust_at)
+
+
+def _resolved_unknown_out(
+    gross_out: int,
+    last_out_utime: int | None,
+    manual_out: int,
+    adjusted_at: float | None,
+) -> int:
+    """Сколько вывода мимо бота закрыто ручной корректировкой."""
     # Корректировка должна быть заведена после вывода, иначе старый /adjust
     # «закрывал» бы любой последующий вывод мимо бота.
     if gross_out and last_out_utime is not None and adjusted_at is not None:
         if adjusted_at >= int(last_out_utime):
-            resolved_out = min(gross_out, int(manual_out_raw or 0))
+            return min(gross_out, manual_out)
+    return 0
 
+
+async def unknown_moves_balance(session, network: str, address: str) -> dict[str, int]:
+    """Сколько «непонятых» переводов ещё открыто, а сколько уже закрыто.
+
+    Трафик в отчёте валовый (сколько всего прошло мимо бота), а тревога —
+    только по остатку:
+
+    * unknown_in закрывается отправленным возвратом тому же отправителю на ту
+      же сумму. Возвраты сопоставляются один к одному и не раньше прихода:
+      иначе один возврат закрыл бы два одинаковых перевода;
+    * unknown_out закрывается ручной корректировкой manual_out, если она
+      заведена после вывода и покрывает его сумму. Такой строкой хранитель
+      сам объясняет «деньги ушли мимо бота, причина известна» (/adjust).
+    """
+    unknown_in = await _unknown_in_rows(session, network, address)
+    refunds = await _sent_refunds(session, network)
+    gross_in, resolved_in = _match_unknown_in(unknown_in, refunds)
+    gross_out, last_out_utime = await _unknown_out_totals(session, network, address)
+    manual_out, adjusted_at = await _manual_out_total(session, network)
+    resolved_out = _resolved_unknown_out(
+        gross_out, last_out_utime, manual_out, adjusted_at
+    )
     return {
         "gross_in": gross_in,
         "open_in": gross_in - resolved_in,
