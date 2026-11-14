@@ -568,92 +568,82 @@ async def on_adjust_action(callback: CallbackQuery) -> None:
     await callback.answer("Записано.")
 
 
-@router.message(Command("finalize"), F.chat.type == ChatType.PRIVATE)
-@require_admin("Команда только для хранителя игры.")
-async def cmd_finalize(message: Message) -> None:
-    """Ручная финализация ставок застрявших дней: /finalize или /finalize 40"""
+async def _finalize_preview(session, message: Message, target_day: int | None) -> bool:
+    """Показать состояние указанного дня до финализации.
+
+    False — дня нет, дальше идти нельзя (ответ уже отправлен).
+    """
+    if target_day is None:
+        return True
+    rnd_result = await session.execute(
+        select(Round).where(Round.day_index == target_day).order_by(Round.id.desc()).limit(1)
+    )
+    row = rnd_result.scalar_one_or_none()
+    if row is None:
+        await message.answer(f"День {target_day} не найден.")
+        return False
+    status = row.status.value
+    fin = row.payouts_finalized
+    pot = row.pot_nanotons
+    wc = row.winner_card
+
+    # Ставки
+    stakes_q = await session.execute(
+        select(Stake).where(Stake.round_id == row.id)
+    )
+    stakes = list(stakes_q.scalars().all())
+    stakes_by_player = {s.player_id: s for s in stakes}
+
+    # Голоса
+    votes_q = await session.execute(
+        select(Vote).where(Vote.round_id == row.id)
+    )
+    votes = list(votes_q.scalars().all())
+
+    # Существующие выплаты
+    payouts_q = await session.execute(
+        select(Payout).where(Payout.round_id == row.id)
+    )
+    payouts = list(payouts_q.scalars().all())
+
+    # Таблица голосов + ставок
+    lines = [f"День {target_day} (Round#{row.id}): status={status}, finalized={fin}"]
+    lines.append(f"Пот: {pot} нанотонов | Победившая карта: {wc}")
+    lines.append("")
+    lines.append("Голоса:")
+    for v in votes:
+        stake = stakes_by_player.get(v.player_id)
+        stake_str = f"{stake.amount_nanotons}n ({stake.status})" if stake else "нет"
+        winner_mark = " ✅ПОБЕДА" if v.card_position == wc else ""
+        lines.append(f"  P{v.player_id}: карта {v.card_position}{winner_mark} | ставка: {stake_str}")
+
+    # Анализ: кто выиграл
+    winner_ids = {v.player_id for v in votes if v.card_position == wc}
+    winning_stakes = [s for s in stakes if s.player_id in winner_ids and s.status == "confirmed"]
+    lines.append("")
+    if winning_stakes:
+        total_prize = sum(s.amount_nanotons for s in winning_stakes)
+        lines.append(f"Победители со ставкой: {len(winning_stakes)}, сумма ставок: {total_prize}n")
+    else:
+        lines.append("Победители со ставкой: 0 — все ставки будут возвращены")
+        if winner_ids:
+            lines.append(f"  (Угадали: {', '.join(f'P{pid}' for pid in winner_ids)}, но ставки не сделали)")
+
+    # Выплаты
+    if payouts:
+        lines.append("")
+        lines.append(f"Выплаты ({len(payouts)}):")
+        for p in payouts:
+            lines.append(f"  id={p.id}: {p.kind} {p.status} {p.amount_nanotons}n → P{p.player_id}")
+
+    await message.answer("\n".join(lines))
+    return True
+
+
+async def _finalize_closed_rounds(rounds: list[Round]) -> list[str]:
+    """Финализировать каждый закрытый день в своей сессии; вернуть строки отчёта."""
     from app.stakes import finalize_day_payouts
-    from app.ton_pay import dispatch_pending_payouts
 
-    words = (message.text or "").split()
-    target_day = int(words[1]) if len(words) > 1 and words[1].isdigit() else None
-
-    # Сначала покажем состояние раунда(ов) для диагностики.
-    async with SessionLocal() as session:
-        if target_day is not None:
-            rnd_result = await session.execute(
-                select(Round).where(Round.day_index == target_day).order_by(Round.id.desc()).limit(1)
-            )
-            row = rnd_result.scalar_one_or_none()
-            if row is None:
-                await message.answer(f"День {target_day} не найден.")
-                return
-            status = row.status.value
-            fin = row.payouts_finalized
-            pot = row.pot_nanotons
-            wc = row.winner_card
-
-            # Ставки
-            stakes_q = await session.execute(
-                select(Stake).where(Stake.round_id == row.id)
-            )
-            stakes = list(stakes_q.scalars().all())
-            stakes_by_player = {s.player_id: s for s in stakes}
-
-            # Голоса
-            votes_q = await session.execute(
-                select(Vote).where(Vote.round_id == row.id)
-            )
-            votes = list(votes_q.scalars().all())
-
-            # Существующие выплаты
-            payouts_q = await session.execute(
-                select(Payout).where(Payout.round_id == row.id)
-            )
-            payouts = list(payouts_q.scalars().all())
-
-            # Таблица голосов + ставок
-            lines = [f"День {target_day} (Round#{row.id}): status={status}, finalized={fin}"]
-            lines.append(f"Пот: {pot} нанотонов | Победившая карта: {wc}")
-            lines.append("")
-            lines.append("Голоса:")
-            for v in votes:
-                stake = stakes_by_player.get(v.player_id)
-                stake_str = f"{stake.amount_nanotons}n ({stake.status})" if stake else "нет"
-                winner_mark = " ✅ПОБЕДА" if v.card_position == wc else ""
-                lines.append(f"  P{v.player_id}: карта {v.card_position}{winner_mark} | ставка: {stake_str}")
-
-            # Анализ: кто выиграл
-            winner_ids = {v.player_id for v in votes if v.card_position == wc}
-            winning_stakes = [s for s in stakes if s.player_id in winner_ids and s.status == "confirmed"]
-            lines.append("")
-            if winning_stakes:
-                total_prize = sum(s.amount_nanotons for s in winning_stakes)
-                lines.append(f"Победители со ставкой: {len(winning_stakes)}, сумма ставок: {total_prize}n")
-            else:
-                lines.append("Победители со ставкой: 0 — все ставки будут возвращены")
-                if winner_ids:
-                    lines.append(f"  (Угадали: {', '.join(f'P{pid}' for pid in winner_ids)}, но ставки не сделали)")
-
-            # Выплаты
-            if payouts:
-                lines.append("")
-                lines.append(f"Выплаты ({len(payouts)}):")
-                for p in payouts:
-                    lines.append(f"  id={p.id}: {p.kind} {p.status} {p.amount_nanotons}n → P{p.player_id}")
-
-            await message.answer("\n".join(lines))
-        # Теперь финализация
-        q = select(Round).where(
-            Round.status == RoundStatus.CLOSED,
-            Round.payouts_finalized.is_(False),
-        )
-        if target_day is not None:
-            q = q.where(Round.day_index == target_day)
-        rounds = list((await session.execute(q)).scalars().all())
-    if not rounds:
-        await message.answer(f"{ok_mark('ok')} Незавершённых дней нет" + (f" (день {target_day} не найден или уже finalized)" if target_day else ""))
-        return
     results = []
     for rnd in rounds:
         try:
@@ -666,12 +656,45 @@ async def cmd_finalize(message: Message) -> None:
                 results.append(f"День {row.day_index} (Round#{row.id}): создано выплат {created}")
         except Exception as exc:
             results.append(f"День {rnd.day_index} (Round#{rnd.id}): ОШИБКА — {redact(repr(exc))}")
-    # Отправляем
+    return results
+
+
+async def _dispatch_after_finalize(message: Message) -> str:
+    """Разослать созданные выплаты; вернуть строку отчёта для ответа."""
+    from app.ton_pay import dispatch_pending_payouts
+
     try:
         sent = await dispatch_pending_payouts(bot=message.bot)
-        results.append(f"Отправлено: {sent}")
+        return f"Отправлено: {sent}"
     except Exception as exc:
-        results.append(f"Ошибка отправки: {redact(repr(exc))}")
+        return f"Ошибка отправки: {redact(repr(exc))}"
+
+
+@router.message(Command("finalize"), F.chat.type == ChatType.PRIVATE)
+@require_admin("Команда только для хранителя игры.")
+async def cmd_finalize(message: Message) -> None:
+    """Ручная финализация ставок застрявших дней: /finalize или /finalize 40"""
+    words = (message.text or "").split()
+    target_day = int(words[1]) if len(words) > 1 and words[1].isdigit() else None
+
+    # Сначала покажем состояние раунда(ов) для диагностики.
+    async with SessionLocal() as session:
+        if not await _finalize_preview(session, message, target_day):
+            return
+        # Теперь финализация
+        q = select(Round).where(
+            Round.status == RoundStatus.CLOSED,
+            Round.payouts_finalized.is_(False),
+        )
+        if target_day is not None:
+            q = q.where(Round.day_index == target_day)
+        rounds = list((await session.execute(q)).scalars().all())
+    if not rounds:
+        await message.answer(f"{ok_mark('ok')} Незавершённых дней нет" + (f" (день {target_day} не найден или уже finalized)" if target_day else ""))
+        return
+    results = await _finalize_closed_rounds(rounds)
+    # Отправляем
+    results.append(await _dispatch_after_finalize(message))
     await message.answer("\n".join(results))
 
 
