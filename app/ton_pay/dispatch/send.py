@@ -189,6 +189,55 @@ async def _send_raw_batch_with_seqno(
     return await wallet.send_external(body=transfer_msg)
 
 
+async def _send_batch_cycle_seqno(
+    wallet, seqno: int, transfers: list[tuple[str, int, str]]
+) -> None:
+    """Пачка с seqno цикла диспетчера; любой сбой сбрасывает номер."""
+    # Диспетчер держит seqno из одного get_seqno() на цикл: вся пачка
+    # подписывается одним номером, гонки следующих seqno внутри неё нет.
+    # Инкремент — только при УСПЕХЕ вещания; при сбое батч отменяется.
+    try:
+        result = await _send_raw_batch_with_seqno(wallet, seqno, transfers)
+    except (Exception, asyncio.CancelledError):
+        # Таймаут диспетчера (asyncio.wait_for) обрывает корутину через
+        # CancelledError — это НЕ Exception, и без явного перехвата
+        # _batch_seqno остался бы протухшим.
+        _state._batch_seqno = None
+        raise
+    if result != 1:
+        _state._batch_seqno = None
+        raise BatchRejected(f"Лайтсерверы не приняли пачку (результат {result})")
+    _state._batch_seqno = seqno + 1
+
+
+async def _send_batch_fresh_seqno(
+    wallet, transfers: list[tuple[str, int, str]]
+) -> None:
+    """Пачка вне цикла диспетчера (смоук /payout test): свежий seqno на всю пачку."""
+    # Устаревший номер контракт отвергнет сам, потерять перевод нельзя.
+    result = await _send_raw_batch_with_seqno(
+        wallet, await wallet.get_seqno(), transfers
+    )
+    if result != 1:
+        raise BatchRejected(f"Лайтсерверы не приняли пачку (результат {result})")
+
+
+def _note_batch_success(batch_size: int) -> str:
+    """Лайтсерверы приняли пачку: снять флаг HTTP-канала и выдать метку."""
+    import app.ton_pay as _tp
+
+    # Лайтсерверы ответили: серия сбоев канала оборвалась.
+    _tp.notify_liteserver_ok()
+    if _state._http_channel_engaged_at is not None:
+        # Лайтсерверы снова принимают вещание — флаг HTTP-канала снимается
+        # (симметрично одиночному пути, иначе алерт «недоступны» врал бы
+        # после возврата канала).
+        _state._http_channel_engaged_at = None
+    marker = f"bcast:{int(datetime.now(UTC).timestamp())}"
+    logger.info("Пачка из %d переводов разослана (%s)", batch_size, marker)
+    return marker
+
+
 async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str | None:
     """Пачка переводов ОДНИМ внешним сообщением v5r1. Метка вещания или None.
 
@@ -221,41 +270,10 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
 
         wallet = await _tp._get_wallet()
         if _state._batch_seqno is not None:
-            # Диспетчер держит seqno из одного get_seqno() на цикл: вся пачка
-            # подписывается одним номером, гонки следующих seqno внутри неё нет.
-            # Инкремент — только при УСПЕХЕ вещания; при сбое батч отменяется.
-            seqno = _state._batch_seqno
-            try:
-                result = await _send_raw_batch_with_seqno(wallet, seqno, transfers)
-            except (Exception, asyncio.CancelledError):
-                # Таймаут диспетчера (asyncio.wait_for) обрывает корутину через
-                # CancelledError — это НЕ Exception, и без явного перехвата
-                # _batch_seqno остался бы протухшим.
-                _state._batch_seqno = None
-                raise
-            if result != 1:
-                _state._batch_seqno = None
-                raise BatchRejected(f"Лайтсерверы не приняли пачку (результат {result})")
-            _state._batch_seqno += 1
+            await _send_batch_cycle_seqno(wallet, _state._batch_seqno, transfers)
         else:
-            # Вне цикла диспетчера (смоук /payout test): свежий seqno на всю
-            # пачку; устаревший номер контракт отвергнет сам, потерять
-            # перевод нельзя.
-            result = await _send_raw_batch_with_seqno(
-                wallet, await wallet.get_seqno(), transfers
-            )
-        if result != 1:
-            raise BatchRejected(f"Лайтсерверы не приняли пачку (результат {result})")
-        # Лайтсерверы ответили: серия сбоев канала оборвалась.
-        _tp.notify_liteserver_ok()
-        if _state._http_channel_engaged_at is not None:
-            # Лайтсерверы снова принимают вещание — флаг HTTP-канала снимается
-            # (симметрично одиночному пути, иначе алерт «недоступны» врал бы
-            # после возврата канала).
-            _state._http_channel_engaged_at = None
-        marker = f"bcast:{int(datetime.now(UTC).timestamp())}"
-        logger.info("Пачка из %d переводов разослана (%s)", len(transfers), marker)
-        return marker
+            await _send_batch_fresh_seqno(wallet, transfers)
+        return _note_batch_success(len(transfers))
     except asyncio.CancelledError:
         # Таймаут диспетчера: он сам решит, что делать со строками. HTTP-канал
         # сюда не цепляем — рваную корутину «добивать» нельзя.
