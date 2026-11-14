@@ -698,14 +698,97 @@ async def cmd_finalize(message: Message) -> None:
     await message.answer("\n".join(results))
 
 
+async def _refinalize_reset(session, message: Message, row: Round, target_day: int) -> int | None:
+    """Погасить старые выплаты и сбросить finalized под локом диспетчера.
+
+    None — перефинализация отменена (ответ уже отправлен): в блокчейн уже
+    ушли деньги, повторное создание выплат задвоило бы их.
+    """
+    from app.ton_pay import dispatch_lock
+
+    async with dispatch_lock():
+        # Перефинализация может задвоить реальные деньги: строка, уже
+        # ушедшая в блокчейн (sent), либо улетевшая в вещание (sending —
+        # коммит отложен от отправки), двигала реальные монеты; пересоздание
+        # создаст её ПОВТОРНО (новый payout.id, анти-дубль по memo слеп).
+        # Отказ внятным сообщением: пусть хранитель сам разберётся с уже
+        # ушедшим (сверка /treasury, /adjust), а не плодит вторую выплату.
+        #
+        # failed тоже в списке, и это не перестраховка. Перевод, ушедший с
+        # неподтверждённым memo, умирает как failed после исчерпания
+        # попыток: с точки зрения БД он «никуда не ушёл», по факту монеты
+        # могли уйти. Новый payout.id даёт новый memo, поэтому
+        # анти-дубль по memo такую строку структурно не видит.
+        moved_q = await session.execute(
+            select(func.count()).select_from(Payout).where(
+                Payout.round_id == row.id,
+                Payout.status.in_(["sent", "sending", "failed"]),
+            )
+        )
+        moved_count = int(moved_q.scalar_one())
+        if moved_count:
+            await message.answer(
+                f"Round#{row.id} (день {target_day}): перефинализация отменена — "
+                f"уже двинуто денег: {moved_count} строк (sent/sending/failed). "
+                "Повторное создание задвоило бы реальные переводы в блокчейне. "
+                "Разберись с ушедшим через /treasury или /adjust."
+            )
+            return None
+        # Гасим только то, что финализация пересоздаст заново: призы,
+        # rake, pot, referral. Refund НЕ гасим — ставка уже refunded,
+        # условный claim (WHERE status IN pending/rejected) не пройдёт,
+        # и возврат потерялся бы навсегда. Manual-refund (/return) —
+        # та же история: payout создан вне финализации, пересоздания нет.
+        stale_q = await session.execute(
+            select(Payout).where(
+                Payout.round_id == row.id,
+                Payout.status.notin_(["sent", "sending"]),
+                Payout.kind != "refund",
+            )
+        )
+        stale = list(stale_q.scalars().all())
+        for p in stale:
+            p.status = "dismissed"
+
+        row.payouts_finalized = False
+        await session.commit()
+        return len(stale)
+
+
+async def _refinalize_run(message: Message, round_id: int) -> bool:
+    """Пересоздать выплаты дня; False — финализация упала, отправку не зовём."""
+    from app.stakes import finalize_day_payouts
+
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(Round, round_id)
+            if row is None:
+                await message.answer("Round не найден после сброса.")
+                return False
+            created = await finalize_day_payouts(session, row)
+            await message.answer(f"Создано выплат: {created}")
+    except Exception as exc:
+        await message.answer(f"Ошибка финализации: {redact(repr(exc))}")
+        return False
+    return True
+
+
+async def _refinalize_dispatch(message: Message) -> None:
+    """Разослать пересозданные выплаты."""
+    from app.ton_pay import dispatch_pending_payouts
+
+    try:
+        sent = await dispatch_pending_payouts(bot=message.bot)
+        await message.answer(f"Отправлено выплат: {sent}")
+    except Exception as exc:
+        await message.answer(f"Ошибка отправки: {redact(repr(exc))}")
+
+
 @router.message(Command("refinalize"), F.chat.type == ChatType.PRIVATE)
 @require_admin("Команда только для хранителя игры.")
 async def cmd_refinalize(message: Message) -> None:
     """Принудительная перефинализация: сбрасывает finalized, помечает старые
     невыполненные выплаты dismissed, пересоздаёт всё заново. /refinalize 1"""
-
-    from app.stakes import finalize_day_payouts
-    from app.ton_pay import dispatch_lock, dispatch_pending_payouts
 
     words = (message.text or "").split()
     if len(words) < 2 or not words[1].isdigit():
@@ -726,76 +809,20 @@ async def cmd_refinalize(message: Message) -> None:
             await message.answer(f"День {target_day}: статус={status}, нужен CLOSED.")
             return
 
-        async with dispatch_lock():
-            # Перефинализация может задвоить реальные деньги: строка, уже
-            # ушедшая в блокчейн (sent), либо улетевшая в вещание (sending —
-            # коммит отложен от отправки), двигала реальные монеты; пересоздание
-            # создаст её ПОВТОРНО (новый payout.id, анти-дубль по memo слеп).
-            # Отказ внятным сообщением: пусть хранитель сам разберётся с уже
-            # ушедшим (сверка /treasury, /adjust), а не плодит вторую выплату.
-            #
-            # failed тоже в списке, и это не перестраховка. Перевод, ушедший с
-            # неподтверждённым memo, умирает как failed после исчерпания
-            # попыток: с точки зрения БД он «никуда не ушёл», по факту монеты
-            # могли уйти. Новый payout.id даёт новый memo, поэтому
-            # анти-дубль по memo такую строку структурно не видит.
-            moved_q = await session.execute(
-                select(func.count()).select_from(Payout).where(
-                    Payout.round_id == row.id,
-                    Payout.status.in_(["sent", "sending", "failed"]),
-                )
-            )
-            moved_count = int(moved_q.scalar_one())
-            if moved_count:
-                await message.answer(
-                    f"Round#{row.id} (день {target_day}): перефинализация отменена — "
-                    f"уже двинуто денег: {moved_count} строк (sent/sending/failed). "
-                    "Повторное создание задвоило бы реальные переводы в блокчейне. "
-                    "Разберись с ушедшим через /treasury или /adjust."
-                )
-                return
-            # Гасим только то, что финализация пересоздаст заново: призы,
-            # rake, pot, referral. Refund НЕ гасим — ставка уже refunded,
-            # условный claim (WHERE status IN pending/rejected) не пройдёт,
-            # и возврат потерялся бы навсегда. Manual-refund (/return) —
-            # та же история: payout создан вне финализации, пересоздания нет.
-            stale_q = await session.execute(
-                select(Payout).where(
-                    Payout.round_id == row.id,
-                    Payout.status.notin_(["sent", "sending"]),
-                    Payout.kind != "refund",
-                )
-            )
-            stale = list(stale_q.scalars().all())
-            for p in stale:
-                p.status = "dismissed"
-
-            row.payouts_finalized = False
-            await session.commit()
-            dismissed = len(stale)
+        dismissed = await _refinalize_reset(session, message, row, target_day)
+        if dismissed is None:
+            return
 
         await message.answer(
             f"Round#{row.id} (день {target_day}): finalized сброшен, "
             f"dismissed {dismissed} старых выплат. Запускаю финализацию..."
         )
+        round_id = row.id
 
-    try:
-        async with SessionLocal() as session:
-            row = await session.get(Round, row.id)
-            if row is None:
-                await message.answer("Round не найден после сброса.")
-                return
-            created = await finalize_day_payouts(session, row)
-            await message.answer(f"Создано выплат: {created}")
-    except Exception as exc:
-        await message.answer(f"Ошибка финализации: {redact(repr(exc))}")
+    if not await _refinalize_run(message, round_id):
         return
 
-    try:
-        sent = await dispatch_pending_payouts(bot=message.bot)
-        await message.answer(f"Отправлено выплат: {sent}")
-    except Exception as exc:
-        await message.answer(f"Ошибка отправки: {redact(repr(exc))}")
+    await _refinalize_dispatch(message)
 
 
 @router.message(Command("pause"), F.chat.type == ChatType.PRIVATE)
