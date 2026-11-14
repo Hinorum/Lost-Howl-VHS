@@ -484,6 +484,52 @@ async def _tonapi_page(since_utime: int, before_lt: str | None) -> Page:
     # скриптованным источником, и подмена обязана дойти до этого адаптера.
     return await _pkg.fetch_recent_transfers_page(since_utime, before_lt=before_lt)
 
+def _deep_fresh_transfers(page: Page, seen: set[str]) -> list[Transfer]:
+    """Новые переводы страницы без дублей; пополняет seen."""
+    fresh = [t for t in page.transfers if t.tx_hash and t.tx_hash not in seen]
+    for item in fresh:
+        seen.add(item.tx_hash)
+    return fresh
+
+
+def _deep_page_floor(page: Page, fresh: list[Transfer]) -> int | None:
+    """Граница покрытия — по СЫРЫМ строкам страницы (или свежим, если их нет)."""
+    # Граница покрытия — по СЫРЫМ строкам страницы: даже полностью
+    # отфильтрованная страница доказывает, что этот участок истории
+    # прочитан. Иначе проход застревал на первой же странице из одних
+    # исходящих/джеттонов и вечно держал SCAN_GAP.
+    page_floor = page.oldest_utime
+    if page_floor is None and fresh:
+        page_floor = min(item.utime for item in fresh)
+    return page_floor
+
+
+def _deep_history_ended(page: Page, since: int) -> bool:
+    """История кончилась или страница накрыла курсор — проход полон."""
+    # «История кончилась» решается по СЫРОМУ числу строк от провайдера.
+    # Длина отфильтрованного списка для этого не годится: одна отброшенная
+    # парсером строка (jetton, value<=0, старая по utime) в полной странице
+    # давала complete=True после первой страницы, и цикл коммитил курсор в
+    # голову цепочки — непрочитанный хвост исчезал навсегда, тихо и без
+    # тревоги. Просили у провайдера page.requested, отдал он page.raw_count.
+    if page.raw_count == 0 or page.raw_count < page.requested:
+        return True
+    # Самая старая СЫРАЯ строка страницы уже накрыла курсор: всё,
+    # что выше, прочитано, даже если фильтры не оставили переводов.
+    return page.oldest_utime is not None and page.oldest_utime <= since
+
+
+def _deep_filtered_page_cursor(page: Page, before: str | None) -> str | None:
+    """Курсор для полной, но полностью отфильтрованной страницы; None — застряли."""
+    # Провайдер отдал полную страницу, но фильтры съели её целиком.
+    # Это не конец истории: next_cursor провайдера ведёт вглубь и
+    # считается по сырым строкам. Рвать проход здесь нельзя — именно
+    # на этом watcher застревал в вечном SCAN_GAP.
+    if page.next_cursor is None or page.next_cursor == before:
+        return None
+    return page.next_cursor
+
+
 async def _deep_collect(
     fetch_page,
     since: int,
@@ -521,38 +567,16 @@ async def _deep_collect(
         parse_fail_count += page.parse_fail_count
         if page.state != _PAGE_OK:
             return PassResult(page.transfers, False, False, floor_utime, parse_fail_count)
-        transfers_page = page.transfers
-        fresh = [t for t in transfers_page if t.tx_hash and t.tx_hash not in seen]
-        for item in fresh:
-            seen.add(item.tx_hash)
+        fresh = _deep_fresh_transfers(page, seen)
         transfers.extend(fresh)
-        # Граница покрытия — по СЫРЫМ строкам страницы: даже полностью
-        # отфильтрованная страница доказывает, что этот участок истории
-        # прочитан. Иначе проход застревал на первой же странице из одних
-        # исходящих/джеттонов и вечно держал SCAN_GAP.
-        page_floor = page.oldest_utime
-        if page_floor is None and fresh:
-            page_floor = min(item.utime for item in fresh)
+        page_floor = _deep_page_floor(page, fresh)
         if page_floor is not None:
             floor_utime = page_floor if floor_utime is None else min(floor_utime, page_floor)
-        # «История кончилась» решается по СЫРОМУ числу строк от провайдера.
-        # Длина отфильтрованного списка для этого не годится: одна отброшенная
-        # парсером строка (jetton, value<=0, старая по utime) в полной странице
-        # давала complete=True после первой страницы, и цикл коммитил курсор в
-        # голову цепочки — непрочитанный хвост исчезал навсегда, тихо и без
-        # тревоги. Просили у провайдера page.requested, отдал он page.raw_count.
-        if page.raw_count == 0 or page.raw_count < page.requested:
-            return PassResult(transfers, True, True, floor_utime, parse_fail_count)  # история кончилась — глубже пусто
-        if page.oldest_utime is not None and page.oldest_utime <= since:
-            # Самая старая СЫРАЯ строка страницы уже накрыла курсор: всё,
-            # что выше, прочитано, даже если фильтры не оставили переводов.
+        if _deep_history_ended(page, since):
             return PassResult(transfers, True, True, floor_utime, parse_fail_count)
-        if not transfers_page:
-            # Провайдер отдал полную страницу, но фильтры съели её целиком.
-            # Это не конец истории: next_cursor провайдера ведёт вглубь и
-            # считается по сырым строкам. Рвать проход здесь нельзя — именно
-            # на этом watcher застревал в вечном SCAN_GAP.
-            if page.next_cursor is None or page.next_cursor == before:
+        if not page.transfers:
+            next_cursor = _deep_filtered_page_cursor(page, before)
+            if next_cursor is None:
                 logger.warning(
                     "Страница от провайдера полная (%d строк), но фильтры оставили "
                     "пусто и курсор пагинации не двигается — проход прерван",
@@ -561,7 +585,7 @@ async def _deep_collect(
                 # Не доказано, что ниже пусто: помечаем проход ненадёжным,
                 # чтобы фолбэк/тревога подхватили, а курсор не уехал вслепую.
                 return PassResult(transfers, False, False, floor_utime, parse_fail_count)
-            before = page.next_cursor
+            before = next_cursor
             await asyncio.sleep(0.12)  # бережём лимиты API на глубоком проходе
             continue
         # Провайдер, который не двигает курсор (параметр пагинации молча
@@ -570,7 +594,7 @@ async def _deep_collect(
         # то есть как успех, и курсор уезжал в голову, обрезая окно. Такое
         # состояние — не конец истории, а деградация: помечаем проход
         # ненадёжным, чтобы цикл не сдвинул курсор и поднял тревогу.
-        window = (transfers_page[0].tx_hash, transfers_page[-1].tx_hash)
+        window = (page.transfers[0].tx_hash, page.transfers[-1].tx_hash)
         if window == prev_window:
             logger.warning(
                 "Провайдер вернул ту же страницу [%s..%s] — курсор пагинации не "
@@ -580,7 +604,7 @@ async def _deep_collect(
             )
             return PassResult(transfers, False, False, floor_utime, parse_fail_count)
         prev_window = window
-        oldest = transfers_page[-1]
+        oldest = page.transfers[-1]
         if oldest.utime <= since:
             return PassResult(transfers, True, True, floor_utime, parse_fail_count)  # страница дотянулась до курсора
         if page.next_cursor is None:
