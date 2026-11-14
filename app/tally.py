@@ -232,17 +232,18 @@ async def format_plugin_results(
     return ""
 
 
-async def day_economics(session: AsyncSession, round_row: Round) -> dict:
-    """Цифры дня для поста итогов: банк, проценты, коэффициент, копилка.
-
-    Читает уже созданные финализацией выплаты, поэтому вызывать стоит после
-    finalize_day_payouts; при пустом банке деньги просто не попадут в пост.
-    """
+def _economics_counts(round_row: Round) -> tuple[dict[int, int], int]:
+    """Голоса по путям из снимка дня и общее число игроков."""
     raw = json.loads(round_row.vote_counts_json or "{}")
     counts = {int(key): int(value) for key, value in raw.items()}
-    players = sum(counts.values())
-    # Ставки по путям: сколько денег стояло за каждый вариант (по голосам
-    # игроков). Победившему пути — отдельная строка с долей банка.
+    return counts, sum(counts.values())
+
+
+async def _economics_path_stakes(session: AsyncSession, round_row: Round) -> dict[int, int]:
+    """Ставки по путям: сколько денег стояло за каждый вариант (по голосам).
+
+    Победившему пути — отдельная строка с долей банка.
+    """
     path_stakes_rows = await session.execute(
         select(Vote.card_position, func.coalesce(func.sum(Stake.amount_nanotons), 0))
         .join(Stake, Stake.player_id == Vote.player_id)
@@ -254,6 +255,16 @@ async def day_economics(session: AsyncSession, round_row: Round) -> dict:
         )
         .group_by(Vote.card_position)
     )
+    return {int(p): int(v) for p, v in path_stakes_rows.all()}
+
+
+def _economics_base_stats(
+    round_row: Round,
+    counts: dict[int, int],
+    players: int,
+    path_stakes: dict[int, int],
+) -> dict:
+    """Базовые цифры дня: явка, банк, доля победившего пути."""
     stats: dict = {
         "players": players,
         "counts": counts,
@@ -265,7 +276,7 @@ async def day_economics(session: AsyncSession, round_row: Round) -> dict:
         "bank_total": 0,
         "fund_total": 0,
         "refunded": False,
-        "path_stakes": {int(p): int(v) for p, v in path_stakes_rows.all()},
+        "path_stakes": path_stakes,
     }
     stats["winner_stake"] = (
         stats["path_stakes"].get(round_row.winner_card, 0)
@@ -275,13 +286,16 @@ async def day_economics(session: AsyncSession, round_row: Round) -> dict:
     stats["winner_share_pct"] = (
         round(stats["winner_stake"] * 100 / stats["pot"]) if stats["pot"] else None
     )
-    if not players and not stats["pot"]:
-        return stats
+    return stats
 
-    # Призовые дня — единственная «детальная» выплата раунда: премия
-    # лидерборда месяцами живёт отдельно (round_id=None, копилка месяца),
-    # поэтому в разбивке раунда ей нечему появляться.
-    prize_sum = int(
+
+async def _economics_prize_sum(session: AsyncSession, round_row: Round) -> int:
+    """Призовые дня — единственная «детальная» выплата раунда.
+
+    Премия лидерборда месяцами живёт отдельно (round_id=None, копилка месяца),
+    поэтому в разбивке раунда ей нечему появляться.
+    """
+    return int(
         (
             await session.execute(
                 select(func.coalesce(func.sum(Payout.amount_nanotons), 0)).where(
@@ -291,42 +305,71 @@ async def day_economics(session: AsyncSession, round_row: Round) -> dict:
             )
         ).scalar_one()
     )
+
+
+async def _economics_totals(
+    session: AsyncSession, round_row: Round
+) -> tuple[int, int, int]:
+    """Копилки на момент итогов: банк лидерборда, неделя дня, Фонд Стаи."""
     bank_row = await session.execute(select(func.coalesce(func.sum(LeaderboardPot.nanotons), 0)))
-    stats["bank_total"] = int(bank_row.scalar_one())
     week_row = await session.execute(
         select(func.coalesce(func.sum(WeeklyPot.nanotons), 0)).where(
             WeeklyPot.week == iso_week_key(round_row.opens_at)
         )
     )
-    stats["week_total"] = int(week_row.scalar_one())
     # Фонд Стаи — единое накопление без периода: показываем общий баланс,
     # а не «сегодня», т.к. разыгрывается вручную, а не по расписанию.
     fund_row = await session.execute(
         select(func.coalesce(func.sum(PackFund.nanotons), 0))
     )
-    stats["fund_total"] = int(fund_row.scalar_one())
+    return int(bank_row.scalar_one()), int(week_row.scalar_one()), int(fund_row.scalar_one())
 
-    if round_row.winner_card is not None:
-        winners_subq = select(Vote.player_id).where(
-            Vote.round_id == round_row.id,
-            Vote.card_position == round_row.winner_card,
+
+async def _economics_multiplier(
+    session: AsyncSession, round_row: Round, stats: dict, prize_sum: int
+) -> None:
+    """Коэффициент дня и флаг настоящего возврата — прямо в stats."""
+    if round_row.winner_card is None:
+        return
+    winners_subq = select(Vote.player_id).where(
+        Vote.round_id == round_row.id,
+        Vote.card_position == round_row.winner_card,
+    )
+    staked_winners = await session.execute(
+        select(func.coalesce(func.sum(Stake.amount_nanotons), 0)).where(
+            Stake.round_id == round_row.id,
+            Stake.network == current_network(),
+            Stake.status == "confirmed",
+            Stake.player_id.in_(winners_subq),
         )
-        staked_winners = await session.execute(
-            select(func.coalesce(func.sum(Stake.amount_nanotons), 0)).where(
-                Stake.round_id == round_row.id,
-                Stake.network == current_network(),
-                Stake.status == "confirmed",
-                Stake.player_id.in_(winners_subq),
-            )
-        )
-        winning_total = int(staked_winners.scalar_one())
-        if winning_total > 0 and prize_sum > 0:
-            stats["multiplier"] = prize_sum / winning_total
-        elif stats["pot"] > 0 and prize_sum == 0 and stats["week_today"] == 0:
-            # Настоящий возврат: на верный путь не ставил никто. Если же
-            # week_today > 0, призовые сгорели в газ сети и ушли в копилку
-            # недели — это не возврат, и строка про возврат не показывается.
-            stats["refunded"] = True
+    )
+    winning_total = int(staked_winners.scalar_one())
+    if winning_total > 0 and prize_sum > 0:
+        stats["multiplier"] = prize_sum / winning_total
+    elif stats["pot"] > 0 and prize_sum == 0 and stats["week_today"] == 0:
+        # Настоящий возврат: на верный путь не ставил никто. Если же
+        # week_today > 0, призовые сгорели в газ сети и ушли в копилку
+        # недели — это не возврат, и строка про возврат не показывается.
+        stats["refunded"] = True
+
+
+async def day_economics(session: AsyncSession, round_row: Round) -> dict:
+    """Цифры дня для поста итогов: банк, проценты, коэффициент, копилка.
+
+    Читает уже созданные финализацией выплаты, поэтому вызывать стоит после
+    finalize_day_payouts; при пустом банке деньги просто не попадут в пост.
+    """
+    counts, players = _economics_counts(round_row)
+    stats = _economics_base_stats(
+        round_row, counts, players, await _economics_path_stakes(session, round_row)
+    )
+    if not players and not stats["pot"]:
+        return stats
+    prize_sum = await _economics_prize_sum(session, round_row)
+    stats["bank_total"], stats["week_total"], stats["fund_total"] = (
+        await _economics_totals(session, round_row)
+    )
+    await _economics_multiplier(session, round_row, stats, prize_sum)
     return stats
 
 
