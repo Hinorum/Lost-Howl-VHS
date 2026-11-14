@@ -365,45 +365,61 @@ async def _test_wait_memo(memo: str) -> str | None:
     return None
 
 
-async def _payout_test(message: Message, tokens: list[str]) -> None:
-    """Холостой перевод: предполёт всегда, отправка только с явным confirm."""
+async def _payout_test_parse(
+    message: Message, tokens: list[str]
+) -> tuple[Decimal, bool, bool, int] | None:
+    """Разбор аргументов; None — формат уже объяснён игроку ответом."""
     try:
-        amount, confirm, force_http, batch_count = _parse_test_args(tokens)
+        return _parse_test_args(tokens)
     except ValueError as exc:
         await message.answer(
             f"{warn_mark('nopay')} Формат: <code>{html_escape(_TEST_USAGE)}</code>\n"
             f"Причина: {html_escape(redact(str(exc)))}",
             parse_mode=ParseMode.HTML,
         )
-        return
+        return None
+
+
+async def _payout_test_preflight_report(
+    message: Message, amount: Decimal, force_http: bool, batch_count: int
+) -> str | None:
+    """Предполётный отчёт; None — предполёт упал, ошибка уже отправлена."""
     try:
-        report = await _test_preflight(amount, force_http, batch_count)
+        return await _test_preflight(amount, force_http, batch_count)
     except Exception as exc:
         await message.answer(
             f"{warn_mark('nopay')} Предполёт не прошёл: {html_escape(redact(str(exc)))}",
             parse_mode=ParseMode.HTML,
         )
-        return
-    if not confirm:
-        await message.answer(
-            f"{report}\n\nНичего не отправлено — это только предполёт. "
-            "Увести деньги: <code>/payout test &lt;сумма Gram&gt; confirm</code>"
-            " (опции <code>http</code> и <code>batch2|batch3</code> — по нужде).",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+        return None
 
-    import app.ton_pay as _tp
 
-    dest = settings.active_treasury_address
-    stamp = int(datetime.now(UTC).timestamp())
-    # У каждого перевода пачки — своё memo: анти-дубль и подтверждение ищут
-    # строки по memo, одинаковые схлопнули бы поиск.
-    memos = (
+def _payout_test_memos(batch_count: int, stamp: int) -> list[str]:
+    """У каждого перевода пачки — своё memo: анти-дубль и подтверждение ищут
+    строки по memo, одинаковые схлопнули бы поиск."""
+    return (
         [f"{_TEST_MEMO_PREFIX} {stamp} #{index + 1}" for index in range(batch_count)]
         if batch_count
         else [f"{_TEST_MEMO_PREFIX} {stamp}"]
     )
+
+
+async def _payout_test_send(
+    message: Message,
+    amount: Decimal,
+    force_http: bool,
+    batch_count: int,
+    memos: list[str],
+    report: str,
+) -> tuple[str, str, list[str | None]] | None:
+    """Отправка холостого перевода и поиск memo.
+
+    Возвращает (метка, канал, найденные хеши) либо None — ошибка уже
+    отправлена, дальше идти некуда.
+    """
+    import app.ton_pay as _tp
+
+    dest = settings.active_treasury_address
     nano = int(amount * 1_000_000_000)
     await message.answer(
         f"{report}\n\n⏳ Отправляю… memo ищу в истории казначея до 30 с.",
@@ -434,7 +450,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
             f"{warn_mark('nopay')} Отправка не удалась: {html_escape(redact(str(exc)))}",
             parse_mode=ParseMode.HTML,
         )
-        return
+        return None
     finally:
         if force_http:
             # Принудительная репетиция — не деградация: флаг «канал
@@ -448,7 +464,7 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
             "мнемоника (канал отправки вернул None).",
             parse_mode=ParseMode.HTML,
         )
-        return
+        return None
     # Фактический канал отправки: успех по фолбэку не должен читаться как
     # «лайтсерверная нога доказана», иначе смоук молча проверяет HTTP.
     # Флаг канала ставится при HTTP-вещании и снимается при успехе на
@@ -464,7 +480,18 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
         channel = "не определить (флаг HTTP-канала стоял ещё до репетиции)"
     # memo пачки ищем параллельно: они в одной транзакции, и последовательные
     # окна по 30 с лишь растянули бы ответ на пустом месте.
-    found = await asyncio.gather(*(_test_wait_memo(comment) for comment in memos))
+    found = list(await asyncio.gather(*(_test_wait_memo(comment) for comment in memos)))
+    return marker, channel, found
+
+
+def _payout_test_result_lines(
+    batch_count: int,
+    marker: str,
+    memos: list[str],
+    found: list[str | None],
+    channel: str,
+) -> list[str]:
+    """Итоговый отчёт: что ушло, нашлось ли memo и каким каналом."""
     if batch_count:
         hashes = {tx for tx in found if tx}
         lines = [
@@ -507,6 +534,33 @@ async def _payout_test(message: Message, tokens: list[str]) -> None:
         "В /treasury движение попадёт в «self-переводы», а не в тревоги: "
         "баланс сдвинулся только на газ."
     )
+    return lines
+
+
+async def _payout_test(message: Message, tokens: list[str]) -> None:
+    """Холостой перевод: предполёт всегда, отправка только с явным confirm."""
+    parsed = await _payout_test_parse(message, tokens)
+    if parsed is None:
+        return
+    amount, confirm, force_http, batch_count = parsed
+    report = await _payout_test_preflight_report(message, amount, force_http, batch_count)
+    if report is None:
+        return
+    if not confirm:
+        await message.answer(
+            f"{report}\n\nНичего не отправлено — это только предполёт. "
+            "Увести деньги: <code>/payout test &lt;сумма Gram&gt; confirm</code>"
+            " (опции <code>http</code> и <code>batch2|batch3</code> — по нужде).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    stamp = int(datetime.now(UTC).timestamp())
+    memos = _payout_test_memos(batch_count, stamp)
+    sent = await _payout_test_send(message, amount, force_http, batch_count, memos, report)
+    if sent is None:
+        return
+    marker, channel, found = sent
+    lines = _payout_test_result_lines(batch_count, marker, memos, found, channel)
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
