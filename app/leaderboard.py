@@ -1121,6 +1121,146 @@ async def _resolve_week_winners(
     return paid, awards, rolled, fee_nano
 
 
+async def _week_settlement_gate(session, prev_key: str) -> WatcherState | None:
+    """Кто может закрывать неделю: метка не закрывала её раньше и лидерборд готов.
+
+    Возвращает маркер, если закрытие недели возможно, иначе None.
+    """
+    marker = await _claim_marker_lock(session, WEEKLY_MARKER_KEY)
+    settled_through = marker.value
+    if settled_through >= prev_key:
+        return None
+
+    # Флаг готовности: последний день недели закрыт (финализирован).
+    ready_marker = await session.get(WatcherState, WEEK_READY_KEY)
+    ready_week = ready_marker.value if ready_marker is not None else ""
+    if ready_week < prev_key:
+        # Последний день ещё не закрыт — лидерборд ждёт.
+        return None
+    return marker
+
+
+async def _week_pots_and_total(
+    session, prev_key: str
+) -> tuple[list[WeeklyPot], int, datetime, datetime] | None:
+    """Горшки недель ≤ prev_key: (pots, total, period_start, period_end).
+
+    None — горшка нет (неделя без ставок: метку двигает вызывающий).
+    """
+    pots = (
+        await session.execute(
+            select(WeeklyPot).where(WeeklyPot.week <= prev_key).order_by(WeeklyPot.week.asc())
+        )
+    ).scalars().all()
+    if not pots:
+        return None
+    total = sum(pot.nanotons for pot in pots)
+    period_start = week_bounds(pots[0].week)[0]
+    period_end = week_bounds(prev_key)[1]
+    return pots, total, period_start, period_end
+
+
+async def _week_has_unfinished(
+    session, period_start: datetime, period_end: datetime
+) -> bool:
+    """Есть ли в периоде нефинализированный день недели — тогда платить рано."""
+    # Неделя долита не полностью (последний день ещё считается или его
+    # выплаты не финализированы) — платить рано, метку не двигаем.
+    unfinished = await session.execute(
+        select(Round.id)
+        .where(
+            Round.opens_at >= period_start,
+            Round.opens_at < period_end,
+            or_(
+                Round.status != RoundStatus.CLOSED,
+                Round.payouts_finalized.is_(False),
+            ),
+        )
+        .limit(1)
+    )
+    return unfinished.scalar_one_or_none() is not None
+
+
+async def _week_short_start(
+    session, period_start: datetime, period_end: datetime, prev_key: str
+) -> bool:
+    """Короткая первая неделя забега — порог WEEKLY_MIN_DAYS снимается."""
+    # Короткая первая неделя забега: если сброс случился за 1–3 дня до
+    # понедельника, порог WEEKLY_MIN_DAYS снимается — новичкам честно
+    # дать шанс, а копилка не должна висеть вечно.
+    relaxed = False
+    try:
+        from app.core.anchor import parse_anchor
+        from app.core.registry import RUN_START_KEY
+
+        anchor_row = await session.get(WatcherState, RUN_START_KEY)
+        anchor = parse_anchor(anchor_row.value if anchor_row is not None else None)
+        if anchor is not None:
+            a_year, a_month = (int(part) for part in anchor["key"].split("-"))
+            start_date = date(a_year, a_month, max(1, min(int(anchor["dom"]), 31)))
+            # Границы недели — datetime, якорь — date: сравниваем как даты,
+            # иначе TypeError уводит в except и порог никогда не снимается.
+            if period_start.date() <= start_date < period_end.date():
+                span_days = (period_end.date() - start_date).days
+                if 1 <= span_days <= 3:
+                    relaxed = True
+                    logger.info(
+                        "Неделя %s — короткий старт забега (%d дн.): порог дней снят",
+                        prev_key, span_days,
+                    )
+    except Exception:
+        logger.warning("Не удалось проверить короткую стартовую неделю", exc_info=True)
+    return relaxed
+
+
+async def _week_carry_remainder(session, now: datetime, rolled: int) -> None:
+    """Незаполненные места переносятся в копилку новой недели."""
+    if rolled <= 0:
+        return
+    current_week = iso_week_key(now)
+    week_row = (
+        await session.execute(select(WeeklyPot).where(WeeklyPot.week == current_week))
+    ).scalar_one_or_none()
+    if week_row is None:
+        session.add(WeeklyPot(week=current_week, nanotons=rolled))
+    else:
+        week_row.nanotons += rolled
+
+
+def _week_ceremony_text(paid: list[tuple[str, str, int]], rolled: int) -> str:
+    """Текст церемонии недели для рассылки."""
+    lines = ["🏆 Итоги недели Стаи:"]
+    for medal, name, amount in paid:
+        lines.append(f"{medal} {html.escape(name)} — <b>{amount / 1e9:.2f} Gram</b>")
+    lines.append(
+        "При равенстве — вклад Gram, затем кто раньше заявил о месте."
+    )
+    if rolled > 0:
+        lines.append("Незаполненные места перешли в копилку новой недели.")
+    lines.append("Копилка новой недели копится с нуля. Удачи!")
+    return "\n".join(lines)
+
+
+async def _notify_week_admins(
+    bot: Bot | None,
+    prev_key: str,
+    paid: list[tuple[str, str, int]],
+    fee_nano: int,
+) -> None:
+    """Сводка отправленных выплат недели администраторам."""
+    if bot is not None and settings.admin_id_set:
+        paid_total = sum(amount for _medal, _name, amount in paid)
+        admin_text = (
+            f"🗓 Копилка недели {prev_key} отправлена: {paid_total / 1e9:.4f} Gram "
+            f"(газ {fee_nano * len(paid) / 1e9:.4f} Gram платит копилка)."
+        )
+        for admin_id in settings.admin_id_set:
+            try:
+                await bot.send_message(admin_id, admin_text)
+            except Exception as exc:
+                logger.warning("Алерт админу %s не доставлен: %s", admin_id, exc)
+
+
 async def _settle_week_locked(bot: Bot | None = None) -> bool:
     """Выплачивает копилку прошедших недель топ-3, если последний день недели закрыт.
 
@@ -1135,97 +1275,31 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
     prev_key = previous_week_key(now)
 
     async with SessionLocal() as session:
-        marker = await _claim_marker_lock(session, WEEKLY_MARKER_KEY)
-        settled_through = marker.value
-        if settled_through >= prev_key:
+        marker = await _week_settlement_gate(session, prev_key)
+        if marker is None:
             return False
 
-        # Флаг готовности: последний день недели закрыт (финализирован).
-        ready_marker = await session.get(WatcherState, WEEK_READY_KEY)
-        ready_week = ready_marker.value if ready_marker is not None else ""
-        if ready_week < prev_key:
-            # Последний день ещё не закрыт — лидерборд ждёт.
-            return False
-
-        pots = (
-            await session.execute(
-                select(WeeklyPot).where(WeeklyPot.week <= prev_key).order_by(WeeklyPot.week.asc())
-            )
-        ).scalars().all()
-        if not pots:
+        pots_data = await _week_pots_and_total(session, prev_key)
+        if pots_data is None:
             marker.value = prev_key
             await session.commit()
             return False
-        total = sum(pot.nanotons for pot in pots)
-        period_start = week_bounds(pots[0].week)[0]
-        period_end = week_bounds(prev_key)[1]
-
-        # Неделя долита не полностью (последний день ещё считается или его
-        # выплаты не финализированы) — платить рано, метку не двигаем.
-        unfinished = await session.execute(
-            select(Round.id)
-            .where(
-                Round.opens_at >= period_start,
-                Round.opens_at < period_end,
-                or_(
-                    Round.status != RoundStatus.CLOSED,
-                    Round.payouts_finalized.is_(False),
-                ),
-            )
-            .limit(1)
-        )
-        if unfinished.scalar_one_or_none() is not None:
+        _pots, total, period_start, period_end = pots_data
+        if await _week_has_unfinished(session, period_start, period_end):
             return False
 
-        # Короткая первая неделя забега: если сброс случился за 1–3 дня до
-        # понедельника, порог WEEKLY_MIN_DAYS снимается — новичкам честно
-        # дать шанс, а копилка не должна висеть вечно.
-        relaxed = False
-        try:
-            from app.core.anchor import parse_anchor
-            from app.core.registry import RUN_START_KEY
-
-            anchor_row = await session.get(WatcherState, RUN_START_KEY)
-            anchor = parse_anchor(anchor_row.value if anchor_row is not None else None)
-            if anchor is not None:
-                a_year, a_month = (int(part) for part in anchor["key"].split("-"))
-                start_date = date(a_year, a_month, max(1, min(int(anchor["dom"]), 31)))
-                # Границы недели — datetime, якорь — date: сравниваем как даты,
-                # иначе TypeError уводит в except и порог никогда не снимается.
-                if period_start.date() <= start_date < period_end.date():
-                    span_days = (period_end.date() - start_date).days
-                    if 1 <= span_days <= 3:
-                        relaxed = True
-                        logger.info(
-                            "Неделя %s — короткий старт забега (%d дн.): порог дней снят",
-                            prev_key, span_days,
-                        )
-        except Exception:
-            logger.warning("Не удалось проверить короткую стартовую неделю", exc_info=True)
-
+        relaxed = await _week_short_start(session, period_start, period_end, prev_key)
         min_days = 0 if relaxed else max(1, settings.weekly_min_days)
         resolved = await _resolve_week_winners(
             session, bot, period_start, period_end, prev_key, now, total, min_days, relaxed,
         )
-        paid: list[tuple[str, str, int]] = []
-        awards: list[tuple[int, int]] = []
-        rolled = 0
         if resolved is None:
             # Хелпер уже залогировал причину отказа; метку двигать нельзя —
             # копилка ждёт следующей недели.
             return False
         paid, awards, rolled, fee_nano = resolved
 
-        # Места без достойного игрока переносятся в копилку новой недели.
-        if rolled > 0:
-            current_week = iso_week_key(now)
-            week_row = (
-                await session.execute(select(WeeklyPot).where(WeeklyPot.week == current_week))
-            ).scalar_one_or_none()
-            if week_row is None:
-                session.add(WeeklyPot(week=current_week, nanotons=rolled))
-            else:
-                week_row.nanotons += rolled
+        await _week_carry_remainder(session, now, rolled)
 
         await session.execute(delete(WeeklyPot).where(WeeklyPot.week <= prev_key))
         marker.value = prev_key
@@ -1238,16 +1312,7 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
         total,
         [(medal, name, amount) for medal, name, amount in paid],
     )
-    lines = ["🏆 Итоги недели Стаи:"]
-    for medal, name, amount in paid:
-        lines.append(f"{medal} {html.escape(name)} — <b>{amount / 1e9:.2f} Gram</b>")
-    lines.append(
-        "При равенстве — вклад Gram, затем кто раньше заявил о месте."
-    )
-    if rolled > 0:
-        lines.append("Незаполненные места перешли в копилку новой недели.")
-    lines.append("Копилка новой недели копится с нуля. Удачи!")
-    ceremony = "\n".join(lines)
+    ceremony = _week_ceremony_text(paid, rolled)
     if bot is not None:
         from app.broadcast import whisper_to_chats
 
@@ -1255,15 +1320,5 @@ async def _settle_week_locked(bot: Bot | None = None) -> bool:
             await whisper_to_chats(bot, ceremony, parse_mode=ParseMode.HTML)
         except Exception as exc:
             logger.warning("Церемония недели не разослана: %s", exc)
-    if bot is not None and settings.admin_id_set:
-        paid_total = sum(amount for _medal, _name, amount in paid)
-        admin_text = (
-            f"🗓 Копилка недели {prev_key} отправлена: {paid_total / 1e9:.4f} Gram "
-            f"(газ {fee_nano * len(paid) / 1e9:.4f} Gram платит копилка)."
-        )
-        for admin_id in settings.admin_id_set:
-            try:
-                await bot.send_message(admin_id, admin_text)
-            except Exception as exc:
-                logger.warning("Алерт админу %s не доставлен: %s", admin_id, exc)
+    await _notify_week_admins(bot, prev_key, paid, fee_nano)
     return True
