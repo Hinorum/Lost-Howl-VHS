@@ -1194,89 +1194,109 @@ async def _check_scheduler_tick(session, bot) -> None:
 
 
 
+async def _check_watcher_beat(session, bot) -> None:
+    """Watcher не завершает успешные циклы — ставки перестают находиться."""
+    if not settings.ton_enabled:
+        return
+    from app.ton_watch import BEAT_KEY
+
+    beat_age = _age_seconds(await _get_state(session, BEAT_KEY))
+    watcher_note: str | None = None
+    if beat_age is None:
+        watcher_note = "watcher ещё ни разу не завершал цикл"
+    elif beat_age > _WATCHER_STALE_AFTER.total_seconds():
+        watcher_note = f"watcher молчит {int(beat_age // 60)} мин"
+    if watcher_note is not None:
+        await _raise(
+            session,
+            bot,
+            ALERT_WATCHER_KEY,
+            watcher_note,
+            f"⚠️ TON-watcher отстаёт: {watcher_note}. Ставки копятся необработанными.",
+        )
+
+
+async def _check_watcher_scan_gap(session, bot) -> None:
+    """Проход не вычитал окно входящих целиком — бюджет страниц кончился.
+
+    Цикл при этом «здоровый» (сердцебиение стоит, новые переводы обработаны),
+    поэтому без этой проверки дыра была бы видна только в логах. Курсор при
+    этом встаёт на дно прочитанного, то есть непрочитанная часть окна
+    догоняется следующими циклами; если backlog не тает — нужен либо больший
+    WATCH_MAX_PAGES, либо ручной разбор.
+    """
+    if not settings.ton_enabled:
+        return
+    from app.ton_watch import _read_scan_gap
+
+    gap = await _read_scan_gap(session)
+    if gap and gap.get("floor") is not None and gap.get("since") is not None:
+        gap_note = (
+            f"непрочитанное окно входящих: курсор {_human_ts(gap['since'])} → "
+            f"прочитано до {_human_ts(gap['floor'])}"
+        )
+        await _raise(
+            session,
+            bot,
+            ALERT_SCAN_GAP_KEY,
+            gap_note,
+            "⚠️ Входящие в окне не дочитаны: ниже прочитанной границы переводы "
+            f"ещё не обработаны (окно {_human_ts(gap['since'])} — "
+            f"{_human_ts(gap['floor'])}). Курсор стоит на границе покрытия, бюджет "
+            "страниц поднят; если так дольше 15 минут — подними WATCH_MAX_PAGES "
+            "или разбери окно через /incoming и /adjust.",
+        )
+
+
+async def _check_watcher_parse_fail(session, bot) -> None:
+    """Парсер провайдера роняет item'ы — тревога, пока счётчик ненулевой.
+
+    Счётчик лежит в watcher_state вместе с parse_fail_last (хеш, utime,
+    время) — /blockchain видит детали. Сбрасывается успешным циклом без
+    потерь; пока ненулевой — стоит алерт, чтобы «битый item» не уходил молча
+    через фильтры. Раньше ошибка парсера возвращала None и сливалась с jetton/
+    старыми/пустыми item'ами: один разломанный перевод казался чистой
+    страницей, курсор уезжал за него — деньги терялись.
+    """
+    if not settings.ton_enabled:
+        return
+    parse_fail_raw = await _get_state(session, PARSE_FAIL_COUNT_KEY)
+    parse_fail_count = (
+        int(parse_fail_raw) if parse_fail_raw and parse_fail_raw.isdigit() else 0
+    )
+    last_raw = await _get_state(session, PARSE_FAIL_LAST_KEY)
+    last_note = ""
+    if last_raw:
+        try:
+            import json as _json
+
+            payload = _json.loads(last_raw)
+            if isinstance(payload, dict):
+                last_note = (
+                    f" (последний: hash={payload.get('tx_hash')!s}, "
+                    f"utime={_human_ts(payload.get('utime'))})"
+                )
+        except (ValueError, TypeError) as exc:
+            # Поле могло пострадать от старой версии бота или миграции;
+            # счётчик важнее sample'а, тревогу глушить нельзя.
+            logger.debug("parse_fail_last не разобран: %s", exc)
+    if parse_fail_count > 0:
+        await _raise(
+            session,
+            bot,
+            ALERT_PARSE_FAIL_KEY,
+            f"парсер отбросил {parse_fail_count} item'ов",
+            f"⚠️ Парсер TonAPI/Toncenter отбросил {parse_fail_count} item'ов с исключением "
+            f"за цикл{last_note}. Это значит: один или несколько переводов НЕ стали "
+            "ставками — проверь лог и /blockchain до сброса счётчика.",
+        )
+
+
 async def _check_watcher(session, bot) -> None:
     """Trevogi TON-watcher: tik, neprochitannoe okno, padayushchii parser."""
-    if settings.ton_enabled:
-        from app.ton_watch import BEAT_KEY
-
-        beat_age = _age_seconds(await _get_state(session, BEAT_KEY))
-        watcher_note: str | None = None
-        if beat_age is None:
-            watcher_note = "watcher ещё ни разу не завершал цикл"
-        elif beat_age > _WATCHER_STALE_AFTER.total_seconds():
-            watcher_note = f"watcher молчит {int(beat_age // 60)} мин"
-        if watcher_note is not None:
-            await _raise(
-                session,
-                bot,
-                ALERT_WATCHER_KEY,
-                watcher_note,
-                f"⚠️ TON-watcher отстаёт: {watcher_note}. Ставки копятся необработанными.",
-            )
-    # 1b. Проход не вычитал окно входящих целиком — бюджет страниц кончился
-    # раньше курсора. Цикл при этом «здоровый» (сердцебиение стоит, новые
-    # переводы обработаны), поэтому без этой проверки дыра была бы видна
-    # только в логах. Курсор при этом встаёт на дно прочитанного, то есть
-    # непрочитанная часть окна догоняется следующими циклами; если backlog
-    # не тает — нужен либо больший WATCH_MAX_PAGES, либо ручной разбор.
-    if settings.ton_enabled:
-        from app.ton_watch import _read_scan_gap
-
-        gap = await _read_scan_gap(session)
-        if gap and gap.get("floor") is not None and gap.get("since") is not None:
-            gap_note = (
-                f"непрочитанное окно входящих: курсор {_human_ts(gap['since'])} → "
-                f"прочитано до {_human_ts(gap['floor'])}"
-            )
-            await _raise(
-                session,
-                bot,
-                ALERT_SCAN_GAP_KEY,
-                gap_note,
-                "⚠️ Входящие в окне не дочитаны: ниже прочитанной границы переводы "
-                f"ещё не обработаны (окно {_human_ts(gap['since'])} — "
-                f"{_human_ts(gap['floor'])}). Курсор стоит на границе покрытия, бюджет "
-                "страниц поднят; если так дольше 15 минут — подними WATCH_MAX_PAGES "
-                "или разбери окно через /incoming и /adjust.",
-            )
-    # 1c. Парсер провайдера роняет item'ы. Счётчик лежит в watcher_state
-    #     вместе с parse_fail_last (хеш, utime, время) — /blockchain видит
-    #     детали. Сбрасывается успешным циклом без потерь; пока ненулевой —
-    #     стоит алерт, чтобы «битый item» не уходил молча через фильтры.
-    #     Раньше ошибка парсера возвращала None и сливалась с jetton/
-    #     старыми/пустыми item'ами: один разломанный перевод казался
-    #     чистой страницей, курсор уезжал за него — деньги терялись.
-    if settings.ton_enabled:
-        parse_fail_raw = await _get_state(session, PARSE_FAIL_COUNT_KEY)
-        parse_fail_count = (
-            int(parse_fail_raw) if parse_fail_raw and parse_fail_raw.isdigit() else 0
-        )
-        last_raw = await _get_state(session, PARSE_FAIL_LAST_KEY)
-        last_note = ""
-        if last_raw:
-            try:
-                import json as _json
-
-                payload = _json.loads(last_raw)
-                if isinstance(payload, dict):
-                    last_note = (
-                        f" (последний: hash={payload.get('tx_hash')!s}, "
-                        f"utime={_human_ts(payload.get('utime'))})"
-                    )
-            except (ValueError, TypeError) as exc:
-                # Поле могло пострадать от старой версии бота или миграции;
-                # счётчик важнее sample'а, тревогу глушить нельзя.
-                logger.debug("parse_fail_last не разобран: %s", exc)
-        if parse_fail_count > 0:
-            await _raise(
-                session,
-                bot,
-                ALERT_PARSE_FAIL_KEY,
-                f"парсер отбросил {parse_fail_count} item'ов",
-                f"⚠️ Парсер TonAPI/Toncenter отбросил {parse_fail_count} item'ов с исключением "
-                f"за цикл{last_note}. Это значит: один или несколько переводов НЕ стали "
-                "ставками — проверь лог и /blockchain до сброса счётчика.",
-            )
+    await _check_watcher_beat(session, bot)
+    await _check_watcher_scan_gap(session, bot)
+    await _check_watcher_parse_fail(session, bot)
     # 2. Очередь выплат старше получаса — казначей застрял или сеть лежит.
 
 
