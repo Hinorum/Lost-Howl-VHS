@@ -590,17 +590,8 @@ async def _refund_confirmed_stakes(
     return created
 
 
-async def _settle_day_prizes(
-    session: AsyncSession,
-    round_row: Round,
-    confirmed: list[Stake],
-    winning_stakes: list[Stake],
-    wallet_map: dict[int, str],
-    network: str,
-    pot: int,
-    fee_nano: int,
-) -> int:
-    """Победный день: доля победителя + рейк/реферальная/фондовая доска."""
+def _day_cuts(pot: int, fee_nano: int) -> tuple[int, int, int, int, int]:
+    """Доли банка дня: рейк хранителю, доска, неделя, фонд и выплата рейка."""
     owner_bp = round(settings.owner_rake_pct * 100)
     board_bp = round(settings.leaderboard_rake_pct * 100)
     weekly_bp = round(settings.weekly_pot_pct * 100)
@@ -617,34 +608,57 @@ async def _settle_day_prizes(
     if house_cut > 0 and rake_payout <= 0:
         weekly_cut += house_cut
         house_cut = 0
+    return house_cut, board_cut, weekly_cut, fund_cut, rake_payout
 
+
+async def _day_referral_entries(
+    session, confirmed: list[Stake]
+) -> list[tuple[int, int]]:
+    """Пары (пригласивший, сумма ставки) по приведённым игрокам дня."""
+    if settings.referral_pct <= 0 or not confirmed:
+        return []
     # Реферальная награда: доля referral_pct от подтверждённых ставок
     # приведённых игроков уходит пригласившим, а НЕ в пул победителей.
     # День без приведённых ставок делится как раньше (96%), при всех
     # приведённых — как 95% победителям + 1% реферальной награде.
-    referred_entries: list[tuple[int, int]] = []
-    if settings.referral_pct > 0 and confirmed:
-        ref_rows = (
-            (
-                await session.execute(
-                    select(Referral.referrer_id, Referral.referred_id).where(
-                        Referral.referred_id.in_([s.player_id for s in confirmed])
-                    )
+    ref_rows = (
+        (
+            await session.execute(
+                select(Referral.referrer_id, Referral.referred_id).where(
+                    Referral.referred_id.in_([s.player_id for s in confirmed])
                 )
             )
-            .all()
         )
-        referred_by = {referred: referrer for referrer, referred in ref_rows}
-        for stake in confirmed:
-            referrer_id = referred_by.get(stake.player_id)
-            if referrer_id is not None:
-                referred_entries.append((referrer_id, stake.amount_nanotons))
-    referral_bp = max(0, round(settings.referral_pct * 100))
-    referral_cut = sum(amount * referral_bp // 10_000 for _rid, amount in referred_entries)
-    round_row.referral_nanotons = referral_cut
-    prize_pool = pot - house_cut - board_cut - weekly_cut - fund_cut - referral_cut
+        .all()
+    )
+    referred_by = {referred: referrer for referrer, referred in ref_rows}
+    entries: list[tuple[int, int]] = []
+    for stake in confirmed:
+        referrer_id = referred_by.get(stake.player_id)
+        if referrer_id is not None:
+            entries.append((referrer_id, stake.amount_nanotons))
+    return entries
 
-    min_payout_nano = to_nano(settings.min_payout_gram)
+
+def _day_referral_cut(entries: list[tuple[int, int]]) -> tuple[int, int]:
+    """Базисные пункты реферальной доли и её сумма по ставкам дня."""
+    referral_bp = max(0, round(settings.referral_pct * 100))
+    referral_cut = sum(amount * referral_bp // 10_000 for _rid, amount in entries)
+    return referral_bp, referral_cut
+
+
+async def _day_prize_payouts(
+    session: AsyncSession,
+    round_row: Round,
+    confirmed: list[Stake],
+    winning_stakes: list[Stake],
+    wallet_map: dict[int, str],
+    network: str,
+    prize_pool: int,
+    fee_nano: int,
+    min_payout_nano: int,
+) -> tuple[int, int]:
+    """Призы победителям; возвращает (создано, пыль в копилку недели)."""
     net_pool = net_payout_pool(prize_pool, len(winning_stakes), fee_nano)
     dust_to_week = 0
     created = 0
@@ -674,25 +688,41 @@ async def _settle_day_prizes(
             created += _create_payout(
                 session, round_row.id, stake.player_id, "prize", share, wallet_map.get(stake.player_id) or "", network
             )
-    if referral_cut > 0:
-        # Один вызов _credit_referral на (день, пригласившего): метка
-        # pot:...:ref:<id> гасит повторный вызов, поэтому доли ВСЕХ его
-        # приведённых (несколько игроков, несколько ставок) обязаны быть
-        # просуммированы ДО зачисления. Раньше доля шла отдельным
-        # вызовом на каждую ставку — в копилку попадала только первая
-        # (крупнейшая по split_pot), остальные молча терялись, хотя
-        # referral_nanotons дня продолжал обещать полную сумму.
-        # Сумма долей сходится с referral_cut до нанотона: это те же
-        # поэлементные floor'ы, что и в его вычислении выше.
-        referral_shares: dict[int, int] = {}
-        for referrer_id, amount in referred_entries:
-            referral_shares[referrer_id] = (
-                referral_shares.get(referrer_id, 0) + amount * referral_bp // 10_000
-            )
-        for referrer_id, share in referral_shares.items():
-            await _credit_referral(session, round_row.id, referrer_id, share)
-    if rake_payout > 0:
-        created += _create_payout(session, round_row.id, None, "rake", rake_payout, settings.owner_wallet_address or "", network)
+    return created, dust_to_week
+
+
+async def _credit_day_referrals(
+    session: AsyncSession,
+    round_row: Round,
+    referred_entries: list[tuple[int, int]],
+    referral_bp: int,
+    referral_cut: int,
+) -> None:
+    """Зачислить реферальные доли пригласившим (одна запись на человека)."""
+    if referral_cut <= 0:
+        return
+    # Один вызов _credit_referral на (день, пригласившего): метка
+    # pot:...:ref:<id> гасит повторный вызов, поэтому доли ВСЕХ его
+    # приведённых (несколько игроков, несколько ставок) обязаны быть
+    # просуммированы ДО зачисления. Раньше доля шла отдельным
+    # вызовом на каждую ставку — в копилку попадала только первая
+    # (крупнейшая по split_pot), остальные молча терялись, хотя
+    # referral_nanotons дня продолжал обещать полную сумму.
+    # Сумма долей сходится с referral_cut до нанотона: это те же
+    # поэлементные floor'ы, что и в его вычислении выше.
+    referral_shares: dict[int, int] = {}
+    for referrer_id, amount in referred_entries:
+        referral_shares[referrer_id] = (
+            referral_shares.get(referrer_id, 0) + amount * referral_bp // 10_000
+        )
+    for referrer_id, share in referral_shares.items():
+        await _credit_referral(session, round_row.id, referrer_id, share)
+
+
+async def _credit_board_pot(
+    session: AsyncSession, round_row: Round, board_cut: int
+) -> None:
+    """Доля копилки месяца — атомарный upsert по месяцу."""
     if board_cut > 0 and await _claim_pot(session, round_row.id, "month"):
         month = round_row.tally_ends_at.strftime("%Y-%m")
         # Атомарный upsert (см. _credit_referral): месяц уникален,
@@ -708,7 +738,12 @@ async def _settle_day_prizes(
             ),
             {"m": month, "amount": board_cut},
         )
-    week_total_cut = weekly_cut + dust_to_week
+
+
+async def _credit_week_pot(
+    session: AsyncSession, round_row: Round, week_total_cut: int
+) -> None:
+    """Доля копилки недели (с пылью дня) — атомарный upsert по неделе."""
     if week_total_cut > 0 and await _claim_pot(session, round_row.id, "week"):
         week = iso_week_key(round_row.opens_at)
         await session.execute(
@@ -727,20 +762,24 @@ async def _settle_day_prizes(
         # payouts_finalized, а это поле не обнуляет, поэтому «0 при
         # уже зачисленной копилке» достижим лишь искусственно.
         round_row.weekly_nanotons = week_total_cut
+
+
+async def _credit_pack_fund(
+    session: AsyncSession, round_row: Round, fund_cut: int
+) -> None:
+    """Фонд Стаи: неубывающее накопление и строка прозрачного журнала."""
     # Фонд Стаи: неубывающее накопление без периода раздачи. Единственная
     # строка-накопитель; деньги остаются на кошельке казначея и забираются
     # хранителем вручную (см. /panel, ручной вывод).
     if fund_cut > 0 and await _claim_pot(session, round_row.id, "fund"):
         fund_row = (
-            
-                await session.execute(
-                    select(PackFund)
-                    .order_by(PackFund.id)
-                    .limit(1)
-                    .with_for_update()
-                )
-            
-            ).scalar_one_or_none()
+            await session.execute(
+                select(PackFund)
+                .order_by(PackFund.id)
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if fund_row is None:
             await session.execute(
                 text(
@@ -750,12 +789,10 @@ async def _settle_day_prizes(
                 {"amount": fund_cut},
             )
             fund_row = (
-                
-                    await session.execute(
-                        select(PackFund).order_by(PackFund.id).limit(1)
-                    )
-                
-                ).scalar_one_or_none()
+                await session.execute(
+                    select(PackFund).order_by(PackFund.id).limit(1)
+                )
+            ).scalar_one_or_none()
         else:
             fund_row.nanotons += fund_cut
         # Аудит: каждое начисление пишется в прозрачный журнал фонда.
@@ -767,6 +804,45 @@ async def _settle_day_prizes(
                 note=f"{_pct_text(settings.pack_fund_pct)}% банка дня {round_row.day_index}",
             )
         )
+
+
+async def _settle_day_prizes(
+    session: AsyncSession,
+    round_row: Round,
+    confirmed: list[Stake],
+    winning_stakes: list[Stake],
+    wallet_map: dict[int, str],
+    network: str,
+    pot: int,
+    fee_nano: int,
+) -> int:
+    """Победный день: доля победителя + рейк/реферальная/фондовая доска."""
+    house_cut, board_cut, weekly_cut, fund_cut, rake_payout = _day_cuts(pot, fee_nano)
+    referred_entries = await _day_referral_entries(session, confirmed)
+    referral_bp, referral_cut = _day_referral_cut(referred_entries)
+    round_row.referral_nanotons = referral_cut
+    prize_pool = pot - house_cut - board_cut - weekly_cut - fund_cut - referral_cut
+
+    min_payout_nano = to_nano(settings.min_payout_gram)
+    created, dust_to_week = await _day_prize_payouts(
+        session,
+        round_row,
+        confirmed,
+        winning_stakes,
+        wallet_map,
+        network,
+        prize_pool,
+        fee_nano,
+        min_payout_nano,
+    )
+    await _credit_day_referrals(
+        session, round_row, referred_entries, referral_bp, referral_cut
+    )
+    if rake_payout > 0:
+        created += _create_payout(session, round_row.id, None, "rake", rake_payout, settings.owner_wallet_address or "", network)
+    await _credit_board_pot(session, round_row, board_cut)
+    await _credit_week_pot(session, round_row, weekly_cut + dust_to_week)
+    await _credit_pack_fund(session, round_row, fund_cut)
     round_row.pot_nanotons = pot
     round_row.rake_nanotons = house_cut + board_cut
     return created
