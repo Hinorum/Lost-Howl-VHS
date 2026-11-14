@@ -197,14 +197,8 @@ def _install_stop_handlers(stop: asyncio.Event) -> None:
             pass
 
 
-def validate_config() -> list[str]:
-    """Проверки критичной конфигурации при старте.
-
-    Вернёт список проблем; пустой список → всё в порядке. Вызывается до
-    init_db/create_bot, чтобы очевидные ошибки (пустой токен, невалидный rake
-   %) не диагностировались молча через часы бездействия.
-    """
-    problems: list[str] = []
+def _validate_identity(problems: list[str]) -> None:
+    """Токен бота и список админов: без них процесс поднимется, но молча."""
     if not settings.bot_token.strip():
         problems.append(
             "BOT_TOKEN пуст — бот не сможет отправлять сообщения в Telegram. "
@@ -215,6 +209,10 @@ def validate_config() -> list[str]:
             "ADMIN_IDS не заполнены — административные команды (/advance, "
             "/resetgame, /panel) будут недоступны никому."
         )
+
+
+def _validate_rake(problems: list[str]) -> None:
+    """Суммарный рейк не может съесть весь банк дня."""
     rake = settings.rake_total_pct
     if rake > 100:
         problems.append(
@@ -225,6 +223,10 @@ def validate_config() -> list[str]:
             f" + referral {settings.referral_pct}%) — "
             "prize_pool станет отрицательным, и все ставки уйдут в копилку недели."
         )
+
+
+def _validate_stakes(problems: list[str]) -> None:
+    """Границы ставки: потолок ниже минимума отклоняет любую сумму."""
     if settings.stake_max_ton > 0 and settings.stake_max_ton < settings.stake_min_ton:
         problems.append(
             f"Потолок ставки STAKE_MAX_TON={settings.stake_max_ton:g} ниже минимума "
@@ -232,12 +234,20 @@ def validate_config() -> list[str]:
             "и все ставки дня будут отклоняться. Подними потолок или обнули его "
             "(0 = потолка нет)."
         )
+
+
+def _validate_health(problems: list[str]) -> None:
+    """Требование токена без токена закрывает /health для всех."""
     if settings.health_require_token and not settings.health_token.strip():
         problems.append(
             "HEALTH_REQUIRE_TOKEN=true, но HEALTH_TOKEN пуст: "
             "/health закрыт для всех (включая self-ping и чек живости Render). "
             "Задай HEALTH_TOKEN либо выключи HEALTH_REQUIRE_TOKEN."
         )
+
+
+def _validate_storage(problems: list[str]) -> None:
+    """SQLite в продакшен-режиме ломает и лок, и сохранность журнала выплат."""
     if settings.admin_ids.strip() and settings.database_url.startswith("sqlite") and not settings.allow_sqlite:
         problems.append(
             "DATABASE_URL указывает на SQLite, а ADMIN_IDS заданы — это продакшен-режим, "
@@ -248,6 +258,10 @@ def validate_config() -> list[str]:
             "деплое вместе с журналом выплат. Укажи PostgreSQL в DATABASE_URL; если "
             "SQLite нужен намеренно (локально, в тестах) — поставь ALLOW_SQLITE=true."
         )
+
+
+def _validate_ton(problems: list[str]) -> None:
+    """Сеть, ключи и адреса TON: несовпадение сети отправляет деньги в никуда."""
     liteserver_mismatch = settings.liteserver_network_mismatch()
     if liteserver_mismatch:
         problems.append(
@@ -257,43 +271,60 @@ def validate_config() -> list[str]:
             "https://ton.org/global.config.json, для testnet — "
             "https://ton.org/testnet-global.config.json."
         )
-    if getattr(settings, "ton_enabled", False):
-        if not settings.active_treasury_address:
+    if not getattr(settings, "ton_enabled", False):
+        return
+    if not settings.active_treasury_address:
+        problems.append(
+            "TON_ENABLED=true, но нет адреса казначея "
+            "(TREASURY_ADDRESS для mainnet или TREASURY_TESTNET_ADDRESS для testnet). "
+            "Ставки не будут приниматься."
+        )
+    if not settings.active_treasury_mnemonic:
+        problems.append(
+            "TON_ENABLED=true, но нет мнемоники казначея "
+            "(TREASURY_MNEMONIC / TREASURY_TESTNET_MNEMONIC). "
+            "Выплаты не будут отправляться."
+        )
+    if (
+        settings.owner_wallet_address
+        and settings.active_treasury_address
+        and _same_address(settings.owner_wallet_address, settings.active_treasury_address)
+    ):
+        problems.append(
+            "OWNER_WALLET_ADDRESS совпадает с адресом казначея — рейк хранителя "
+            "и доли копилки уйдут «сами себе». Укажи отдельный кошелёк владельца."
+        )
+    # Адрес чужой сети молча ломает всё: переводы с него в сети бота не
+    # видны (ставки не засчитаются), выплаты уйдут в никуда. У v5-кошельков
+    # сеть зашита в аккаунт, поэтому «не тот адрес» — это не тот же адрес.
+    active_net = settings.active_network
+    for label, value in (
+        ("TREASURY_ADDRESS", settings.active_treasury_address),
+        ("OWNER_WALLET_ADDRESS", settings.owner_wallet_address),
+    ):
+        address_net = address_network(value) if value else None
+        if address_net is not None and address_net != active_net:
             problems.append(
-                "TON_ENABLED=true, но нет адреса казначея "
-                "(TREASURY_ADDRESS для mainnet или TREASURY_TESTNET_ADDRESS для testnet). "
-                "Ставки не будут приниматься."
+                f"{label} — адрес сети {address_net}, а бот работает в сети "
+                f"{active_net}. Адрес чужой сети здесь не существует: выплаты "
+                "уйдут в никуда, а переводы с него не будут видны."
             )
-        if not settings.active_treasury_mnemonic:
-            problems.append(
-                "TON_ENABLED=true, но нет мнемоники казначея "
-                "(TREASURY_MNEMONIC / TREASURY_TESTNET_MNEMONIC). "
-                "Выплаты не будут отправляться."
-            )
-        if (
-            settings.owner_wallet_address
-            and settings.active_treasury_address
-            and _same_address(settings.owner_wallet_address, settings.active_treasury_address)
-        ):
-            problems.append(
-                "OWNER_WALLET_ADDRESS совпадает с адресом казначея — рейк хранителя "
-                "и доли копилки уйдут «сами себе». Укажи отдельный кошелёк владельца."
-            )
-        # Адрес чужой сети молча ломает всё: переводы с него в сети бота не
-        # видны (ставки не засчитаются), выплаты уйдут в никуда. У v5-кошельков
-        # сеть зашита в аккаунт, поэтому «не тот адрес» — это не тот же адрес.
-        active_net = settings.active_network
-        for label, value in (
-            ("TREASURY_ADDRESS", settings.active_treasury_address),
-            ("OWNER_WALLET_ADDRESS", settings.owner_wallet_address),
-        ):
-            address_net = address_network(value) if value else None
-            if address_net is not None and address_net != active_net:
-                problems.append(
-                    f"{label} — адрес сети {address_net}, а бот работает в сети "
-                    f"{active_net}. Адрес чужой сети здесь не существует: выплаты "
-                    "уйдут в никуда, а переводы с него не будут видны."
-                )
+
+
+def validate_config() -> list[str]:
+    """Проверки критичной конфигурации при старте.
+
+    Вернёт список проблем; пустой список → всё в порядке. Вызывается до
+    init_db/create_bot, чтобы очевидные ошибки (пустой токен, невалидный rake
+   %) не диагностировались молча через часы бездействия.
+    """
+    problems: list[str] = []
+    _validate_identity(problems)
+    _validate_rake(problems)
+    _validate_stakes(problems)
+    _validate_health(problems)
+    _validate_storage(problems)
+    _validate_ton(problems)
     return problems
 
 
