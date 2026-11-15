@@ -36,6 +36,7 @@ from .time import (
     _now,
     announce_claim_cutoff,
     catchup_cutoff,
+    results_claim_cutoff,
     utc_aware,
 )
 from .voting import (
@@ -77,6 +78,7 @@ __all__ = [
     "_now",
     "announce_claim_cutoff",
     "catchup_cutoff",
+    "results_claim_cutoff",
     "utc_aware",
     "_TIE_THEATER",
     "_decisive_counts",

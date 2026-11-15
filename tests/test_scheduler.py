@@ -758,6 +758,165 @@ async def test_retry_results_keeps_batch_alive_after_crash(monkeypatch) -> None:
         await _cleanup(9732, 9733)
 
 
+async def test_results_claim_committed_before_broadcast(monkeypatch) -> None:
+    """Claim итогов закоммичен ДО рассылки: строка дня не заблокирована.
+
+    Раньше _claim_results жил в одной транзакции с бродкастом: row lock дня и
+    соединение пула удерживались всю рассылку (минуты флуд-контроля). Теперь
+    метка фиксируется сразу, а results_at — только после успеха. Проверяем оба
+    факта из ОТДЕЛЬНОЙ сессии прямо во время «рассылки».
+    """
+    from app import scheduler as sched
+
+    rid = await _make_round(9742, RoundStatus.CLOSED)
+    monkeypatch.setattr(sched, "_bot", object())
+    observed: dict[str, object] = {}
+
+    async def inspect_claim(_bot, _finished):
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+            observed["claimed"] = row.results_claimed_at
+            observed["delivered"] = row.results_at
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", inspect_claim)
+        monkeypatch.setattr(
+            "app.broadcast.announce_player_results", AsyncMock(return_value=0)
+        )
+        await sched._announce_results_job(rid)
+
+        assert observed["claimed"] is not None, "claim не закоммичен до рассылки"
+        assert observed["delivered"] is None, "results_at выставлен до доставки"
+        async with SessionLocal() as db:
+            row = (await db.execute(select(Round).where(Round.id == rid))).scalar_one()
+        assert row.results_at is not None
+        assert row.results_claimed_at is None, "успех обязан снять claim"
+    finally:
+        await _cleanup(9742)
+
+
+async def test_announce_results_failure_keeps_newer_claim(monkeypatch) -> None:
+    """Упавший вещатель снимает только СВОЙ claim, не перехваченный новый.
+
+    Пока шла рассылка, брошенную метку мог забрать догон. Безусловный unclaim
+    стёр бы свежий claim и открыл день для третьего прохода поверх
+    работающего.
+    """
+    from app import scheduler as sched
+    from app.rounds import utc_aware
+
+    rid = await _make_round(9743, RoundStatus.CLOSED)
+    monkeypatch.setattr(sched, "_bot", object())
+    fresh_stamp = datetime.now(UTC) + timedelta(minutes=5)
+
+    async def steal_then_boom(_bot, _finished):
+        async with SessionLocal() as db:
+            row = await db.get(Round, rid)
+            assert row is not None
+            row.results_claimed_at = fresh_stamp
+            await db.commit()
+        raise RuntimeError("сеть легла в середине рассылки")
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", steal_then_boom)
+        monkeypatch.setattr(
+            "app.broadcast.announce_player_results", AsyncMock(return_value=0)
+        )
+        await sched._announce_results_job(rid)  # падение проглочено
+        async with SessionLocal() as db:
+            row = await db.get(Round, rid)
+            assert row is not None
+            await db.refresh(row)
+        assert row.results_at is None
+        assert row.results_claimed_at is not None
+        assert utc_aware(row.results_claimed_at) == fresh_stamp
+    finally:
+        await _cleanup(9743)
+
+
+async def test_retry_results_reclaims_stale_claim_only(monkeypatch) -> None:
+    """Догон перехватывает брошенный claim итогов, но не свежий.
+
+    Жёсткий краш между коммитом results_claimed_at и unclaim оставлял день
+    «разносится» навсегда: восстановитель искал только results_at IS NULL и
+    не видел занятую метку. Перехват обязан быть атомарным и не трогать
+    живого вещателя — метка моложе окна это чужой работающий claim.
+    """
+    from app import scheduler as sched
+
+    monkeypatch.setattr(settings, "results_claim_timeout_seconds", 60)
+    stale = await _make_round(9744, RoundStatus.CLOSED)
+    live = await _make_round(9745, RoundStatus.CLOSED)
+    async with SessionLocal() as db:
+        for round_id, age_seconds in ((stale, 120), (live, 30)):
+            row = await db.get(Round, round_id)
+            assert row is not None
+            row.results_claimed_at = datetime.now(UTC) - timedelta(seconds=age_seconds)
+        await db.commit()
+
+    seen: list[int] = []
+
+    async def fake_announce(_bot, finished):
+        seen.append(finished.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_announce)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_announce)
+        await sched._retry_results_job()
+        assert seen.count(stale) == 2  # общий пост + личные итоги
+        assert live not in seen, "свежий claim живого вещателя перехватывать нельзя"
+        async with SessionLocal() as db:
+            stale_row = await db.get(Round, stale)
+            live_row = await db.get(Round, live)
+        assert stale_row is not None and stale_row.results_at is not None
+        assert stale_row.results_claimed_at is None
+        assert live_row is not None and live_row.results_at is None
+        assert live_row.results_claimed_at is not None
+        seen.clear()
+        await sched._retry_results_job()
+        assert stale not in seen
+        assert live not in seen
+    finally:
+        await _cleanup(9744, 9745)
+
+
+async def test_retry_results_skips_ancient_stale_claim(monkeypatch) -> None:
+    """Древняя брошенная метка не переигрывается: recency-гард сильнее stale.
+
+    Stale-reclaim существует ради свежих крашей, а не археологии. День вне
+    catchup_cutoff не должен уйти в чаты заново, даже если его claim просрочен.
+    """
+    from app import scheduler as sched
+
+    monkeypatch.setattr(settings, "results_claim_timeout_seconds", 60)
+    old = datetime.now(UTC) - timedelta(days=100)
+    rid = await _make_round(
+        9746, RoundStatus.CLOSED, voting_in=timedelta(days=-100)
+    )
+    async with SessionLocal() as db:
+        row = await db.get(Round, rid)
+        assert row is not None
+        row.results_claimed_at = old
+        await db.commit()
+
+    seen: list[int] = []
+
+    async def fake_announce(_bot, finished):
+        seen.append(finished.id)
+
+    try:
+        monkeypatch.setattr("app.broadcast.announce_results", fake_announce)
+        monkeypatch.setattr("app.broadcast.announce_player_results", fake_announce)
+        await sched._retry_results_job()
+        assert rid not in seen
+        async with SessionLocal() as db:
+            row = await db.get(Round, rid)
+        assert row is not None and row.results_at is None
+        assert row.results_claimed_at is not None
+    finally:
+        await _cleanup(9746)
+
+
 async def test_finalize_new_day_job_opens_next_and_announces(monkeypatch) -> None:
     from app import scheduler as sched
 

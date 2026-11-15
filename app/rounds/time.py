@@ -59,6 +59,19 @@ def announce_claim_cutoff() -> datetime:
     return _now() - timedelta(seconds=settings.announce_claim_timeout_seconds)
 
 
+def results_claim_cutoff() -> datetime:
+    """Граница «claim рассылки итогов брошен»: метка старше — можно перехватить.
+
+    _claim_results коммитит results_claimed_at ДО бродкаста. Исключение снимает
+    метку (unclaim), но жёсткий краш — kill -9, деплой, пропажа инстанса — нет:
+    восстановитель ищет дни без results_at, и без перехвата день остался бы без
+    итогов навсегда. Окно обязано быть заведомо больше самой долгой живой
+    рассылки (см. results_claim_timeout_seconds): иначе догон заберёт claim у
+    работающего вещателя и итоги уйдут в чаты дважды.
+    """
+    return _now() - timedelta(seconds=settings.results_claim_timeout_seconds)
+
+
 def _day_window(opens_at: datetime) -> tuple[datetime, datetime]:
     """Границы голосования и подсчёта дня на сетке UTC.
 

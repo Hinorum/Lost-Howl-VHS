@@ -192,9 +192,16 @@ class Round(Base):
     # при ошибке; брошенная метка (жёсткий краш) перехватывается догоном
     # после announce_claim_timeout_seconds.
     announced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Claim рассылки итогов: ставится и коммитится ДО бродкаста, чтобы не
+    # держать транзакцию и row lock через всю рассылку. Ошибка снимает только
+    # свой claim; брошенный (жёсткий краш) перехватывается догоном после
+    # results_claim_timeout_seconds. Свежий claim живого вещателя не трогается.
+    results_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Момент доставки итогов дня (общий пост + личные) — маркер at-least-once:
     # ставится ПОСЛЕ успешного бродкаста; отсутствие у CLOSED-дня позади
-    # актуального включает восстановитель (_retry_results_job). Откат снимает.
+    # актуального включает восстановитель (_retry_results_job).
     results_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pot_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)
     rake_nanotons: Mapped[int] = mapped_column(BigInteger, default=0)

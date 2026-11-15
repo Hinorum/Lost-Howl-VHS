@@ -8,7 +8,7 @@ from typing import Any, cast
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -28,6 +28,7 @@ from app.rounds import (
     finish_tally,
     get_active_round,
     get_latest_round,
+    results_claim_cutoff,
     utc_aware,
 )
 from app.tally import award_pending_points, award_points
@@ -278,6 +279,11 @@ async def _announce_results_job(finished_id: int) -> None:
     Дёргается отдельной джобой сразу после вскрытия, чтобы не ждать
     нейро-контент нового дня. Своя сессия — запущена из тика после закрытия
     его собственной транзакции.
+
+    Claim (results_claimed_at) коммитится ДО рассылки: строка дня и соединение
+    пула не удерживаются на всё время бродкаста (минуты флуд-контроля). Успех
+    ставит results_at, ошибка снимает только свой claim — восстановитель
+    дошлёт день следующим тиком.
     """
     try:
         from app.broadcast import announce_player_results, announce_results
@@ -292,8 +298,10 @@ async def _announce_results_job(finished_id: int) -> None:
             if finished is None:
                 logger.warning("Итоги дня %s: раунд не найден", finished_id)
                 return
-            if not await _claim_results(session, finished_id):
-                # Восстановитель уже взял этот день (гонка джоб) — дублей нет.
+            stamp = await _claim_results(session, finished_id)
+            if stamp is None:
+                # Восстановитель уже взял этот день или итоги уже доставлены —
+                # дублей нет.
                 return
             # Личный доказ «за что голосовал и чем кончилось» — следом за общими
             # итогами, чтобы игрок сначала увидел сводку дня, потом свой исход.
@@ -301,28 +309,90 @@ async def _announce_results_job(finished_id: int) -> None:
                 await announce_results(_bot, finished)
                 await announce_player_results(_bot, finished)
             except Exception:
-                await session.rollback()  # маркер снят — восстановитель дошлёт
+                await _unclaim_results(session, finished_id, stamp)
                 raise
-            await session.commit()
+            await _mark_results_delivered(session, finished_id)
     except Exception:
         logger.exception("Рассылка итогов дня упала (id=%s)", finished_id)
 
 
-async def _claim_results(session: AsyncSession, finished_id: int) -> bool:
-    """Атомарная метка «итоги этого дня разношу я» (results_at = токен).
+async def _claim_results(session: AsyncSession, finished_id: int) -> datetime | None:
+    """Атомарный claim рассылки итогов; коммитит метку ДО бродкаста.
 
-    Ставится ДО бродкаста, в той же транзакции, что и сама рассылка: откат
-    транзакции снимает маркер (крах в середине разрешает повтор — at-least-once),
-    а прав на одну рассылку ровно один (гонка джоб/реплик — at-most-once).
+    Возвращает свой штамп или None, если итоги уже доставлены (results_at
+    стоит) либо claim свежий — его держит живой вещатель. Метка старше
+    results_claim_timeout_seconds считается брошенной (жёсткий краш между
+    claim и unclaim) и перехватывается атомарно: условный UPDATE по-прежнему
+    выбирает ровно одного победителя.
+
+    Коммит здесь обязателен: раньше claim жил в одной транзакции с рассылкой,
+    и row lock дня вместе с соединением пула удерживались минуты, пока
+    _fanout обходил чаты. Теперь транзакция claim короткая, а от повторной
+    рассылки защищает сама метка.
     """
     from app.models import Round
 
+    stamp = _now()
     claimed = await session.execute(
         update(Round)
-        .where(Round.id == finished_id, Round.results_at.is_(None))
-        .values(results_at=_now())
+        # Синхронизация ORM сравнивала бы aware-stamp с naive UTC из SQLite.
+        # Загруженный объект дня нам для этой метки не нужен.
+        .execution_options(synchronize_session=False)
+        .where(
+            Round.id == finished_id,
+            Round.results_at.is_(None),
+            or_(
+                Round.results_claimed_at.is_(None),
+                Round.results_claimed_at <= results_claim_cutoff(),
+            ),
+        )
+        .values(results_claimed_at=stamp)
     )
-    return cast(CursorResult[Any], claimed).rowcount == 1
+    await session.commit()
+    return stamp if cast(CursorResult[Any], claimed).rowcount == 1 else None
+
+
+async def _unclaim_results(
+    session: AsyncSession, finished_id: int, stamp: datetime
+) -> None:
+    """Снимает ТОЛЬКО свой claim рассылки итогов.
+
+    Пока этот вещатель работал, его брошенную метку мог перехватить догон.
+    Безусловное снятие открыло бы день для третьего прохода поверх
+    работающего. Условие по штампу делает unclaim безопасным.
+    """
+    from app.models import Round
+
+    await session.execute(
+        update(Round)
+        .execution_options(synchronize_session=False)
+        .where(Round.id == finished_id, Round.results_claimed_at == stamp)
+        .values(results_claimed_at=None)
+    )
+    await session.commit()
+
+
+async def _mark_results_delivered(session: AsyncSession, finished_id: int) -> None:
+    """Фиксирует факт доставки итогов и снимает claim.
+
+    results_at — маркер «итоги доставлены», его читают восстановитель и
+    тревоги ops. Ставим его только ПОСЛЕ успешного бродкаста, поэтому
+    прежний смысл колонки не меняется. coalesce сохраняет первый момент
+    доставки, если день уже успел отметить другой проход (редкий дубль после
+    перехвата брошенного claim): повторная запись не сдвигает метку.
+    """
+    from app.models import Round
+
+    await session.execute(
+        update(Round)
+        .execution_options(synchronize_session=False)
+        .where(Round.id == finished_id)
+        .values(
+            results_at=func.coalesce(Round.results_at, _now()),
+            results_claimed_at=None,
+        )
+    )
+    await session.commit()
 
 
 async def _announce_round(session: AsyncSession, round_row, bot: Bot | None) -> None:
@@ -424,9 +494,16 @@ async def _retry_results_job() -> None:
 
     Краш между коммитом закрытия дня (finish_tally) и spawn'ом джобы итогов
     оставлял день без единого поста навсегда — heal 'ли закрывает OPEN/TALLYING
-    и ничего не анонсирует. Здесь такие дни дохожу: общий пост + личные, откат
-    транзакции снимает маркер и повтор разрешён. Кап 3 дня за тик — налёт
-    заваленных деплоем дней не валит бота флудом.
+    и ничего не анонсирует. Здесь такие дни дохожу: общий пост + личные.
+    Claim (results_claimed_at) коммитится ДО рассылки; ошибка снимает только
+    свой штамп и повтор разрешён. Кап 3 дня за тик — налёт заваленных деплоем
+    дней не валит бота флудом.
+
+    Сюда же попадает БРОШЕННЫЙ claim: жёсткий краш между коммитом метки и
+    снятием её при ошибке не оставляет шанса на unclaim, и день числился бы
+    «разносится» вечно. Метка старше results_claim_timeout_seconds считается
+    мёртвой и перехватывается внутри _claim_results; свежая метка живого
+    вещателя не трогается, иначе итоги ушли бы дважды.
 
     Ловим только НЕДАВНИЕ дни (catchup_cutoff): results_at добавлен
     миграцией без бэкфилла, поэтому у КАЖДОГО исторического закрытого дня
@@ -446,6 +523,10 @@ async def _retry_results_job() -> None:
                     .where(
                         Round.status == RoundStatus.CLOSED,
                         Round.results_at.is_(None),
+                        or_(
+                            Round.results_claimed_at.is_(None),
+                            Round.results_claimed_at <= results_claim_cutoff(),
+                        ),
                         Round.voting_ends_at >= catchup_cutoff(),
                     )
                     .order_by(Round.day_index.asc())
@@ -453,33 +534,35 @@ async def _retry_results_job() -> None:
                     .options(selectinload(Round.cards))
                 )
             ).scalars().all()
-            # Снимок до цикла: session.rollback() в except-блоке истекает ВСЕ
-            # инстансы сессии, и чтение атрибутов после отката предыдущего дня —
-            # это lazy load вне greenlet (MissingGreenlet). Второй exception
-            # тогда вылетал прямо из except, continue не выполнялся и до
-            # остальных дней тика восстановитель не доходил. Id и день держим
-            # простыми int, инстанс достаём заново через session.get — как в
-            # rounds/lifecycle.py.
+            # Снимок до цикла: _claim_results/_unclaim_results коммитят сессию,
+            # а инстансы после commit-а (expire_on_commit=False) живы, но
+            # держать их в batch всё равно незачем. Id и день — простые int,
+            # инстанс достаём заново через session.get, как в lifecycle.py.
             batch = [(finished.id, finished.day_index) for finished in missing]
             for finished_id, day_index in batch:
-                if not await _claim_results(session, finished_id):
+                stamp = await _claim_results(session, finished_id)
+                if stamp is None:
                     continue
                 finished = await session.get(
                     Round, finished_id, options=[selectinload(Round.cards)]
                 )
                 if finished is None:
+                    await _unclaim_results(session, finished_id, stamp)
                     continue
                 try:
                     await announce_results(_bot, finished)
                     await announce_player_results(_bot, finished)
                 except Exception:
-                    await session.rollback()  # маркер снят — повтор разрешён
+                    # Снимаем только свой claim: пока шла рассылка, брошенную
+                    # метку мог перехватить другой проход — его свежий claim
+                    # трогать нельзя.
+                    await _unclaim_results(session, finished_id, stamp)
                     logger.exception(
                         "Восстановитель итогов дня %s упал — повторит в следующем тике",
                         day_index,
                     )
                     continue
-                await session.commit()
+                await _mark_results_delivered(session, finished_id)
                 logger.info(
                     "Итоги дня %s досланы восстановителем после краха",
                     day_index,
