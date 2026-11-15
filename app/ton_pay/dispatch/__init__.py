@@ -26,6 +26,7 @@ from aiogram import Bot
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 
+from app import payout_lock as _payout_lock
 from app.config import settings
 from app.core.fees import fee_estimate_nano
 from app.db import SessionLocal
@@ -226,6 +227,9 @@ async def _try_send_batch_v5(
       • в пачку не берутся строки, уже найденные в маркерах (поштучный проход
         пометит их sent без повтора), и повторы с недоступной/неполной
         историей казначея (поштучный проход заморозит их с видимой причиной);
+      • перед вещанием lease каждой строки продлевается условным UPDATE по
+        нашему штампу; строки, потерявшие клейм, из пачки исключаются и
+        поштучным проходом не отправляются;
       • BatchRejected (ошибка сборки/явный отказ лайтсерверов) — ничего не
         помечаем и не держаем: поштучный проход отправит строки как раньше.
         Транзакция v5r1 атомарна (одно плохое действие отменяет всю пачку),
@@ -240,6 +244,20 @@ async def _try_send_batch_v5(
     batch_rows = _batch_rows(payouts, markers)
     if not batch_rows:
         return 0, set()
+
+    # Все кандидаты пачки: и отправленные, и потерявшие клейм строки нельзя
+    # отдавать поштучному проходу этого цикла — первые уже разосланы одним
+    # сообщением, вторые принадлежат другому циклу/сбросу.
+    candidate_ids = {payout.id for payout, _candidates in batch_rows}
+    renewed_ids = await _renew_claims([payout for payout, _candidates in batch_rows])
+    lost_ids = candidate_ids - renewed_ids
+    batch_rows = [
+        (payout, candidates)
+        for payout, candidates in batch_rows
+        if payout.id in renewed_ids
+    ]
+    if not batch_rows:
+        return 0, candidate_ids
 
     import app.ton_pay as _tp
 
@@ -258,7 +276,7 @@ async def _try_send_batch_v5(
             len(batch_rows),
             exc,
         )
-        return 0, set()
+        return 0, lost_ids
     except Exception as exc:
         # «Неясно», а не «не ушло»: таймаут вещания (asyncio.wait_for), сбой
         # обоих каналов после таймаута лайтсерверов (BatchUncertain) и прочие
@@ -279,23 +297,44 @@ async def _try_send_batch_v5(
                 exc,
             )
         confirmed, pending_ids = await _settle_batch_uncertain(batch_rows)
-        return confirmed, pending_ids
+        return confirmed, pending_ids | lost_ids
 
     if marker is None:
         # TON выключен или нет мнемоники: причина строк пишется поштучным
         # проходом ниже (он единственный путь с видимым last_error).
-        return 0, set()
+        return 0, lost_ids
     sent_count = _mark_batch_sent(batch_rows, marker)
     logger.info("Пачка: %d переводов разошлись одним внешним сообщением", sent_count)
-    return sent_count, {payout.id for payout, _candidates in batch_rows}
+    return sent_count, candidate_ids
 
 
 async def dispatch_pending_payouts(limit: int = 50, bot: Bot | None = None) -> int:
-    """Разгребает очередь выплат. Весь цикл под _DISPATCH_LOCK: только один
-    диспетчер в эвентлупе вещает, _reset_retriable не восстанавливает строки,
-    которые другой цикл взял в работу (иначе двойная рассылка)."""
+    """Разгребает очередь выплат под двумя локами.
+
+    _DISPATCH_LOCK сериализует циклы внутри процесса, межпроцессный advisory
+    lock (app.payout_lock) — между процессами: webhook ручных команд может
+    жить в другом инстансе, и без него два диспетчера одновременно вернули бы
+    sending → pending и отправили один перевод дважды. Локи берутся в этом
+    порядке: сначала процессный (ждём свою очередь), затем advisory (если
+    база занята чужим процессом — цикл пропускаем, не копим очередь задач).
+    """
     async with _state._DISPATCH_LOCK:
-        return await _dispatch_pending_payouts_impl(limit=limit, bot=bot)
+        if not await _payout_lock.acquire_payout_dispatch_lock():
+            return 0
+        try:
+            return await _dispatch_pending_payouts_impl(limit=limit, bot=bot)
+        except _payout_lock.PayoutDispatchLockLost:
+            # Соединение-держатель умерло посреди прохода: незавершённые
+            # статусы НЕ фиксируем (сессия ниже откатится). Уже ушедшие
+            # переводы восстановит _reset_retriable + анти-дубль по memo,
+            # а второй процесс больше не получит нашу очередь.
+            logger.error(
+                "Лок выплат потерян во время прохода — цикл остановлен без "
+                "фиксации статусов; восстановление начнётся со следующего цикла"
+            )
+            return 0
+        finally:
+            await _payout_lock.release_payout_dispatch_lock()
 
 async def _apply_payout_halt(session, network: str) -> bool:
     """Kill switch (/halt-payouts) для исходящих выплат: стоп для цикла.
@@ -445,6 +484,92 @@ async def _claim_pending_payouts(
         claimed_ids.add(payout.id)
     await session.commit()
     return claimed_ids, prior_attempts
+
+
+async def _renew_claim(payout: Payout) -> bool:
+    """Продлить lease и перепроверить владение строкой перед вещанием.
+
+    Клейм pending→sending атомарен, но проход может быть длинным: пока ждём
+    подтверждения предыдущего перевода, сброс зависших или ручной разбор мог
+    вернуть строку в очередь и отдать её другому циклу. Вещать такую строку
+    нельзя — платёж уйдёт дважды. Условный UPDATE по нашему штампу продлевает
+    окно «клейм жив» и одновременно доказывает владение: у повторного клейма
+    штамп другой, у сброшенной строки статус уже не sending. rowcount != 1 —
+    строка не наша, не трогаем её и не вещаем.
+
+    UPDATE идёт в СВОЕЙ короткой сессии: основной проход держит изменения
+    статусов в памяти до финального commit, и вклинивать туда commit на
+    каждую отправку — значит менять порядок записей денежного контура. Здесь
+    фиксируется только продление lease, статусы выплат не пишутся.
+    """
+    stamp = payout.claimed_at
+    if stamp is None:
+        return False
+    if not await _payout_lock.verify_payout_dispatch_lock():
+        raise _payout_lock.PayoutDispatchLockLost(
+            f"advisory lock потерян перед выплатой {payout.id}"
+        )
+    fresh = datetime.now(UTC)
+    async with SessionLocal() as lease_session:
+        gate = await lease_session.execute(
+            update(Payout)
+            .where(
+                Payout.id == payout.id,
+                Payout.status == "sending",
+                Payout.claimed_at == stamp,
+            )
+            .values(claimed_at=fresh)
+        )
+        if cast(CursorResult[Any], gate).rowcount != 1:
+            await lease_session.rollback()
+            logger.warning(
+                "Выплата %d: клейм больше не наш (сброс или другой процесс) — не вещаю",
+                payout.id,
+            )
+            return False
+        await lease_session.commit()
+    payout.claimed_at = fresh
+    return True
+
+
+async def _renew_claims(payouts: list[Payout]) -> set[int]:
+    """Продлить lease пачки одним коротким коммитом; вернуть id удержанных.
+
+    Пачка вещает все строки одним внешним сообщением, поэтому продлевать
+    lease по одной перед сборкой бессмысленно: между продлением первой и
+    отправкой последней снова набежит время. Один UPDATE на строку в общей
+    lease-сессии и один commit — окно «все клеймы свежие» совпадает с
+    моментом вещания.
+    """
+    if not await _payout_lock.verify_payout_dispatch_lock():
+        raise _payout_lock.PayoutDispatchLockLost("advisory lock потерян перед пачкой")
+    fresh = datetime.now(UTC)
+    renewed: set[int] = set()
+    async with SessionLocal() as lease_session:
+        for payout in payouts:
+            stamp = payout.claimed_at
+            if stamp is None:
+                continue
+            gate = await lease_session.execute(
+                update(Payout)
+                .where(
+                    Payout.id == payout.id,
+                    Payout.status == "sending",
+                    Payout.claimed_at == stamp,
+                )
+                .values(claimed_at=fresh)
+            )
+            if cast(CursorResult[Any], gate).rowcount == 1:
+                renewed.add(payout.id)
+                payout.claimed_at = fresh
+            else:
+                logger.warning(
+                    "Выплата %d: клейм больше не наш (сброс или другой процесс) — "
+                    "исключена из пачки",
+                    payout.id,
+                )
+        await lease_session.commit()
+    return renewed
 
 
 async def _init_payout_batch(payouts: list[Payout]) -> bool:
@@ -676,24 +801,18 @@ def _mark_already_broadcast(payout: Payout) -> None:
     )
 
 
-def _defer_unconfirmed_if_needed(
-    payout: Payout,
-    candidates: list[str],
-    markers: set[str],
-    prior_attempts: dict[int, int],
+def _needs_defer_unconfirmed(
+    payout: Payout, candidates: list[str], markers: set[str]
 ) -> bool:
-    """True — строка отложена: история недостоверна, повтор мог бы задвоить."""
+    """Пора отложить повтор: история недостоверна, а memo в ней не видно."""
     history_trusted = (
         _state._RECONCILE_HISTORY_OK and _state._RECONCILE_WINDOW_COMPLETE
     )
-    if (
+    return (
         payout.attempts > 1
         and not any(candidate in markers for candidate in candidates)
         and not history_trusted
-    ):
-        _defer_unconfirmed_history(payout, prior_attempts)
-        return True
-    return False
+    )
 
 
 def _mark_payout_unsent(payout: Payout) -> None:
@@ -750,7 +869,11 @@ async def _run_payout_pass(
                 _mark_already_broadcast(payout)
                 sent += 1
                 continue
-            if _defer_unconfirmed_if_needed(payout, candidates, markers, prior_attempts):
+            if _needs_defer_unconfirmed(payout, candidates, markers):
+                # Откладываем только СВОЮ строку: клейм мог уйти другому
+                # циклу, и его sending перетирать pending'ом нельзя.
+                if await _renew_claim(payout):
+                    _defer_unconfirmed_history(payout, prior_attempts)
                 continue
             if prev_memo:
                 # Гонка двух быстрых переводов: следующий seqno подписываем,
@@ -779,6 +902,12 @@ async def _run_payout_pass(
                     _state._batch_seqno = None
                     deferred = True
                     break
+            # Lease продлеваем непосредственно перед вещанием: окно
+            # send_timeout + confirm_seconds должно укладываться в cutoff
+            # сброса (send_timeout + 30), иначе другой цикл вправе вернуть
+            # строку в очередь, пока наш перевод ещё в пути.
+            if not await _renew_claim(payout):
+                continue
             sent_now, _tx_hash = await _send_payout_tx(payout, comment)
             if sent_now:
                 sent += 1
