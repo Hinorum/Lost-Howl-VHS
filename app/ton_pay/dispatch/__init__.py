@@ -662,6 +662,53 @@ async def _send_payout_tx(payout: Payout, comment: str) -> tuple[bool, str | Non
         return False, None
 
 
+def _mark_already_broadcast(payout: Payout) -> None:
+    """Перевод уже ушёл в цепочку раньше — фиксируем доставку без повтора.
+
+    Статус тогда не сохранился (краш/таймаут после вещания); повтор задвоил
+    бы платёж, поэтому просто помечаем строку sent.
+    """
+    payout.tx_hash = None
+    _mark_payout_sent(payout, None, reset_attempts=False)
+    logger.warning(
+        "Выплата %d уже разослана ранее (memo найдено у казначея) — помечена sent без повтора",
+        payout.id,
+    )
+
+
+def _defer_unconfirmed_if_needed(
+    payout: Payout,
+    candidates: list[str],
+    markers: set[str],
+    prior_attempts: dict[int, int],
+) -> bool:
+    """True — строка отложена: история недостоверна, повтор мог бы задвоить."""
+    history_trusted = (
+        _state._RECONCILE_HISTORY_OK and _state._RECONCILE_WINDOW_COMPLETE
+    )
+    if (
+        payout.attempts > 1
+        and not any(candidate in markers for candidate in candidates)
+        and not history_trusted
+    ):
+        _defer_unconfirmed_history(payout, prior_attempts)
+        return True
+    return False
+
+
+def _mark_payout_unsent(payout: Payout) -> None:
+    """Отправка не удалась: причина и статус строки для следующего цикла."""
+    if payout.last_error is None:
+        # Единственный путь сюда — guard выключенного TON/мнемоники.
+        payout.last_error = "отправка недоступна: TON выключен или нет мнемоники казначея"
+    if payout.attempts >= settings.payout_max_attempts:
+        payout.status = "failed"
+    else:
+        # Лимит не исчерпан — вернётся в очередь следующего цикла;
+        # last_error сохраняем: причина видна в /payouts уже сейчас.
+        payout.status = "pending"
+
+
 async def _run_payout_pass(
     payouts: list[Payout],
     markers: set[str],
@@ -700,26 +747,10 @@ async def _run_payout_pass(
             candidates = _payout_comment_candidates(payout)
             comment = candidates[0]
             if any(candidate in markers for candidate in candidates):
-                # Перевод уже ушёл в цепочку раньше, но статус тогда не
-                # сохранился (краш/таймаут после вещания). Повтор задвоил бы
-                # платёж — фиксируем доставку без новой отправки.
-                payout.tx_hash = None
-                _mark_payout_sent(payout, None, reset_attempts=False)
+                _mark_already_broadcast(payout)
                 sent += 1
-                logger.warning(
-                    "Выплата %d уже разослана ранее (memo найдено у казначея) — помечена sent без повтора",
-                    payout.id,
-                )
                 continue
-            history_trusted = (
-                _state._RECONCILE_HISTORY_OK and _state._RECONCILE_WINDOW_COMPLETE
-            )
-            if (
-                payout.attempts > 1
-                and not any(candidate in markers for candidate in candidates)
-                and not history_trusted
-            ):
-                _defer_unconfirmed_history(payout, prior_attempts)
+            if _defer_unconfirmed_if_needed(payout, candidates, markers, prior_attempts):
                 continue
             if prev_memo:
                 # Гонка двух быстрых переводов: следующий seqno подписываем,
@@ -748,21 +779,13 @@ async def _run_payout_pass(
                     _state._batch_seqno = None
                     deferred = True
                     break
-            sent_now, tx_hash = await _send_payout_tx(payout, comment)
+            sent_now, _tx_hash = await _send_payout_tx(payout, comment)
             if sent_now:
                 sent += 1
                 # Следующий перевод пачки дождётся подтверждения ЭТОГО в блоке.
                 prev_memo = set(candidates)
                 continue
-            if payout.last_error is None:
-                # Единственный путь сюда — guard выключенного TON/мнемоники.
-                payout.last_error = "отправка недоступна: TON выключен или нет мнемоники казначея"
-            if payout.attempts >= settings.payout_max_attempts:
-                payout.status = "failed"
-            else:
-                # Лимит не исчерпан — вернётся в очередь следующего цикла;
-                # last_error сохраняем: причина видна в /payouts уже сейчас.
-                payout.status = "pending"
+            _mark_payout_unsent(payout)
     finally:
         _state._batch_seqno = None
 
