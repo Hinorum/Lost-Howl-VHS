@@ -13,7 +13,8 @@
   5. claim_once с разными ключами не конфликтует.
   6. claim_once валидирует длину ключа (≤80).
   7. claim_announcement (rounds/lifecycle) — объявление дня достаётся
-     ровно одному «процессу»: UPDATE WHERE announced_at IS NULL.
+     ровно одному «процессу»: атомарный UPDATE по announced_at IS NULL
+     (или брошенной метке старше окна stale-reclaim).
 
 ВАЖНО про среду:
   - aiosqlite сериализует записи в одном SQLite-файле через свой
@@ -42,7 +43,7 @@ from app.models import (
     WinRule,
 )
 from app.ops import claim_once
-from app.rounds.lifecycle import claim_announcement
+from app.rounds.lifecycle import claim_announcement, unclaim_announcement
 
 # ----- Утилиты -----------------------------------------------------------
 
@@ -340,10 +341,11 @@ async def test_claim_announcement_is_atomic(tmp_path) -> None:
     """Объявить день может ровно один «процесс».
 
     claim_announcement — условный UPDATE Round SET announced_at=... WHERE
-    announced_at IS NULL, тот же примитив at-most-once, что close_voting.
-    Если бы он стал no-op'ом или read-modify-write, два инстанса бота
-    объявили бы один день дважды: второй вызов пошёл бы в send_announcement
-    повторно (лишний пост участникам, дважды запущенный таймер дня).
+    announced_at IS NULL OR announced_at <= cutoff, тот же примитив
+    at-most-once, что close_voting. Если бы он стал no-op'ом или
+    read-modify-write, два инстанса бота объявили бы один день дважды:
+    второй вызов пошёл бы в send_announcement повторно (лишний пост
+    участникам, дважды запущенный таймер дня).
     """
     engine, maker = await _fresh_db(tmp_path)
     try:
@@ -394,6 +396,84 @@ async def test_claim_announcement_is_per_round(tmp_path) -> None:
         async with maker() as sess:
             r = await sess.get(Round, first_id)
             assert r.announced_at is not None
+    finally:
+        await engine.dispose()
+
+
+async def test_claim_announcement_reclaims_only_stale_claim(tmp_path, monkeypatch) -> None:
+    """Брошенный claim перехватывается после окна, свежий — нет.
+
+    Жёсткий краш (kill -9, деплой) между коммитом announced_at и снятием
+    метки оставлял день «объявленным» навсегда: восстановитель ищет только
+    NULL и пост дня терялся. Перехват обязан быть атомарным (два догоняющих
+    процесса — один победитель) и не трогать живого вещателя: метка моложе
+    окна — чужой работающий claim.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "announce_claim_timeout_seconds", 60)
+    engine, maker = await _fresh_db(tmp_path)
+    try:
+        async with maker() as sess:
+            row = _round_row(14)
+            row.announced_at = datetime.now(UTC) - timedelta(seconds=120)
+            sess.add(row)
+            await sess.commit()
+            round_id = row.id
+
+        async with maker() as sess:
+            assert await claim_announcement(sess, await sess.get(Round, round_id)) is True
+        # Сразу после перехвата метка свежая: второй процесс не проходит.
+        async with maker() as sess:
+            assert await claim_announcement(sess, await sess.get(Round, round_id)) is False
+
+        # Метка моложе окна — живой claim, перехватывать нельзя.
+        async with maker() as sess:
+            row = await sess.get(Round, round_id)
+            assert row is not None
+            row.announced_at = datetime.now(UTC) - timedelta(seconds=30)
+            await sess.commit()
+        async with maker() as sess:
+            assert await claim_announcement(sess, await sess.get(Round, round_id)) is False
+    finally:
+        await engine.dispose()
+
+
+async def test_unclaim_does_not_clear_newer_claim(tmp_path) -> None:
+    """Упавший старый вещатель не снимает метку, перехваченную новым.
+
+    После stale-reclaim у старого прохода ещё может остаться свой штамп.
+    Безусловный unclaim стёр бы СВЕЖИЙ claim нового вещателя и открыл день
+    для третьего анонса. Снимаем только свой штамп; без него — прежний
+    контракт (ветка пустой аудитории снимает любую метку).
+    """
+    engine, maker = await _fresh_db(tmp_path)
+    old_stamp = datetime.now(UTC) - timedelta(hours=2)
+    fresh_stamp = datetime.now(UTC)
+    try:
+        async with maker() as sess:
+            row = _round_row(15)
+            row.announced_at = old_stamp
+            sess.add(row)
+            await sess.commit()
+            round_id = row.id
+        async with maker() as sess:
+            row = await sess.get(Round, round_id)
+            assert row is not None
+            row.announced_at = fresh_stamp
+            await sess.commit()
+
+        async with maker() as sess:
+            await unclaim_announcement(sess, round_id, stamp=old_stamp)
+        async with maker() as sess:
+            row = await sess.get(Round, round_id)
+            assert row is not None and row.announced_at is not None
+
+        async with maker() as sess:
+            await unclaim_announcement(sess, round_id)
+        async with maker() as sess:
+            row = await sess.get(Round, round_id)
+            assert row is not None and row.announced_at is None
     finally:
         await engine.dispose()
 

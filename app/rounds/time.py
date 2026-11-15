@@ -46,6 +46,19 @@ def catchup_cutoff() -> datetime:
     return _now() - timedelta(hours=settings.catchup_window_hours)
 
 
+def announce_claim_cutoff() -> datetime:
+    """Граница «claim анонса брошен»: метка старше окна — можно перехватить.
+
+    claim_announcement коммитит announced_at ДО рассылки. Исключение снимает
+    метку (unclaim), но жёсткий краш — kill -9, деплой, пропажа инстанса —
+    нет: тик догона ищет только announced_at IS NULL, и день остался бы без
+    поста навсегда. Окно обязано быть заведомо больше самой долгой живой
+    рассылки (см. announce_claim_timeout_seconds): иначе догон заберёт claim
+    у работающего вещателя и день уйдёт в чаты дважды.
+    """
+    return _now() - timedelta(seconds=settings.announce_claim_timeout_seconds)
+
+
 def _day_window(opens_at: datetime) -> tuple[datetime, datetime]:
     """Границы голосования и подсчёта дня на сетке UTC.
 

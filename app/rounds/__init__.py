@@ -34,6 +34,7 @@ from .time import (
     _day_window,
     _next_hour_slot,
     _now,
+    announce_claim_cutoff,
     catchup_cutoff,
     utc_aware,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "_day_window",
     "_next_hour_slot",
     "_now",
+    "announce_claim_cutoff",
     "catchup_cutoff",
     "utc_aware",
     "_TIE_THEATER",

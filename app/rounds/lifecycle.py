@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, NoReturn, cast
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.config import settings
 from app.core.registry import LOCAL_TIE_PREFIX
@@ -34,7 +36,7 @@ from .materialization import _materialize_round, _stamp_day_money_mode
 from .pot import round_pot
 from .queries import get_active_round, get_latest_round, get_round
 from .rendering import plan_and_render
-from .time import _ROMAN, _now, utc_aware
+from .time import _ROMAN, _now, announce_claim_cutoff, utc_aware
 from .voting import (
     _TIE_THEATER,
     _decisive_counts,
@@ -192,17 +194,43 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
 
 
 async def claim_announcement(session: AsyncSession, round_row: Round) -> bool:
-    """Занимает право объявить день: True только для первого вызывающего."""
+    """Занимает право объявить день: True только для первого вызывающего.
+
+    NULL — день ещё не объявлен. Метка старше announce_claim_timeout_seconds
+    — брошенный claim: вещатель умер между коммитом метки и снятием её при
+    ошибке (kill -9, деплой), и без перехвата день остался бы без анонса
+    навсегда. Перехват атомарен: условный UPDATE по-прежнему выбирает ровно
+    одного победителя, поэтому два догоняющих процесса не объявят день
+    дважды. Живая рассылка метку не теряет — её длительность заведомо
+    меньше окна (см. app.config.announce_claim_timeout_seconds).
+    """
+    stamp = _now()
+    cutoff = announce_claim_cutoff()
     result = await session.execute(
         update(Round)
-        .where(Round.id == round_row.id, Round.announced_at.is_(None))
-        .values(announced_at=_now())
+        # Синхронизация ORM-объектов сравнивает announced_at в Python, а
+        # SQLite отдаёт naive UTC против aware cutoff. Нам она не нужна:
+        # свой штамп вызывающему ставим вручную ниже.
+        .execution_options(synchronize_session=False)
+        .where(
+            Round.id == round_row.id,
+            or_(Round.announced_at.is_(None), Round.announced_at <= cutoff),
+        )
+        .values(announced_at=stamp)
     )
     await session.commit()
-    return cast(CursorResult[Any], result).rowcount > 0
+    if cast(CursorResult[Any], result).rowcount > 0:
+        # Свой штамп запоминаем БЕЗ пометки объекта грязным: иначе следующий
+        # execute в этой же сессии (unclaim после ошибки) автофлашнул бы
+        # старый штамп поверх метки, которую уже перехватил другой процесс.
+        set_committed_value(round_row, "announced_at", stamp)
+        return True
+    return False
 
 
-async def unclaim_announcement(session: AsyncSession, round_id: int) -> None:
+async def unclaim_announcement(
+    session: AsyncSession, round_id: int, *, stamp: datetime | None = None
+) -> None:
     """Освобождает право анонса неудачливому вещателю.
 
     claim_announcement коммитит метку ДО реального анонса: сбой сети в
@@ -210,10 +238,23 @@ async def unclaim_announcement(session: AsyncSession, round_id: int) -> None:
     анонс нового дня потерялся бы навсегда (тик и /advance не повторяют уже
     помеченное). Снятие метки возвращает право восстановителю
     (_retry_new_day_job): анонс становится at-least-once вместо дыры.
+
+    stamp — метка, которую ставил ИМЕННО этот вещатель. После stale-reclaim
+    (claim_announcement перехватил брошенную метку) снимать чужую свежую
+    метку нельзя: иначе упавший старый проход откроет день для третьего
+    анонса поверх работающего нового. Без stamp — прежнее поведение «снять
+    любую метку» (ветка пустой аудитории в broadcast).
     """
+    conditions = [Round.id == round_id, Round.announced_at.is_not(None)]
+    if stamp is not None:
+        conditions.append(Round.announced_at == stamp)
     await session.execute(
         update(Round)
-        .where(Round.id == round_id, Round.announced_at.is_not(None))
+        # fetch, а не evaluate: SQLite отдаёт naive UTC, а stamp — aware,
+        # и Python-сравнение в ORM падало бы. fetch обновляет загруженный
+        # Round по фактически совпавшим строкам.
+        .execution_options(synchronize_session="fetch")
+        .where(*conditions)
         .values(announced_at=None)
     )
     await session.commit()

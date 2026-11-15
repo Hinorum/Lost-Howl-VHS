@@ -8,7 +8,7 @@ from typing import Any, cast
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -21,6 +21,7 @@ from app.db import SessionLocal
 from app.models import RoundStatus, WatcherState
 from app.rounds import (
     _now,
+    announce_claim_cutoff,
     claim_announcement,
     close_voting,
     ensure_current_round,
@@ -331,16 +332,19 @@ async def _announce_round(session: AsyncSession, round_row, bot: Bot | None) -> 
     вещатель в гонке джоб/реплик). Если вещание падает — метка снимается
     (unclaim), и _retry_new_day_job на ближайшем тике объявит день снова:
     потеря поста нового дня хуже редкого дубля (at-least-once), а дубль всё
-    равно исключён, пока метка стоит.
+    равно исключён, пока метка стоит. Снимаем только СВОЙ штамп: брошенную
+    метку мог уже перехватить другой процесс, и его свежий claim трогать
+    нельзя.
     """
     if not await claim_announcement(session, round_row):
         return
+    stamp = getattr(round_row, "announced_at", None)
     try:
         await announce_new_day(bot, round_row)
     except Exception:
         from app.rounds import unclaim_announcement
 
-        await unclaim_announcement(session, round_row.id)
+        await unclaim_announcement(session, round_row.id, stamp=stamp)
         raise
 
 
@@ -354,6 +358,14 @@ async def _retry_new_day_job() -> None:
     Сюда же попадает день, чей анонс ушёл в пустую аудиторию: announce_new_day
     снимает claim, а гейт по получателям не даёт досылке крутиться вхолостую,
     пока получателей нет (см. ветку пустоты в announce_new_day).
+
+    Сюда же попадает БРОШЕННЫЙ claim: жёсткий краш (kill -9, деплой) между
+    коммитом announced_at и снятием метки не оставляет шанса на unclaim, и
+    день числился бы объявленным вечно. Метка старше
+    announce_claim_timeout_seconds считается мёртвой и перехватывается
+    атомарно внутри claim_announcement; свежая метка живого вещателя не
+    трогается. Окно заведомо больше самой долгой рассылки — иначе догон
+    украл бы claim у работающего процесса и день ушёл бы дважды.
 
     Ловим только НЕДАВНИЕ дни (catchup_cutoff): announced_at добавлен
     миграцией без бэкфилла, так что у всей истории маркер NULL — без границы
@@ -378,7 +390,10 @@ async def _retry_new_day_job() -> None:
                     select(Round.id)
                     .where(
                         Round.status == RoundStatus.OPEN,
-                        Round.announced_at.is_(None),
+                        or_(
+                            Round.announced_at.is_(None),
+                            Round.announced_at <= announce_claim_cutoff(),
+                        ),
                         Round.opens_at >= catchup_cutoff(),
                     )
                     .order_by(Round.day_index.asc())

@@ -902,6 +902,145 @@ async def test_retry_new_day_job_announces_only_open_unannounced(monkeypatch) ->
         await _cleanup(missing, claimed, tallying)
 
 
+async def test_retry_new_day_job_reclaims_stale_claim_only(monkeypatch) -> None:
+    """Догон перехватывает брошенный claim, но не трогает свежий.
+
+    Жёсткий краш между коммитом announced_at и unclaim оставляет метку
+    навсегда; догон ищет и NULL, и метки старше
+    announce_claim_timeout_seconds. Метка живого вещателя моложе окна —
+    чужой работающий claim: перехват дал бы второй пост дня.
+    """
+    from app import scheduler as sched
+
+    monkeypatch.setattr(settings, "announce_claim_timeout_seconds", 60)
+    monkeypatch.setattr(sched, "_bot", object())
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    monkeypatch.setattr(sched, "announce_audience_size", AsyncMock(return_value=2))
+    stale = await _make_round(9738, RoundStatus.OPEN)
+    live = await _make_round(9739, RoundStatus.OPEN)
+    async with SessionLocal() as db:
+        for round_id, age_seconds in ((stale, 120), (live, 30)):
+            row = await db.get(Round, round_id)
+            assert row is not None
+            row.announced_at = datetime.now(UTC) - timedelta(seconds=age_seconds)
+        await db.commit()
+
+    seen: list[int] = []
+
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    try:
+        await sched._retry_new_day_job()
+        assert stale in seen
+        assert live not in seen, "свежий claim живого вещателя перехватывать нельзя"
+        async with SessionLocal() as db:
+            stale_row = await db.get(Round, stale)
+            live_row = await db.get(Round, live)
+        assert stale_row is not None and stale_row.announced_at is not None
+        assert live_row is not None and live_row.announced_at is not None
+        seen.clear()
+        await sched._retry_new_day_job()
+        assert stale not in seen  # перехваченный день уже со свежей меткой
+        assert live not in seen
+    finally:
+        await _cleanup(stale, live)
+
+
+async def test_retry_new_day_job_skips_ancient_stale_claim(monkeypatch) -> None:
+    """Древняя брошенная метка не переигрывается: recency-гард сильнее stale.
+
+    announced_at добавлен миграцией без бэкфилла: у истории маркер NULL.
+    Stale-reclaim не должен обойти catchup_cutoff и объявить старый день
+    заново — догон существует ради свежих крашей, а не археологии.
+    """
+    from app import scheduler as sched
+
+    monkeypatch.setattr(settings, "announce_claim_timeout_seconds", 60)
+    ancient = datetime.now(UTC) - timedelta(days=100)
+    old = await _make_round(9740, RoundStatus.OPEN)
+    async with SessionLocal() as db:
+        row = await db.get(Round, old)
+        assert row is not None
+        row.opens_at = ancient
+        row.announced_at = ancient
+        await db.commit()
+
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    monkeypatch.setattr(sched, "announce_audience_size", AsyncMock(return_value=2))
+    seen: list[int] = []
+
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    try:
+        await sched._retry_new_day_job()
+        assert old not in seen
+        async with SessionLocal() as db:
+            row = await db.get(Round, old)
+        assert row is not None and row.announced_at is not None
+    finally:
+        await _cleanup(old)
+
+
+async def test_announce_round_keeps_newer_claim_on_failure(monkeypatch) -> None:
+    """Упавший старый вещатель не снимает метку, перехваченную новым.
+
+    Пока старый проход вещал, его брошенную метку мог перехватить догон.
+    unclaim без сверки штампа стёр бы свежий claim и открыл день для
+    третьего анонса поверх работающего.
+    """
+    from app import scheduler as sched
+    from app.rounds import utc_aware
+
+    monkeypatch.setattr(settings, "announce_claim_timeout_seconds", 60)
+    did = 9741
+    async with SessionLocal() as db:
+        day = Round(
+            day_index=did,
+            status=RoundStatus.OPEN,
+            win_rule=WinRule.MAJORITY,
+            chapter_title=f"День {did}",
+            chapter_text="Текст.",
+            opens_at=datetime.now(UTC) - timedelta(hours=1),
+            voting_ends_at=datetime.now(UTC) + timedelta(hours=9),
+            tally_ends_at=datetime.now(UTC) + timedelta(hours=10),
+            vote_counts_json="{}",
+            announced_at=datetime.now(UTC) - timedelta(minutes=10),
+        )
+        db.add(day)
+        await db.commit()
+        row_id = day.id
+
+    fresh_stamp = datetime.now(UTC) + timedelta(minutes=5)
+
+    async def steal_then_boom(bot_, round_row):
+        # Другой процесс перехватил брошенную метку и уже вещает.
+        async with SessionLocal() as db:
+            row = await db.get(Round, row_id)
+            assert row is not None
+            row.announced_at = fresh_stamp
+            await db.commit()
+        raise RuntimeError("сеть легла в середине рассылки")
+
+    monkeypatch.setattr(sched, "announce_new_day", steal_then_boom)
+    try:
+        async with SessionLocal() as db:
+            day = await db.get(Round, row_id)
+            assert day is not None
+            with pytest.raises(RuntimeError):
+                await sched._announce_round(db, day, object())
+            fresh = await db.get(Round, row_id)
+            assert fresh is not None
+            await db.refresh(fresh)
+            assert fresh.announced_at is not None
+            assert utc_aware(fresh.announced_at) == fresh_stamp
+    finally:
+        await _cleanup(did)
+
+
 async def test_retry_new_day_job_respects_pause(monkeypatch) -> None:
     """Стоп-кран: восстановитель молчит, пока игра на паузе."""
     from app import scheduler as sched
