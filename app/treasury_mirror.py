@@ -981,6 +981,102 @@ async def _check_mirror(
     )
 
 
+async def _mirror_probe_head(
+    session: AsyncSession, summary: dict, network: str
+) -> tuple[_head.HeadProbe | None, bool]:
+    """Зонд головы цепочки. Второй элемент True — голова та же, цикл завершён."""
+    probe: _head.HeadProbe | None = None
+    if settings.ton_head_probe_enabled:
+        probe = await _head.fetch_head_probe()
+    if probe is not None and probe.ok:
+        head = await _head.read_head(session, TREASURY_MIRROR_HEAD_KEY)
+        head_check = await _head.read_check(session, TREASURY_MIRROR_HEAD_CHECK_KEY)
+        if _head.head_is_fresh(
+            head_check, settings.treasury_mirror_full_rescan_seconds
+        ) and _head.same_head(head, probe):
+            # Голова та же: истории выше неё нет, страницу зеркала
+            # читать не нужно. Тождество всё равно меряем — это один
+            # лёгкий запрос баланса + сумма по БД.
+            summary.update(source=probe.source, skipped=True, bootstrapped=True)
+            await _check_mirror(
+                session, summary, network, probe.source, True, 0, 0, 0
+            )
+            return probe, True
+    return probe, False
+
+
+async def _mirror_increment(
+    session: AsyncSession,
+    network: str,
+    max_pages: int,
+    probe: _head.HeadProbe | None,
+) -> tuple[int, int, int, str, bool]:
+    """Инкремент выше головы; после полного догона пишет отпечаток головы."""
+    (
+        pages,
+        added,
+        updated,
+        source,
+        page_ok,
+        complete,
+    ) = await _increment_sync(session, network, max_pages)
+    if (
+        complete
+        and page_ok
+        and probe is not None
+        and probe.ok
+        and probe.source == source
+    ):
+        # Отпечаток — только после полного догона и только если
+        # страницы читались тем же источником, что и зонд.
+        await _head.write_head(
+            session,
+            key=TREASURY_MIRROR_HEAD_KEY,
+            check_key=TREASURY_MIRROR_HEAD_CHECK_KEY,
+            lt=probe.lt,
+            head_hash=probe.hash,
+            source=probe.source,
+            cursor=0,
+        )
+    return pages, added, updated, source, page_ok
+
+
+async def _mirror_finalize(
+    session: AsyncSession,
+    summary: dict,
+    network: str,
+    source: str,
+    page_ok: bool,
+    bootstrapped: bool,
+    pages: int,
+    added: int,
+    updated: int,
+) -> dict:
+    """Записать источник/сводку и, если зеркало выстроено, сверить тождество."""
+    if page_ok:
+        await _set_state(session, TREASURY_MIRROR_SOURCE_KEY, source)
+    summary.update(
+        pages=pages,
+        added=added,
+        updated=updated,
+        source=source,
+        bootstrapped=bootstrapped,
+    )
+    if not bootstrapped:
+        return summary
+    await _check_mirror(
+        session,
+        summary,
+        network,
+        source,
+        bootstrapped,
+        pages,
+        added,
+        updated,
+    )
+    return summary
+
+
 async def sync_treasury_mirror() -> dict:
     """Один цикл синка зеркала. Возвращает сводку для лога/отчёта.
 
@@ -1021,7 +1117,6 @@ async def sync_treasury_mirror() -> dict:
         pages = added = updated = 0
         source = "none"
         page_ok = False
-        probe: _head.HeadProbe | None = None
         if not bootstrapped:
             (
                 pages,
@@ -1032,70 +1127,23 @@ async def sync_treasury_mirror() -> dict:
                 page_ok,
             ) = await _bootstrap_sync(session, network, max_pages)
         else:
-            if settings.ton_head_probe_enabled:
-                probe = await _head.fetch_head_probe()
-            if probe is not None and probe.ok:
-                head = await _head.read_head(session, TREASURY_MIRROR_HEAD_KEY)
-                head_check = await _head.read_check(session, TREASURY_MIRROR_HEAD_CHECK_KEY)
-                if _head.head_is_fresh(
-                    head_check, settings.treasury_mirror_full_rescan_seconds
-                ) and _head.same_head(head, probe):
-                    # Голова та же: истории выше неё нет, страницу зеркала
-                    # читать не нужно. Тождество всё равно меряем — это один
-                    # лёгкий запрос баланса + сумма по БД.
-                    summary.update(source=probe.source, skipped=True, bootstrapped=True)
-                    await _check_mirror(
-                        session, summary, network, probe.source, True, 0, 0, 0
-                    )
-                    return summary
-            (
-                pages,
-                added,
-                updated,
-                source,
-                page_ok,
-                complete,
-            ) = await _increment_sync(session, network, max_pages)
-            if (
-                complete
-                and page_ok
-                and probe is not None
-                and probe.ok
-                and probe.source == source
-            ):
-                # Отпечаток — только после полного догона и только если
-                # страницы читались тем же источником, что и зонд.
-                await _head.write_head(
-                    session,
-                    key=TREASURY_MIRROR_HEAD_KEY,
-                    check_key=TREASURY_MIRROR_HEAD_CHECK_KEY,
-                    lt=probe.lt,
-                    head_hash=probe.hash,
-                    source=probe.source,
-                    cursor=0,
-                )
-        if page_ok:
-            await _set_state(session, TREASURY_MIRROR_SOURCE_KEY, source)
-        summary.update(
-            pages=pages,
-            added=added,
-            updated=updated,
-            source=source,
-            bootstrapped=bootstrapped,
-        )
-        if not bootstrapped:
-            return summary
-        await _check_mirror(
+            probe, done = await _mirror_probe_head(session, summary, network)
+            if done:
+                return summary
+            pages, added, updated, source, page_ok = await _mirror_increment(
+                session, network, max_pages, probe
+            )
+        return await _mirror_finalize(
             session,
             summary,
             network,
             source,
+            page_ok,
             bootstrapped,
             pages,
             added,
             updated,
         )
-    return summary
 
 
 async def reset_treasury_mirror() -> str:
