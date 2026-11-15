@@ -1049,6 +1049,138 @@ async def _watch_confirm_side_effects(bot: Bot | None) -> None:
         logger.exception("Актуализация банка дня в постах упала (не мешает циклу)")
 
 
+async def _watch_skip_cycle(probe: _head.HeadProbe, bot: Bot | None) -> None:
+    """Голова не изменилась: сердцебиение и подтверждение ставок — и цикл завершён."""
+    # Голова та же, окно курсора не двигалось: сверху новых переводов
+    # нет, полная страница истории (≈70 КБ) не нужна. Сердцебиение и
+    # подтверждение ставок всё равно обновляем.
+    async with SessionLocal() as session:
+        await _watch_heartbeat(session, probe.source, api_ok=True)
+    await _watch_confirm_side_effects(bot)
+    logger.debug(
+        "Цикл watcher: голова не изменилась (lt %d, источник %s) — проход пропущен",
+        probe.lt,
+        probe.source,
+    )
+
+
+async def _watch_record_parse_fail(parse_fail_count: int) -> None:
+    """Счётчик отброшенных парсером item'ов за цикл — в watcher_state и лог."""
+    if parse_fail_count <= 0:
+        return
+    # Item'ы, отброшенные парсером с исключением (см. P0 #4 в README лога):
+    # раньше parser глушил ошибку как «нормальный None» и считать их было
+    # негде. Теперь счётчик за цикл уезжает в watcher_state как
+    # parse_fail_count и поднимает alarm до чистого цикла.
+    async with SessionLocal() as session:
+        await _bump_parse_fail(session, parse_fail_count)
+    logger.warning(
+        "За цикл отброшено %d item'ов парсером TonAPI/Toncenter — "
+        "счётчик записан в watcher_state[parse_fail_count]",
+        parse_fail_count,
+    )
+
+
+def _watch_head_trusted(
+    *,
+    probe: _head.HeadProbe | None,
+    source: str,
+    api_ok: bool,
+    gap_at: int | None,
+    parse_fail_count: int,
+    stuck: dict,
+) -> bool:
+    """Можно ли писать отпечаток головы: проход полный, здоровый и тем же источником."""
+    # Отпечаток головы — только после полного здорового прохода, который
+    # читал тот же источник, что и зонд. Иначе следующий цикл мог бы
+    # пропустить окно, которое этот проход не видел (например, зонд по
+    # TonAPI, а страницы — по отстающему Toncenter).
+    return (
+        probe is not None
+        and probe.ok
+        and probe.source == source
+        and api_ok
+        and gap_at is None
+        and parse_fail_count == 0
+        and not stuck
+    )
+
+
+async def _watch_persist_cycle(
+    *,
+    api_ok: bool,
+    since: int,
+    gap_at: int | None,
+    raw_cursor: int,
+    stuck: dict,
+    processed_through: int,
+    source: str,
+    probe: _head.HeadProbe | None,
+    parse_fail_count: int,
+) -> None:
+    """Сохранить курсор, stuck, сердцебиение и (если проход доверенный) голову."""
+    async with SessionLocal() as session:
+        effective_cursor = await _watch_persist_cursor(
+            session,
+            api_ok=api_ok,
+            since=since,
+            gap_at=gap_at,
+            raw_cursor=raw_cursor,
+            stuck=stuck,
+            processed_through=processed_through,
+        )
+        await _watch_persist_stuck(session, api_ok=api_ok, stuck=stuck)
+        await _watch_heartbeat(session, source, api_ok=api_ok)
+        if _watch_head_trusted(
+            probe=probe,
+            source=source,
+            api_ok=api_ok,
+            gap_at=gap_at,
+            parse_fail_count=parse_fail_count,
+            stuck=stuck,
+        ):
+            assert probe is not None  # гарантировано _watch_head_trusted
+            await _write_head(
+                session,
+                lt=probe.lt,
+                head_hash=probe.hash,
+                source=probe.source,
+                cursor=effective_cursor,
+            )
+
+
+async def _watch_heal_after_cycle(bot: Bot | None) -> None:
+    """Авто-лечение брошенных сбойных переводов — не мешает циклу при сбое."""
+    try:
+        # Авто-лечение брошенных сбойных переводов: не даём деньгам зависать
+        # в казне до ручного разбора (инцидент Kote). Идемпотентно и не мешает
+        # циклу, если лечение временно падает.
+        healed = await _watch_heal_stuck(bot)
+        if healed:
+            logger.info("Авто-лечение stuck-трансакций: исцелено %d", healed)
+    except Exception:
+        logger.exception("Авто-лечение stuck-трансакций упало (не мешает циклу)")
+
+
+def _watch_log_cycle(
+    transfers: list[Transfer],
+    since: int,
+    processed_through: int,
+    gap_at: int | None,
+    source: str,
+    stuck: dict,
+) -> None:
+    """Итоговая строка цикла, если были переводы."""
+    if transfers:
+        logger.info(
+            "Цикл watcher: найдено %d переводов, курсор %d → %d, проход %s (источник %s), stuck %d",
+            len(transfers), since, processed_through,
+            "полный" if gap_at is None else "ЧАСТИЧНЫЙ (курсор встанет на дно прочитанного)",
+            source,
+            len(stuck),
+        )
+
+
 async def watch_once(bot: Bot | None = None) -> None:
     async with SessionLocal() as session:
         (
@@ -1073,82 +1205,26 @@ async def watch_once(bot: Bot | None = None) -> None:
             raw_cursor=raw_cursor,
             probe=probe,
         ):
-            # Голова та же, окно курсора не двигалось: сверху новых переводов
-            # нет, полная страница истории (≈70 КБ) не нужна. Сердцебиение и
-            # подтверждение ставок всё равно обновляем.
-            async with SessionLocal() as session:
-                await _watch_heartbeat(session, probe.source, api_ok=True)
-            await _watch_confirm_side_effects(bot)
-            logger.debug(
-                "Цикл watcher: голова не изменилась (lt %d, источник %s) — проход пропущен",
-                probe.lt,
-                probe.source,
-            )
+            assert probe is not None  # гарантировано _watch_skip_by_head
+            await _watch_skip_cycle(probe, bot)
             return
     transfers, api_ok, source, gap_at, parse_fail_count = await _collect_transfers(
         since, _MAX_PAGES * scan_boost
     )
-    # Item'ы, отброшенные парсером с исключением (см. P0 #4 в README лога):
-    # раньше parser глушил ошибку как «нормальный None» и считать их было
-    # негде. Теперь счётчик за цикл уезжает в watcher_state как
-    # parse_fail_count и поднимает alarm до чистого цикла.
-    if parse_fail_count > 0:
-        async with SessionLocal() as session:
-            await _bump_parse_fail(session, parse_fail_count)
-        logger.warning(
-            "За цикл отброшено %d item'ов парсером TonAPI/Toncenter — "
-            "счётчик записан в watcher_state[parse_fail_count]",
-            parse_fail_count,
-        )
+    await _watch_record_parse_fail(parse_fail_count)
     processed_through = await _watch_process_batch(transfers, bot, stuck, since)
     await _watch_confirm_side_effects(bot)
-    async with SessionLocal() as session:
-        effective_cursor = await _watch_persist_cursor(
-            session,
-            api_ok=api_ok,
-            since=since,
-            gap_at=gap_at,
-            raw_cursor=raw_cursor,
-            stuck=stuck,
-            processed_through=processed_through,
-        )
-        await _watch_persist_stuck(session, api_ok=api_ok, stuck=stuck)
-        await _watch_heartbeat(session, source, api_ok=api_ok)
-        # Отпечаток головы — только после полного здорового прохода, который
-        # читал тот же источник, что и зонд. Иначе следующий цикл мог бы
-        # пропустить окно, которое этот проход не видел (например, зонд по
-        # TonAPI, а страницы — по отстающему Toncenter).
-        if (
-            probe is not None
-            and probe.ok
-            and probe.source == source
-            and api_ok
-            and gap_at is None
-            and parse_fail_count == 0
-            and not stuck
-        ):
-            await _write_head(
-                session,
-                lt=probe.lt,
-                head_hash=probe.hash,
-                source=probe.source,
-                cursor=effective_cursor,
-            )
+    await _watch_persist_cycle(
+        api_ok=api_ok,
+        since=since,
+        gap_at=gap_at,
+        raw_cursor=raw_cursor,
+        stuck=stuck,
+        processed_through=processed_through,
+        source=source,
+        probe=probe,
+        parse_fail_count=parse_fail_count,
+    )
     await _watch_scan_gap(api_ok=api_ok, since=since, gap_at=gap_at, scan_boost=scan_boost)
-    try:
-        # Авто-лечение брошенных сбойных переводов: не даём деньгам зависать
-        # в казне до ручного разбора (инцидент Kote). Идемпотентно и не мешает
-        # циклу, если лечение временно падает.
-        healed = await _watch_heal_stuck(bot)
-        if healed:
-            logger.info("Авто-лечение stuck-трансакций: исцелено %d", healed)
-    except Exception:
-        logger.exception("Авто-лечение stuck-трансакций упало (не мешает циклу)")
-    if transfers:
-        logger.info(
-            "Цикл watcher: найдено %d переводов, курсор %d → %d, проход %s (источник %s), stuck %d",
-            len(transfers), since, processed_through,
-            "полный" if gap_at is None else "ЧАСТИЧНЫЙ (курсор встанет на дно прочитанного)",
-            source,
-            len(stuck),
-        )
+    await _watch_heal_after_cycle(bot)
+    _watch_log_cycle(transfers, since, processed_through, gap_at, source, stuck)
