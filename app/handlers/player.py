@@ -272,6 +272,67 @@ async def on_claim_month(callback: CallbackQuery) -> None:
     await _on_claim(callback, "month")
 
 
+async def _claim_window_state(
+    session, kind: str
+) -> tuple[dict | None, list[int], str]:
+    """Окно Claim: (window, tied_player_ids, period); окна нет — пусто.
+
+    Дублирующий check здесь — защита от hand-craft callback: период берётся
+    из окна, а не из текущей даты, а битые данные окна (_load_claim_window)
+    возвращают None и тап отклоняется.
+    """
+    from app.leaderboard import _load_claim_window
+
+    window = await _load_claim_window(session, kind)
+    if window is None:
+        return None, [], ""
+    return window, list(window.get("players") or []), window.get("period") or ""
+
+
+def _claim_opened_at(window: dict | None) -> datetime | None:
+    """opened_at окна Claim (ISO) → aware datetime; битый/нет — None.
+
+    Битый opened_at окно чинит по-своему (settle перезапускает таймер), поэтому
+    здесь просто не считаем дедлайн прошедшим.
+    """
+    if window is None:
+        return None
+    try:
+        opened_at = datetime.fromisoformat(str(window.get("opened_at") or ""))
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=UTC)
+        return opened_at
+    except (ValueError, TypeError):
+        return None
+
+
+def _claim_deadline_passed(opened_at: datetime | None, claim_window_hours: int) -> bool:
+    """Дедлайн Claim: opened_at + claim_window_hours; без opened_at/часов — не наступил."""
+    if opened_at is None or claim_window_hours <= 0:
+        return False
+    return (datetime.now(UTC) - opened_at).total_seconds() >= claim_window_hours * 3600
+
+
+def _claim_confirm_text(kind: str, period: str) -> str:
+    """Текст подтверждения претензии: при равенстве верных путей и ставок Gram
+    заявившийся позже (или не заявившийся вовсе) выше молчаливого соперника."""
+    human = human_claim_period(kind, period)
+    if kind == "week":
+        return (
+            f"Заявка на копилку недели ({human}) принята: при равенстве верных "
+            "путей и ставок Gram ты выше тех, кто заявился позже (или не заявился вовсе)."
+        )
+    return (
+        f"Заявка на копилку месяца ({human}) принята: при равенстве верных "
+        "путей и ставок Gram ты выше тех, кто заявился позже (или не заявился вовсе)."
+    )
+
+
+def _claim_already_answered() -> str:
+    """Ответ на повторную/неудачную запись претензии: место уже учтено."""
+    return "Место уже заявлено: твоя претензия учтена (раньше — выше)."
+
+
 async def _on_claim(callback: CallbackQuery, kind: str) -> None:
     """Претензия на место лидерборда: решает ничьи по времени Claim.
 
@@ -286,12 +347,9 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
     if callback.from_user is None:
         await callback.answer()
         return
-    from app.leaderboard import _load_claim_window
 
     async with SessionLocal() as session:
-        window = await _load_claim_window(session, kind)
-        tied_players = list(window.get("players") or []) if window else []
-        period = (window.get("period") or "") if window else ""
+        window, tied_players, period = await _claim_window_state(session, kind)
         player = await upsert_player(session, callback.from_user)
         if not period or not tied_players or player.id not in tied_players:
             await callback.answer(
@@ -300,22 +358,8 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
                 show_alert=True,
             )
             return
-        # Дедлайн, как его считает settle: после opened_at + claim_window_hours
-        # заявки закрыты — поздняя претензия не должна перестоять молчаливого
-        # соперника. Битый opened_at окно чинит по-своему (settle перезапускает
-        # таймер), поэтому здесь просто не считаем дедлайн прошедшим.
-        try:
-            opened_at = datetime.fromisoformat((window or {}).get("opened_at", ""))
-            if opened_at.tzinfo is None:
-                opened_at = opened_at.replace(tzinfo=UTC)
-        except (ValueError, TypeError):
-            opened_at = None
-        now = datetime.now(UTC)
-        if (
-            opened_at is not None
-            and settings.claim_window_hours > 0
-            and (now - opened_at).total_seconds() >= settings.claim_window_hours * 3600
-        ):
+        opened_at = _claim_opened_at(window)
+        if _claim_deadline_passed(opened_at, settings.claim_window_hours):
             await callback.answer(
                 f"Заявки закрыты: дедлайн {settings.claim_window_hours}ч прошёл — "
                 "приз решится по заявкам, поданным вовремя.",
@@ -327,14 +371,7 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
                 "Сначала привяжи кошелёк — без него приз не уйдёт.", show_alert=True
             )
             return
-        human = human_claim_period(kind, period)
-        confirm = (
-            f"Заявка на копилку недели ({human}) принята: при равенстве верных "
-            "путей и ставок Gram ты выше тех, кто заявился позже (или не заявился вовсе)."
-            if kind == "week"
-            else f"Заявка на копилку месяца ({human}) принята: при равенстве верных "
-            "путей и ставок Gram ты выше тех, кто заявился позже (или не заявился вовсе)."
-        )
+        confirm = _claim_confirm_text(kind, period)
         existing = await session.scalar(
             select(LeaderboardClaim.id).where(
                 LeaderboardClaim.player_id == player.id,
@@ -343,10 +380,7 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
             )
         )
         if existing is not None:
-            await callback.answer(
-                "Место уже заявлено: твоя претензия учтена (раньше — выше).",
-                show_alert=True,
-            )
+            await callback.answer(_claim_already_answered(), show_alert=True)
             return
         session.add(
             LeaderboardClaim(
@@ -360,10 +394,7 @@ async def _on_claim(callback: CallbackQuery, kind: str) -> None:
             await session.commit()
         except IntegrityError:
             await session.rollback()
-            await callback.answer(
-                "Место уже заявлено: твоя претензия учтена (раньше — выше).",
-                show_alert=True,
-            )
+            await callback.answer(_claim_already_answered(), show_alert=True)
             return
     await callback.answer(confirm, show_alert=True)
 
