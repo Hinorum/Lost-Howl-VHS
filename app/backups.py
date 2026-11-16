@@ -120,41 +120,60 @@ def _restrict_owner_only(path: Path, mode: int) -> None:
         logger.warning("Не удалось сузить права %s до %o", path, mode, exc_info=True)
 
 
+def _sqlite_copy(source: Path, dest: Path) -> None:
+    # Живая БД в этот момент пишется тиком: без timeout при заблокированной
+    # базе копия вылетала бы «database is locked». 30с — запас на всплеск.
+    src_conn = sqlite3.connect(str(source), timeout=30.0)
+    try:
+        dst_conn = sqlite3.connect(str(dest), timeout=30.0)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+    finally:
+        src_conn.close()
+
+
+async def _pg_backup(directory: Path, stamp: str) -> Path | None:
+    """pg_dump в custom-формате: сжатый, восстанавливается pg_restore.
+
+    DSN отдаётся как есть, кроме пароля (см. _pg_env): libpq понимает
+    postgres:// и параметры провайдера, sslmode и прочие вычищать не нужно.
+    Возвращает путь к дампу; None — pg_dump нет в окружении (бэкап пропущен).
+    """
+    if shutil.which("pg_dump") is None:
+        logger.warning(
+            "pg_dump не найден в окружении — бэкап Postgres пропущен. "
+            "Включи снапшоты провайдера (Neon) или поставь postgresql-client."
+        )
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    dest = directory / f"backup-{stamp}.dump"
+    await asyncio.to_thread(_pg_dump_sync, dest)
+    return dest
+
+
+async def _sqlite_backup(directory: Path, source: Path, stamp: str) -> Path:
+    """Снимок SQLite через штатный backup-API: консистентен при живых записях."""
+    directory.mkdir(parents=True, exist_ok=True)
+    dest = directory / f"backup-{stamp}.db"
+    await asyncio.to_thread(_sqlite_copy, source, dest)
+    return dest
+
+
 async def backup_now(keep: int = KEEP) -> Path | None:
     """Создаёт копию БД (SQLite или Postgres через pg_dump) и подрезает хвост."""
     directory = Path("data") / "backups"
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
     if is_postgres():
-        if shutil.which("pg_dump") is None:
-            logger.warning(
-                "pg_dump не найден в окружении — бэкап Postgres пропущен. "
-                "Включи снапшоты провайдера (Neon) или поставь postgresql-client."
-            )
+        dest = await _pg_backup(directory, stamp)
+        if dest is None:
             return None
-        directory.mkdir(parents=True, exist_ok=True)
-        dest = directory / f"backup-{stamp}.dump"
-        await asyncio.to_thread(_pg_dump_sync, dest)
     else:
         source = sqlite_file_path()
         if source is None or not source.exists():
             return None
-        directory.mkdir(parents=True, exist_ok=True)
-        dest = directory / f"backup-{stamp}.db"
-
-        def _sqlite_copy() -> None:
-            # Живая БД в этот момент пишется тиком: без timeout при заблокированной
-            # базе копия вылетала бы «database is locked». 30с — запас на всплеск.
-            src_conn = sqlite3.connect(str(source), timeout=30.0)
-            try:
-                dst_conn = sqlite3.connect(str(dest), timeout=30.0)
-                try:
-                    src_conn.backup(dst_conn)
-                finally:
-                    dst_conn.close()
-            finally:
-                src_conn.close()
-
-        await asyncio.to_thread(_sqlite_copy)
+        dest = await _sqlite_backup(directory, source, stamp)
     # Сужение прав после создания файла: каталог — 700, сам дамп — 600.
     _restrict_owner_only(directory, 0o700)
     _restrict_owner_only(dest, 0o600)
