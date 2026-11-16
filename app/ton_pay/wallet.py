@@ -202,6 +202,104 @@ def notify_liteserver_ok() -> None:
     state._liteserver_down_streak = 0
 
 
+def _wallet_mnemonic_parts() -> tuple[bytes, bytes, int]:
+    """Мнемоника казначея → (private_key, public_key, network_global_id).
+
+    Слова нормализуются (переносы → пробелы); мнемоника должна быть не пустой
+    и содержать минимум 12 слов (реальные — 24). Ключи генерируются ДО
+    подключения к сети: неполная мнемоника не доходит до крипто-математики и
+    не даёт «мутных» ошибок сети.
+    """
+    words = settings.active_treasury_mnemonic.replace("\n", " ").split()
+    if len(words) < 12:
+        raise ValueError("Мнемоника казначея неполная (нужно 24 слова)")
+    from pytoniq_core.crypto.keys import mnemonic_to_private_key, private_key_to_public_key
+
+    _, private_key = mnemonic_to_private_key(words)
+    public_key = private_key_to_public_key(private_key)
+    return private_key, public_key, NETWORK_GLOBAL_IDS[settings.active_network]
+
+
+def _resolve_treasury_version(
+    network_global_id: int,
+    public_key: bytes,
+    treasury_address: str,
+    requested_version: str,
+) -> str:
+    """Версия контракта казначея: явная из настроек либо авто-детект по адресу.
+
+    Явная версия должна быть среди поддерживаемых (WALLET_VERSIONS) и её
+    производный адрес — совпадать с настроенным. Несовпадение досаждает до
+    выхода в сеть и падает с внятной ошибкой: отправлять в кошелёк с чужой
+    парой мнемоника/адрес нельзя в принципе. Авто — детект по адресу казначея
+    среди поддерживаемых версий; если ни одна не подошла, ошибка несёт кандидаты
+    — так расхождение мнемоники и адреса видно сразу.
+    """
+    version = requested_version.strip().lower()
+    if version in WALLET_VERSIONS:
+        derived = wallet_address(version, public_key, network_global_id)
+        if normalize_address(derived) != normalize_address(treasury_address):
+            raise ValueError(
+                f"Адрес казначея не совпадает с производным от мнемоники "
+                f"(TREASURY_WALLET_VERSION={version}): {derived}. "
+                "Проверь пару мнемоника/адрес или верни auto."
+            )
+        return version
+    detected, candidates = detect_wallet_version(public_key, treasury_address, network_global_id)
+    if detected is None:
+        raise ValueError(
+            "Адрес казначея не совпадает ни с одной поддерживаемой версией "
+            f"кошелька для этой мнемоники: {candidates}. Проверь адрес и "
+            "мнемонику, либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
+        )
+    return detected
+
+
+async def _start_treasury_provider(
+    state,
+    network: str,
+    version: str,
+    private_key: bytes,
+    network_global_id: int,
+):
+    """Поднимает свежий лайтсерверный провайдер и строит кошелёк казначея.
+
+    Закрывает старый провайдер (если кошелёк уже был построен), затем поднимает
+    свежий из LITESERVER_CONFIG_URL (fallback: встроенный конфиг pytoniq для
+    сети) и создаёт кошелёк контракта version (v5r1/v4r2) по private_key.
+    Готовый wallet возвращается вызывающему; сетевые флаги состояния
+    (state._provider / state._wallet) здесь же обновляются.
+    """
+    from pytoniq import LiteBalancer
+    from pytoniq.contract.wallets.wallet import WalletV4R2
+    from pytoniq.contract.wallets.wallet_v5 import WalletV5R1
+
+    if state._provider is not None:
+        try:
+            await state._provider.close_all()
+        except Exception:
+            logger.warning("Не удалось закрыть старый провайдер лайтсерверов", exc_info=True)
+        state._provider = None
+        state._wallet = None
+    if settings.liteserver_config_url:
+        config = await fetch_remote_json(settings.liteserver_config_url)
+        state._provider = LiteBalancer.from_config(config)
+        logger.info("Лайтсерверы: конфиг из LITESERVER_CONFIG_URL")
+    elif network == "testnet":
+        state._provider = LiteBalancer.from_testnet_config()
+    else:
+        state._provider = LiteBalancer.from_mainnet_config()
+    await state._provider.start_up()
+    if version == "v5r1":
+        wallet = await WalletV5R1.from_private_key(
+            state._provider, private_key=private_key, wc=0, network_global_id=network_global_id
+        )
+    else:
+        wallet = await WalletV4R2.from_private_key(state._provider, private_key, wc=0)
+    state._wallet = wallet
+    return wallet
+
+
 async def get_wallet():
     """Ленивая инициализация кошелька казначея для активной сети.
 
@@ -233,63 +331,18 @@ async def get_wallet():
             raise ValueError("Нет мнемоники казначея для активной сети")
         if not settings.active_treasury_address:
             raise ValueError("Нет адреса казначея для активной сети")
-        words = settings.active_treasury_mnemonic.replace("\n", " ").split()
-        if len(words) < 12:
-            raise ValueError("Мнемоника казначея неполная (нужно 24 слова)")
+        private_key, public_key, network_global_id = _wallet_mnemonic_parts()
+        version = _resolve_treasury_version(
+            network_global_id,
+            public_key,
+            settings.active_treasury_address,
+            settings.treasury_wallet_version,
+        )
 
-        from pytoniq import LiteBalancer
-        from pytoniq.contract.wallets.wallet import WalletV4R2
-        from pytoniq.contract.wallets.wallet_v5 import WalletV5R1
-        from pytoniq_core.crypto.keys import mnemonic_to_private_key, private_key_to_public_key
-
-        _, private_key = mnemonic_to_private_key(words)
-        public_key = private_key_to_public_key(private_key)
-        network_global_id = NETWORK_GLOBAL_IDS[network]
-
-        requested = settings.treasury_wallet_version.strip().lower()
-        if requested in WALLET_VERSIONS:
-            derived = wallet_address(requested, public_key, network_global_id)
-            if normalize_address(derived) != normalize_address(settings.active_treasury_address):
-                raise ValueError(
-                    f"Адрес казначея не совпадает с производным от мнемоники "
-                    f"(TREASURY_WALLET_VERSION={requested}): {derived}. "
-                    "Проверь пару мнемоника/адрес или верни auto."
-                )
-            version = requested
-        else:
-            detected, candidates = detect_wallet_version(
-                public_key, settings.active_treasury_address, network_global_id
-            )
-            if detected is None:
-                raise ValueError(
-                    "Адрес казначея не совпадает ни с одной поддерживаемой версией "
-                    f"кошелька для этой мнемоники: {candidates}. Проверь адрес и "
-                    "мнемонику, либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
-                )
-            version = detected
-
-        if state._provider is not None:
-            try:
-                await state._provider.close_all()
-            except Exception:
-                logger.warning("Не удалось закрыть старый провайдер лайтсерверов", exc_info=True)
-            state._provider = None
-            state._wallet = None
-        if settings.liteserver_config_url:
-            config = await fetch_remote_json(settings.liteserver_config_url)
-            state._provider = LiteBalancer.from_config(config)
-            logger.info("Лайтсерверы: конфиг из LITESERVER_CONFIG_URL")
-        elif network == "testnet":
-            state._provider = LiteBalancer.from_testnet_config()
-        else:
-            state._provider = LiteBalancer.from_mainnet_config()
-        await state._provider.start_up()
-        if version == "v5r1":
-            state._wallet = await WalletV5R1.from_private_key(
-                state._provider, private_key=private_key, wc=0, network_global_id=network_global_id
-            )
-        else:
-            state._wallet = await WalletV4R2.from_private_key(state._provider, private_key, wc=0)
+        wallet = await _start_treasury_provider(
+            state, network, version, private_key, network_global_id
+        )
+        state._wallet = wallet
         state._wallet_network = network
         logger.info("Кошелёк казначея готов (%s, контракт %s)", network, version)
         # Холодный старт: сверяем seqno, который отдают лайтсерверы, с тем же
