@@ -797,28 +797,54 @@ async def _deliver_day(
 
     False — пакет доставлен не полностью; вызывающий обязан считать это промахом.
     """
-    outgoing_results: str | None = None
-    if finished is not None:
-        if results_text is None:
-            results_text = await results_body(finished)
-        outgoing_results = results_text or None
+    if not await _deliver_results(bot, chat_id, finished, results_text):
+        return False
+    if await _deliver_status(bot, chat_id, round_row, is_dm=is_dm) is None:
+        return False
+    return True
 
-    # Медиа дня нет: build_day_post() всегда возвращал пустой список, поэтому
-    # ветки send_photo/send_media_group были недостижимы. Картинки вернутся
-    # вместе с реальной генерацией — тогда понадобится и send_media_group
-    # (Telegram принимает его только от двух вложений, см. историю 2dfc1a).
+
+async def _deliver_results(
+    bot: Bot,
+    chat_id: int,
+    finished: Round | None,
+    results_text: str | None,
+) -> bool:
+    """Итоги дня отправляются готовым текстом; пустой итог — это успех.
+
+    Возвращает False только если отправка итогов не удалась: финализация дня
+    обязана дойти до поста статуса, иначе день уйдёт в чат без истории.
+    """
+    if finished is None:
+        return True
+    if results_text is None:
+        results_text = await results_body(finished)
+    if not results_text:
+        return True
+    # Итоги дня — только текстом. Фото победившей ветки не постим: это был
+    # дубль обложки нового дня, а вечерний костёр уже дал отдельный кадр.
+    return (await _send_once(bot, chat_id, results_text, "Итоги дня")) is not None
+
+
+async def _deliver_status(
+    bot: Bot,
+    chat_id: int,
+    round_row: Round,
+    *,
+    is_dm: bool,
+) -> object | None:
+    """Пост дня (статус + карты) с запоминанием точки доставки. None — не доставлено.
+
+    Медиа дня нет: build_day_post() всегда возвращал пустой список, поэтому
+    ветки send_photo/send_media_group были недостижимы. Картинки вернутся
+    вместе с реальной генерацией — тогда понадобится и send_media_group
+    (Telegram принимает его только от двух вложений, см. историю 2dfc1a).
+    """
     status_body = await status_text(round_row, show_title=True)
     markup = cards_keyboard(round_row.id, cards=round_row.cards)
-
-    if outgoing_results:
-        # Итоги дня — только текстом. Фото победившей ветки не постим: это был
-        # дубль обложки нового дня, а вечерний костёр уже дал отдельный кадр.
-        if await _send_once(bot, chat_id, outgoing_results, "Итоги дня") is None:
-            return False
-
     sent = await _send_once(bot, chat_id, status_body, "Пост дня", markup=markup)
     if sent is None:
-        return False
+        return None
     # Запоминаем, куда ушёл пост-статус дня: когда watcher подтвердит новые
     # ставки, refresh_day_bank отредактирует этот пост с актуальным банком —
     # без повторного /today. Точку доставки пишем защищённо: тесты и легаси
@@ -826,7 +852,7 @@ async def _deliver_day(
     msg_id = getattr(sent, "message_id", 0)
     if msg_id and isinstance(getattr(round_row, "id", None), int):
         await remember_day_post(round_row.id, chat_id, msg_id, is_dm=is_dm)
-    return True
+    return sent
 
 
 async def remember_day_post(round_id: int, chat_id: int, message_id: int, *, is_dm: bool) -> None:
