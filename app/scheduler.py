@@ -8,7 +8,7 @@ from typing import Any, cast
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.async_utils import spawn
 from app.broadcast import announce_audience_size, announce_day_diary, announce_new_day
 from app.config import settings
-from app.core.registry import LOCK_LOST_KEY
+from app.core.registry import ANNOUNCE_DELIVERED_PREFIX, LOCK_LOST_KEY
 from app.db import SessionLocal
 from app.models import RoundStatus, WatcherState
 from app.rounds import (
@@ -465,6 +465,15 @@ async def _retry_new_day_job() -> None:
                             Round.announced_at <= announce_claim_cutoff(),
                         ),
                         Round.opens_at >= catchup_cutoff(),
+                        # День с уже поставленным маркером доставлен: пере-отправлять
+                        # не нужно, даже если claim-метка (announced_at) к моменту
+                        # срабатывания окна уже «старше» announce_claim_timeout_seconds.
+                        ~exists(
+                            select(WatcherState.key).where(
+                                WatcherState.key
+                                == f"{ANNOUNCE_DELIVERED_PREFIX}{Round.day_index}"
+                            )
+                        ),
                     )
                     .order_by(Round.day_index.asc())
                     .limit(5)

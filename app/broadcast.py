@@ -20,7 +20,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import NO_VALUE
 
 from app.config import settings
-from app.core.registry import ANNOUNCE_EMPTY_DAY_KEY
+from app.core.registry import ANNOUNCE_DELIVERED_PREFIX, ANNOUNCE_EMPTY_DAY_KEY
 from app.db import SessionLocal
 from app.models import Chat, Round, RoundStatus, StatusPost, WatcherState
 from app.story.schema import FIELD_LIMITS
@@ -1113,6 +1113,32 @@ async def _mark_announce_empty(round_row: Round) -> None:
         )
 
 
+async def _mark_announce_delivered(day_index: int) -> None:
+    """Маркер «анонс дня доставлен игрокам».
+
+    Claim (announced_at) живёт окном announce_claim_timeout_seconds и после
+    успеха снимается только при ошибке вещателя (unclaim) или при пустой
+    аудитории. Доставленный день после окна claim от этого не должен
+    объявляться повторно: иначе retry-джоба воспринимает его как «брошенный
+    claim» и день уходит в чаты заново (у пользователя — каждые три часа,
+    ровно после истечения announce_claim_timeout_seconds).
+
+    Маркер пишется в телеметрии-стиле: сбой записи не роняет рассылку, он
+    лишь оставит claim живым — день будет пере-отправлен по окну, что
+    безопаснее дубля.
+    """
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    key = f"{ANNOUNCE_DELIVERED_PREFIX}{day_index}"
+    async with SessionLocal() as session:
+        row = await session.get(WatcherState, key)
+        if row is None:
+            row = WatcherState(key=key, value=str(day_index))
+        row.value = str(day_index)
+        await session.commit()
+
+
 async def _deliver_announcement_to_chat(
     bot: Bot,
     chat_id: int,
@@ -1231,6 +1257,11 @@ async def announce_new_day(
         bot, chat_ids, round_row, finished, results_text
     )
     await _deliver_personal_dms(bot, round_row, finished, results_text)
+    if delivered:
+        # Досылка прошла: ставим маркер, чтобы retry не объявлял день заново
+        # по истечении окна claim (там, где раньше начиналось «каждые три
+        # часа» — повторный пост уже доставленного дня).
+        await _mark_announce_delivered(round_row.day_index)
     return delivered
 
 
