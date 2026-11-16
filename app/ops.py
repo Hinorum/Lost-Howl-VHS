@@ -34,6 +34,7 @@ from app.core.registry import (
     ALERT_LOCAL_TIE_KEY,
     ALERT_LOCK_LOST_KEY,
     ALERT_MIRROR_KEY,
+    ALERT_OFFSITE_BACKUP_KEY,
     ALERT_PARSE_FAIL_KEY,
     ALERT_QUEUE_KEY,
     ALERT_REFUND_KEY,
@@ -49,6 +50,7 @@ from app.core.registry import (
     LOCAL_TIE_PREFIX,
     LOCK_LOST_KEY,
     MONEY_MODE_KEY,
+    OFFSITE_BACKUP_LAST_OK_KEY,
     OPS_ALERT_DIGEST_KEY,
     OPS_ALERT_TRACK_KEY,
     OPS_PROBLEMS_AT_KEY,
@@ -899,34 +901,61 @@ async def _check_fee_growth(session, bot) -> None:
     )
 
 
+async def _backup_age(session, key: str) -> tuple[float, datetime] | None:
+    """Возраст успешной отметки бэкапа и её момент; None — метки нет/битая."""
+    row = (
+        await session.execute(
+            select(WatcherState.value).where(WatcherState.key == key)
+        )
+    ).scalar_one_or_none()
+    if not row:
+        return None
+    try:
+        last_ok = datetime.fromisoformat(row)
+    except ValueError:
+        return None
+    if last_ok.tzinfo is None:
+        last_ok = last_ok.replace(tzinfo=UTC)
+    return (_now() - last_ok).total_seconds() / 3600, last_ok
+
+
 async def _check_backup_freshness(session, bot) -> None:
-    """Тревога: успешного бэкапа не было слишком долго.
+    """Тревоги: успешного бэкапа не было слишком долго — локального и офсайтового.
 
     Про бэкапы не знала ни одна проверка: если pg_dump ломался, крон промахивался
     (дефолт misfire_grace_time в секунду), контейнер пересоздался не вовремя или
     workflow на стороне CI отключился, узнать об этом было нельзя. Бэкап, о
     котором никто не знает, что он сломан, — это отсутствие бэкапа.
 
-    Отметку ставит только успешный backup_now, и только после проверки файла.
-    Неизвестно (отметки нет вовсе) считаем проблемой: свежий процесс без
-    отметки — это как раз случай «бэкап ни разу не удался».
+    Два независимых контура:
+      * локальный — отметку ставит backup_now после проверки файла; копии
+        лежат на эфемерном диске Render и не переживают деплой;
+      * офсайтовый — отметку ставит GitHub Actions db-backup после успешной
+        публикации зашифрованного артефакта. Бот не видит сам workflow, но
+        видит доказательство его успеха.
+
+    Проверки независимы сознательно: локальный диск и GitHub ломаются по
+    разным причинам, и свежая копия одного контура не должна скрывать смерть
+    другого. Неизвестно (отметки нет вовсе) считаем проблемой: свежий процесс
+    без отметки — это как раз случай «бэкап ни разу не удался».
     """
-    row = (
-        await session.execute(
-            select(WatcherState.value).where(WatcherState.key == BACKUP_LAST_OK_KEY)
+    local = await _backup_age(session, BACKUP_LAST_OK_KEY)
+    if local is None:
+        await _raise(
+            session,
+            bot,
+            ALERT_BACKUP_KEY,
+            "бэкап не подтверждён ни разу",
+            "⚠️ Успешного ЛОКАЛЬНОГО бэкапа БД не зафиксировано ни разу с "
+            "момента, как это стало проверяться. Либо джоба db-backup на "
+            "Render не отрабатывает, либо каждый запуск падает. Без бэкапа "
+            "восстановление после любой потери базы невозможно.\n"
+            "Разбор: /ops (возраст задач), логи планировщика, наличие "
+            "pg_dump в окружении.",
         )
-    ).scalar_one_or_none()
-    if row:
-        try:
-            last_ok = datetime.fromisoformat(row)
-        except ValueError:
-            last_ok = None
-        if last_ok is not None:
-            if last_ok.tzinfo is None:
-                last_ok = last_ok.replace(tzinfo=UTC)
-            age_h = (_now() - last_ok).total_seconds() / 3600
-            if age_h < _BACKUP_STALE_AFTER_HOURS:
-                return
+    else:
+        age_h, last_ok = local
+        if age_h >= _BACKUP_STALE_AFTER_HOURS:
             await _raise(
                 session,
                 bot,
@@ -934,34 +963,52 @@ async def _check_backup_freshness(session, bot) -> None:
                 f"нет успешного бэкапа {age_h:.0f} ч",
                 # _human_ts ждёт unix-время; раньше сюда передавали сам datetime,
                 # int() падал, и тревога честно врала «был ?» вместо даты.
-                f"⚠️ Последний успешный бэкап БД был {_human_ts(last_ok.timestamp())}, "
-                f"это {age_h:.0f} ч назад (порог {_BACKUP_STALE_AFTER_HOURS} ч).\n"
-                "Меряется ЛОКАЛЬНЫЙ pg_dump на Render (cron db-backup, в /ops — "
-                "возраст задач): копии на эфемерном диске не переживают деплой, "
+                f"⚠️ Последний успешный ЛОКАЛЬНЫЙ бэкап БД был "
+                f"{_human_ts(last_ok.timestamp())}, это {age_h:.0f} ч назад "
+                f"(порог {_BACKUP_STALE_AFTER_HOURS} ч).\n"
+                "Меряется pg_dump на Render (cron db-backup, в /ops — возраст "
+                "задач): копии на эфемерном диске не переживают деплой, "
                 "живёт только отметка в БД.\n"
-                "Реальная копия, переживающая деплой, — GitHub Actions → "
-                "db-backup (ежедневный зашифрованный дамп, хранится 30 суток). "
-                "Бот её не видит — её молчание тревогами не ловится: проверь "
-                "вкладку workflow, последний прогон должен быть зелёным.\n"
-                "Разбор локального контура: /ops (возраст задач cron db-backup), "
-                "логи планировщика, наличие pg_dump в окружении.",
+                "Разбор: /ops (возраст задач cron db-backup), логи "
+                "планировщика, наличие pg_dump в окружении.",
             )
-            return
-    await _raise(
-        session,
-        bot,
-        ALERT_BACKUP_KEY,
-        "бэкап не подтверждён ни разу",
-        "⚠️ Успешного бэкапа БД не зафиксировано ни разу с момента, как это "
-        "стало проверяться. Либо джоба db-backup не отрабатывает, либо каждый "
-        "запуск падает. Без бэкапа восстановление после любой потери базы "
-        "невозможно.\n"
-        "Разбор локального контура: /ops (возраст задач), логи планировщика, "
-        "наличие pg_dump в окружении.\n"
-        "Офсайтовая копия (GitHub Actions → db-backup, ежедневный зашифрованный "
-        "дамп на 30 суток) боту не видна: проверь вкладку workflow — последний "
-        "прогон должен быть зелёным.",
-    )
+
+    offsite = await _backup_age(session, OFFSITE_BACKUP_LAST_OK_KEY)
+    if offsite is None:
+        await _raise(
+            session,
+            bot,
+            ALERT_OFFSITE_BACKUP_KEY,
+            "офсайт-бэкап не подтверждён ни разу",
+            "⚠️ Успешного ОФСАЙТОВОГО бэкапа (GitHub Actions → db-backup) "
+            "не зафиксировано ни разу.\n"
+            "Копии на диске Render деплой не переживают; восстановление после "
+            "потери базы держится на ежедневном зашифрованном дампе в "
+            "артефактах GitHub (30 суток).\n"
+            "Проверь: Actions → db-backup — последний прогон должен быть "
+            "зелёным; секреты SUPABASE_URL и BACKUP_PASSPHRASE; расписание "
+            "workflow не отключено.\n"
+            "Если проверка включена только что, отметки ещё нет: дождись "
+            "ближайшего прогона (01:30 UTC) или запусти workflow вручную.",
+        )
+    else:
+        age_h, last_ok = offsite
+        if age_h >= _BACKUP_STALE_AFTER_HOURS:
+            await _raise(
+                session,
+                bot,
+                ALERT_OFFSITE_BACKUP_KEY,
+                f"нет офсайт-бэкапа {age_h:.0f} ч",
+                f"⚠️ Последний успешный ОФСАЙТОВЫЙ бэкап (GitHub Actions → "
+                f"db-backup) был {_human_ts(last_ok.timestamp())}, это "
+                f"{age_h:.0f} ч назад (порог "
+                f"{_BACKUP_STALE_AFTER_HOURS} ч).\n"
+                "Копии на диске Render деплой не переживают; живая копия — "
+                "зашифрованный артефакт GitHub (30 суток).\n"
+                "Проверь: Actions → db-backup — последний прогон должен быть "
+                "зелёным; секреты SUPABASE_URL и BACKUP_PASSPHRASE; расписание "
+                "workflow не отключено.",
+            )
 
 
 def _detail(entries: list[tuple[str, dict]]) -> list[dict]:

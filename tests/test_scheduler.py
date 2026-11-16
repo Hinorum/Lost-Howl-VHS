@@ -1602,7 +1602,7 @@ async def test_boot_maintenance_runs_backup(monkeypatch) -> None:
 
 async def test_cleanup_watcher_state_removes_stale_keeps_live() -> None:
     from app import scheduler as sched
-    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.core.registry import BACKUP_LAST_OK_KEY, OFFSITE_BACKUP_LAST_OK_KEY
     from app.models import WatcherState
 
     async with SessionLocal() as db:
@@ -1618,14 +1618,16 @@ async def test_cleanup_watcher_state_removes_stale_keeps_live() -> None:
     # Убираются только маркеры дедупа, которые действительно пишутся
     # (ton_watch/refunds.py и ton_watch/ledger.py).
     #
-    # Остальное остаётся: потоковые якоря, отметка последнего бэкапа и свежий
-    # бит тика (конфтест) — снести их значило бы поднять тревогу на ровном
-    # месте; pot:* — метка «копилка за этот день уже зачислена», её снос
-    # начислил бы копилку второй раз; teaser:* / img_stubs:* — бывшие префиксы
-    # снятого слоя, писателей у них нет, и чистить их нечего.
+    # Остальное остаётся: потоковые якоря, отметки локального и офсайтового
+    # бэкапа и свежий бит тика (конфтест) — снести их значило бы поднять
+    # тревогу на ровном месте; pot:* — метка «копилка за этот день уже
+    # зачислена», её снос начислил бы копилку второй раз; teaser:* /
+    # img_stubs:* — бывшие префиксы снятого слоя, писателей у них нет, и
+    # чистить их нечего.
     assert keys == {
         "run:anchor",
         BACKUP_LAST_OK_KEY,
+        OFFSITE_BACKUP_LAST_OK_KEY,
         "last_tick_iso",
         "pot:1",
         "teaser:5",

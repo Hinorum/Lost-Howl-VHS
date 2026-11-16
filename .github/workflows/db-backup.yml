@@ -109,3 +109,29 @@ jobs:
           # поведение нельзя — проверять надо на свежей загрузке.
           retention-days: 30
           if-no-files-found: error
+
+      # Отметка «офсайт-бэкап доставлен». Стоит ПОСЛЕ upload-artifact и
+      # выполняется только при его успехе (дефолтный if: success()): упавшая
+      # публикация не должна оставить доказательство живой копии. Значение
+      # читает app/ops.py (_check_backup_freshness) и поднимает отдельную
+      # тревогу, если отметка старше 26 ч или её нет вовсе. Запись идёт тем же
+      # DSN, что и pg_dump, — новых секретов не нужно.
+      - name: Record offsite heartbeat
+        if: success()
+        env:
+          PGURL: ${{ secrets.SUPABASE_URL }}
+        run: |
+          set -eu
+          dsn="${PGURL}"
+          case "${dsn}" in
+            *\?*) dsn="${dsn}&sslmode=verify-full&sslrootcert=$GITHUB_WORKSPACE/certs/supabase-root.pem" ;;
+            *)    dsn="${dsn}?sslmode=verify-full&sslrootcert=$GITHUB_WORKSPACE/certs/supabase-root.pem" ;;
+          esac
+          stamp="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+          /usr/lib/postgresql/17/bin/psql -X "${dsn}" -v ON_ERROR_STOP=1 \
+            -v stamp="${stamp}" <<'SQL'
+          INSERT INTO watcher_state (key, value, updated_at)
+          VALUES ('offsite_backup_last_ok_iso', :'stamp', now())
+          ON CONFLICT (key) DO UPDATE
+          SET value = EXCLUDED.value, updated_at = now();
+          SQL

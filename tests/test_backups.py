@@ -329,15 +329,13 @@ async def test_stale_backup_mark_raises_problem() -> None:
             await session.commit()
 
 
-async def test_backup_alarm_names_the_offsite_chain(monkeypatch) -> None:
-    """Тревога о бэкапах различает локальный pg_dump и GitHub-воркфлоу.
+async def test_local_backup_alarm_stays_on_the_local_chain(monkeypatch) -> None:
+    """Локальная тревога не отправляет разбираться в GitHub, если офсайт жив.
 
-    Оба называются db-backup, и текст тревоги вёл только в /ops — то есть к
-    локальному крону Render. Между тем локальные копии лежат на эфемерном
-    диске, а переживает деплой только цепочка GitHub Actions, которую бот не
-    видит вообще. Разбор, начатый по старому тексту, молча упирался в не ту
-    сторону: локальный бэкап был исправен, а офсайтовых копий не было двое
-    суток.
+    Оба контура называются db-backup, и раньше локальная тревога вела в /ops,
+    то есть к крону Render, даже когда копий не было в GitHub. Теперь контуры
+    разведены: локальная проверка говорит только о своём pg_dump, а офсайт
+    имеет собственную отметку и текст.
     """
     from app import ops
     from app.core.registry import ALERT_BACKUP_KEY, BACKUP_LAST_OK_KEY
@@ -366,26 +364,22 @@ async def test_backup_alarm_names_the_offsite_chain(monkeypatch) -> None:
 
         ops._problems_in_flight.clear()
         ops._problem_entry.clear()
-        await ops.check_anomalies(_Bot())
+        async with SessionLocal() as session:
+            await ops._check_backup_freshness(session, _Bot())
         joined = "\n".join(sent)
-        # Оба контура названы поимённо. Проверка на «есть слово GitHub» держалась
-        # бы на одной фразе и пропускала главное: что локальная джоба и офсайтовая
-        # разведены. Именно их разведение и было нужно — иначе «проверь джобу
-        # db-backup» отправляло в Render, где всё исправно.
+        assert "ЛОКАЛЬНЫЙ" in joined, joined
         assert "Render" in joined, joined
-        assert "GitHub Actions" in joined, joined
         assert "db-backup" in joined, joined
-        # Проверка на «BACKUP_PASSPHRASE» снята: секрет задан (05.10) и все
-        # прогоны workflow зелёные — упоминать его в тревоге значит посылать
-        # владельца настраивать уже настроенное. Держится разведение контуров:
-        # локальные копии деплой не переживает, живая копия — офсайтовая.
         assert "не переживают деплой" in joined, joined
+        assert "GitHub Actions" not in joined, joined
         # Дата в тревоге настоящая, а не «?»: раньше в _human_ts (форматер
         # unix-времени) передавали datetime, int() падал и тревога скрывала,
         # когда бэкап был.
         expect = datetime.fromisoformat(stale).astimezone().strftime("%d.%m %H:%M")
         assert f"был {expect}" in joined, joined
         assert "был ?" not in joined, joined
+        # Офсайт свежий (autouse-фикстура) — его проблема не поднимается.
+        assert not any("офсайт" in problem for problem in ops._problems_in_flight)
     finally:
         ops._problems_in_flight.clear()
         ops._problem_entry.clear()
@@ -396,6 +390,103 @@ async def test_backup_alarm_names_the_offsite_chain(monkeypatch) -> None:
                 )
             )
             await session.commit()
+
+
+async def test_stale_offsite_mark_raises_its_own_alarm(monkeypatch) -> None:
+    """Старая отметка GitHub-контура даёт тревогу про офсайт, а не про Render.
+
+    Это та самая дыра, которую закрывает heartbeat: workflow мог падать двое
+    суток, а бот молчал, потому что локальный pg_dump был исправен и его
+    отметка свежая. Теперь у офсайта своя отметка и свой текст с вкладкой
+    Actions и секретами.
+    """
+    from app import ops
+    from app.core.registry import (
+        ALERT_OFFSITE_BACKUP_KEY,
+        OFFSITE_BACKUP_LAST_OK_KEY,
+    )
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    monkeypatch.setattr(ops.settings, "admin_ids", "42")
+    stale = (datetime.now(UTC) - timedelta(hours=40)).isoformat()
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(
+                WatcherState.key.in_(
+                    [OFFSITE_BACKUP_LAST_OK_KEY, ALERT_OFFSITE_BACKUP_KEY]
+                )
+            )
+        )
+        session.add(WatcherState(key=OFFSITE_BACKUP_LAST_OK_KEY, value=stale))
+        await session.commit()
+    try:
+        sent: list[str] = []
+
+        class _Bot:
+            async def send_message(self, chat_id: int, text: str) -> None:
+                sent.append(text)
+
+        ops._problems_in_flight.clear()
+        ops._problem_entry.clear()
+        async with SessionLocal() as session:
+            await ops._check_backup_freshness(session, _Bot())
+        joined = "\n".join(sent)
+        assert "ОФСАЙТОВЫЙ" in joined, joined
+        assert "GitHub Actions" in joined, joined
+        assert "db-backup" in joined, joined
+        assert "деплой не переживают" in joined, joined
+        expect = datetime.fromisoformat(stale).astimezone().strftime("%d.%m %H:%M")
+        assert f"был {expect}" in joined, joined
+        assert "был ?" not in joined, joined
+        assert any("офсайт-бэкап" in problem for problem in ops._problems_in_flight)
+        # Локальная отметка свежая (autouse-фикстура) — локальной тревоги нет.
+        assert not any(
+            "нет успешного бэкапа" in problem
+            for problem in ops._problems_in_flight
+        )
+    finally:
+        ops._problems_in_flight.clear()
+        ops._problem_entry.clear()
+        async with SessionLocal() as session:
+            await session.execute(
+                WatcherState.__table__.delete().where(
+                    WatcherState.key.in_(
+                        [OFFSITE_BACKUP_LAST_OK_KEY, ALERT_OFFSITE_BACKUP_KEY]
+                    )
+                )
+            )
+            await session.commit()
+
+
+async def test_never_offsite_backed_up_is_reported() -> None:
+    """Нет отметки GitHub-контура вовсе — проблема, даже если локальный жив.
+
+    Свежий деплой мог ни разу не запустить workflow; молчание не должно
+    выглядеть как «офсайт в порядке».
+    """
+    from app import ops
+    from app.core.registry import OFFSITE_BACKUP_LAST_OK_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    async with SessionLocal() as session:
+        await session.execute(
+            WatcherState.__table__.delete().where(
+                WatcherState.key == OFFSITE_BACKUP_LAST_OK_KEY
+            )
+        )
+        await session.commit()
+
+    ops._problems_in_flight.clear()
+    ops._problem_entry.clear()
+    async with SessionLocal() as session:
+        await ops._check_backup_freshness(session, None)
+
+    assert any(
+        "офсайт-бэкап не подтверждён" in problem
+        for problem in ops._problems_in_flight
+    ), ops._problems_in_flight
 
 
 async def test_fresh_backup_mark_is_quiet() -> None:

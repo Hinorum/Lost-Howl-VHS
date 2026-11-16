@@ -449,15 +449,15 @@ async def _clean_watcher_state_between_tests():
     в том же модуле налетает на IntegrityError. Чистим таблицу в начале
     каждого теста (дёшево: таблица мелкая).
 
-    Заодно ставим свежую отметку последнего бэкапа и свежий бит тика:
-    проверка свежести бэкапа и тревога «никогда не тикал» входят в
-    check_anomalies, поэтому «проблем нет» требует, чтобы бэкап был, а
+    Заодно ставим свежие отметки локального и офсайтового бэкапа и свежий
+    бит тика: проверка свежести бэкапа и тревога «никогда не тикал» входят в
+    check_anomalies, поэтому «проблем нет» требует, чтобы обе копии были, а
     планировщик считался работающим. Тесты, которые проверяют сами эти
     тревоги, отметки убирают явно (test_backups.py, test_tick_heartbeat.py).
     """
     from sqlalchemy import delete
 
-    from app.core.registry import BACKUP_LAST_OK_KEY
+    from app.core.registry import BACKUP_LAST_OK_KEY, OFFSITE_BACKUP_LAST_OK_KEY
     from app.db import SessionLocal
     from app.models import WatcherState
     from app.ops import TICK_KEY
@@ -466,6 +466,10 @@ async def _clean_watcher_state_between_tests():
     async with SessionLocal() as db:
         await db.execute(delete(WatcherState))
         db.add(WatcherState(key=BACKUP_LAST_OK_KEY, value=now_iso))
+        # Второй контур (GitHub Actions db-backup) проверяется отдельной
+        # отметкой: без неё «проблем нет» невозможно даже там, где локальный
+        # бэкап исправен.
+        db.add(WatcherState(key=OFFSITE_BACKUP_LAST_OK_KEY, value=now_iso))
         db.add(WatcherState(key=TICK_KEY, value=now_iso))
         await db.commit()
     yield

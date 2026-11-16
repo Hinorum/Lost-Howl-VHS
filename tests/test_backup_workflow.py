@@ -1,8 +1,10 @@
 """db-backup.yml — единственный контур копий, переживающих деплой.
 
 Рвётся он тихо: воркфлоу может падать два дня подряд, а бот об этом не знает
-(ALERT_BACKUP_KEY смотрит только на локальный pg_dump в контейнере Render).
-Поэтому инварианты шагов проверяются здесь, а не в момент инцидента.
+(локальный ALERT_BACKUP_KEY смотрит только на pg_dump в контейнере Render).
+Поэтому инварианты шагов проверяются здесь, а не в момент инцидента, а после
+успешной публикации артефакта workflow пишет heartbeat-отметку в
+watcher_state: по ней app/ops.py ведёт отдельную тревогу.
 
 Инвариант, который здесь защищается: **сырой дамп удаляется только ПОСЛЕ
 шифрования**. Раньше `rm -f backup-*.dump` стоял в шаге `pg_dump`, сразу после
@@ -81,3 +83,38 @@ def test_artifact_carries_only_ciphertext() -> None:
     )
     assert upload["with"]["path"].strip() == "backup-*.enc"
     assert upload["with"]["if-no-files-found"] == "error"
+
+
+def test_offsite_heartbeat_is_recorded_only_after_upload() -> None:
+    """Отметку офсайта ставит только успешная публикация артефакта.
+
+    Если записать heartbeat раньше upload-artifact (или при его падении),
+    бот будет считать контур живым, хотя копии нет. Поэтому шаг стоит после
+    upload и явно ограничен success().
+    """
+    steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["dump"]["steps"]
+    upload_at = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses", "").startswith("actions/upload-artifact")
+    )
+    heartbeat_at = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Record offsite heartbeat"
+    )
+    assert heartbeat_at > upload_at, "отметка офсайта ставится до публикации артефакта"
+
+    heartbeat = steps[heartbeat_at]
+    assert heartbeat["if"] == "success()"
+    assert heartbeat["env"]["PGURL"].startswith("${{ secrets.")
+    script = _code(heartbeat["run"])
+    # Отметка должна попасть именно туда, куда смотрит app/ops.py.
+    assert "offsite_backup_last_ok_iso" in script
+    assert "watcher_state" in script
+    assert "ON CONFLICT (key) DO UPDATE" in script
+    # Время — UTC в ISO-формате: его парсит datetime.fromisoformat в ops.
+    assert "date -u" in script
+    # Сбой записи обязан валить прогон, а не оставлять старую отметку молча.
+    assert "ON_ERROR_STOP=1" in script
+    assert "psql" in script
