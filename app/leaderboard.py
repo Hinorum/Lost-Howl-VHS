@@ -1097,7 +1097,7 @@ async def _resolve_week_winners(
 ) -> tuple[list[tuple[str, str, int]], list[tuple[int, int]], int, int] | None:
     """Выбирает места недельной копилки и формирует выплаты.
 
-    Возвращает ``(paid, awards, rolled)`` либо ``None`` — если с выплатой
+    Возвращает ``(paid, awards, rolled, fee_nano)`` либо ``None`` — если с выплатой
     ничего не сделать (логи внутри; метку двигать нельзя, копилка ждёт).
 
     Места — три сильнейших игрока по (верные пути, вклад Gram, Claim, player_id),
@@ -1108,8 +1108,6 @@ async def _resolve_week_winners(
     сортировке — иначе roll-over теряет их и переоткрывает окно уже под
     периодом B с новым таймером.
     """
-    rows = await _rank_window(session, period_start, period_end, by="opens_at", limit=50)
-    staked = await _players_with_stake(session, period_start, period_end, by="opens_at")
     claim_weeks: list[str] = []
     cursor = period_start
     while cursor < period_end:
@@ -1120,15 +1118,7 @@ async def _resolve_week_winners(
         if settings.leaderboard_claim_enabled
         else {}
     )
-    candidates: list[tuple[int, int, int, str]] = []
-    for pid, correct, days, gram in rows:
-        if correct <= 0 or days < min_days or pid not in staked:
-            continue
-        player = await session.get(Player, pid)
-        if player is None or not player.wallet_address or not player.wallet_verified:
-            continue
-        candidates.append((pid, correct, gram, player.wallet_address))
-    ordered = _order_by_ties(candidates, claims)
+    ordered = await _week_candidates(session, period_start, period_end, min_days, claims)
     places = ordered[:3]
     if not places:
         logger.warning(
@@ -1143,13 +1133,62 @@ async def _resolve_week_winners(
         session, bot, "week", prev_key, ordered, top_k=3, claims=claims, now=now
     ):
         return None
+    paid, awards, rolled, fee_nano = await _week_payouts(session, places, total)
+    return paid, awards, rolled, fee_nano
+
+
+async def _week_candidates(
+    session: AsyncSession,
+    period_start: datetime,
+    period_end: datetime,
+    min_days: int,
+    claims: dict[int, datetime],
+) -> list[tuple[int, int, int, str]]:
+    """Кандидаты на места недели: топ-3 сильнейших игроков с подтверждённым кошельком.
+
+    Места — три сильнейших игрока по (верные пути, вклад Gram, Claim, player_id),
+    а не ступени счёта: внутри места приз не делится. Претензии за поглощённый
+    период — как claim_months в месяце: если settle недели A откладывался
+    (открытое окно Claim, даунтайм), в понедельник недели B горш A+B считается
+    заново и заявки недели A обязаны участвовать в сортировке — иначе roll-over
+    теряет их и переоткрывает окно уже под периодом B с новым таймером.
+
+    Возвращает отсортированные кандидаты (player_id, верных, вклад Gram, wallet):
+    место — позиция в списке, остаток — для roll-over в копилку следующей недели.
+    """
+    rows = await _rank_window(session, period_start, period_end, by="opens_at", limit=50)
+    staked = await _players_with_stake(session, period_start, period_end, by="opens_at")
+    candidates: list[tuple[int, int, int, str]] = []
+    for pid, correct, days, gram in rows:
+        if correct <= 0 or days < min_days or pid not in staked:
+            continue
+        player = await session.get(Player, pid)
+        if player is None or not player.wallet_address or not player.wallet_verified:
+            continue
+        candidates.append((pid, correct, gram, player.wallet_address))
+    return _order_by_ties(candidates, claims)
+
+
+async def _week_payouts(
+    session: AsyncSession,
+    places: list[tuple[int, int, int, str]],
+    total: int,
+) -> tuple[list[tuple[str, str, int]], list[tuple[int, int]], int, int]:
+    """Формирует выплаты за призовые места недели.
+
+    Возвращает (paid, awards, rolled, fee_nano): paid — (медаль, описание, сумма)
+    по местам, ушедшим в payout; awards — (player_id, net) для казны; rolled — сумма,
+    перенесённая в копилку следующей недели (меньше порога или чистый ноль).
+    """
     amounts, rolled = _week_prize_amounts(total, len(places))
     min_payout_nano = to_nano(settings.min_payout_gram)
     fee_nano = await fee_estimate_nano(session)
     network = _active_network()
     paid: list[tuple[str, str, int]] = []
     awards: list[tuple[int, int]] = []
-    for place, ((pid, correct, _gram, wallet), amount) in enumerate(zip(places, amounts, strict=True), 1):
+    for place, ((pid, correct, _gram, wallet), amount) in enumerate(
+        zip(places, amounts, strict=True), 1
+    ):
         if amount < min_payout_nano:
             rolled += amount
             continue
