@@ -17,6 +17,12 @@
 Третью мы долго не сверяли, а именно её оператор копирует в `.env` при
 первом развороте — расхождение там тише всех остальных и доживает до
 боевого деплоя, потому что цифра уже не отличается от задуманной.
+
+Есть и второй класс ключей — боевые тумблеры: их живое значение держится в
+дашборде Render, а манифест объявляет только `sync: false`. Для них
+проверяем не равенство с манифестом (значения там нет), а то, что Blueprint
+Sync не перезапишет живое состояние, и что дефолт в `.env.example` совпадает
+с кодом.
 """
 
 from __future__ import annotations
@@ -43,7 +49,9 @@ NON_SETTING_KEYS = {
     "PYTHON_VERSION",
 }
 
-# Рычаги, которые render.yaml объявляет «те же, что в app/config.py».
+# Рычаги, у которых значение обязано приходить из манифеста: оно должно
+# совпадать с дефолтом в коде, иначе прод живёт не тем числом, которое видит
+# оператор.
 MONEY_LEVERS = (
     ("PAYOUT_FEE_GRAM", "payout_fee_gram"),
     ("MIN_PAYOUT_GRAM", "min_payout_gram"),
@@ -57,48 +65,54 @@ MONEY_LEVERS = (
     # потому, что этих строк здесь не было.
     ("WEEKLY_MIN_DAYS", "weekly_min_days"),
     ("LEADERBOARD_CORRECT_CAP", "leaderboard_correct_cap"),
-    # Флаг пачки v5r1 — не сумма, а выключатель денежного пути: расхождение
-    # «в render.yaml true, в коде false» — та же тихая дивергенция копий,
-    # ради которой этот тест и существует.
-    ("PAYOUT_V5_BATCH", "payout_v5_batch"),
-    # Второй вещатель HTTP-канала — тоже выключатель денежного пути: при
-    # «render.yaml true, код false» отказавший Toncenter не будет продублирован
-    # через TonAPI, и выплаты встанут там, где задумано было не вставать.
-    ("HTTP_TONAPI_FALLBACK", "http_tonapi_fallback"),
-    # Пересборка пула лайтсерверов по серии сбоев: включена в Render, но
-    # выключена в коде — «больное окно» лайтсерверов останется вечным, а
-    # оператор будет думать, что лечение уже включено.
-    ("TON_PROVIDER_REBUILD", "ton_provider_rebuild"),
-    # Границы ставки и тай-брейк ничьей — тоже денежные рычаги: минимум
-    # определяет, что вообще станет ставкой, потолок — что не станет, а
-    # tie_break_by_votes меняет, кто получит банк при равных суммах.
+    # Минимум ставки определяет, что вообще станет ставкой.
     ("STAKE_MIN_TON", "stake_min_ton"),
+)
+
+# Боевые тумблеры: живое значение держится в дашборде Render, а не в
+# манифесте. Blueprint Sync обязан их не трогать — иначе синк после
+# экстренного стопа (TON_ENABLED=false) или включения в бою молча вернул бы
+# нейтральный дефолт из репозитория. Render не принимает `value` и `sync`
+# одновременно, поэтому у этих ключей нет value: дефолт живёт в
+# app/config.py и .env.example.
+LIVE_TOGGLES = (
+    ("TON_ENABLED", "ton_enabled"),
+    # Флаг пачки v5r1 — выключатель денежного пути: в бою включался true.
+    ("PAYOUT_V5_BATCH", "payout_v5_batch"),
+    # Второй вещатель HTTP-канала: при отказе Toncenter выплаты держатся
+    # только на нём.
+    ("HTTP_TONAPI_FALLBACK", "http_tonapi_fallback"),
+    # Пересборка пула лайтсерверов по серии сбоев: без неё «больное окно»
+    # лайтсерверов может остаться вечным.
+    ("TON_PROVIDER_REBUILD", "ton_provider_rebuild"),
+    # Потолок одной ставки: число выбирает хранитель в дашборде.
     ("STAKE_MAX_TON", "stake_max_ton"),
+    # Тай-брейк ничьей меняет, кто получит банк при равных суммах.
     ("TIE_BREAK_BY_VOTES", "tie_break_by_votes"),
 )
 
 
-def _manifest_values() -> dict[str, str]:
+def _manifest_entries() -> list[dict]:
     data = yaml.safe_load(RENDER_YAML.read_text(encoding="utf-8"))
-    values: dict[str, str] = {}
-    for service in data.get("services", []):
-        for entry in service.get("envVars", []):
-            key = entry.get("key")
-            if key is not None and entry.get("value") is not None:
-                values[key] = str(entry["value"])
-    return values
+    return [
+        entry
+        for service in data.get("services", [])
+        for entry in service.get("envVars", []) or []
+    ]
+
+
+def _manifest_values() -> dict[str, str]:
+    """KEY=VALUE только для записей, где значение реально задано в манифесте."""
+    return {
+        str(entry["key"]): str(entry["value"])
+        for entry in _manifest_entries()
+        if entry.get("key") is not None and entry.get("value") is not None
+    }
 
 
 def _manifest_keys() -> set[str]:
     """ВСЕ ключи render.yaml — включая те, у которых нет значения (sync: false)."""
-    data = yaml.safe_load(RENDER_YAML.read_text(encoding="utf-8"))
-    keys: set[str] = set()
-    for service in data.get("services", []):
-        for entry in service.get("envVars", []) or []:
-            key = entry.get("key")
-            if key:
-                keys.add(str(key))
-    return keys
+    return {str(entry["key"]) for entry in _manifest_entries() if entry.get("key")}
 
 
 def _env_example_keys() -> set[str]:
@@ -142,18 +156,62 @@ def test_money_lever_matches_code_default(env_key: str, field: str) -> None:
     _assert_matches_default(env_key, field, manifest[env_key], "в render.yaml")
 
 
-@pytest.mark.parametrize(("env_key", "field"), MONEY_LEVERS)
+@pytest.mark.parametrize(("env_key", "field"), (*MONEY_LEVERS, *LIVE_TOGGLES))
 def test_money_lever_matches_env_example(env_key: str, field: str) -> None:
-    """Третья копия рычагов — .env.example — обязана совпадать с кодом.
+    """Третья копия рычагов и тумблеров — .env.example — совпадает с кодом.
 
     Именно её оператор копирует в `.env` при первом развороте, и именно её
     никто раньше не сверял. Расхождение здесь тише остальных: числа в
     render.yaml перечитываются перед деплоем, а копию читают один раз в
-    начале и дальше уже не отличают от задуманного.
+    начале и дальше уже не отличают от задуманного. У боевых тумблеров это
+    ещё и единственная копия дефолта, которую видит оператор: в манифесте
+    значения нет — только sync: false.
     """
     env = _env_example_values()
     assert env_key in env, f"{env_key} пропал из .env.example — рычаг стал невидимым при развороте"
     _assert_matches_default(env_key, field, env[env_key], "в .env.example")
+
+
+@pytest.mark.parametrize(("env_key", "field"), LIVE_TOGGLES)
+def test_live_toggle_is_not_synced_from_manifest(env_key: str, field: str) -> None:
+    """Боевой тумблер объявлен, но его значение не приходит из манифеста.
+
+    `sync: false` говорит Render: при обновлении Blueprint не трогай живое
+    значение из дашборда. Без этого синк после экстренного стопа
+    (TON_ENABLED=false) или включения в бою молча вернул бы нейтральный
+    дефолт из репозитория. `value` рядом стоять не может: Render отклоняет
+    такую запись (`cannot simultaneously specify fields value and sync`),
+    поэтому дефолт живёт только в коде и .env.example.
+    """
+    entries = {
+        str(entry["key"]): entry for entry in _manifest_entries() if entry.get("key")
+    }
+    assert env_key in entries, f"{env_key} пропал из render.yaml — тумблер стал невидимым"
+    entry = entries[env_key]
+    assert entry.get("sync") is False, (
+        f"{env_key} обязан быть sync: false — иначе Blueprint Sync перезапишет "
+        "живое значение из дашборда"
+    )
+    assert "value" not in entry, (
+        f"{env_key}: Render не принимает value и sync одновременно; "
+        "дефолт живёт в app/config.py и .env.example"
+    )
+
+
+def test_manifest_never_combines_value_and_sync() -> None:
+    """Render отклоняет envVar с одновременно заданными value и sync.
+
+    Такая запись выглядит как «дефолт в манифесте + не перезаписывать живое
+    значение», но Blueprint Sync падает с
+    `cannot simultaneously specify fields value and sync`. Ловим это здесь,
+    а не на деплое.
+    """
+    offenders = [
+        str(entry["key"])
+        for entry in _manifest_entries()
+        if entry.get("key") and "value" in entry and "sync" in entry
+    ]
+    assert not offenders, f"value и sync одновременно в render.yaml: {offenders}"
 
 
 def test_every_setting_is_documented_in_env_example() -> None:
