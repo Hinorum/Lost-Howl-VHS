@@ -219,10 +219,16 @@ async def test_second_dispatch_skips_while_first_send_in_flight(monkeypatch) -> 
     async def fake_release() -> None:
         held["value"] = False
 
+    async def fake_verify() -> bool:
+        # На PostgreSQL verify без живого соединения-держателя честно
+        # возвращает False: настоящий лок здесь заменён фейком acquire.
+        return held["value"]
+
     monkeypatch.setattr(ton_pay, "send_ton_transfer", slow_send)
     monkeypatch.setattr(ton_pay, "fetch_broadcast_markers", _empty_markers)
     monkeypatch.setattr("app.payout_lock.acquire_payout_dispatch_lock", fake_acquire)
     monkeypatch.setattr("app.payout_lock.release_payout_dispatch_lock", fake_release)
+    monkeypatch.setattr("app.payout_lock.verify_payout_dispatch_lock", fake_verify)
     monkeypatch.setattr("app.ton_pay.state._DISPATCH_LOCK", _NoopLock())
     try:
         first = asyncio.create_task(ton_pay.dispatch_pending_payouts(bot=None))
@@ -303,6 +309,13 @@ async def test_reset_during_pass_skips_lost_claim(monkeypatch) -> None:
 async def test_renew_claims_extends_only_owned_rows(monkeypatch) -> None:
     """Lease пачки: чужой/сброшенный клейм не продлевается и не вещается."""
     from app.ton_pay.dispatch import _claim_pending_payouts, _renew_claims
+
+    # Продление требует живого advisory-лока. На PostgreSQL без настоящего
+    # соединения-держателя verify возвращает False, поэтому лок эмулируем:
+    # предмет теста — условный UPDATE по штампу, а не сам замок.
+    monkeypatch.setattr(
+        "app.payout_lock.verify_payout_dispatch_lock", AsyncMock(return_value=True)
+    )
 
     ids = await _seed_payouts(2)
     try:
