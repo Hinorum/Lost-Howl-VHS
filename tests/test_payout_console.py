@@ -527,6 +527,8 @@ async def test_fundout_validates_arguments(monkeypatch) -> None:
     cases = (
         ("/fundout 1", "Формат"),
         ("/fundout много причина", "числом"),
+        ("/fundout nan причина", "конечным"),
+        ("/fundout inf причина", "конечным"),
         ("/fundout 0 причина", "положительной"),
         ("/fundout -3 причина", "положительной"),
     )

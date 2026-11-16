@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, cast
 
 from sqlalchemy import select, text, update
@@ -110,8 +111,16 @@ def refund_net_amount(
     плодить дохлый/отрицательный перевод.
     """
     ratio = getattr(settings, "refund_fee_ratio", 0.0) or 0.0
-    if ratio > 0:
-        return max(0, int(stake_amount_nanotons * (1.0 - ratio)))
+    # Доля из env приходит float; str(0.07) == «0.07», поэтому Decimal
+    # считает именно ту десятичную долю, которую задал оператор. Прямое
+    # умножение на float давало 500 * (1 − 0.07) = 464.999… → возврат
+    # 464 вместо 465 нанотонов: деньги терялись на ровном месте.
+    ratios = Decimal(str(ratio))
+    if not ratios.is_finite():
+        raise ValueError("REFUND_FEE_RATIO должен быть конечным числом")
+    if ratios > 0:
+        refund = Decimal(stake_amount_nanotons) * (Decimal(1) - ratios)
+        return max(0, int(refund))
     fee = to_nano(settings.payout_fee_gram) if fee_nanotons is None else fee_nanotons
     return net_payout_amount(stake_amount_nanotons, fee)
 

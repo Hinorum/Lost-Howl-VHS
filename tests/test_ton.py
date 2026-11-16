@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select, update
@@ -78,6 +79,24 @@ def test_nano_conversion_roundtrip() -> None:
     assert to_nano(1.5) == 1_500_000_000
     assert from_nano(1_500_000_000) == 1.5
     assert to_nano(0.1) == 100_000_000
+
+
+def test_to_nano_is_exact_decimal_and_rejects_non_finite() -> None:
+    """Деньги не проходят через binary float.
+
+    Decimal/строка с большим числом знаков переводятся точно, а NaN и
+    бесконечность отсекаются до арифметики: раньше они падали в недрах
+    int(round(...)) уже после проверок «сумма положительная».
+    """
+    assert to_nano(Decimal("0.000000001")) == 1
+    assert to_nano("1234567.890123456") == 1_234_567_890_123_456
+    assert to_nano(Decimal("83604450.855222174068561977")) == 83_604_450_855_222_174
+    with pytest.raises(ValueError, match="конечным"):
+        to_nano(Decimal("NaN"))
+    with pytest.raises(ValueError, match="конечным"):
+        to_nano(float("inf"))
+    with pytest.raises(ValueError, match="не число"):
+        to_nano("не сумма")
 
 
 async def test_wallet_migration_survives_duplicate_raw(session) -> None:

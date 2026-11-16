@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 
 NANO = 1_000_000_000
 
@@ -123,8 +124,28 @@ def friendly_address(raw: str, *, testnet: bool = False, bounceable: bool = Fals
     return base64.b64encode(payload).decode().replace("+", "-").replace("/", "_")
 
 
-def to_nano(amount_ton: float) -> int:
-    return int(round(amount_ton * NANO))
+def to_nano(amount_ton: float | int | Decimal | str) -> int:
+    """Gram → нанотоны без binary float: деньги считаются целыми.
+
+    Float здесь допустим только как вход из настроек/старых вызовов: он
+    приводится через str, то есть по тому десятичному значению, которое
+    человек записал в env, а не по его двоичному приближению. Дальше
+    умножение и округление идут в Decimal; режим ROUND_HALF_EVEN сохраняет
+    прежнее поведение round() для дробных нанотонов.
+
+    NaN/бесконечность — ошибка ввода, а не деньги: int(round(...)) на них
+    падал невнятным ValueError/OverflowError уже в середине записи.
+    """
+    if isinstance(amount_ton, Decimal):
+        amount = amount_ton
+    else:
+        try:
+            amount = Decimal(str(amount_ton))
+        except InvalidOperation as exc:
+            raise ValueError(f"сумма не число: {amount_ton!r}") from exc
+    if not amount.is_finite():
+        raise ValueError(f"сумма должна быть конечным числом: {amount_ton!r}")
+    return int((amount * NANO).to_integral_value(rounding=ROUND_HALF_EVEN))
 
 
 def from_nano(amount_nanotons: int) -> float:

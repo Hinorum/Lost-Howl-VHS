@@ -792,6 +792,23 @@ async def test_adjust_command_with_explicit_amount(ton_on, admin_only) -> None:
         await _wipe_money_rows()
 
 
+async def test_adjust_command_rejects_non_finite_amount(ton_on, admin_only) -> None:
+    """NaN/бесконечность — не деньги: отказ до записи, а не исключение.
+
+    float("nan") проходил проверку amount <= 0 (сравнение с NaN ложно) и
+    падал уже в to_nano. Хранитель должен видеть понятный отказ.
+    """
+    for value in ("nan", "inf"):
+        message = make_message(ADMIN_ID, f"/adjust {value} in проверка")
+        await cmd_adjust(message)
+        text = message.answer.call_args.args[0]
+        assert "конечным" in text, (value, text)
+    async with SessionLocal() as db:
+        assert (
+            await db.execute(select(Income).where(Income.kind == ops.MANUAL_IN_KIND))
+        ).scalars().all() == []
+
+
 # ---------- Пауза: переводы возвращаются, игра замирает ----------
 
 

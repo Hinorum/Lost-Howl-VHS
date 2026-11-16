@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 
 from aiogram import F
 from aiogram.enums import ChatType, ParseMode
@@ -495,12 +496,18 @@ async def cmd_adjust(message: Message) -> None:
     parts = (message.text or "").split()
     if len(parts) >= 3 and parts[2].lower() in {"out", "in", "loss"}:
         try:
-            amount = float(parts[1].replace(",", "."))
-        except ValueError:
+            # Decimal, а не float: сумма из команды — деньги. float("nan") и
+            # float("inf") проходили проверку amount <= 0 и падали уже в
+            # to_nano; «0.1 + 0.2» не должен решаться двоичным приближением.
+            amount = Decimal(parts[1].replace(",", "."))
+        except InvalidOperation:
             await message.answer(
                 "Сумма не разобралась. Формат: <code>/adjust &lt;сумма&gt; out|in|loss [комментарий]</code>",
                 parse_mode=ParseMode.HTML,
             )
+            return
+        if not amount.is_finite():
+            await message.answer("Сумма должна быть конечным числом.")
             return
         if amount <= 0:
             await message.answer("Сумма должна быть положительной.")

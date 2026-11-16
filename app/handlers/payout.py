@@ -675,9 +675,15 @@ async def cmd_fundout(message: Message) -> None:
         await message.answer("Формат: /fundout <Gram> <причина. Что купили/разыграли>")
         return
     try:
-        amount_gram = float(args[1].replace(",", "."))
-    except ValueError:
+        # Decimal, а не float: это сумма денег. float("nan")/float("inf")
+        # проходили проверку <= 0 и падали исключением в to_nano уже после
+        # ответа «сумма положительная»; двоичное приближение здесь не нужно.
+        amount_gram = Decimal(args[1].replace(",", "."))
+    except InvalidOperation:
         await message.answer("Сумма должна быть числом в Gram.")
+        return
+    if not amount_gram.is_finite():
+        await message.answer("Сумма должна быть конечным числом.")
         return
     if amount_gram <= 0:
         await message.answer("Сумма должна быть положительной.")

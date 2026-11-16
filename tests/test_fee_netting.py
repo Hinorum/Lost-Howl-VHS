@@ -231,6 +231,21 @@ async def test_refunds_deduct_gas(session: AsyncSession) -> None:
     ]
 
 
+# ---------- Точность долей ----------
+
+
+def test_refund_ratio_is_exact_not_binary_float(monkeypatch) -> None:
+    """Ставка 500 нанотонов при доле 7% возвращает ровно 465, не 464.
+
+    Прямое `500 * (1.0 - 0.07)` в double даёт 464.99999999999994:
+    int() отбрасывает дробь и теряет нанотон. Decimal считает по той
+    десятичной доле, которую оператор задал в REFUND_FEE_RATIO.
+    """
+    monkeypatch.setattr(settings, "refund_fee_ratio", 0.07)
+    assert stakes_mod.refund_net_amount(500) == 465
+    assert stakes_mod.refund_net_amount(0) == 0
+
+
 async def test_refunds_proportional_ratio(monkeypatch, session: AsyncSession) -> None:
     """refund_fee_ratio: комиссия на возврат пропорциональна ставке, а не плоская."""
     monkeypatch.setattr(settings, "refund_fee_ratio", 0.01)  # 1%
@@ -251,7 +266,7 @@ async def test_refunds_proportional_ratio(monkeypatch, session: AsyncSession) ->
         .all()
     )
     # Возврат = ставка × (1 − 1%) = пропорционально, без плоской потери.
-    assert refunds[0].amount_nanotons == int(to_nano(0.7) * 0.99)
+    assert refunds[0].amount_nanotons == to_nano(0.7) * 99 // 100
     monkeypatch.undo()
 
 
