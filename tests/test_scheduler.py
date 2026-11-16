@@ -1107,6 +1107,51 @@ async def test_retry_new_day_job_reclaims_stale_claim_only(monkeypatch) -> None:
         await _cleanup(stale, live)
 
 
+async def test_retry_new_day_job_skips_delivered_stale_claim(monkeypatch) -> None:
+    """Доставленный день не пере-отправляется по истечении окна claim.
+
+    Регрессия: после успешной досылки claim (announced_at) не снимается, а
+    retry-джоба считала метку старше announce_claim_timeout_seconds «брошенной»
+    и объявляла заново уже доставленный OPEN-день — у игроков это воспринималось
+    как повторный пост дня каждые announce_claim_timeout_seconds (по умолчанию
+    три часа), а не одноразовое объявление в начале дня.
+    """
+    from app import scheduler as sched
+    from app.core.registry import ANNOUNCE_DELIVERED_PREFIX
+    from app.models import WatcherState
+
+    monkeypatch.setattr(settings, "announce_claim_timeout_seconds", 60)
+    delivered = await _make_round(9746, RoundStatus.OPEN)
+    abandoned = await _make_round(9747, RoundStatus.OPEN)
+    async with SessionLocal() as db:
+        delivered_row = await db.get(Round, delivered)
+        abandoned_row = await db.get(Round, abandoned)
+        assert delivered_row is not None and abandoned_row is not None
+        for row in (delivered_row, abandoned_row):
+            row.opens_at = datetime.now(UTC) - timedelta(hours=30)
+            row.announced_at = datetime.now(UTC) - timedelta(seconds=120)  # старше окна 60
+        await db.commit()
+    async with SessionLocal() as db:
+        db.add(WatcherState(key=f"{ANNOUNCE_DELIVERED_PREFIX}{delivered_row.day_index}", value=str(delivered_row.day_index)))
+        await db.commit()
+
+    monkeypatch.setattr(sched, "_bot", object())
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    monkeypatch.setattr(sched, "announce_audience_size", AsyncMock(return_value=2))
+    seen: list[int] = []
+
+    async def fake_announce(bot_, round_row):
+        seen.append(round_row.id)
+
+    monkeypatch.setattr(sched, "announce_new_day", fake_announce)
+    try:
+        await sched._retry_new_day_job()
+        assert delivered not in seen, "доставленный день не должен объявляться повторно"
+        assert abandoned in seen, "брошенный claim (без маркера доставлен) должен дозваниваться"
+    finally:
+        await _cleanup(delivered, abandoned)
+
+
 async def test_retry_new_day_job_skips_ancient_stale_claim(monkeypatch) -> None:
     """Древняя брошенная метка не переигрывается: recency-гард сильнее stale.
 

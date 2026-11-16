@@ -8,7 +8,7 @@ from typing import Any, cast
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -395,6 +395,18 @@ async def _mark_results_delivered(session: AsyncSession, finished_id: int) -> No
     await session.commit()
 
 
+async def _announce_delivered(session: AsyncSession, day_index: int) -> bool:
+    """Маркер «анонс дня доставлен игрокам» (см. broadcast._mark_announce_delivered).
+
+    Claim-метка (announced_at) после успешной досылки не снимается: она нужна
+    для страховки «краш вещателя между commit и unclaim». А вот доставленный
+    день по истечении окна announce_claim_timeout_seconds не должен объявляться
+    заново — поэтому retry смотрит отдельный маркер доставленности.
+    """
+    row = await session.get(WatcherState, f"{ANNOUNCE_DELIVERED_PREFIX}{day_index}")
+    return row is not None
+
+
 async def _announce_round(session: AsyncSession, round_row, bot: Bot | None) -> None:
     """Объявляет новый день под claim-меткой announced_at.
 
@@ -465,15 +477,6 @@ async def _retry_new_day_job() -> None:
                             Round.announced_at <= announce_claim_cutoff(),
                         ),
                         Round.opens_at >= catchup_cutoff(),
-                        # День с уже поставленным маркером доставлен: пере-отправлять
-                        # не нужно, даже если claim-метка (announced_at) к моменту
-                        # срабатывания окна уже «старше» announce_claim_timeout_seconds.
-                        ~exists(
-                            select(WatcherState.key).where(
-                                WatcherState.key
-                                == f"{ANNOUNCE_DELIVERED_PREFIX}{Round.day_index}"
-                            )
-                        ),
                     )
                     .order_by(Round.day_index.asc())
                     .limit(5)
@@ -484,6 +487,11 @@ async def _retry_new_day_job() -> None:
                 # роняла бы пакет дня на MissingGreenlet — см. _ensure_cards.
                 day = await get_round(session, round_id)
                 if day is None:
+                    continue
+                if await _announce_delivered(session, day.day_index):
+                    # День доставлен игрокам (broadcast._mark_announce_delivered):
+                    # claim-окно (announced_at) может к этому моменту уже «стареть»,
+                    # но пере-отправлять доставленный день не нужно.
                     continue
                 try:
                     await _announce_round(session, day, _bot)
