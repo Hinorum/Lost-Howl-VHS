@@ -387,6 +387,88 @@ async def ensure_cold_start_check() -> None:
         )
 
 
+async def _cold_start_sources(wallet) -> tuple[int | None, int | None, list[str]]:
+    """Чтение seqno из обоих источников независимо.
+
+    Источники читаемы каждый своим try: что прочиталось — то и берём, а что
+    не прочиталось — с причиной в problems. Первая версия читала их одним
+    try-блоком, и мёртвые лайтсерверы (а они умирают отдельно от Toncenter)
+    уносили сверку целиком: живой Toncenter так и не спрашивался, метка не
+    писалась, и в /treasury было пусто.
+
+    Возвращает (lite_seqno, http_seqno, problems); None-значения с причиной
+    — признак «источник недоступен», сверка при этом не считается проваленной.
+    """
+    from .http_channel import http_get_wallet_seqno
+
+    lite_seqno: int | None = None
+    http_seqno: int | None = None
+    problems: list[str] = []
+
+    try:
+        lite_seqno = int(await wallet.get_seqno())
+    except Exception as exc:
+        problems.append(f"лайтсерверы: {type(exc).__name__}: {exc}"[:200])
+    try:
+        http_seqno = int(await http_get_wallet_seqno(wallet))
+    except Exception as exc:
+        problems.append(f"toncenter: {type(exc).__name__}: {exc}"[:200])
+    return lite_seqno, http_seqno, problems
+
+
+def _cold_start_delta(lite_seqno: int | None, http_seqno: int | None) -> int | None:
+    """Расхождение лайт-серверов против Toncenter; None — источник мёртв.
+
+    Тот же seqno через Toncenter (HTTP, всегда свежий) показывает правду:
+    подписанный старым номером перевод уходит «в пустоту», если лайтсерверы
+    отстали — а метка должна это видеть.
+    """
+    if lite_seqno is None or http_seqno is None:
+        return None
+    return lite_seqno - http_seqno
+
+
+def _cold_start_stamp(
+    lite_seqno: int | None,
+    http_seqno: int | None,
+    problems: list[str],
+    delta: int | None,
+) -> str:
+    """Метка сверки для watcher_state: лайт/тон/дельта/время/причина."""
+    return json.dumps(
+        {
+            "lite": lite_seqno,
+            "http": http_seqno,
+            "delta": delta,
+            "at": datetime.now(UTC).isoformat(),
+            "error": "; ".join(problems) if problems else None,
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _save_cold_start_stamp(payload: str) -> None:
+    """Записать метку сверки в watcher_state.
+
+    Метка — удобство наблюдаемости, а не условие работы: её потеря не должна
+    превращаться в сбой старта.
+    """
+    from app.core.registry import COLD_START_SEQNO_KEY
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, COLD_START_SEQNO_KEY)
+            if row is None:
+                session.add(WatcherState(key=COLD_START_SEQNO_KEY, value=payload))
+            else:
+                row.value = payload
+            await session.commit()
+    except Exception:
+        logger.warning("Cold-start сверка seqno: метку в watcher_state не сохранили", exc_info=True)
+
+
 async def cold_start_seqno_check(wallet) -> None:
     """Сверка seqno на холодном старте: лайтсерверы против Toncenter.
 
@@ -410,49 +492,10 @@ async def cold_start_seqno_check(wallet) -> None:
     Ничего не блокирует: сбой проверки (мёртвые лайтсерверы, молчащий
     Toncenter) — предупреждение, кошелёк остаётся рабочим.
     """
-    from app.core.registry import COLD_START_SEQNO_KEY
-    from app.db import SessionLocal
-    from app.models import WatcherState
+    lite_seqno, http_seqno, problems = await _cold_start_sources(wallet)
+    delta = _cold_start_delta(lite_seqno, http_seqno)
+    await _save_cold_start_stamp(_cold_start_stamp(lite_seqno, http_seqno, problems, delta))
 
-    from .http_channel import http_get_wallet_seqno
-
-    lite_seqno: int | None = None
-    http_seqno: int | None = None
-    problems: list[str] = []
-
-    try:
-        lite_seqno = int(await wallet.get_seqno())
-    except Exception as exc:
-        problems.append(f"лайтсерверы: {type(exc).__name__}: {exc}"[:200])
-    try:
-        http_seqno = int(await http_get_wallet_seqno(wallet))
-    except Exception as exc:
-        problems.append(f"toncenter: {type(exc).__name__}: {exc}"[:200])
-
-    delta = (lite_seqno - http_seqno) if lite_seqno is not None and http_seqno is not None else None
-    stamp = datetime.now(UTC).isoformat()
-    payload = json.dumps(
-        {
-            "lite": lite_seqno,
-            "http": http_seqno,
-            "delta": delta,
-            "at": stamp,
-            "error": "; ".join(problems) if problems else None,
-        },
-        ensure_ascii=False,
-    )
-    try:
-        async with SessionLocal() as session:
-            row = await session.get(WatcherState, COLD_START_SEQNO_KEY)
-            if row is None:
-                session.add(WatcherState(key=COLD_START_SEQNO_KEY, value=payload))
-            else:
-                row.value = payload
-            await session.commit()
-    except Exception:
-        # Метка — удобство наблюдаемости, а не условие работы: её потеря
-        # не должна превращаться в сбой старта.
-        logger.warning("Cold-start сверка seqno: метку в watcher_state не сохранили", exc_info=True)
     if problems:
         logger.warning(
             "Cold-start сверка seqno неполная: %s (прочитано: лайт=%s, http=%s)",
