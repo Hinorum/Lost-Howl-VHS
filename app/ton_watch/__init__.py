@@ -321,6 +321,43 @@ _REVOTE_REFUND_STATUSES = frozenset(
 )
 
 
+def _revote_paid_note(transfer: Transfer) -> str:
+    """DM после принятой оплаты перемотки."""
+    return (
+        f"💎 Перемотка кадра оплачена ({from_nano(transfer.value_nanotons):g} Gram). "
+        "Нажми другой вариант — кадр перемотается."
+    )
+
+
+def _revote_refund_note(status: str, transfer: Transfer) -> str:
+    """Персональное объяснение возврата платы за перемотку по исходу."""
+    amount = from_nano(transfer.value_nanotons)
+    if status == "revote_no_vote":
+        return (
+            f"↩️ Перевод {amount:g} Gram возвращается: "
+            "за перемотку кадра платить нечего — ты ещё не сделал выбор дня. "
+            "Первая запись бесплатная: жми свой вариант, без оплаты."
+        )
+    if status == "revote_too_large":
+        return (
+            f"↩️ Перевод {amount:g} Gram возвращается: "
+            "сумма с rv:-мемо превышает минимум ставки — это ставка, а не перемотка кадра. "
+            "Отправь без rv:-мемо, чтобы поставить."
+        )
+    if status == "revote_money_off":
+        return (
+            f"↩️ Перевод {amount:g} Gram возвращается: "
+            "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем."
+        )
+    if status == "revote_disabled":
+        return (
+            f"↩️ Перевод {amount:g} Gram возвращается: "
+            "смена выбора сейчас отключена — плата за неё не взимается."
+        )
+    reason = "день уже закрыт." if status == "revote_closed" else "сумма меньше нужной."
+    return f"↩️ Оплата {amount:g} Gram возвращается: {reason}"
+
+
 async def _handle_revote(
     session, transfer: Transfer, bot: Bot | None, player: Player, revote_round_id: int
 ) -> str:
@@ -331,12 +368,7 @@ async def _handle_revote(
         # ждёт уведомления, которого не будет, и платит повторно:
         # второй перевод с другим хешем дедупликацию проходит и
         # приносит ещё один грант — деньги списываются дважды.
-        await _dm_stake(
-            bot,
-            player.id,
-            f"💎 Перемотка кадра оплачена ({from_nano(transfer.value_nanotons):g} Gram). "
-            "Нажми другой вариант — кадр перемотается.",
-        )
+        await _dm_stake(bot, player.id, _revote_paid_note(transfer))
         return status
     if status not in _REVOTE_REFUND_STATUSES:
         return status
@@ -350,48 +382,9 @@ async def _handle_revote(
         ledger_result=f"revote:{status}",
         ledger_player_id=player.id,
     )
-    if status == "revote_no_vote":
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            "за перемотку кадра платить нечего — ты ещё не сделал выбор дня. "
-            "Первая запись бесплатная: жми свой вариант, без оплаты.",
-        )
-    elif status == "revote_too_large":
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            "сумма с rv:-мемо превышает минимум ставки — это ставка, а не перемотка кадра. "
-            "Отправь без rv:-мемо, чтобы поставить.",
-        )
-    elif status == "revote_money_off":
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
-        )
-    elif status == "revote_disabled":
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            "смена выбора сейчас отключена — плата за неё не взимается.",
-        )
-    else:
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Оплата {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            + ("день уже закрыт." if status == "revote_closed" else "сумма меньше нужной."),
-        )
+    await _dm_refund_queued(
+        bot, player.id, refund_status, _revote_refund_note(status, transfer)
+    )
     return status
 
 
