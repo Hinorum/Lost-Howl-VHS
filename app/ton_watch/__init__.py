@@ -765,6 +765,55 @@ async def _migrate_wallet_formats(session) -> None:
 _STUCK_HEAL_MAX_REFUND_FAILS = 3
 
 
+def _stuck_due(record, now: float) -> bool:
+    """Пора ли снова лечить запись: снимок есть и окно перепроверки истекло."""
+    if not isinstance(record, dict) or not record.get("reported"):
+        return False
+    if not record.get("source"):
+        return False  # старый формат без снимка — только ручной разбор
+    return (
+        now - float(record.get("heal_at") or 0)
+        >= settings.stuck_heal_recheck_seconds
+    )
+
+
+def _stuck_transfer(tx_hash: str, record: dict) -> Transfer:
+    """Восстанавливает перевод из снимка stuck-записи."""
+    return Transfer(
+        tx_hash=tx_hash,
+        source=str(record["source"]),
+        value_nanotons=int(record["value_nanotons"]),
+        comment=str(record.get("comment") or ""),
+        utime=int(record["utime"]),
+    )
+
+
+async def _refund_stuck_transfer(
+    session, tx_hash: str, transfer: Transfer
+) -> bool:
+    """Авто-возврат брошенного перевода; False — возврат не удался."""
+    try:
+        refund = await _stash_refund(
+            session,
+            transfer,
+            None,
+            ledger_result="stuck:abandoned",
+            ledger_player_id=None,
+            force=True,
+        )
+    except Exception as exc:
+        logger.error(
+            "Stuck-транзакция %s: авто-возврат не удался: %s",
+            tx_hash[:16], exc, exc_info=True,
+        )
+        return False
+    logger.info(
+        "Stuck-транзакция %s: авто-возврат отправителю (%s)",
+        tx_hash[:16], refund,
+    )
+    return True
+
+
 async def _heal_stuck_transfers(bot: Bot | None = None) -> int:
     """Авто-лечение брошенных сбойных переводов (reported, cursor за ними).
 
@@ -788,59 +837,36 @@ async def _heal_stuck_transfers(bot: Bot | None = None) -> int:
         stuck = await _read_stuck(session)
         touched = False
         for tx_hash, record in list(stuck.items()):
-            if not isinstance(record, dict) or not record.get("reported"):
-                continue
-            if not record.get("source"):
-                continue  # старый формат без снимка — только ручной разбор
-            if now - float(record.get("heal_at") or 0) < settings.stuck_heal_recheck_seconds:
+            if not _stuck_due(record, now):
                 continue
             record["heal_at"] = now
             touched = True
-            transfer = Transfer(
-                tx_hash=tx_hash,
-                source=str(record["source"]),
-                value_nanotons=int(record["value_nanotons"]),
-                comment=str(record.get("comment") or ""),
-                utime=int(record["utime"]),
-            )
+            transfer = _stuck_transfer(tx_hash, record)
             try:
                 status = await process_transfer(transfer, bot=bot)
-                logger.info(
-                    "Stuck-транзакция %s исцелена повторной обработкой: %s",
-                    tx_hash[:16], status,
-                )
-                del stuck[tx_hash]
-                healed += 1
             except Exception as exc:
                 record["heal_fails"] = int(record.get("heal_fails", 0)) + 1
                 logger.warning(
                     "Stuck-транзакция %s всё ещё не обрабатывается (попытка %d): %s",
                     tx_hash[:16], record["heal_fails"], exc,
                 )
-                if record["heal_fails"] >= _STUCK_HEAL_MAX_REFUND_FAILS:
-                    try:
-                        refund = await _stash_refund(
-                            session,
-                            transfer,
-                            None,
-                            ledger_result="stuck:abandoned",
-                            ledger_player_id=None,
-                            force=True,
-                        )
-                        logger.info(
-                            "Stuck-транзакция %s: авто-возврат отправителю (%s)",
-                            tx_hash[:16], refund,
-                        )
-                        del stuck[tx_hash]
-                        healed += 1
-                    except Exception as exc2:
-                        logger.error(
-                            "Stuck-транзакция %s: авто-возврат не удался: %s",
-                            tx_hash[:16], exc2, exc_info=True,
-                        )
+                if (
+                    record["heal_fails"] >= _STUCK_HEAL_MAX_REFUND_FAILS
+                    and await _refund_stuck_transfer(session, tx_hash, transfer)
+                ):
+                    del stuck[tx_hash]
+                    healed += 1
+                continue
+            logger.info(
+                "Stuck-транзакция %s исцелена повторной обработкой: %s",
+                tx_hash[:16], status,
+            )
+            del stuck[tx_hash]
+            healed += 1
         if healed or touched:
             await _write_stuck(session, stuck)
     return healed
+
 
 async def _watch_state_read(
     session: AsyncSession,
