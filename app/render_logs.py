@@ -239,8 +239,53 @@ async def resolve_service() -> tuple[str, str]:
     return str(chosen.get("id")), owner_id
 
 
+async def _fetch_log_page(
+    params: dict[str, Any],
+    since: datetime,
+    upper: datetime,
+    seen_ids: set[str],
+) -> tuple[list[str], list[datetime], int, int]:
+    """Одна страница логов Render (backward): (сообщения, штампы, свежие, размер).
+
+    Следующая страница читается от самой старой записи предыдущей (exclusive),
+    поэтому штампы нужны — они двигают границу `upper` назад.
+    """
+    params["startTime"] = (
+        since.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    params["endTime"] = (
+        upper.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    payload = await _api_get("/logs", params)
+    entries = (
+        payload if isinstance(payload, list) else (payload or {}).get("logs") or []
+    )
+    messages: list[str] = []
+    fresh = 0
+    page_stamps: list[datetime] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "")
+        if entry_id and entry_id in seen_ids:
+            continue
+        if entry_id:
+            seen_ids.add(entry_id)
+            fresh += 1
+        message = entry.get("message")
+        if isinstance(message, str):
+            messages.append(message)
+        stamp = _entry_time(entry.get("timestamp"))
+        if stamp is not None:
+            page_stamps.append(stamp)
+    return messages, page_stamps, fresh, len(entries)
+
+
 async def fetch_logs(
-    service_id: str, owner_id: str, since: datetime, limit: int
+    service_id: str,
+    owner_id: str,
+    since: datetime,
+    limit: int,
 ) -> tuple[list[str], dict[str, Any]]:
     """Забирает тексты логов сервиса за окно назад — постранично НАЗАД.
 
@@ -273,43 +318,18 @@ async def fetch_logs(
         pages = 0
         try:
             while pages < max_pages and len(messages) < total_limit:
-                params["startTime"] = (
-                    since.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                )
-                params["endTime"] = (
-                    upper.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                )
-                payload = await _api_get("/logs", params)
-                entries = (
-                    payload if isinstance(payload, list) else (payload or {}).get("logs") or []
+                page_messages, page_stamps, fresh, page_len = await _fetch_log_page(
+                    params, since, upper, seen_ids
                 )
                 pages += 1
-                if not entries:
+                if not page_len:
                     break
-                page_stamps: list[datetime] = []
-                fresh = 0
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    entry_id = str(entry.get("id") or "")
-                    if entry_id and entry_id in seen_ids:
-                        continue
-                    if entry_id:
-                        seen_ids.add(entry_id)
-                        fresh += 1
-                    message = entry.get("message")
-                    if isinstance(message, str):
-                        messages.append(message)
-                    stamp = _entry_time(entry.get("timestamp"))
-                    if stamp is not None:
-                        page_stamps.append(stamp)
+                messages.extend(page_messages)
                 if not page_stamps or not fresh:
-                    # Страница не двинулась или повторилась — дальше бессмысленно.
                     break
                 stamps.extend(page_stamps)
-                # Следующая страница — всё, что СТАРШЕ самой ранней записи этой.
                 upper = min(page_stamps) - timedelta(seconds=1)
-                if len(entries) < page_limit:
+                if page_len < page_limit:
                     break
         except Exception as exc:
             # Форма не подошла — пробуем следующую.
