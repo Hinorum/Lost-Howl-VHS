@@ -506,6 +506,79 @@ async def _retry_new_day_job() -> None:
         logger.exception("Повтор анонса нового дня упал")
 
 
+async def _results_recovery_batch(session: AsyncSession) -> list[tuple[int, int]]:
+    """Снимок CLOSED-дней без итогов, которые пора досылать.
+
+    Отбираем только недавние дни (catchup_cutoff) и только свободные или
+    просроченные claim-метки; кап 3 дня за тик. Возвращаем пары
+    (id, day_index): инстансы после commit-ов хелперов не нужны, а день
+    для логов — простой int.
+    """
+    from app.models import Round
+    from app.rounds import catchup_cutoff
+
+    missing = (
+        await session.execute(
+            select(Round)
+            .where(
+                Round.status == RoundStatus.CLOSED,
+                Round.results_at.is_(None),
+                or_(
+                    Round.results_claimed_at.is_(None),
+                    Round.results_claimed_at <= results_claim_cutoff(),
+                ),
+                Round.voting_ends_at >= catchup_cutoff(),
+            )
+            .order_by(Round.day_index.asc())
+            .limit(3)
+            .options(selectinload(Round.cards))
+        )
+    ).scalars().all()
+    return [(finished.id, finished.day_index) for finished in missing]
+
+
+async def _results_recovery_pass(
+    session: AsyncSession, batch: list[tuple[int, int]]
+) -> None:
+    """Досылает итоги по снимку: claim → анонсы → mark; ошибка снимает claim.
+
+    _claim_results/_unclaim_results коммитят сессию, а инстансы после commit-а
+    (expire_on_commit=False) живы, но держать их в batch незачем: id и день —
+    простые int, инстанс достаём заново через session.get, как в lifecycle.py.
+    """
+    from app.broadcast import announce_player_results, announce_results
+    from app.models import Round
+
+    for finished_id, day_index in batch:
+        stamp = await _claim_results(session, finished_id)
+        if stamp is None:
+            continue
+        finished = await session.get(
+            Round, finished_id, options=[selectinload(Round.cards)]
+        )
+        if finished is None:
+            await _unclaim_results(session, finished_id, stamp)
+            continue
+        try:
+            await announce_results(_bot, finished)
+            await announce_player_results(_bot, finished)
+        except Exception:
+            # Снимаем только свой claim: пока шла рассылка, брошенную
+            # метку мог перехватить другой проход — его свежий claim
+            # трогать нельзя.
+            await _unclaim_results(session, finished_id, stamp)
+            logger.exception(
+                "Восстановитель итогов дня %s упал — повторит в следующем тике",
+                day_index,
+            )
+            continue
+        await _mark_results_delivered(session, finished_id)
+        logger.info(
+            "Итоги дня %s досланы восстановителем после краха",
+            day_index,
+        )
+
+
 async def _retry_results_job() -> None:
     """Восстановитель рассылки итогов: CLOSED-дни без маркера results_at.
 
@@ -529,61 +602,9 @@ async def _retry_results_job() -> None:
     чат за пару минут. Догон нужен только для свежих крашей.
     """
     try:
-        from app.broadcast import announce_player_results, announce_results
-        from app.models import Round
-        from app.rounds import catchup_cutoff
-
         async with SessionLocal() as session:
-            missing = (
-                await session.execute(
-                    select(Round)
-                    .where(
-                        Round.status == RoundStatus.CLOSED,
-                        Round.results_at.is_(None),
-                        or_(
-                            Round.results_claimed_at.is_(None),
-                            Round.results_claimed_at <= results_claim_cutoff(),
-                        ),
-                        Round.voting_ends_at >= catchup_cutoff(),
-                    )
-                    .order_by(Round.day_index.asc())
-                    .limit(3)
-                    .options(selectinload(Round.cards))
-                )
-            ).scalars().all()
-            # Снимок до цикла: _claim_results/_unclaim_results коммитят сессию,
-            # а инстансы после commit-а (expire_on_commit=False) живы, но
-            # держать их в batch всё равно незачем. Id и день — простые int,
-            # инстанс достаём заново через session.get, как в lifecycle.py.
-            batch = [(finished.id, finished.day_index) for finished in missing]
-            for finished_id, day_index in batch:
-                stamp = await _claim_results(session, finished_id)
-                if stamp is None:
-                    continue
-                finished = await session.get(
-                    Round, finished_id, options=[selectinload(Round.cards)]
-                )
-                if finished is None:
-                    await _unclaim_results(session, finished_id, stamp)
-                    continue
-                try:
-                    await announce_results(_bot, finished)
-                    await announce_player_results(_bot, finished)
-                except Exception:
-                    # Снимаем только свой claim: пока шла рассылка, брошенную
-                    # метку мог перехватить другой проход — его свежий claim
-                    # трогать нельзя.
-                    await _unclaim_results(session, finished_id, stamp)
-                    logger.exception(
-                        "Восстановитель итогов дня %s упал — повторит в следующем тике",
-                        day_index,
-                    )
-                    continue
-                await _mark_results_delivered(session, finished_id)
-                logger.info(
-                    "Итоги дня %s досланы восстановителем после краха",
-                    day_index,
-                )
+            batch = await _results_recovery_batch(session)
+            await _results_recovery_pass(session, batch)
     except Exception:
         logger.exception("Восстановитель итогов упал целиком")
 
