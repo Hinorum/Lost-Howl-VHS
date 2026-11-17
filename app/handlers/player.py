@@ -409,49 +409,32 @@ async def cmd_today(message: Message) -> None:
     )
 
 
-async def _score_text(user) -> str:
-    """Единый экран Стаи: выбор дня, титул, серия, голоса и личный блок.
+def _score_scene_label(vote, round_row) -> str:
+    """Название сцены дня: не наш текст — из кассеты, с HTML-экранированием."""
+    if vote is None or round_row is None:
+        return "—"
+    name = next((c.title for c in round_row.cards if c.position == vote.card_position), None)
+    if name is None:
+        return f"{POSITIONS[vote.card_position]}."
+    escaped = html.escape(name, quote=False)
+    return f"{POSITIONS[vote.card_position]}. «{escaped}»"
 
-    Одна карточка для /score (и /rank): выбор дня, прогресс и голоса за
-    неделю и месяц, затем личные данные (кошелёк, ставка дня, приведённые в стаю).
-    В группе сюда не показываем — только приватный поп-ап _score_short.
-    """
-    from app.handlers.wallet import _today_stake_line
-    from app.referrals import invited_count
-    from app.streaks import TITLES, calc_rank, streak_lines, title_for_streak
 
-    async with SessionLocal() as session:
-        player = await upsert_player(session, user)
-        round_row = await get_active_round(session) or await get_latest_round(session)
-        vote = await get_vote(session, round_row.id, player.id) if round_row else None
-        rank = await calc_rank(session, player.id)
-        stake_line = await _today_stake_line(session, player.id)
-
-    invited = await invited_count(user.id)
-
-    def _scene_label() -> str:
-        # Название сцены — не наш текст: приходит из кассеты. Карточка Стаи
-        # уходит parse_mode=HTML, поэтому сырой `<`/`&` из правки в /panel
-        # Telegram отвергнет целиком. Экранируем здесь, у самой HTML-витрины
-        # (scene_label экранирует так же, но эта локальная подпись добавляет
-        # римскую позицию и раньше шла в обход общего хелпера).
-        if vote is None or round_row is None:
-            return "—"
-        name = next((c.title for c in round_row.cards if c.position == vote.card_position), None)
-        if name is None:
-            return f"{POSITIONS[vote.card_position]}."
-        escaped = html.escape(name, quote=False)
-        return f"{POSITIONS[vote.card_position]}. «{escaped}»"
-
+def _score_choice(user, vote, round_row) -> str:
+    """Персональный блок выбора дня: нет выбора / «твой» / «вчерашний»."""
     if vote is None:
-        choice = f"{hint_mark(str(user.id))} Сегодня ты ещё не сделал выбор дня."
-    elif round_row is not None and round_row.status in (RoundStatus.OPEN, RoundStatus.TALLYING):
-        choice = f"{path_mark('care', str(user.id))} Твой выбор: {_scene_label()}"
-    else:
-        choice = f"Вчера твой выбор: {_scene_label()}"
+        return f"{hint_mark(str(user.id))} Сегодня ты ещё не сделал выбор дня."
+    if round_row is not None and round_row.status in (RoundStatus.OPEN, RoundStatus.TALLYING):
+        return f"{path_mark('care', str(user.id))} Твой выбор: {_score_scene_label(vote, round_row)}"
+    return f"Вчера твой выбор: {_score_scene_label(vote, round_row)}"
 
+
+def _score_personal_lines(
+    player, invited: int, stake_line: str | None, ton_enabled: bool
+) -> list[str]:
+    """Личные строки карточки: кошелёк, ставка дня, приглашённые в стаю."""
     personal: list[str] = []
-    if settings.ton_enabled:
+    if ton_enabled:
         if player.wallet_address:
             state = "подтверждён" if player.wallet_verified else "ждёт подтверждения"
             personal.append(f"💰 Кошелёк: привязан ({state})")
@@ -461,31 +444,73 @@ async def _score_text(user) -> str:
             personal.append(f"💸 {stake_line}")
     if invited:
         personal.append(f"🐾 Приведено в стаю: {invited}")
+    return personal
+
+
+def _score_prize_line(ton_enabled: bool) -> str | None:
+    """Строка о копилках топ-3 недели/месяца; без TON — нет."""
+    if not ton_enabled:
+        return None
+    w_pcts = "/".join(
+        part.strip() for part in settings.weekly_prize_pcts.split(",") if part.strip()
+    )
+    m_pcts = "/".join(
+        part.strip() for part in settings.monthly_prize_weights.split(",") if part.strip()
+    )
+    return (
+        f"🏆 Топ-3 верных сцен недели и месяца делят копилки Gram "
+        f"(доли недели {w_pcts}, месяца {m_pcts})"
+    )
+
+
+def _score_ladder_lines() -> list[str]:
+    """Лестница титулов: по три ступени за строку, ·-разделение."""
+    from app.streaks import TITLES
+
+    ladder = [f"{t.correct_needed} {t.emoji} {t.name}" for t in TITLES[1:]]
+    lines: list[str] = []
+    for i in range(0, len(ladder), 3):
+        lines.append(" · ".join(ladder[i : i + 3]))
+    return lines
+
+
+async def _score_text(user) -> str:
+    """Единый экран Стаи: выбор дня, титул, серия, голоса и личный блок.
+
+    Одна карточка для /score (и /rank): выбор дня, прогресс и голоса за
+    неделю и месяц, затем личные данные (кошелёк, ставка дня, приведённые в стаю).
+    В группе сюда не показываем — только приватный поп-ап _score_short.
+    """
+    from app.handlers.wallet import _today_stake_line
+    from app.referrals import invited_count
+    from app.streaks import calc_rank, streak_lines, title_for_streak
+
+    async with SessionLocal() as session:
+        player = await upsert_player(session, user)
+        round_row = await get_active_round(session) or await get_latest_round(session)
+        vote = await get_vote(session, round_row.id, player.id) if round_row else None
+        rank = await calc_rank(session, player.id)
+        stake_line = await _today_stake_line(session, player.id)
+
+    invited = await invited_count(user.id)
+    personal = _score_personal_lines(player, invited, stake_line, settings.ton_enabled)
 
     title = title_for_streak(player.current_streak)
     lines = [
         f"{title.emoji} <b>{title.name}</b> — титул Стаи: растёт за серию верных сцен",
-        choice,
+        _score_choice(user, vote, round_row),
         "",
         *streak_lines(player),
         "",
         f"📅 Голосов на неделе: {rank['week_votes']} · верных: {rank['week_correct']}",
         f"🗓 Голосов в месяце: {rank['month_votes']} · верных: {rank['month_correct']}",
     ]
-    if settings.ton_enabled:
-        w_pcts = "/".join(
-            part.strip() for part in settings.weekly_prize_pcts.split(",") if part.strip()
-        )
-        m_pcts = "/".join(
-            part.strip() for part in settings.monthly_prize_weights.split(",") if part.strip()
-        )
-        lines.append(
-            f"🏆 Топ-3 верных сцен недели и месяца делят копилки Gram "
-            f"(доли недели {w_pcts}, месяца {m_pcts})"
-        )
+    prize = _score_prize_line(settings.ton_enabled)
+    if prize is not None:
+        lines.append(prize)
     lines.append("")
     lines.append("🐾 Лестница титулов (верных сцен подряд):")
-    ladder = [f"{t.correct_needed} {t.emoji} {t.name}" for t in TITLES[1:]]
+    ladder = _score_ladder_lines()
     for i in range(0, len(ladder), 3):
         lines.append(" · ".join(ladder[i : i + 3]))
     if personal:
