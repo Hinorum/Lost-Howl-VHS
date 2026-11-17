@@ -375,6 +375,38 @@ async def _handle_revote(
     return status
 
 
+async def _auto_grant_ok(bot: Bot | None, transfer: Transfer, player: Player) -> str:
+    """Автогрант прошёл: DM игроку о зачёте перемотки (сумма перевода)."""
+    await _dm_stake(
+        bot,
+        player.id,
+        f"💎 Перемотка кадра оплачена ({from_nano(transfer.value_nanotons):g} Gram, "
+        "без мемо — зачтено по сумме). Нажми другой вариант — кадр перемотается.",
+    )
+    return "revote_ok"
+
+
+async def _auto_grant_refund(
+    bot: Bot | None,
+    session,
+    transfer: Transfer,
+    player: Player,
+    ledger_result: str,
+    status: str,
+    dm_text: str,
+) -> str:
+    """Автогрант не прошёл: возврат суммы штатным путём (стэш + персональный DM)."""
+    refund_status = await _stash_refund(
+        session,
+        transfer,
+        None,
+        ledger_result=ledger_result,
+        ledger_player_id=player.id,
+    )
+    await _dm_refund_queued(bot, player.id, refund_status, dm_text)
+    return status
+
+
 async def _handle_auto_grant(
     session, transfer: Transfer, bot: Bot | None, player: Player
 ) -> str | None:
@@ -389,74 +421,59 @@ async def _handle_auto_grant(
     """
     auto_status = await _maybe_auto_grant(session, transfer, player)
     if auto_status == "revote_ok":
-        await _dm_stake(
-            bot,
-            player.id,
-            f"💎 Перемотка кадра оплачена ({from_nano(transfer.value_nanotons):g} Gram, "
-            "без мемо — зачтено по сумме). Нажми другой вариант — кадр перемотается.",
-        )
-        return "revote_ok"
+        return await _auto_grant_ok(bot, transfer, player)
     if auto_status == "no_vote":
         # День открыт, но пути ещё нет — менять нечего, а суммой это
         # и не ставка: возвращаем сразу с объяснением. Уведомление —
         # только если возврат действительно встал в очередь: повторный
         # проход watcher'а по тому же переводу не должен повторять DM.
-        refund_status = await _stash_refund(
+        return await _auto_grant_refund(
+            bot,
             session,
             transfer,
-            None,
+            player,
             ledger_result="revote_auto:no_vote",
-            ledger_player_id=player.id,
+            status="revote_auto_no_vote",
+            dm_text=(
+                f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
+                "он меньше минимума ставки, а за перемотку кадра платить нечего — "
+                "ты ещё не сделал выбор дня. Первая запись бесплатная: жми свой "
+                "вариант, без оплаты."
+            ),
         )
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            "он меньше минимума ставки, а за перемотку кадра платить нечего — "
-            "ты ещё не сделал выбор дня. Первая запись бесплатная: жми свой "
-            "вариант, без оплаты.",
-        )
-        return "revote_auto_no_vote"
     if auto_status == "duplicate_tx":
         # Грант уже выдан ранее, молча выходим.
         return "revote_dup"
     if auto_status == "revote_money_off":
         # Бесплатный день: серверный гейт сработал, когда UI уже принял
         # сумму за смену пути — возвращаем с объяснением.
-        refund_status = await _stash_refund(
+        return await _auto_grant_refund(
+            bot,
             session,
             transfer,
-            None,
+            player,
             ledger_result="revote_auto:money_off",
-            ledger_player_id=player.id,
+            status="revote_auto_money_off",
+            dm_text=(
+                f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
+                "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем."
+            ),
         )
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            "сегодня версия без ставок: смена выбора закрыта — платить за неё нечем.",
-        )
-        return "revote_auto_money_off"
     if auto_status == "revote_disabled":
         # Смена выбора выключена флагом: сумма из вилки не ставка,
         # поэтому сразу возвращаем её, а не оставляем в казне.
-        refund_status = await _stash_refund(
+        return await _auto_grant_refund(
+            bot,
             session,
             transfer,
-            None,
+            player,
             ledger_result="revote_auto:disabled",
-            ledger_player_id=player.id,
+            status="revote_auto_disabled",
+            dm_text=(
+                f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
+                "смена выборки сейчас отключена — плата за неё не взимается."
+            ),
         )
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {from_nano(transfer.value_nanotons):g} Gram возвращается: "
-            "смена выбора сейчас отключена — плата за неё не взимается.",
-        )
-        return "revote_auto_disabled"
     # auto_status == "revote_closed" — открытого дня нет: обработка
     # продолжается штатным путём (закрытый день вернёт перевод штатно).
     return None
