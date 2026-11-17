@@ -217,6 +217,46 @@ async def _settle_batch_uncertain(
     return confirmed, {payout.id for payout, _candidates in batch_rows}
 
 
+async def _claim_batch_rows(
+    payouts: list[Payout], markers: set[str]
+) -> tuple[list[tuple[Payout, tuple[str, ...]]], set[int], set[int]]:
+    """Кандидаты пачки под живым lease: (строки, все id, id потерявших клейм)."""
+    batch_rows = _batch_rows(payouts, markers)
+    if not batch_rows:
+        return [], set(), set()
+    # Все кандидаты пачки: и отправленные, и потерявшие клейм строки нельзя
+    # отдавать поштучному проходу этого цикла — первые уже разосланы одним
+    # сообщением, вторые принадлежат другому циклу/сбросу.
+    candidate_ids = {payout.id for payout, _candidates in batch_rows}
+    renewed_ids = await _renew_claims([payout for payout, _candidates in batch_rows])
+    lost_ids = candidate_ids - renewed_ids
+    batch_rows = [
+        (payout, candidates)
+        for payout, candidates in batch_rows
+        if payout.id in renewed_ids
+    ]
+    return batch_rows, candidate_ids, lost_ids
+
+
+def _log_batch_uncertain(
+    batch_rows: list[tuple[Payout, tuple[str, ...]]], exc: Exception
+) -> None:
+    """Лог «судьба пачки неясна»: таймаут вещания отличается от сбоя канала."""
+    if isinstance(exc, TimeoutError):
+        logger.warning(
+            "Пачка из %d переводов: таймаут вещания >%ss — решаю по memo",
+            len(batch_rows),
+            settings.payout_send_timeout_seconds,
+        )
+    else:
+        logger.warning(
+            "Пачка из %d переводов: вещание не подтвердилось (%s) — "
+            "считаю судьбу неясной, повтор в цикле не шлю",
+            len(batch_rows),
+            exc,
+        )
+
+
 async def _try_send_batch_v5(
     payouts: list[Payout], markers: set[str]
 ) -> tuple[int, set[int]]:
@@ -231,7 +271,7 @@ async def _try_send_batch_v5(
         нашему штампу; строки, потерявшие клейм, из пачки исключаются и
         поштучным проходом не отправляются;
       • BatchRejected (ошибка сборки/явный отказ лайтсерверов) — ничего не
-        помечаем и не держаем: поштучный проход отправит строки как раньше.
+        помечаем и не держим: поштучный проход отправит строки как раньше.
         Транзакция v5r1 атомарна (одно плохое действие отменяет всю пачку),
         поэтому поштучный фолбэк — не опция, а требование корректности;
       • всё прочее (таймаут вещания, сбой обоих каналов, неклассифицированные
@@ -241,21 +281,7 @@ async def _try_send_batch_v5(
         не возвращаем: вещание могло уйти); следующий цикл начнёт с
         анти-дубля.
     """
-    batch_rows = _batch_rows(payouts, markers)
-    if not batch_rows:
-        return 0, set()
-
-    # Все кандидаты пачки: и отправленные, и потерявшие клейм строки нельзя
-    # отдавать поштучному проходу этого цикла — первые уже разосланы одним
-    # сообщением, вторые принадлежат другому циклу/сбросу.
-    candidate_ids = {payout.id for payout, _candidates in batch_rows}
-    renewed_ids = await _renew_claims([payout for payout, _candidates in batch_rows])
-    lost_ids = candidate_ids - renewed_ids
-    batch_rows = [
-        (payout, candidates)
-        for payout, candidates in batch_rows
-        if payout.id in renewed_ids
-    ]
+    batch_rows, candidate_ids, lost_ids = await _claim_batch_rows(payouts, markers)
     if not batch_rows:
         return 0, candidate_ids
 
@@ -283,19 +309,7 @@ async def _try_send_batch_v5(
         # неклассифицированные сбои. Внешка могла уйти в сеть — повтор в этом
         # цикле рискнул бы двойным платежом. Решаем по memo, как одиночный
         # путь при таймауте.
-        if isinstance(exc, TimeoutError):
-            logger.warning(
-                "Пачка из %d переводов: таймаут вещания >%ss — решаю по memo",
-                len(batch_rows),
-                settings.payout_send_timeout_seconds,
-            )
-        else:
-            logger.warning(
-                "Пачка из %d переводов: вещание не подтвердилось (%s) — "
-                "считаю судьбу неясной, повтор в цикле не шлю",
-                len(batch_rows),
-                exc,
-            )
+        _log_batch_uncertain(batch_rows, exc)
         confirmed, pending_ids = await _settle_batch_uncertain(batch_rows)
         return confirmed, pending_ids | lost_ids
 
