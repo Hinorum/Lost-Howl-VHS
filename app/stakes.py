@@ -432,17 +432,11 @@ async def _credit_referral(
     )
 
 
-async def _settle_referral_pots(session: AsyncSession) -> int:
-    """Дозрелые реферальные накопления превращаются в выплаты (kind="referral").
-
-    Платим только >= referral_min_payout_gram: микропереводы не плодим, газ
-    (~payout_fee_gram) стоит заметную долю микро-«поощрения». Атомарно:
-    UPDATE ... WHERE nanotons == прочитанному замеру — при параллельных
-    вызовах (несколько реплик) строку заберёт ровно один процесс. Реферер
-    без ПОДТВЕРЖДЁННОГО кошелька не платится: накопление ждёт привязку.
-    """
-    min_nano = to_nano(settings.referral_min_payout_gram)
-    rows = (
+async def _ripe_referral_pots(
+    session: AsyncSession, min_nano: int
+) -> list[ReferralPot]:
+    """Накопления, доросшие до порога выплаты."""
+    return list(
         (
             await session.execute(
                 select(ReferralPot)
@@ -453,10 +447,13 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
         .scalars()
         .all()
     )
-    if not rows:
-        return 0
-    referrer_ids = {pot.referrer_id for pot in rows}
-    wallets = dict(
+
+
+async def _referrer_wallets(
+    session: AsyncSession, referrer_ids: set[int]
+) -> dict[int, str | None]:
+    """Подтверждённые кошельки рефереров: без них накопление ждёт привязку."""
+    return dict(
         (
             await session.execute(
                 select(Player.id, Player.wallet_address).where(
@@ -466,6 +463,34 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
             )
         ).all()
     )
+
+
+async def _claim_referral_pot(
+    session: AsyncSession, pot: ReferralPot, amount: int
+) -> bool:
+    """Атомарно забирает замер накопления; False — уже забрал другой процесс."""
+    claimed = await session.execute(
+        update(ReferralPot)
+        .where(ReferralPot.id == pot.id, ReferralPot.nanotons == amount)
+        .values(nanotons=0, updated_at=datetime.now(UTC))
+    )
+    return cast(CursorResult[Any], claimed).rowcount == 1
+
+
+async def _settle_referral_pots(session: AsyncSession) -> int:
+    """Дозрелые реферальные накопления превращаются в выплаты (kind="referral").
+
+    Платим только >= referral_min_payout_gram: микропереводы не плодим, газ
+    (~payout_fee_gram) стоит заметную долю микро-«поощрения». Атомарно:
+    UPDATE ... WHERE nanotons == прочитанному замеру — при параллельных
+    вызовах (несколько реплик) строку заберёт ровно один процесс. Реферер
+    без ПОДТВЕРЖДЁННОГО кошелька не платится: накопление ждёт привязку.
+    """
+    min_nano = to_nano(settings.referral_min_payout_gram)
+    rows = await _ripe_referral_pots(session, min_nano)
+    if not rows:
+        return 0
+    wallets = await _referrer_wallets(session, {pot.referrer_id for pot in rows})
     network = current_network()
     fee_nano = await fee_estimate_nano(session)
     created = 0
@@ -487,12 +512,7 @@ async def _settle_referral_pots(session: AsyncSession) -> int:
         net = net_payout_amount(amount, fee_nano)
         if net <= 0:
             continue  # накопление меньше газа — ждём роста
-        claimed = await session.execute(
-            update(ReferralPot)
-            .where(ReferralPot.id == pot.id, ReferralPot.nanotons == amount)
-            .values(nanotons=0, updated_at=datetime.now(UTC))
-        )
-        if cast(CursorResult[Any], claimed).rowcount == 0:
+        if not await _claim_referral_pot(session, pot, amount):
             continue  # другой процесс уже забрал — следующий цикл догонит
         session.add(
             Payout(
