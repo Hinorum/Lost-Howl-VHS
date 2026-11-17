@@ -1530,10 +1530,86 @@ def _exact_line(check: dict, bootstrapped: bool) -> str:
     )
 
 
+def _mirror_beat_age(stats: dict) -> int | None:
+    """Возраст последнего завершённого цикла в секундах; None — метки нет/битая."""
+    if not stats["beat_iso"]:
+        return None
+    try:
+        moment = datetime.fromisoformat(stats["beat_iso"])
+    except ValueError as exc:
+        # Метка зеркала битая: возраст неизвестен, и /treasury так и скажет.
+        logger.debug(
+            "Метка времени зеркала не разобрана (%r): %s", stats.get("beat_iso"), exc
+        )
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return max(0, int((datetime.now(UTC) - moment).total_seconds()))
+
+
+def _mirror_last_lag(stats: dict) -> int | None:
+    """Сколько секунд назад была последняя транзакция; None — движений нет."""
+    if stats["last_utime"] is None:
+        return None
+    return max(0, int(datetime.now(UTC).timestamp()) - int(stats["last_utime"]))
+
+
+def _mirror_coverage_line(moves: int, lag: int | None, source: str | None) -> str:
+    """Строка покрытия: сколько транзакций и как давно последняя."""
+    cov = f"{moves:,}".replace(",", " ")
+    lag_part = "—"
+    if lag is not None and lag >= 0:
+        lag_part = f"{lag // 60} мин назад" if lag >= 60 else "только что"
+    src = f" · источник {source}" if source else ""
+    return f"  покрытие: {cov} транзакций · актуально {lag_part}{src}"
+
+
+def _mirror_traffic_lines(groups: dict) -> list[str]:
+    """Строки трафика по видам и реального газа из цепочки."""
+    lines: list[str] = []
+    traffic = [g for g in groups if g not in ("self", "other")]
+    if traffic:
+        shown = ", ".join(
+            f"{_kind_label(kind)} {groups[kind]['count']} "
+            f"({groups[kind]['value'] / 1e9:.2f} Gram)"
+            for kind in sorted(traffic)
+        )
+        lines.append(f"  трафик: {shown}")
+    fees = sum(g["fee"] for g in groups.values())
+    if fees:
+        lines.append(
+            f"  газ (реальный, из цепочки): {fees / 1e9:.4f} Gram суммарно"
+        )
+    return lines
+
+
+def _mirror_unknown_lines(unknown: dict) -> list[str]:
+    """Непонятые переводы: открытые требуют разбора, закрытые — только аудит."""
+    open_unknown = int(unknown.get("open_in", 0)) + int(unknown.get("open_out", 0))
+    gross_unknown = int(unknown.get("gross_in", 0)) + int(unknown.get("gross_out", 0))
+    if open_unknown:
+        return [
+            f"  ☑️ непонятых переводов на {open_unknown / 1e9:.3f} Gram — "
+            "разбери вручную (пыль/jetton/вывод мимо бота)"
+        ]
+    if not gross_unknown:
+        return []
+    # Валовый трафик остаётся в строке «трафик» для аудита; тревоги
+    # нет, потому что каждый перевод уже закрыт возвратом или /adjust.
+    closed = []
+    resolved_in = int(unknown.get("resolved_in", 0))
+    resolved_out = int(unknown.get("resolved_out", 0))
+    if resolved_in:
+        closed.append(f"{resolved_in / 1e9:.2f} Gram возвращено")
+    if resolved_out:
+        closed.append(f"{resolved_out / 1e9:.2f} Gram списано корректировкой")
+    if closed:
+        return ["  ✓ непонятые переводы закрыты: " + ", ".join(closed)]
+    return []
+
+
 async def treasury_mirror_block() -> str:
     """Текстовый блок «Зеркало казны» для /treasury (без доступа к сети)."""
-    from datetime import UTC as _UTC
-
     async with SessionLocal() as session:
         stats = await treasury_mirror_stats(session)
     network = _active_network()
@@ -1541,72 +1617,26 @@ async def treasury_mirror_block() -> str:
     if not settings.ton_enabled or not settings.active_treasury_address:
         lines.append("  не активно (TON выключен или адрес казначея не задан)")
         return "\n".join(lines)
-    beat_age = None
-    if stats["beat_iso"]:
-        try:
-            moment = datetime.fromisoformat(stats["beat_iso"])
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=_UTC)
-            beat_age = max(0, int((datetime.now(_UTC) - moment).total_seconds()))
-        except ValueError as exc:
-            # Метка зеркала битая: возраст неизвестен, и /treasury так и скажет.
-            logger.debug("Метка времени зеркала не разобрана (%r): %s", stats.get("beat_iso"), exc)
-    lag = None
-    if stats["last_utime"] is not None:
-        lag = max(0, int(datetime.now(_UTC).timestamp()) - int(stats["last_utime"]))
+    beat_age = _mirror_beat_age(stats)
+    lag = _mirror_last_lag(stats)
     moves = stats["move_count"]
     if moves == 0 and not stats["bootstrapped"]:
         lines.append("  история кошелька пуста либо бутстрап ещё не начался")
     else:
-        cov = f"{moves:,}".replace(",", " ")
-        lag_part = "—"
-        if lag is not None and lag >= 0:
-            lag_part = f"{lag // 60} мин назад" if lag >= 60 else "только что"
-        src = f" · источник {stats['source']}" if stats["source"] else ""
-        lines.append(f"  покрытие: {cov} транзакций · актуально {lag_part}{src}")
+        lines.append(_mirror_coverage_line(moves, lag, stats["source"]))
     if beat_age is not None:
         lines.append(f"  последний цикл: {beat_age} с назад")
     elif moves:
         lines.append("  последний цикл: не завершался (индексаторы молчат) ⚠️")
     if stats["bootstrapped"]:
         lines.append(f"  {_exact_line(stats['check'], True)}")
-        groups = stats["groups"]
-        traffic = [g for g in groups if g not in ("self", "other")]
-        if traffic:
-            shown = ", ".join(
-                f"{_kind_label(kind)} {groups[kind]['count']} "
-                f"({groups[kind]['value'] / 1e9:.2f} Gram)"
-                for kind in sorted(traffic)
-            )
-            lines.append(f"  трафик: {shown}")
-        fees = sum(g["fee"] for g in groups.values())
-        if fees:
-            lines.append(
-                f"  газ (реальный, из цепочки): {fees / 1e9:.4f} Gram суммарно"
-            )
-        unknown = stats.get("unknown") or {}
-        open_unknown = int(unknown.get("open_in", 0)) + int(unknown.get("open_out", 0))
-        gross_unknown = int(unknown.get("gross_in", 0)) + int(unknown.get("gross_out", 0))
-        if open_unknown:
-            lines.append(
-                f"  ☑️ непонятых переводов на {open_unknown / 1e9:.3f} Gram — "
-                "разбери вручную (пыль/jetton/вывод мимо бота)"
-            )
-        elif gross_unknown:
-            # Валовый трафик остаётся в строке «трафик» для аудита; тревоги
-            # нет, потому что каждый перевод уже закрыт возвратом или /adjust.
-            closed = []
-            resolved_in = int(unknown.get("resolved_in", 0))
-            resolved_out = int(unknown.get("resolved_out", 0))
-            if resolved_in:
-                closed.append(f"{resolved_in / 1e9:.2f} Gram возвращено")
-            if resolved_out:
-                closed.append(f"{resolved_out / 1e9:.2f} Gram списано корректировкой")
-            if closed:
-                lines.append("  ✓ непонятые переводы закрыты: " + ", ".join(closed))
+        lines.extend(_mirror_traffic_lines(stats["groups"]))
+        lines.extend(_mirror_unknown_lines(stats.get("unknown") or {}))
     else:
         remaining_note = ""
         if stats["bottom_lt"] is not None:
             remaining_note = " — история дотягивается от головы к генезису"
-        lines.append(f"  бутстрап: идёт{remaining_note}, сверка станет возможной после покрытия")
+        lines.append(
+            f"  бутстрап: идёт{remaining_note}, сверка станет возможной после покрытия"
+        )
     return "\n".join(lines)
