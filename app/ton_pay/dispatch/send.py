@@ -107,6 +107,16 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
     if not settings.ton_enabled or not settings.active_treasury_mnemonic:
         logger.warning("TON выключен или нет мнемоники: выплата к …%s не отправлена", dest_address[-6:])
         return None
+    # Лайтсерверный канал выключен (TON_LITESERVER_MODE=off): сразу HTTP-канал.
+    # Иначе пришлось бы поднимать пул, чтобы тут же от него отказаться.
+    if settings.ton_liteserver_mode == "off":
+        import app.ton_pay as _tp
+
+        logger.info(
+            "Лайтсерверный канал выключен — перевод к …%s уходит по HTTP (toncenter)",
+            dest_address[-6:],
+        )
+        return await _tp._send_ton_transfer_http(dest_address, amount_nanotons, comment)
     try:
         # Вызовы идут через app.ton_pay: тесты патчат ton_pay._get_wallet /
         # ton_pay._send_ton_transfer_http / ton_pay._is_liteserver_down.
@@ -281,6 +291,16 @@ async def send_ton_transfers_batch(transfers: list[tuple[str, int, str]]) -> str
             len(transfers),
         )
         return None
+    # Лайтсерверный канал выключен (TON_LITESERVER_MODE=off) — пачка уходит
+    # по HTTP тем же подписанным BoC.
+    if settings.ton_liteserver_mode == "off":
+        import app.ton_pay as _tp
+
+        logger.info(
+            "Лайтсерверный канал выключен — пачка из %d уходит по HTTP (toncenter)",
+            len(transfers),
+        )
+        return await _tp._send_ton_transfers_http(transfers)
     try:
         # Вызовы идут через app.ton_pay: тесты патчат ton_pay._get_wallet /
         # ton_pay._send_ton_transfers_http / ton_pay._is_liteserver_down.

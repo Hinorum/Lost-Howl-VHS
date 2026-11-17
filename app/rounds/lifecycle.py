@@ -34,7 +34,14 @@ from app.models import (
 
 from .materialization import _materialize_round, _stamp_day_money_mode
 from .pot import round_pot
-from .queries import get_active_round, get_latest_round, get_round
+from .queries import (
+    RoundMeta,
+    get_active_round,
+    get_active_round_meta,
+    get_latest_round,
+    get_latest_round_meta,
+    get_round,
+)
 from .rendering import plan_and_render
 from .time import _ROMAN, _now, announce_claim_cutoff, utc_aware
 from .voting import (
@@ -272,16 +279,59 @@ async def ensure_current_round(session: AsyncSession) -> Round:
     return await create_next_round(session)
 
 
-async def heal_stale_rounds(session: AsyncSession) -> int:
-    """Дочитывает дни, застрявшие не-закрытыми ПОЗАДИ актуального."""
-    latest = await get_latest_round(session)
-    if latest is None:
-        return 0
+async def ensure_current_round_meta(
+    session: AsyncSession,
+) -> tuple[RoundMeta, Round | None]:
+    """Лёгкий аналог ensure_current_round для горячего тика.
+
+    Возвращает мету текущего дня и — только если день пришлось создать —
+    его полный объект (он уже в памяти после материализации). В обычном тике
+    полная строка дня с chapter_text и картами не читается: она нужна лишь
+    при закрытии/анонсе, а не каждые 15 секунд.
+    """
+    current = await get_active_round_meta(session)
+    if current is not None:
+        return current, None
+    latest = await get_latest_round_meta(session)
+    if latest is not None and latest.status != RoundStatus.CLOSED:
+        return latest, None
+    if latest is not None and utc_aware(latest.tally_ends_at) > _now():
+        return latest, None
+    created = await create_next_round(session)
+    return (
+        RoundMeta(
+            id=created.id,
+            day_index=created.day_index,
+            status=created.status,
+            voting_ends_at=created.voting_ends_at,
+            tally_ends_at=created.tally_ends_at,
+        ),
+        created,
+    )
+
+
+async def heal_stale_rounds(
+    session: AsyncSession, latest_day_index: int | None = None
+) -> int:
+    """Дочитывает дни, застрявшие не-закрытыми ПОЗАДИ актуального.
+
+    latest_day_index передаёт горячий тик: он уже знает самый поздний день из
+    лёгкой меты, и второй полный Round с chapter_text здесь не нужен. Без
+    аргумента (админский /advance) читается только номер дня, а не вся строка.
+    """
+    if latest_day_index is None:
+        latest_day_index = (
+            await session.execute(
+                select(Round.day_index).order_by(Round.day_index.desc()).limit(1)
+            )
+        ).scalar_one_or_none()
+        if latest_day_index is None:
+            return 0
     result = await session.execute(
         select(Round)
         .options(selectinload(Round.cards))
         .where(
-            Round.day_index < latest.day_index,
+            Round.day_index < latest_day_index,
             Round.status.in_([RoundStatus.OPEN, RoundStatus.TALLYING]),
         )
         .order_by(Round.day_index.asc())

@@ -447,7 +447,7 @@ async def test_tick_returns_early_when_paused(monkeypatch) -> None:
     async def bomb(*_args, **_kwargs):
         raise AssertionError("тик не должен идти дальше стоп-крана")
 
-    monkeypatch.setattr(sched, "get_latest_round", bomb)
+    monkeypatch.setattr(sched, "get_latest_round_meta", bomb)
     await sched.tick()
 
 
@@ -459,17 +459,22 @@ async def test_tick_announces_first_round(monkeypatch) -> None:
     monkeypatch.setattr(sched, "_now", lambda: now)
     monkeypatch.setattr("app.ops.mark_tick", AsyncMock())
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
-    monkeypatch.setattr(sched, "get_latest_round", AsyncMock(return_value=None))
+    monkeypatch.setattr(sched, "get_latest_round_meta", AsyncMock(return_value=None))
     monkeypatch.setattr("app.rounds.heal_stale_rounds", AsyncMock(return_value=0))
     monkeypatch.setattr("app.rounds.get_run_anchor", AsyncMock(return_value={}))
 
     current = SimpleNamespace(
         id=1,
+        day_index=1,
         status=RoundStatus.OPEN,
         voting_ends_at=now + timedelta(hours=1),
         tally_ends_at=now + timedelta(hours=2),
     )
-    monkeypatch.setattr(sched, "ensure_current_round", AsyncMock(return_value=current))
+    monkeypatch.setattr(
+        sched, "ensure_current_round_meta", AsyncMock(return_value=(current, None))
+    )
+    # Пост дня читает полную строку (с картами) — она нужна только тут.
+    monkeypatch.setattr(sched, "get_round", AsyncMock(return_value=current))
     monkeypatch.setattr(sched, "claim_announcement", AsyncMock(return_value=True))
     announced = []
     async def fake_announce(bot, round_row):
@@ -488,7 +493,9 @@ async def test_tick_swallows_internal_error_and_rolls_back(monkeypatch) -> None:
 
     monkeypatch.setattr("app.ops.mark_tick", AsyncMock())
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
-    monkeypatch.setattr(sched, "get_latest_round", AsyncMock(side_effect=RuntimeError("взрыв")))
+    monkeypatch.setattr(
+        sched, "get_latest_round_meta", AsyncMock(side_effect=RuntimeError("взрыв"))
+    )
     monkeypatch.setattr("app.rounds.heal_stale_rounds", AsyncMock())
     monkeypatch.setattr("app.rounds.get_run_anchor", AsyncMock())
 
@@ -504,17 +511,26 @@ async def test_tick_closes_finished_day_and_kicks_background_jobs(monkeypatch) -
     monkeypatch.setattr("app.ops.mark_tick", AsyncMock())
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
     # previous.id=9 > current.id=2 — ветка «новый день» не срабатывает.
-    monkeypatch.setattr(sched, "get_latest_round", AsyncMock(return_value=SimpleNamespace(id=9)))
+    monkeypatch.setattr(
+        sched,
+        "get_latest_round_meta",
+        AsyncMock(return_value=SimpleNamespace(id=9, day_index=9)),
+    )
     monkeypatch.setattr("app.rounds.heal_stale_rounds", AsyncMock(return_value=0))
     monkeypatch.setattr("app.rounds.get_run_anchor", AsyncMock(return_value={}))
 
     current = SimpleNamespace(
         id=2,
+        day_index=2,
         status=RoundStatus.TALLYING,
         voting_ends_at=now - timedelta(hours=1),
         tally_ends_at=now - timedelta(minutes=1),
     )
-    monkeypatch.setattr(sched, "ensure_current_round", AsyncMock(return_value=current))
+    monkeypatch.setattr(
+        sched, "ensure_current_round_meta", AsyncMock(return_value=(current, None))
+    )
+    # Закрытие дня читает полную строку с картами — она нужна только тут.
+    monkeypatch.setattr(sched, "get_round", AsyncMock(return_value=current))
 
     awarded = []
     async def fake_award(session, round_row):

@@ -40,16 +40,20 @@ def _patch_happy_tick(monkeypatch) -> None:
     now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
     monkeypatch.setattr(sched, "_now", lambda: now)
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
-    monkeypatch.setattr(sched, "get_latest_round", AsyncMock(return_value=None))
+    monkeypatch.setattr(sched, "get_latest_round_meta", AsyncMock(return_value=None))
     monkeypatch.setattr("app.rounds.heal_stale_rounds", AsyncMock(return_value=0))
     monkeypatch.setattr("app.rounds.get_run_anchor", AsyncMock(return_value={}))
     current = SimpleNamespace(
         id=1,
+        day_index=1,
         status=RoundStatus.OPEN,
         voting_ends_at=now + timedelta(hours=1),
         tally_ends_at=now + timedelta(hours=2),
     )
-    monkeypatch.setattr(sched, "ensure_current_round", AsyncMock(return_value=current))
+    monkeypatch.setattr(
+        sched, "ensure_current_round_meta", AsyncMock(return_value=(current, None))
+    )
+    monkeypatch.setattr(sched, "get_round", AsyncMock(return_value=current))
     monkeypatch.setattr(sched, "claim_announcement", AsyncMock(return_value=True))
     monkeypatch.setattr(sched, "announce_new_day", AsyncMock())
 
@@ -70,7 +74,9 @@ async def test_failed_tick_leaves_heartbeat_stale(monkeypatch) -> None:
             await db.commit()
 
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
-    monkeypatch.setattr(sched, "get_latest_round", AsyncMock(side_effect=RuntimeError("взрыв")))
+    monkeypatch.setattr(
+        sched, "get_latest_round_meta", AsyncMock(side_effect=RuntimeError("взрыв"))
+    )
 
     await sched.tick()
 
@@ -148,7 +154,7 @@ async def test_paused_tick_beats_heartbeat(monkeypatch) -> None:
     async def bomb(*_args, **_kwargs):
         raise AssertionError("тик не должен идти дальше стоп-крана")
 
-    monkeypatch.setattr(sched, "get_latest_round", bomb)
+    monkeypatch.setattr(sched, "get_latest_round_meta", bomb)
 
     await sched.tick()
 

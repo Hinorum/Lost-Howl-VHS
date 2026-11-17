@@ -24,10 +24,11 @@ from app.rounds import (
     announce_claim_cutoff,
     claim_announcement,
     close_voting,
-    ensure_current_round,
+    ensure_current_round_meta,
     finish_tally,
     get_active_round,
-    get_latest_round,
+    get_latest_round_meta,
+    get_round,
     results_claim_cutoff,
     utc_aware,
 )
@@ -175,11 +176,11 @@ async def _tick_paused() -> bool:
     return False
 
 
-async def _tick_heal_stale(session: AsyncSession) -> None:
+async def _tick_heal_stale(session: AsyncSession, latest_day_index: int | None) -> None:
     """Самолечение: дни, застрявшие не-закрытыми позади актуального."""
     from app.rounds import heal_stale_rounds
 
-    healed = await heal_stale_rounds(session)
+    healed = await heal_stale_rounds(session, latest_day_index=latest_day_index)
     if healed:
         logger.warning("Вылечено застрявших дней: %d", healed)
 
@@ -191,9 +192,28 @@ async def _tick_warm_anchor(session: AsyncSession) -> None:
     await get_run_anchor(session)
 
 
-async def _tick_close_if_due(session: AsyncSession, current, bot: Bot | None) -> None:
-    """Закрыть голосование/подсчёт, если срок пришёл; финализировать день."""
+async def _tick_close_if_due(session: AsyncSession, current_meta, bot: Bot | None) -> None:
+    """Закрыть голосование/подсчёт, если срок пришёл; финализировать день.
+
+    Решение принимается по лёгкой мете дня (без chapter_text и карт): полный
+    Round нужен только когда день действительно закрывается. На обычном тике
+    каждые 15 секунд эта функция не читает тяжёлую строку вовсе.
+    """
     now = _now()
+    close_due = (
+        current_meta.status == RoundStatus.OPEN
+        and now >= utc_aware(current_meta.voting_ends_at)
+    )
+    tally_due = (
+        current_meta.status == RoundStatus.TALLYING
+        and now >= utc_aware(current_meta.tally_ends_at)
+    )
+    if not (close_due or tally_due):
+        return
+    # Карты нужны close_voting/finish_tally (счёт, канон) — грузим один раз.
+    current = await get_round(session, current_meta.id)
+    if current is None:
+        return
     if current.status == RoundStatus.OPEN and now >= utc_aware(current.voting_ends_at):
         await close_voting(session, current)
     if current.status == RoundStatus.TALLYING and now >= utc_aware(current.tally_ends_at):
@@ -249,13 +269,28 @@ async def _tick_body(bot: Bot | None, span) -> None:
         return
     async with SessionLocal() as session:
         try:
-            previous = await get_latest_round(session)
-            current = await ensure_current_round(session)
-            await _tick_heal_stale(session)
+            # Лёгкая мета дня вместо полной строки: chapter_text и карты нужны
+            # только при закрытии/анонсе, а тик ходит каждые 15 секунд. Полная
+            # строка — это заметная доля трафика между сервисом и внешней БД
+            # (Supabase), а на free-плане Render каждый байт на счету.
+            previous = await get_latest_round_meta(session)
+            current, created = await ensure_current_round_meta(session)
+            # День, который сейчас актуален, — граница для самолечения. После
+            # создания нового дня это он (номер выше прежнего), поэтому берём
+            # максимум: иначе застрявший предыдущий день не попал бы в
+            # выборку и остался бы незакрытым.
+            latest_day_index = max(
+                previous.day_index if previous is not None else 0,
+                current.day_index,
+            )
+            await _tick_heal_stale(session, latest_day_index)
             await _tick_warm_anchor(session)
             # Первый запуск или только что созданный день — анонсим без итогов.
             if previous is None or current.id > previous.id:
-                await _announce_round(session, current, bot)
+                # Полная строка с картами нужна только тут — ради поста дня.
+                day = created if created is not None else await get_round(session, current.id)
+                if day is not None:
+                    await _announce_round(session, day, bot)
             await _tick_close_if_due(session, current, bot)
             await _tick_catch_up(session)
         except Exception as exc:

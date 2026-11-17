@@ -55,13 +55,29 @@ async def _send_attempt(
     timeout: float | None,
     host: str,
 ) -> httpx.Response:
-    """Одна попытка запроса с метрикой; timeout — только если задан явно."""
+    """Одна попытка запроса с метрикой; timeout — только если задан явно.
+
+    Считаем и байты ответа: на free-плане Render каждый скачанный байт —
+    это исходящий трафик, и без счётчика не видно, какой внешний API съедает
+    лимит. Тело ответа — то, что реально ушло по сети (заголовки не считаем:
+    они ничтожны по сравнению с JSON-страницами истории транзакций).
+    """
     request_kwargs: dict = {}
     if timeout is not None:
         request_kwargs["timeout"] = timeout
     response = await send(**request_kwargs)
     inc("http_requests_total", {"host": host, "status": str(response.status_code)})
+    inc("http_response_bytes_total", {"host": host}, _response_bytes(response))
     return response
+
+
+def _response_bytes(response: httpx.Response) -> int:
+    """Размер тела ответа в байтах (0, если тело не прочитано)."""
+    try:
+        return len(response.content)
+    except Exception:
+        # Потоковый ответ без прочитанного тела: считать нечего.
+        return 0
 
 
 def _backoff_delay(

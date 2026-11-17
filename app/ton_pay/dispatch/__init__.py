@@ -586,6 +586,26 @@ async def _renew_claims(payouts: list[Payout]) -> set[int]:
     return renewed
 
 
+async def _close_liteserver_pool() -> None:
+    """Закрыть пул лайтсерверов после цикла выплат (режим on_demand).
+
+    Пул нужен только на время вещания. Каждый LiteClient в pytoniq держит
+    фоновый block_updater и на каждом мастерчейн-блоке (~5 с) тянет
+    getAllShardsInfo — конфиг шардов сети с доказательством. В mainnet-
+    конфиге 18 лайтсерверов: оставленный жить пул качает сеть непрерывно и
+    съедает free-план Render (5 ГБ/мес) на ровном месте.
+
+    В режимах off (пула нет) и always (пул живёт намеренно) ничего не делаем.
+    """
+    if settings.ton_liteserver_mode != "on_demand":
+        return
+    # Через app.ton_pay — тем же способом, как в цикле достаются кошелёк и
+    # отправка: так тесты патчат один объект.
+    import app.ton_pay as _tp
+
+    await _tp.close_treasury_provider()
+
+
 async def _init_payout_batch(payouts: list[Payout]) -> bool:
     """Батчный режим: seqno кошелька ОДИН раз на цикл + провайдер v5r1.
 
@@ -605,6 +625,22 @@ async def _init_payout_batch(payouts: list[Payout]) -> bool:
         # ton_pay._http_get_wallet_seqno / ton_pay._is_liteserver_down.
         import app.ton_pay as _tp
 
+        if settings.ton_liteserver_mode == "off":
+            # Лайтсерверы выключены: кошелёк собираем оффлайн (без сети), а
+            # seqno читаем по HTTP. Так пачка остаётся пачкой — одним
+            # внешним сообщением, а не рассыпается на поштучные переводы.
+            try:
+                wallet_for_batch, _version = _tp.build_offline_treasury_wallet()
+                _state._batch_seqno = await _tp._http_get_wallet_seqno(wallet_for_batch)
+                v5_batch_capable = _tp.wallet_supports_batch(wallet_for_batch)
+            except Exception as exc:
+                _state._batch_seqno = None
+                v5_batch_capable = False
+                logger.warning(
+                    "seqno для батча не прочитан по HTTP (%s) — отправлю по одному",
+                    exc,
+                )
+            return v5_batch_capable
         try:
             wallet_for_batch = await _tp._get_wallet()
             _state._batch_seqno = await wallet_for_batch.get_seqno()
@@ -1014,6 +1050,11 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
         if deferred:
             _rollback_deferred_batch(payouts, prior_attempts)
         await session.commit()
+        # Пул лайтсерверов больше не нужен: цикл выплат отработал. Держать его
+        # дальше — значит держать фоновый опрос getAllShardsInfo (18 клиентов
+        # mainnet-конфига) на сутки вперёд ради бота, который лайтсерверы
+        # трогает раз в день. Это и есть главный пожиратель трафика Render.
+        await _close_liteserver_pool()
     dead = [p.id for p in payouts if p.status == "failed"]
     if dead:
         logger.warning("Выплаты окончательно не отправлены: %s", dead)

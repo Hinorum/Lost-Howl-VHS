@@ -45,6 +45,10 @@ def is_liteserver_down(exc: BaseException) -> bool:
     """
     if isinstance(exc, asyncio.TimeoutError):
         return True
+    # Канал выключен настройкой (TON_LITESERVER_MODE=off) — это не сбой
+    # выплаты, а «канала нет»: уходим в HTTP-вещание штатно.
+    if isinstance(exc, _wallet_pkg.LiteserverChannelDisabled):
+        return True
     text = str(exc).lower()
     return "no alive peers" in text or "cannot load block" in text
 

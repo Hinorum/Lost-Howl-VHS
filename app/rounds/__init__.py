@@ -19,6 +19,7 @@ from .lifecycle import (
     create_next_round,
     create_next_round_detailed,
     ensure_current_round,
+    ensure_current_round_meta,
     finish_tally,
     heal_stale_rounds,
     public_round_view,
@@ -27,7 +28,14 @@ from .lifecycle import (
 )
 from .materialization import _materialize_round, _stamp_day_money_mode
 from .pot import round_pot
-from .queries import get_active_round, get_latest_round, get_round
+from .queries import (
+    RoundMeta,
+    get_active_round,
+    get_active_round_meta,
+    get_latest_round,
+    get_latest_round_meta,
+    get_round,
+)
 from .rendering import PREPARED_PAYLOAD_VERSION
 from .time import (
     _ROMAN,
@@ -61,6 +69,7 @@ __all__ = [
     "create_next_round",
     "create_next_round_detailed",
     "ensure_current_round",
+    "ensure_current_round_meta",
     "finish_tally",
     "heal_stale_rounds",
     "public_round_view",
@@ -69,8 +78,11 @@ __all__ = [
     "_stamp_day_money_mode",
     "round_pot",
     "get_active_round",
+    "get_active_round_meta",
     "get_latest_round",
+    "get_latest_round_meta",
     "get_round",
+    "RoundMeta",
     "PREPARED_PAYLOAD_VERSION",
     "_ROMAN",
     "_day_window",

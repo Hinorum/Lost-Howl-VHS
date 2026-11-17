@@ -54,6 +54,22 @@ _HELP: dict[str, tuple[str, str]] = {
         "counter",
         "Обращения к внешним API по хосту и коду ответа",
     ),
+    "http_response_bytes_total": (
+        "counter",
+        "Скачано байт по внешним API (тела ответов) — прямой исходящий трафик Render",
+    ),
+    "db_queries_total": (
+        "counter",
+        "Запросов к БД: каждый — исходящий трафик Render (БД живёт за пределами Render)",
+    ),
+    "liteserver_pool_opened_total": (
+        "counter",
+        "Подъёмов пула лайтсерверов: каждый тянет фоновый опрос сети (getAllShardsInfo)",
+    ),
+    "liteserver_pool_active": (
+        "gauge",
+        "Пул лайтсерверов открыт прямо сейчас (1/0) — в норме должен быть 0 между выплатами",
+    ),
     "http_retries_total": (
         "counter",
         "Повторы обращений к внешним API по хосту и причине",
@@ -273,3 +289,38 @@ def reset() -> None:
     """Обнулить счётчики: тесты и пересоздание модуля при горячей правке."""
     _COUNTERS.clear()
     _GAUGES.clear()
+
+
+# ---------- Учёт трафика к БД ----------
+
+_DB_COUNTER_INSTALLED = False
+
+
+def install_db_query_counter() -> None:
+    """Считает запросы к БД: каждый — это исходящий трафик Render.
+
+    База живёт за пределами Render (Supabase), поэтому ответ на каждый запрос
+    физически уходит с инстанса и попадает в месячный лимит трафика. Счётчик
+    нужен, чтобы видеть, какой контур (тик, watcher, сверка) жрёт трафик: одних
+    байт HTTP тут не хватает — БД отвечает по своему протоколу.
+
+    Слушатель живёт здесь, а не в app/db.py: db не должен знать про метрики.
+    Иначе выходит цикл metrics → db → metrics, который ловит import-linter
+    (контракт «нет циклических импортов в app»).
+
+    Метка — первое слово запроса (SELECT/INSERT/UPDATE/DELETE): по ней видно,
+    что именно чаще всего ходит в базу.
+    """
+    global _DB_COUNTER_INSTALLED
+    if _DB_COUNTER_INSTALLED:
+        return
+    _DB_COUNTER_INSTALLED = True
+
+    from sqlalchemy import event
+
+    from app.db import engine
+
+    @event.listens_for(engine.sync_engine, "after_cursor_execute")
+    def _count_db_queries(conn, cursor, statement, parameters, context, executemany):
+        kind = statement.strip().split(" ", 1)[0].upper()[:12] if statement else "?"
+        inc("db_queries_total", {"kind": kind})

@@ -51,7 +51,7 @@ async def test_lock_lost_and_not_regained_freezes_the_tick(monkeypatch) -> None:
     async def bomb(*_args, **_kwargs):
         raise AssertionError("тик без лока не должен трогать игру")
 
-    monkeypatch.setattr(sched, "get_latest_round", bomb)
+    monkeypatch.setattr(sched, "get_latest_round_meta", bomb)
     try:
         await sched.tick()
         async with SessionLocal() as db:
@@ -68,7 +68,7 @@ async def test_regained_lock_clears_marker_and_lets_tick_work(monkeypatch) -> No
     monkeypatch.setattr("app.ops.mark_tick", AsyncMock())
     monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
     latest = AsyncMock(side_effect=RuntimeError("дошли до игры"))
-    monkeypatch.setattr(sched, "get_latest_round", latest)
+    monkeypatch.setattr(sched, "get_latest_round_meta", latest)
     try:
         # Метка от прошлого случая должна быть снята.
         await sched._mark_lock_lost()

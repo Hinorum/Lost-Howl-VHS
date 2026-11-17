@@ -148,6 +148,37 @@ def _assert_matches_default(env_key: str, field: str, actual: str, where: str) -
     )
 
 
+# Строковые рычаги: значение — не число, поэтому _assert_matches_default
+# (float) их не берёт. Паритет проверяем отдельно: режим лайтсерверного канала
+# разошёлся бы между манифестом, .env.example и кодом тихо — а расходится он
+# не по цифре, а по тому, КАК уходят выплаты (лайтсерверы или HTTP).
+STRING_LEVERS = (
+    ("TON_LITESERVER_MODE", "ton_liteserver_mode"),
+)
+
+
+@pytest.mark.parametrize(("env_key", "field"), STRING_LEVERS)
+def test_string_lever_matches_code_default(env_key: str, field: str) -> None:
+    """Строковый рычаг в манифесте совпадает с дефолтом в коде."""
+    manifest = _manifest_values()
+    assert env_key in manifest, f"{env_key} пропал из render.yaml — рычаг стал невидимым на деплое"
+    default = str(Settings.model_fields[field].default)
+    assert manifest[env_key].strip() == default.strip(), (
+        f"{env_key} в render.yaml = {manifest[env_key]!r}, а в app/config.py = {default!r}"
+    )
+
+
+@pytest.mark.parametrize(("env_key", "field"), STRING_LEVERS)
+def test_string_lever_matches_env_example(env_key: str, field: str) -> None:
+    """Строковый рычаг в .env.example совпадает с дефолтом в коде."""
+    env = _env_example_values()
+    assert env_key in env, f"{env_key} пропал из .env.example — рычаг стал невидимым при развороте"
+    default = str(Settings.model_fields[field].default)
+    assert env[env_key].strip() == default.strip(), (
+        f"{env_key} в .env.example = {env[env_key]!r}, а в app/config.py = {default!r}"
+    )
+
+
 @pytest.mark.parametrize(("env_key", "field"), MONEY_LEVERS)
 def test_money_lever_matches_code_default(env_key: str, field: str) -> None:
     """Порог из манифеста деплоя обязан совпадать с дефолтом в коде."""

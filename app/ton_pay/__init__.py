@@ -240,8 +240,10 @@ from .treasury import (  # noqa: F401  # noqa: E402,F401
 from .wallet import (  # noqa: F401  # noqa: E402,F401
     NETWORK_GLOBAL_IDS,
     WALLET_VERSIONS,
+    LiteserverChannelDisabled,
     build_offline_treasury_wallet,
     build_offline_wallet,
+    close_treasury_provider,
     cold_start_seqno_check,
     detect_wallet_version,
     ensure_cold_start_check,

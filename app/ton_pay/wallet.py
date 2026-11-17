@@ -33,6 +33,59 @@ WALLET_VERSIONS = ("v4r2", "v5r1")
 # Дефолтный wallet_id контракта v4r2 (константа pytoniq; в data-ячейке v4).
 _V4R2_WALLET_ID = 698983191
 
+
+class LiteserverChannelDisabled(RuntimeError):
+    """Лайтсерверный канал выключен настройкой (TON_LITESERVER_MODE=off).
+
+    Отдельный тип, а не «прочие ошибки»: выплата при этом не сломалась —
+    канал просто не используется, и путь обязан уйти в HTTP-канал (оффлайн-
+    подпись + Toncenter sendBoc). Классифицировать это как «сбой выплаты»
+    нельзя: диспетчер записал бы в last_error ложь и застрял на ретраях.
+    """
+
+
+async def close_treasury_provider() -> None:
+    """Закрыть пул лайтсерверов и забыть кошелёк.
+
+    Зачем: каждый LiteClient в pytoniq держит фоновый block_updater и на
+    каждом мастерчейн-блоке (~5 с) тянет getAllShardsInfo — конфиг шардов
+    сети с доказательством. В mainnet-конфиге 18 лайтсерверов, то есть
+    постоянный фон выкачивает сотни мегабайт в сутки, пока бот просто ждёт
+    следующей выплаты. Закрытый пул не качает ничего.
+
+    Закрытие идемпотентно и не бросает: вызывающий не должен падать из-за
+    того, что пул уже закрыт или сеть пропала.
+    """
+    provider = state._provider
+    state._provider = None
+    state._wallet = None
+    state._wallet_network = None
+    state._provider_last_used_at = None
+
+    from app.metrics import set_gauge
+
+    set_gauge("liteserver_pool_active", None, 0)
+    if provider is None:
+        return
+    try:
+        await provider.close_all()
+    except Exception:
+        logger.warning("Пул лайтсерверов не закрылся", exc_info=True)
+
+
+def _pool_expired() -> bool:
+    """Протух ли пул по TTL (ton_liteserver_pool_ttl_seconds).
+
+    TTL=0 — пул не протухает (прежнее поведение «живёт весь процесс»).
+    """
+    ttl = int(settings.ton_liteserver_pool_ttl_seconds)
+    if ttl <= 0:
+        return False
+    last_used = state._provider_last_used_at
+    if last_used is None:
+        return True
+    return (datetime.now(UTC) - last_used).total_seconds() > ttl
+
 # Сколько редиректов при загрузке конфига лайтсерверов готовы пройти вручную,
 # проверяя каждый хоп SSRF-гейтом (см. fetch_remote_json).
 _MAX_CONFIG_REDIRECTS = 5
@@ -275,6 +328,8 @@ async def _start_treasury_provider(
     from pytoniq.contract.wallets.wallet import WalletV4R2
     from pytoniq.contract.wallets.wallet_v5 import WalletV5R1
 
+    from app.metrics import inc, set_gauge
+
     if state._provider is not None:
         try:
             await state._provider.close_all()
@@ -291,6 +346,8 @@ async def _start_treasury_provider(
     else:
         state._provider = LiteBalancer.from_mainnet_config()
     await state._provider.start_up()
+    inc("liteserver_pool_opened_total", {"network": network})
+    set_gauge("liteserver_pool_active", None, 1)
     if version == "v5r1":
         wallet = await WalletV5R1.from_private_key(
             state._provider, private_key=private_key, wc=0, network_global_id=network_global_id
@@ -315,6 +372,13 @@ async def get_wallet():
     """
     network = settings.active_network
     async with state._wallet_lock:
+        if settings.ton_liteserver_mode == "off":
+            # Канал выключен осознанно (трафик): лайтсерверы не поднимаем вообще.
+            # Выплата уйдёт в HTTP-канал (см. dispatch/send.py) — кошелёк с
+            # лайтсерверами тут просто не нужен.
+            raise LiteserverChannelDisabled(
+                "лайтсерверный канал выключен (TON_LITESERVER_MODE=off)"
+            )
         if state._provider_reset_requested:
             # Фолбэк-путь заметил серию сбоев лайтсерверов: больной узел
             # остаётся «живым» и приоритетным, ретраи бесполезны — обнуляем
@@ -327,7 +391,14 @@ async def get_wallet():
                 state._wallet = None
                 logger.info("Пересборка пула лайтсерверов: серия сбоев исчерпала порог")
         if state._wallet is not None and state._wallet_network == network:
-            return state._wallet
+            if _pool_expired():
+                # Пул протух: он всё это время молча качал getAllShardsInfo с
+                # каждого лайтсервера. Закрываем и поднимаем свежий.
+                logger.info("Пул лайтсерверов протух — закрываю и поднимаю заново")
+                await close_treasury_provider()
+            else:
+                state._provider_last_used_at = datetime.now(UTC)
+                return state._wallet
         if not settings.active_treasury_mnemonic:
             raise ValueError("Нет мнемоники казначея для активной сети")
         if not settings.active_treasury_address:
@@ -345,6 +416,7 @@ async def get_wallet():
         )
         state._wallet = wallet
         state._wallet_network = network
+        state._provider_last_used_at = datetime.now(UTC)
         logger.info("Кошелёк казначея готов (%s, контракт %s)", network, version)
         # Холодный старт: сверяем seqno, который отдают лайтсерверы, с тем же
         # номером из Toncenter (HTTP). Расхождение — признак того, что во время
@@ -372,11 +444,24 @@ async def ensure_cold_start_check() -> None:
 
     Неудача (лайтсерверы мертвы — кошелёк не собрался) не считается
     выполненной: попытка повторяется не чаще раза в 10 минут.
+
+    Про лайтсерверный пул: в режиме on_demand он нужен ТОЛЬКО ради этой
+    сверки, поэтому закрывается сразу после неё. Иначе пул (18 клиентов с
+    фоновым опросом getAllShardsInfo) жил бы до конца процесса и выкачивал
+    бы сеть сотнями мегабайт в сутки ради бота, который лайтсерверы
+    использует раз в день. В режиме off лайтсерверы не поднимаются вообще:
+    сверка идёт по HTTP (Toncenter), сети лайтсерверов это не касается.
     """
     if state._cold_start_checked:
         return
     now = datetime.now(UTC)
     if state._cold_start_next_attempt_at is not None and now < state._cold_start_next_attempt_at:
+        return
+    if settings.ton_liteserver_mode == "off":
+        if await _cold_start_http_only():
+            state._cold_start_checked = True
+        else:
+            state._cold_start_next_attempt_at = now + timedelta(minutes=10)
         return
     try:
         await get_wallet()
@@ -386,6 +471,35 @@ async def ensure_cold_start_check() -> None:
             "Холодный старт: кошелёк не собрался (%s) — сверка seqno отложена",
             exc,
         )
+        return
+    # Пул поднят ради сверки: закрываем, чтобы он не жил до конца процесса.
+    if settings.ton_liteserver_mode == "on_demand":
+        await close_treasury_provider()
+
+
+async def _cold_start_http_only() -> bool:
+    """Сверка seqno без лайтсерверов — только HTTP-источник (Toncenter).
+
+    Лайтсерверы выключены (TON_LITESERVER_MODE=off) — значит, поднимать пул
+    ради сверки нельзя: это ровно тот трафик, который режим off и отменяет.
+    Читаем seqno по HTTP (тот же runGetMethod, что и в HTTP-канале выплат) и
+    пишем метку: /treasury покажет «лайт=—, http=N», то есть честно скажет,
+    что лайтсерверы не сверялись.
+
+    True — seqno прочитан; False — нет (повтор через 10 минут).
+    """
+    from .http_channel import http_get_wallet_seqno
+
+    http_seqno: int | None = None
+    problems: list[str] = []
+    try:
+        wallet, _ = build_offline_treasury_wallet()
+        http_seqno = int(await http_get_wallet_seqno(wallet))
+    except Exception as exc:
+        problems.append(f"toncenter: {type(exc).__name__}: {exc}"[:200])
+        logger.warning("Холодный старт: seqno по HTTP не прочитан: %s", exc)
+    await _save_cold_start_stamp(_cold_start_stamp(None, http_seqno, problems, None))
+    return http_seqno is not None
 
 
 async def _cold_start_sources(wallet) -> tuple[int | None, int | None, list[str]]:

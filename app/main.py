@@ -15,6 +15,7 @@ from app.db import init_db
 from app.handlers import build_dispatcher, create_bot
 from app.http_utils import close_http_client, get_http_client
 from app.log_scrub import install as install_log_scrub
+from app.metrics import install_db_query_counter
 from app.profile import apply_profile
 from app.scheduler import set_bot, start_scheduler, tick
 from app.scheduler_lock import acquire_scheduler_lock, release_scheduler_lock
@@ -747,6 +748,9 @@ async def main() -> None:
         )
     for warning in warn_config():
         log.warning("CONFIG: %s", warning)
+    # Счётчик запросов к БД: каждый ответ СУБД — исходящий трафик Render (база
+    # живёт за пределами Render), а лимит трафика на free-плане жёсткий.
+    install_db_query_counter()
     await init_db()
     bot = await create_bot()
     dispatcher = build_dispatcher()
