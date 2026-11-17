@@ -949,6 +949,58 @@ async def _increment_sync(
     return pages, added, updated, source, page_ok, complete
 
 
+async def _mirror_balance_sum(session: AsyncSession, network: str) -> int:
+    """Σ balance_delta_nanotons по строкам зеркала для сети и адреса казны."""
+    return int(
+        (
+            await session.execute(
+                select(func.coalesce(func.sum(TreasuryMove.balance_delta_nanotons), 0))
+                .where(
+                    TreasuryMove.network == network,
+                    TreasuryMove.address == _address_for(network),
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def _read_chain_balance() -> int | None:
+    """Живой баланс казны для сверки; недоступность провайдера — None."""
+    from app.ton_pay import fetch_account_state
+
+    try:
+        chain_balance, _status, _src = await fetch_account_state()
+    except Exception as exc:
+        logger.warning("Зеркало: живой баланс для сверки не прочитан: %s", exc)
+        return None
+    return chain_balance
+
+
+async def _persist_mirror_check(
+    session: AsyncSession, mirror_sum: int, chain_balance: int | None, source: str
+) -> tuple[bool | None, int | None]:
+    """Сохраняет результат сверки тождества; возвращает exact и diff."""
+    if chain_balance is None:
+        return None, None
+    diff = mirror_sum - chain_balance
+    exact = diff == 0
+    await _set_state(
+        session,
+        TREASURY_MIRROR_CHECK_KEY,
+        json.dumps(
+            {
+                "exact": exact,
+                "diff_nanotons": diff,
+                "mirror_balance": mirror_sum,
+                "chain_balance": chain_balance,
+                "checked_at": datetime.now(UTC).isoformat(),
+                "source": source,
+            }
+        ),
+    )
+    return exact, diff
+
+
 async def _check_mirror(
     session: AsyncSession,
     summary: dict,
@@ -960,43 +1012,11 @@ async def _check_mirror(
     updated: int,
 ) -> None:
     """После успешного спуска/инкремента: сверка «Σ balance_delta = живой баланс»."""
-    mirror_sum = int(
-        (
-            await session.execute(
-                select(func.coalesce(func.sum(TreasuryMove.balance_delta_nanotons), 0))
-                .where(
-                    TreasuryMove.network == network,
-                    TreasuryMove.address == _address_for(network),
-                )
-            )
-        ).scalar_one()
+    mirror_sum = await _mirror_balance_sum(session, network)
+    chain_balance = await _read_chain_balance()
+    exact, diff = await _persist_mirror_check(
+        session, mirror_sum, chain_balance, source
     )
-    from app.ton_pay import fetch_account_state
-
-    try:
-        chain_balance, _status, _src = await fetch_account_state()
-    except Exception as exc:
-        logger.warning("Зеркало: живой баланс для сверки не прочитан: %s", exc)
-        chain_balance = None
-    exact = None
-    diff = None
-    if chain_balance is not None:
-        diff = mirror_sum - chain_balance
-        exact = diff == 0
-        await _set_state(
-            session,
-            TREASURY_MIRROR_CHECK_KEY,
-            json.dumps(
-                {
-                    "exact": exact,
-                    "diff_nanotons": diff,
-                    "mirror_balance": mirror_sum,
-                    "chain_balance": chain_balance,
-                    "checked_at": datetime.now(UTC).isoformat(),
-                    "source": source,
-                }
-            ),
-        )
     summary.update(
         exact=exact,
         diff_nanotons=diff,
