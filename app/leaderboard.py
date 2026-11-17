@@ -950,6 +950,17 @@ async def _notify_month_admins(
                 logger.warning("Алерт админу %s не доставлен: %s", admin_id, exc)
 
 
+async def _month_mark_paid(
+    session: AsyncSession, marker: WatcherState, prev_key: str
+) -> None:
+    """Закрывает месяц: горш копилки за прошлые месяцы чистится, метка ставится."""
+    await session.execute(
+        delete(LeaderboardPot).where(LeaderboardPot.month <= prev_key)
+    )
+    marker.value = prev_key
+    await session.commit()
+
+
 async def _settle_month_locked(bot: Bot | None = None) -> bool:
     """Выплачивает копилку прошедших месяцев, если последний день месяца закрыт.
 
@@ -1015,11 +1026,7 @@ async def _settle_month_locked(bot: Bot | None = None) -> bool:
 
         network = settings.active_network
         _month_add_payouts(session, payments, network)
-        await session.execute(
-            delete(LeaderboardPot).where(LeaderboardPot.month <= prev_key)
-        )
-        marker.value = prev_key
-        await session.commit()
+        await _month_mark_paid(session, marker, prev_key)
 
     await _notify_leaderboard_winners(
         bot, "month", [(player_id, amount) for player_id, _wallet, amount in payments]
