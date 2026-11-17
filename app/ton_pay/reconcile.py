@@ -51,6 +51,38 @@ _out_comments_tonapi = _out_comments
 _out_comments_toncenter = _out_comments
 
 
+def _scan_page_map(items: list) -> dict[str, str]:
+    """Карта memo → хеш по одной странице истории исходящих."""
+    page: dict[str, str] = {}
+    for item in items:
+        tx_hash = str(item.get("hash") or "")
+        if not tx_hash:
+            continue
+        # Каждая исходящая транзакция казначея имеет hash; комментарий
+        # берём из её out_msgs. Если в одной транзакции несколько
+        # переводов с разными memo — все попадают в карту.
+        for comment in _out_comments(item):
+            page[comment] = tx_hash
+    return page
+
+
+def _scan_window_closed(
+    items: list,
+    *,
+    page_limit: int,
+    cutoff: float,
+    targets: set[str] | None,
+    found: set[str],
+) -> bool:
+    """Окно истории покрыто целиком по ФАКТУ прохода по странице."""
+    if targets and targets <= found:
+        return True  # все цели найдены — вопросов нет
+    oldest_utime = items[-1].get("utime")
+    if oldest_utime is not None and float(oldest_utime) < cutoff:
+        return True  # окно истории покрыто целиком
+    return len(items) < page_limit  # неполная страница = хвост истории
+
+
 async def _scan_broadcast_history(
     targets: set[str] | None,
     *,
@@ -107,24 +139,15 @@ async def _scan_broadcast_history(
         if page_first_hash and page_first_hash == first_hash:
             break  # пагинация не сдвинулась (провайдер не взял курсор) — хватит
         first_hash = page_first_hash
-        for item in items:
-            tx_hash = str(item.get("hash") or "")
-            if not tx_hash:
-                continue
-            # Каждая исходящая транзакция казначея имеет hash; комментарий
-            # берём из её out_msgs. Если в одной транзакции несколько
-            # переводов с разными memo — все попадают в карту.
-            for comment in _out_comments(item):
-                tx_map[comment] = tx_hash
-        if targets and targets <= set(tx_map):
-            _state._RECONCILE_WINDOW_COMPLETE = True  # все цели найдены — вопросов нет
-            break
-        oldest_utime = items[-1].get("utime")
-        if oldest_utime is not None and float(oldest_utime) < cutoff:
-            _state._RECONCILE_WINDOW_COMPLETE = True  # окно истории покрыто целиком
-            break
-        if len(items) < page_limit:
-            _state._RECONCILE_WINDOW_COMPLETE = True  # неполная страница = хвост истории
+        tx_map.update(_scan_page_map(items))
+        if _scan_window_closed(
+            items,
+            page_limit=page_limit,
+            cutoff=cutoff,
+            targets=targets,
+            found=set(tx_map),
+        ):
+            _state._RECONCILE_WINDOW_COMPLETE = True
             break
         before_lt = next_token(items, before_lt) or ""
         if not before_lt:
