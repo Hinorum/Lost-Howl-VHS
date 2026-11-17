@@ -404,6 +404,56 @@ def _payout_test_memos(batch_count: int, stamp: int) -> list[str]:
     )
 
 
+async def _payout_test_broadcast(
+    dest: str, nano: int, force_http: bool, batch_count: int, memos: list[str]
+) -> str | None:
+    """Вещание холостого перевода под локом; None — отправки не было."""
+    import app.ton_pay as _tp
+
+    engaged_before = _tp.state._http_channel_engaged_at
+    # Метка вещания: у каналов разный контракт (HTTP-ветка возвращает всегда
+    # строку, лайтсерверная — None, если отправки не было).
+    marker: str | None = None
+    try:
+        # Лок диспетчера обязателен: цикл очереди держит один seqno на пачку,
+        # параллельный перевод с тем же seqno молча потерялся бы.
+        async with _tp.dispatch_lock():
+            if batch_count:
+                transfers = [(dest, nano, comment) for comment in memos]
+                if force_http:
+                    marker = await _tp._send_ton_transfers_http(transfers)
+                else:
+                    marker = await _tp.send_ton_transfers_batch(transfers)
+            elif force_http:
+                marker = await _tp._send_ton_transfer_http(dest, nano, memos[0])
+            else:
+                marker = await _tp.send_ton_transfer(dest, nano, memos[0])
+    finally:
+        if force_http:
+            # Принудительная репетиция — не деградация: флаг «канал
+            # задействован» возвращаю как был, иначе диспетчер ушёл бы
+            # хранителю ложным «лайтсерверы недоступны» при живых лайтсерах.
+            _tp.state._http_channel_engaged_at = engaged_before
+    return marker
+
+
+def _payout_test_channel(
+    force_http: bool, engaged_before, engaged_after
+) -> str:
+    """Фактический канал отправки по флагу «HTTP-канал задействован»."""
+    # Успех по фолбэку не должен читаться как «лайтсерверная нога доказана»,
+    # иначе смоук молча проверяет HTTP. Флаг канала ставится при HTTP-вещании
+    # и снимается при успехе на лайтсерверах; если он уже стоял до репетиции
+    # и не сменился — честно говорим «не определить», а не угадываем.
+    if force_http:
+        return "HTTP (принудительно)"
+    if engaged_before is None and engaged_after is not None:
+        return "HTTP (фолбэк — лайтсерверы не отдали отправку)"
+    if engaged_after is None:
+        return "лайтсерверы"
+    return "не определить (флаг HTTP-канала стоял ещё до репетиции)"
+
+
 async def _payout_test_send(
     message: Message,
     amount: Decimal,
@@ -426,37 +476,17 @@ async def _payout_test_send(
         parse_mode=ParseMode.HTML,
     )
     engaged_before = _tp.state._http_channel_engaged_at
-    engaged_after = None
-    # Метка вещания: у каналов разный контракт (HTTP-ветка возвращает всегда
-    # строку, лайтсерверная — None, если отправки не было).
-    marker: str | None = None
     try:
-        # Лок диспетчера обязателен: цикл очереди держит один seqno на пачку,
-        # параллельный перевод с тем же seqno молча потерялся бы.
-        async with _tp.dispatch_lock():
-            if batch_count:
-                transfers = [(dest, nano, comment) for comment in memos]
-                if force_http:
-                    marker = await _tp._send_ton_transfers_http(transfers)
-                else:
-                    marker = await _tp.send_ton_transfers_batch(transfers)
-            elif force_http:
-                marker = await _tp._send_ton_transfer_http(dest, nano, memos[0])
-            else:
-                marker = await _tp.send_ton_transfer(dest, nano, memos[0])
-        engaged_after = _tp.state._http_channel_engaged_at
+        marker = await _payout_test_broadcast(
+            dest, nano, force_http, batch_count, memos
+        )
     except Exception as exc:
         await message.answer(
             f"{warn_mark('nopay')} Отправка не удалась: {html_escape(redact(str(exc)))}",
             parse_mode=ParseMode.HTML,
         )
         return None
-    finally:
-        if force_http:
-            # Принудительная репетиция — не деградация: флаг «канал
-            # задействован» возвращаю как был, иначе диспетчер ушёл бы
-            # хранителю ложным «лайтсерверы недоступны» при живых лайтсерверах.
-            _tp.state._http_channel_engaged_at = engaged_before
+    engaged_after = _tp.state._http_channel_engaged_at
 
     if marker is None:
         await message.answer(
@@ -465,19 +495,7 @@ async def _payout_test_send(
             parse_mode=ParseMode.HTML,
         )
         return None
-    # Фактический канал отправки: успех по фолбэку не должен читаться как
-    # «лайтсерверная нога доказана», иначе смоук молча проверяет HTTP.
-    # Флаг канала ставится при HTTP-вещании и снимается при успехе на
-    # лайтсерверах; если он уже стоял до репетиции и не сменился — честно
-    # говорим «не определить», а не угадываем.
-    if force_http:
-        channel = "HTTP (принудительно)"
-    elif engaged_before is None and engaged_after is not None:
-        channel = "HTTP (фолбэк — лайтсерверы не отдали отправку)"
-    elif engaged_after is None:
-        channel = "лайтсерверы"
-    else:
-        channel = "не определить (флаг HTTP-канала стоял ещё до репетиции)"
+    channel = _payout_test_channel(force_http, engaged_before, engaged_after)
     # memo пачки ищем параллельно: они в одной транзакции, и последовательные
     # окна по 30 с лишь растянули бы ответ на пустом месте.
     found = list(await asyncio.gather(*(_test_wait_memo(comment) for comment in memos)))
