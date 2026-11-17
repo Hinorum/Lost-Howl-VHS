@@ -209,58 +209,57 @@ async def _stash_paused_refund(
     return f"paused_{result}"
 
 
-async def _maybe_verify_wallet(
-    session, transfer: Transfer, bot: Bot | None, player: Player
-) -> str | None:
-    """Проверка владения кошельком через мемо bv:<код>.
-
-    Возвращает статус обработки (в т.ч. результат возврата, если код не
-    прошёл), либо None, если верификация не требуется — переход к ставке.
-    """
+def _verify_memo_code(transfer: Transfer, player: Player) -> str | None:
+    """Код из memo bv:<код> либо голый код без префикса."""
     verify_code = parse_verify_memo(transfer.comment)
     if verify_code is None and player.wallet_verify_code:
         bare = re.sub(r"[\s\u200b\u200c\u200d]+", "", (transfer.comment or "")).upper()
         if bare == player.wallet_verify_code.upper():
             verify_code = player.wallet_verify_code
-    if player.wallet_verify_code is None:
-        # Кошелёк уже подтверждён (код очищен) — проверять нечего.
-        return None
-    if (
-        verify_code is not None
-        and verify_code == player.wallet_verify_code
-        and player.wallet_address == normalize_address(transfer.source or "")
-    ):
-        player.wallet_verified = True
-        player.wallet_verify_code = None
-        player.wallet_verify_created = None
-        await session.commit()
-        result = await _stash_refund(
-            session,
-            transfer,
-            None,
-            ledger_result="walletverify:ok",
-            ledger_player_id=player.id,
-            force=True,
+    return verify_code
+
+
+async def _wallet_verify_ok(
+    session, transfer: Transfer, bot: Bot | None, player: Player
+) -> str:
+    """Мемо верное и перевод с привязанного адреса: подтверждаем и возвращаем."""
+    player.wallet_verified = True
+    player.wallet_verify_code = None
+    player.wallet_verify_created = None
+    await session.commit()
+    result = await _stash_refund(
+        session,
+        transfer,
+        None,
+        ledger_result="walletverify:ok",
+        ledger_player_id=player.id,
+        force=True,
+    )
+    if result == "refund_queued":
+        await _dm_stake(
+            bot,
+            player.id,
+            f"✅ Кошелёк подтверждён. {from_nano(transfer.value_nanotons):g} Gram "
+            "проверочного перевода возвращаются на него целиком.",
         )
-        if result == "refund_queued":
-            await _dm_stake(
-                bot,
-                player.id,
-                f"✅ Кошелёк подтверждён. {from_nano(transfer.value_nanotons):g} Gram "
-                "проверочного перевода возвращаются на него целиком.",
-            )
-        else:
-            await _dm_stake(
-                bot,
-                player.id,
-                "✅ Кошелёк подтверждён — теперь переводы с него засчитываются ставками.",
-            )
-        # Приз/доли, удержанные на неподтверждённом кошельке (last_error
-        # «кошелёк привязан, но не подтверждён»), разблокированы: кикаем
-        # очередь выплат, чтобы игрок получил награду сразу, а не ждал
-        # следующего закрытия дня.
-        await _kick_dispatch_after_verify(bot)
-        return f"walletverify_{result}"
+    else:
+        await _dm_stake(
+            bot,
+            player.id,
+            "✅ Кошелёк подтверждён — теперь переводы с него засчитываются ставками.",
+        )
+    # Приз/доли, удержанные на неподтверждённом кошельке (last_error
+    # «кошелёк привязан, но не подтверждён»), разблокированы: кикаем
+    # очередь выплат, чтобы игрок получил награду сразу, а не ждал
+    # следующего закрытия дня.
+    await _kick_dispatch_after_verify(bot)
+    return f"walletverify_{result}"
+
+
+async def _wallet_verify_fail(
+    session, transfer: Transfer, bot: Bot | None, player: Player
+) -> str:
+    """Код неверный/чужой адрес: возвращаем штатно и объясняем причину."""
     # bv: с неверным/чужим кодом или не с привязанного адреса — возвращаем
     # штатно, но объясняем игроку, почему кошелёк НЕ привязался: деньги
     # уже едут обратно, а не гадаеся в тишине (источник этого кейса —
@@ -287,6 +286,27 @@ async def _maybe_verify_wallet(
     elif result == "refund_queued":
         await _dm_verify_mismatch(bot, player, transfer)
     return result
+
+
+async def _maybe_verify_wallet(
+    session, transfer: Transfer, bot: Bot | None, player: Player
+) -> str | None:
+    """Проверка владения кошельком через мемо bv:<код>.
+
+    Возвращает статус обработки (в т.ч. результат возврата, если код не
+    прошёл), либо None, если верификация не требуется — переход к ставке.
+    """
+    verify_code = _verify_memo_code(transfer, player)
+    if player.wallet_verify_code is None:
+        # Кошелёк уже подтверждён (код очищен) — проверять нечего.
+        return None
+    if (
+        verify_code is not None
+        and verify_code == player.wallet_verify_code
+        and player.wallet_address == normalize_address(transfer.source or "")
+    ):
+        return await _wallet_verify_ok(session, transfer, bot, player)
+    return await _wallet_verify_fail(session, transfer, bot, player)
 
 
 _REVOTE_REFUND_STATUSES = frozenset(
