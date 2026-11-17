@@ -530,6 +530,27 @@ def _deep_filtered_page_cursor(page: Page, before: str | None) -> str | None:
     return page.next_cursor
 
 
+def _deep_inconclusive(
+    transfers: list[Transfer], floor_utime: int | None, parse_fail_count: int
+) -> PassResult:
+    """Проход не удался: результат сохранён, но считать его успехом нельзя."""
+    return PassResult(transfers, False, False, floor_utime, parse_fail_count)
+
+
+def _deep_history_done(
+    transfers: list[Transfer], floor_utime: int | None, parse_fail_count: int
+) -> PassResult:
+    """Проход доказал завершение: история или курсор исчерпаны."""
+    return PassResult(transfers, True, True, floor_utime, parse_fail_count)
+
+
+def _deep_open_ended(
+    transfers: list[Transfer], floor_utime: int | None, parse_fail_count: int
+) -> PassResult:
+    """Источник не дал доказательства конца: окно ниже floor_utime не прочитано."""
+    return PassResult(transfers, True, False, floor_utime, parse_fail_count)
+
+
 async def _deep_collect(
     fetch_page,
     since: int,
@@ -566,14 +587,14 @@ async def _deep_collect(
         # item'ы (parse_fail_count > 0), и оператор должен видеть это в PassResult.
         parse_fail_count += page.parse_fail_count
         if page.state != _PAGE_OK:
-            return PassResult(page.transfers, False, False, floor_utime, parse_fail_count)
+            return _deep_inconclusive(page.transfers, floor_utime, parse_fail_count)
         fresh = _deep_fresh_transfers(page, seen)
         transfers.extend(fresh)
         page_floor = _deep_page_floor(page, fresh)
         if page_floor is not None:
             floor_utime = page_floor if floor_utime is None else min(floor_utime, page_floor)
         if _deep_history_ended(page, since):
-            return PassResult(transfers, True, True, floor_utime, parse_fail_count)
+            return _deep_history_done(transfers, floor_utime, parse_fail_count)
         if not page.transfers:
             next_cursor = _deep_filtered_page_cursor(page, before)
             if next_cursor is None:
@@ -584,7 +605,7 @@ async def _deep_collect(
                 )
                 # Не доказано, что ниже пусто: помечаем проход ненадёжным,
                 # чтобы фолбэк/тревога подхватили, а курсор не уехал вслепую.
-                return PassResult(transfers, False, False, floor_utime, parse_fail_count)
+                return _deep_inconclusive(transfers, floor_utime, parse_fail_count)
             before = next_cursor
             await asyncio.sleep(0.12)  # бережём лимиты API на глубоком проходе
             continue
@@ -602,19 +623,20 @@ async def _deep_collect(
                 window[0][:12],
                 window[1][:12],
             )
-            return PassResult(transfers, False, False, floor_utime, parse_fail_count)
+            return _deep_inconclusive(transfers, floor_utime, parse_fail_count)
         prev_window = window
         oldest = page.transfers[-1]
         if oldest.utime <= since:
-            return PassResult(transfers, True, True, floor_utime, parse_fail_count)  # страница дотянулась до курсора
+            # страница дотянулась до курсора
+            return _deep_history_done(transfers, floor_utime, parse_fail_count)
         if page.next_cursor is None:
             # Источник не умеет вести нас вглубь — продолжать бессмысленно.
-            return PassResult(transfers, True, False, floor_utime, parse_fail_count)
+            return _deep_open_ended(transfers, floor_utime, parse_fail_count)
         before = page.next_cursor
         await asyncio.sleep(0.12)  # бережём лимиты API на глубоком проходе
     # Бюджет страниц исчерпан, курсор не достигнут: окно ниже floor_utime не
     # прочитано. Это дыра, а не полный проход — вызывающий обязан её учесть.
-    return PassResult(transfers, True, False, floor_utime, parse_fail_count)
+    return _deep_open_ended(transfers, floor_utime, parse_fail_count)
 
 def _merge_unique(batches: list[list[Transfer]]) -> list[Transfer]:
     """Слияние результатов источников без дублей, по возрастанию utime."""
