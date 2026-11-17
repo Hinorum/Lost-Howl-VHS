@@ -214,6 +214,106 @@ def _stake_amount_status(amount_nanotons: int) -> tuple[str, str]:
     return status, reason
 
 
+async def _refund_replaced_stake(
+    session: AsyncSession, previous: Stake, player: Player
+) -> None:
+    """Возвращает остаток вытесняемой пылевой ставки (за вычетом газа)."""
+    refund = refund_net_amount(
+        previous.amount_nanotons, fee_nanotons=await fee_estimate_nano(session)
+    )
+    if refund <= 0:
+        return
+    session.add(
+        Payout(
+            round_id=previous.round_id,
+            player_id=previous.player_id,
+            kind="refund",
+            amount_nanotons=refund,
+            # Только подтверждённый bv: адрес, как в пустом dest приза:
+            # недоказанный адрес после перепривязки увёл бы возврат в
+            # bounce, а пустой dest дозаполнит _hydrate_player_dests,
+            # когда игрок подтвердит кошелёк. Саму ставку это не
+            # блокирует — сумма не теряется, она ждёт в очереди.
+            dest_address=(
+                player.wallet_address if player.wallet_verified else ""
+            ),
+            # tx_hash возврата — хеш ВХОДЯЩЕГО перевода, который
+            # возвращается (по конвенции авто-возвратов в
+            # app/ton_watch/refunds.py): он же защита от второго
+            # возврата того же перевода и след для аудита. Раньше
+            # здесь был NULL, и повторный проход watcher'а не находил
+            # этот возврат ни по одной из проверок — и создавал второй.
+            tx_hash=previous.tx_hash[:80],
+            network=current_network(),
+        )
+    )
+
+
+async def _replace_rejected_stake(
+    session: AsyncSession,
+    previous: Stake,
+    player: Player,
+    *,
+    status: str,
+    amount_nanotons: int,
+    tx_hash: str,
+    memo: str,
+) -> str:
+    """Валидная ставка занимает слот отклонённой и возвращает пыль."""
+    # Метка «перевод разобран» — ДО любых записей и в той же транзакции,
+    # что и сама ставка: падение между ними не оставит перевод
+    # «наполовину разобранным» (а падение ПОСЛЕ метки откатит её вместе
+    # с эффектом — перевод будет разобран заново).
+    if not await claim_transfer(
+        session, tx_hash, current_network(), KIND_STAKE, amount_nanotons
+    ):
+        return "duplicate_tx"
+    # Отклонённая (пылевая) ставка НЕ занимает слот дня: валидная ставка
+    # записывается на её место — иначе игрок, пославший микро-перевод ниже
+    # минимума, физически не поставил бы в этот день (вторая попытка ловила
+    # already_staked и возвращалась). Пылевой остаток возвращается сразу
+    # тем же расчётом, что и поток финализации (с вычетом газа).
+    await _refund_replaced_stake(session, previous, player)
+    previous.status = status
+    previous.amount_nanotons = amount_nanotons
+    previous.tx_hash = tx_hash
+    previous.memo = memo[:64]
+    previous.network = current_network()
+    previous.created_at = datetime.now(UTC)
+    previous.confirmed_at = None
+    await session.commit()
+    return "ok"
+
+
+async def _store_new_stake(
+    session: AsyncSession,
+    round_row: Round,
+    player: Player,
+    amount_nanotons: int,
+    tx_hash: str,
+    memo: str,
+    status: str,
+) -> str:
+    """Первая ставка дня: метка перевода и строка ставки за один коммит."""
+    if not await claim_transfer(
+        session, tx_hash, current_network(), KIND_STAKE, amount_nanotons
+    ):
+        return "duplicate_tx"
+    session.add(
+        Stake(
+            round_id=round_row.id,
+            player_id=player.id,
+            amount_nanotons=amount_nanotons,
+            tx_hash=tx_hash,
+            memo=memo[:64],
+            network=current_network(),
+            status=status,
+        )
+    )
+    await session.commit()
+    return "ok"
+
+
 async def register_stake(
     session: AsyncSession,
     round_row: Round,
@@ -232,78 +332,25 @@ async def register_stake(
             select(Stake).where(Stake.round_id == round_row.id, Stake.player_id == player.id)
         )
     ).scalar_one_or_none()
-    if previous is not None and (previous.status != "rejected" or status == "rejected"):
-        # Повтор неотклонённой ставки (confirmed/pending) — уже_staked; пылевая
-        # ставка поверх пылевой тоже не валидная замена — как вторая ставка дня.
-        return "already_staked"
     if previous is not None:
-        # Метка «перевод разобран» — ДО любых записей и в той же транзакции,
-        # что и сама ставка: падение между ними не оставит перевод
-        # «наполовину разобранным» (а падение ПОСЛЕ метки откатит её вместе
-        # с эффектом — перевод будет разобран заново).
-        if not await claim_transfer(
-            session, tx_hash, current_network(), KIND_STAKE, amount_nanotons
-        ):
-            return "duplicate_tx"
-        # Отклонённая (пылевая) ставка НЕ занимает слот дня: валидная ставка
-        # записывается на её место — иначе игрок, пославший микро-перевод ниже
-        # минимума, физически не поставил бы в этот день (вторая попытка ловила
-        # already_staked и возвращалась). Пылевой остаток возвращается сразу
-        # тем же расчётом, что и поток финализации (с вычетом газа).
-        refund = refund_net_amount(
-            previous.amount_nanotons, fee_nanotons=await fee_estimate_nano(session)
-        )
-        if refund > 0:
-            session.add(
-                Payout(
-                    round_id=previous.round_id,
-                    player_id=previous.player_id,
-                    kind="refund",
-                    amount_nanotons=refund,
-                    # Только подтверждённый bv: адрес, как в пустом dest приза:
-                    # недоказанный адрес после перепривязки увёл бы возврат в
-                    # bounce, а пустой dest дозаполнит _hydrate_player_dests,
-                    # когда игрок подтвердит кошелёк. Саму ставку это не
-                    # блокирует — сумма не теряется, она ждёт в очереди.
-                    dest_address=(
-                        player.wallet_address if player.wallet_verified else ""
-                    ),
-                    # tx_hash возврата — хеш ВХОДЯЩЕГО перевода, который
-                    # возвращается (по конвенции авто-возвратов в
-                    # app/ton_watch/refunds.py): он же защита от второго
-                    # возврата того же перевода и след для аудита. Раньше
-                    # здесь был NULL, и повторный проход watcher'а не находил
-                    # этот возврат ни по одной из проверок — и создавал второй.
-                    tx_hash=previous.tx_hash[:80],
-                    network=current_network(),
-                )
-            )
-        previous.status = status
-        previous.amount_nanotons = amount_nanotons
-        previous.tx_hash = tx_hash
-        previous.memo = memo[:64]
-        previous.network = current_network()
-        previous.created_at = datetime.now(UTC)
-        previous.confirmed_at = None
-        await session.commit()
-        return reason or "ok"
-    if not await claim_transfer(
-        session, tx_hash, current_network(), KIND_STAKE, amount_nanotons
-    ):
-        return "duplicate_tx"
-    session.add(
-        Stake(
-            round_id=round_row.id,
-            player_id=player.id,
+        if previous.status != "rejected" or status == "rejected":
+            # Повтор неотклонённой ставки (confirmed/pending) — уже_staked;
+            # пылевая ставка поверх пылевой тоже не валидная замена — как
+            # вторая ставка дня.
+            return "already_staked"
+        return await _replace_rejected_stake(
+            session,
+            previous,
+            player,
+            status=status,
             amount_nanotons=amount_nanotons,
             tx_hash=tx_hash,
-            memo=memo[:64],
-            network=current_network(),
-            status=status,
+            memo=memo,
         )
+    stored = await _store_new_stake(
+        session, round_row, player, amount_nanotons, tx_hash, memo, status
     )
-    await session.commit()
-    return reason or "ok"
+    return reason or stored
 
 
 async def confirm_stake(session: AsyncSession, tx_hash: str) -> bool:
