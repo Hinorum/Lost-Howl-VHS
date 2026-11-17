@@ -808,6 +808,76 @@ def _advance_cursor(
     return next_lt, None
 
 
+def _page_window(moves: list[MirrorMove]) -> tuple[int, int]:
+    """Границы страницы по lt: (самый старый, самый свежий)."""
+    return min(move.lt for move in moves), max(move.lt for move in moves)
+
+
+def _page_repeated(
+    window: tuple[int, int],
+    prev_window: tuple[int, int] | None,
+    source: str,
+    prev_source: str | None,
+) -> bool:
+    """Провайдер вернул ту же страницу: курсор не движется."""
+    return window == prev_window and source == prev_source
+
+
+def _log_stuck_cursor(source: str, window: tuple[int, int], phase: str) -> None:
+    """Лог застрявшего курсора: пагинация не сдвинулась."""
+    logger.warning(
+        "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
+        "двигается, %s остановлен",
+        source,
+        window[0],
+        window[1],
+        phase,
+    )
+
+
+async def _mirror_apply_page(
+    session: AsyncSession, moves: list[MirrorMove]
+) -> tuple[int, int]:
+    """Классифицирует и записывает страницу зеркала: (added, updated)."""
+    kinds = await _resolve_kinds_batch(session, moves)
+    return await _apply_page(session, moves, kinds)
+
+
+async def _save_sync_progress(
+    session: AsyncSession, *, bottom_lt: int | None = None, cursor_lt: int | None = None
+) -> None:
+    """Фиксирует дно/голову спуска и коммитит страницу зеркала."""
+    if bottom_lt is not None:
+        await _set_state(session, TREASURY_MIRROR_BOTTOM_KEY, str(bottom_lt))
+    if cursor_lt is not None:
+        await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(cursor_lt))
+    await session.commit()
+
+
+async def _finish_bootstrap(
+    session: AsyncSession, network: str, full_walk: bool, seen_hashes: set[str]
+) -> None:
+    """Генезис достигнут: чистка (если весь спуск в одном цикле), метка, коммит."""
+    if full_walk:
+        purged = await _purge_moves_missing_from_chain(
+            session, network, _address_for(network), seen_hashes
+        )
+    else:
+        purged = 0
+        logger.warning(
+            "Зеркало казны: генезис достигнут за несколько циклов — "
+            "чистка строк вне цепочки пропущена (виден только "
+            "последний отрезок спуска)"
+        )
+    await _set_state(session, TREASURY_MIRROR_BOOTSTRAP_KEY, "1")
+    await session.commit()
+    logger.info(
+        "Зеркало казны: бутстрап до генезиса завершён, вычищено "
+        "строк вне цепочки: %d",
+        purged,
+    )
+
+
 async def _bootstrap_sync(
     session: AsyncSession, network: str, max_pages: int
 ) -> tuple[int, int, int, str, bool, bool]:
@@ -841,49 +911,22 @@ async def _bootstrap_sync(
         pages += 1
         if not moves:
             bootstrapped = True
-            purged = 0
-            if full_walk:
-                purged = await _purge_moves_missing_from_chain(
-                    session, network, _address_for(network), seen_hashes
-                )
-            else:
-                logger.warning(
-                    "Зеркало казны: генезис достигнут за несколько циклов — "
-                    "чистка строк вне цепочки пропущена (виден только "
-                    "последний отрезок спуска)"
-                )
-            await _set_state(session, TREASURY_MIRROR_BOOTSTRAP_KEY, "1")
-            await session.commit()
-            logger.info(
-                "Зеркало казны: бутстрап до генезиса завершён, вычищено "
-                "строк вне цепочки: %d",
-                purged,
-            )
+            await _finish_bootstrap(session, network, full_walk, seen_hashes)
             break
-        window = (min(move.lt for move in moves), max(move.lt for move in moves))
-        if window == prev_window and source == prev_source:
-            logger.warning(
-                "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
-                "двигается, спуск к генезису остановлен",
-                source,
-                window[0],
-                window[1],
-            )
+        window = _page_window(moves)
+        if _page_repeated(window, prev_window, source, prev_source):
+            _log_stuck_cursor(source, window, "спуск к генезису")
             break
         prev_window = window
         prev_source = source
         if head_lt is None:
             head_lt = moves[0].lt
         seen_hashes.update(move.tx_hash for move in moves)
-        kinds = await _resolve_kinds_batch(session, moves)
-        part_added, part_updated = await _apply_page(session, moves, kinds)
+        part_added, part_updated = await _mirror_apply_page(session, moves)
         added += part_added
         updated += part_updated
         before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
-        await _set_state(session, TREASURY_MIRROR_BOTTOM_KEY, str(before_lt))
-        if head_lt is not None:
-            await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
-        await session.commit()
+        await _save_sync_progress(session, bottom_lt=before_lt, cursor_lt=head_lt)
     return pages, added, updated, source, bootstrapped, page_ok
 
 
@@ -900,8 +943,8 @@ async def _increment_sync(
     """
     before_lt = None
     offset = None
-    prev_window = None
-    prev_source = None
+    prev_window: tuple[int, int] | None = None
+    prev_source: str | None = None
     head_lt = await _state_int(session, TREASURY_MIRROR_CURSOR_KEY)
     pages = added = updated = 0
     source = "none"
@@ -920,26 +963,18 @@ async def _increment_sync(
         if head_lt is not None and page_max <= head_lt:
             complete = True
             break  # самая свежая уже учтена — ничего нового
-        window = (min(move.lt for move in moves), page_max)
-        if window == prev_window and source == prev_source:
-            logger.warning(
-                "Зеркало: %s вернул ту же страницу [%d..%d] — курсор не "
-                "двигается, догон головы остановлен",
-                source,
-                window[0],
-                window[1],
-            )
+        window = _page_window(moves)
+        if _page_repeated(window, prev_window, source, prev_source):
+            _log_stuck_cursor(source, window, "догон головы")
             break
         prev_window = window
         prev_source = source
-        kinds = await _resolve_kinds_batch(session, moves)
-        part_added, part_updated = await _apply_page(session, moves, kinds)
+        part_added, part_updated = await _mirror_apply_page(session, moves)
         added += part_added
         updated += part_updated
         prev_head = head_lt
         head_lt = max(head_lt or 0, page_max)
-        await _set_state(session, TREASURY_MIRROR_CURSOR_KEY, str(head_lt))
-        await session.commit()
+        await _save_sync_progress(session, cursor_lt=head_lt)
         before_lt, offset = _advance_cursor(source, moves, before_lt, offset)
         if prev_head is not None and before_lt is not None and before_lt <= prev_head:
             # Страница пересекла известную границу — хвост под меткой,
