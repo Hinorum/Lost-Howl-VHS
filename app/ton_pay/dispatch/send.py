@@ -39,6 +39,60 @@ async def _send_raw_with_seqno(wallet, seqno: int, dest_address: str, amount_nan
     )
     return await wallet.send_external(body=transfer_msg)
 
+async def _send_with_batch_seqno(
+    wallet, dest_address: str, amount_nanotons: int, comment: str
+) -> int:
+    """Перевод с seqno батча цикла либо обычным transfer, если батча нет."""
+    if _state._batch_seqno is None:
+        return await wallet.transfer(
+            destination=dest_address,
+            amount=amount_nanotons,
+            body=_comment_cell(comment),
+        )
+    # Диспетчер держит seqno из одного get_seqno() на цикл: два подряд
+    # перевода не получают одинаковый seqno (иначе один молча потеряется).
+    # Инкремент — только при УСПЕХЕ вещания; при сбое батч отменяется:
+    # последующие переводы получат свежий seqno из нового get_seqno().
+    seqno = _state._batch_seqno
+    try:
+        result = await _send_raw_with_seqno(
+            wallet, seqno, dest_address, amount_nanotons, _comment_cell(comment)
+        )
+    except (Exception, asyncio.CancelledError):
+        # Таймаут диспетчера (asyncio.wait_for) обрывает корутину через
+        # CancelledError — это НЕ Exception, и без явного перехвата
+        # _batch_seqno остался бы протухшим: следующий перевод батча
+        # переиспользовал бы уже разосланный seqno и молча потерялся.
+        _state._batch_seqno = None
+        raise
+    if result != 1:
+        _state._batch_seqno = None
+        raise RuntimeError(f"Лайтсерверы не приняли перевод (результат {result})")
+    _state._batch_seqno += 1
+    return result
+
+
+async def _maybe_http_fallback(
+    exc: Exception, dest_address: str, amount_nanotons: int, comment: str
+) -> str | None:
+    """Сбой лайтсерверов — уход в HTTP-канал; прочие ошибки пробрасываем."""
+    import app.ton_pay as _tp
+
+    if not _tp._is_liteserver_down(exc):
+        raise
+    # Серия сбоев лайтсерверов: после порога пул пересоберётся при
+    # следующем обращении к кошельку (флаг TON_PROVIDER_REBUILD).
+    _tp.notify_liteserver_down(exc)
+    # Лайтсерверы не отдают вещание (нет пиров, таймауты, отстающий
+    # узел), а деньги слать надо: оффлайн-подпись + HTTPS-вещание
+    # через Toncenter.
+    logger.warning(
+        "Лайтсерверы недоступны (%s) — переключаюсь на HTTP-канал (toncenter)",
+        exc,
+    )
+    return await _tp._send_ton_transfer_http(dest_address, amount_nanotons, comment)
+
+
 async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: str) -> str | None:
     """Отправляет перевод с казначея. Возвращает метку вещания или None.
 
@@ -59,33 +113,9 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
         import app.ton_pay as _tp
 
         wallet = await _tp._get_wallet()
-        if _state._batch_seqno is not None:
-            # Диспетчер держит seqno из одного get_seqno() на цикл: два подряд
-            # перевода не получают одинаковый seqno (иначе один молча потеряется).
-            # Инкремент — только при УСПЕХЕ вещания; при сбое батч отменяется:
-            # последующие переводы получат свежий seqno из нового get_seqno().
-            seqno = _state._batch_seqno
-            try:
-                result = await _send_raw_with_seqno(
-                    wallet, seqno, dest_address, amount_nanotons, _comment_cell(comment)
-                )
-            except (Exception, asyncio.CancelledError):
-                # Таймаут диспетчера (asyncio.wait_for) обрывает корутину через
-                # CancelledError — это НЕ Exception, и без явного перехвата
-                # _batch_seqno остался бы протухшим: следующий перевод батча
-                # переиспользовал бы уже разосланный seqno и молча потерялся.
-                _state._batch_seqno = None
-                raise
-            if result != 1:
-                _state._batch_seqno = None
-                raise RuntimeError(f"Лайтсерверы не приняли перевод (результат {result})")
-            _state._batch_seqno += 1
-        else:
-            result = await wallet.transfer(
-                destination=dest_address,
-                amount=amount_nanotons,
-                body=_comment_cell(comment),
-            )
+        result = await _send_with_batch_seqno(
+            wallet, dest_address, amount_nanotons, comment
+        )
         if result != 1:
             raise RuntimeError(f"Лайтсерверы не приняли перевод (результат {result})")
         # Лайтсерверы ответили: серия сбоев канала оборвалась.
@@ -104,21 +134,9 @@ async def send_ton_transfer(dest_address: str, amount_nanotons: int, comment: st
         # сюда не цепляем — рваную корутину «добивать» нельзя.
         raise
     except Exception as exc:
-        import app.ton_pay as _tp
-
-        if not _tp._is_liteserver_down(exc):
-            raise
-        # Серия сбоев лайтсерверов: после порога пул пересоберётся при
-        # следующем обращении к кошельку (флаг TON_PROVIDER_REBUILD).
-        _tp.notify_liteserver_down(exc)
-        # Лайтсерверы не отдают вещание (нет пиров, таймауты, отстающий
-        # узел), а деньги слать надо: оффлайн-подпись + HTTPS-вещание
-        # через Toncenter.
-        logger.warning(
-            "Лайтсерверы недоступны (%s) — переключаюсь на HTTP-канал (toncenter)",
-            exc,
+        return await _maybe_http_fallback(
+            exc, dest_address, amount_nanotons, comment
         )
-        return await _tp._send_ton_transfer_http(dest_address, amount_nanotons, comment)
 
 
 class BatchRejected(RuntimeError):
