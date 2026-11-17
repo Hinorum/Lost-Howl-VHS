@@ -995,7 +995,17 @@ async def _dispatch_pending_payouts_impl(limit: int, bot: Bot | None) -> int:
             # Через app.ton_pay: тесты патчат ton_pay.fetch_broadcast_markers.
             import app.ton_pay as _tp
 
-            markers = await _tp.fetch_broadcast_markers()
+            # Окно маркеров сужаем возрастом самих выплат: memo не может
+            # появиться в цепочке раньше created_at. Граница едет через
+            # ContextVar, а не аргумент: подмены fetch_broadcast_markers в
+            # тестах и соседних контурах не принимают параметров.
+            cutoff_token = _state.RECONCILE_CUTOFF_OVERRIDE.set(
+                _tp.scan_cutoff_for(payout.created_at for payout in payouts)
+            )
+            try:
+                markers = await _tp.fetch_broadcast_markers()
+            finally:
+                _state.RECONCILE_CUTOFF_OVERRIDE.reset(cutoff_token)
         v5_batch_capable = await _init_payout_batch(payouts)
         sent_this_pass, deferred = await _run_payout_pass(
             payouts, markers, prior_attempts, v5_batch_capable

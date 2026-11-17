@@ -273,7 +273,9 @@ def _install_history(monkeypatch: pytest.MonkeyPatch, net: _Net) -> None:
             return set()
         return set(net.chain.visible)
 
-    async def tx_map(targets: set[str] | None = None) -> dict[str, str]:
+    async def tx_map(
+        targets: set[str] | None = None, *, cutoff: float | None = None
+    ) -> dict[str, str]:
         if net.history_down:
             return {}
         if targets is None:

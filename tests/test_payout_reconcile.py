@@ -17,6 +17,7 @@ memo «уже отправленного» в длинной очереди ух
 import json
 import os
 import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -395,18 +396,114 @@ async def test_window_flag_true_when_targets_found(monkeypatch) -> None:
     assert ton_pay.state._RECONCILE_WINDOW_COMPLETE is True
 
 
-async def test_fetch_broadcast_tx_map_passes_targets_to_fetchers(monkeypatch) -> None:
-    """fetch_broadcast_tx_map пробрасывает цели в оба фетчера."""
-    seen: dict[str, set[str]] = {}
+# ---------- Граница скана по возрасту выплат ----------
 
-    async def fake_api(targets: set[str] | None) -> dict[str, str]:
+
+def test_scan_cutoff_for_uses_oldest_payout(monkeypatch) -> None:
+    """Свежие выплаты сужают окно скана до min(created_at) - запас.
+
+    Транзакция с memo не может быть старше самой выплаты: читать 7 суток
+    истории ради строки, созданной час назад, — мегабайты трафика впустую.
+    Naive UTC (SQLite) и aware (Postgres) дают одну и ту же границу.
+    """
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 7 * 24 * 3600)
+    now = datetime.now(UTC)
+    fresh = now - timedelta(hours=1)
+    oldest = now - timedelta(minutes=10)  # свежее fresh — границу задаёт fresh
+
+    cutoff = ton_pay.scan_cutoff_for([oldest, fresh])
+    assert fresh.timestamp() - 900 - 5 <= cutoff <= fresh.timestamp() - 900 + 5
+
+    naive_cutoff = ton_pay.scan_cutoff_for([fresh.replace(tzinfo=None)])
+    assert abs(naive_cutoff - cutoff) < 1
+
+    # Пустой набор — полное окно, а не «сейчас».
+    empty_cutoff = ton_pay.scan_cutoff_for([])
+    assert empty_cutoff < now.timestamp() - 6 * 24 * 3600
+
+
+def test_scan_cutoff_for_never_deeper_than_configured_window(monkeypatch) -> None:
+    """Старая выплата не заставляет скан залезть глубже настроенного окна."""
+    history = 7 * 24 * 3600
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", history)
+    old = datetime.now(UTC) - timedelta(days=30)
+    before = time.time()
+    cutoff = ton_pay.scan_cutoff_for([old])
+    after = time.time()
+    assert before - history <= cutoff <= after - history + 1
+
+
+async def test_cutoff_stops_scan_at_payout_age_not_full_window(monkeypatch) -> None:
+    """Свежая выплата не заставляет читать всё 7-суточное окно истории.
+
+    Регрессия трафика: без границы по created_at промах сверки упирался в
+    payout_reconcile_max_pages и вычитывал 12×256 tx. Теперь скан честно
+    останавливается, пройдя возраст выплаты с запасом.
+    """
+    now = int(time.time())
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 7 * 24 * 3600)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    # Поток длиннее любого разумного окна: полный скан упёрся бы в max_pages.
+    items = _build_stream(now, _toncenter_item, count=_LIMIT * 12)
+    capture: list[dict] = []
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
+    cutoff = ton_pay.scan_cutoff_for([datetime.now(UTC) - timedelta(minutes=1)])
+
+    tx_map = await ton_pay._tx_map_via_toncenter(cutoff=cutoff)
+    assert len(capture) < settings.payout_reconcile_max_pages, (
+        "свежая выплата не должна вычитывать всё 7-суточное окно"
+    )
+    assert ton_pay.state._RECONCILE_WINDOW_COMPLETE is True
+    assert len(tx_map) < len(items)
+
+
+async def test_cutoff_contextvar_reaches_markers_scan(monkeypatch) -> None:
+    """Диспетчерская граница доезжает до fetch без аргументов (ContextVar).
+
+    Подмены fetch_broadcast_markers в тестах и соседних контурах не принимают
+    параметров, поэтому граница едет через ContextVar, а не аргумент.
+    """
+    now = int(time.time())
+    monkeypatch.setattr(settings, "payout_reconcile_history_seconds", 7 * 24 * 3600)
+    monkeypatch.setattr(settings, "payout_reconcile_max_pages", 12)
+    monkeypatch.setattr(settings, "ton_network", "testnet")
+    monkeypatch.setattr(settings, "treasury_testnet_address", "0:" + os.urandom(32).hex())
+    items = _build_stream(now, _tonapi_item, count=_LIMIT * 12)
+    capture: list[dict] = []
+    monkeypatch.setattr(ton_pay, "get_http_client", lambda: _FakeClient(items, capture))
+    cutoff = ton_pay.scan_cutoff_for([datetime.now(UTC) - timedelta(minutes=1)])
+
+    token = ton_pay.state.RECONCILE_CUTOFF_OVERRIDE.set(cutoff)
+    try:
+        markers = await ton_pay.fetch_broadcast_markers()
+    finally:
+        ton_pay.state.RECONCILE_CUTOFF_OVERRIDE.reset(token)
+
+    assert len(capture) < settings.payout_reconcile_max_pages
+    assert ton_pay.state._RECONCILE_WINDOW_COMPLETE is True
+    # Маркеры — memo головы истории; глубокий хвост потока не читался.
+    assert markers
+    assert f"way:1:pr#{len(items) - 1}" not in markers
+
+
+async def test_fetch_broadcast_tx_map_passes_targets_to_fetchers(monkeypatch) -> None:
+    """fetch_broadcast_tx_map пробрасывает цели и границу окна в фетчеры."""
+    seen: dict[str, object] = {}
+
+    async def fake_api(
+        targets: set[str] | None, *, cutoff: float | None = None
+    ) -> dict[str, str]:
         seen["api"] = targets if targets is None or targets == set() else targets
+        seen["cutoff"] = cutoff
         return {}
 
     monkeypatch.setattr(ton_pay, "_tx_map_via_tonapi", fake_api)
-    result = await ton_pay.fetch_broadcast_tx_map(targets={"way:1:pr#1"})
+    result = await ton_pay.fetch_broadcast_tx_map(targets={"way:1:pr#1"}, cutoff=123.0)
     assert result == {}
     assert seen["api"] == {"way:1:pr#1"}
+    assert seen["cutoff"] == 123.0
 
 
 async def test_empty_200_without_transactions_is_unknown(monkeypatch) -> None:
@@ -593,6 +690,39 @@ async def test_first_attempt_not_blocked_by_unknown_history(monkeypatch) -> None
         async with SessionLocal() as session:
             row = await session.get(Payout, payout_id)
         assert row.status == "sent"
+    finally:
+        async with SessionLocal() as session:
+            await session.delete(await session.get(Payout, payout_id))
+            await session.commit()
+
+
+async def test_dispatch_bounds_marker_scan_by_payout_creation(monkeypatch) -> None:
+    """Диспетчер сужает скан маркеров возрастом выплат через ContextVar.
+
+    Без границы скан маркеров при каждом цикле с отправкой читал всё
+    7-суточное окно истории, даже когда выплата создана минуту назад.
+    """
+    payout_id = await _seed_payout(attempts=0)
+    seen: list[float | None] = []
+
+    async def markers_with_cutoff() -> set[str]:
+        seen.append(ton_pay.state.RECONCILE_CUTOFF_OVERRIDE.get())
+        return set()
+
+    transfer = AsyncMock(return_value="bcast:1000")
+    _patch_send_environment(monkeypatch, transfer, markers_with_cutoff)
+
+    before = time.time()
+    try:
+        await ton_pay.dispatch_pending_payouts(bot=None)
+        assert len(seen) == 1, "маркеры обязаны читаться один раз на цикл"
+        cutoff = seen[0]
+        assert cutoff is not None, "диспетчер не передал границу окна"
+        # created_at строки ~сейчас: граница на запас раньше, но не полное окно.
+        assert before - 1100 <= cutoff <= time.time() - 800
+        assert cutoff > time.time() - settings.payout_reconcile_history_seconds
+        # ContextVar сброшен: граница не протекает в соседние задачи.
+        assert ton_pay.state.RECONCILE_CUTOFF_OVERRIDE.get() is None
     finally:
         async with SessionLocal() as session:
             await session.delete(await session.get(Payout, payout_id))

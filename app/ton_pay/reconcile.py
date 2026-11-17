@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from datetime import UTC, datetime
 from typing import Any
 
 from app.config import settings
@@ -26,6 +27,59 @@ from app.ton_codec import extract_comment, tonapi_headers
 from . import state as _state
 
 logger = logging.getLogger(__name__)
+
+# Запас к created_at выплаты. Перевод не может попасть в цепочку раньше
+# создания самой выплаты, но часы приложения и валидаторов расходятся на
+# секунды. Пятнадцати минут хватает с большим избытком и всё равно отсекает
+# почти всё настроенное окно сверки у свежих выплат.
+_RECONCILE_CREATED_MARGIN_SECONDS = 900.0
+
+
+def _utc_timestamp(moment: datetime) -> float:
+    """Unix-время момента: SQLite отдаёт naive UTC, Postgres — aware."""
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    return aware.timestamp()
+
+
+def scan_cutoff_for(created_ats: Iterable[datetime]) -> float:
+    """Самая поздняя безопасная граница скана истории для набора выплат.
+
+    Транзакция с memo выплаты не может оказаться в цепочке раньше создания
+    самой выплаты. Значит, для поиска memo достаточно прочитать историю до
+    min(created_at) - запас, а не всё настроенное окно
+    payout_reconcile_history_seconds: с ростом истории каждый поиск иначе
+    превращается в чтение многих мегабайт. Нижняя граница — само окно (глубже
+    него не ходим), пустой набор — тоже полное окно.
+
+    Полнота такого суженного окна остаётся честной: всё, что новее границы,
+    прочитано, а memo старше самой выплаты в цепочке существовать не может.
+    """
+    full_cutoff = time.time() - settings.payout_reconcile_history_seconds
+    earliest: float | None = None
+    for moment in created_ats:
+        bound = _utc_timestamp(moment) - _RECONCILE_CREATED_MARGIN_SECONDS
+        if earliest is None or bound < earliest:
+            earliest = bound
+    if earliest is None:
+        return full_cutoff
+    return max(full_cutoff, earliest)
+
+
+def _resolve_scan_cutoff(cutoff: float | None) -> float:
+    """Итоговая граница окна: не глубже настройки и не глубже переданных границ.
+
+    cutoff приходит от конкретного набора выплат (scan_cutoff_for), ContextVar
+    — от диспетчера, который не может передать аргумент в подменяемый тестами
+    fetch_broadcast_markers. Если границ несколько, действует самая поздняя:
+    она всё равно покрывает все memo этих выплат.
+    """
+    full_cutoff = time.time() - settings.payout_reconcile_history_seconds
+    bounds = [
+        value
+        for value in (cutoff, _state.RECONCILE_CUTOFF_OVERRIDE.get())
+        if value is not None
+    ]
+    return max(full_cutoff, *bounds) if bounds else full_cutoff
 
 
 def _out_comments(item: dict) -> list[str]:
@@ -113,6 +167,10 @@ async def _scan_broadcast_history(
     найдено» — это «не знаю», а не «перевода нет». Стартовое False пессимистично:
     аварийный выход (raise, истощение страниц) оставляет отрицательные ответы
     недоказанными (см. app.ton_pay.state).
+
+    cutoff — нижняя граница по времени. Потребитель вправе поднять её к возрасту
+    самих выплат (scan_cutoff_for): транзакция с их memo не может быть старше
+    created_at, и чтение более глубокой истории — трафик впустую.
     """
     tx_map: dict[str, str] = {}
     _state._RECONCILE_WINDOW_COMPLETE = False
@@ -155,7 +213,9 @@ async def _scan_broadcast_history(
     return tx_map
 
 
-async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
+async def _tx_map_via_tonapi(
+    targets: set[str] | None = None, *, cutoff: float | None = None
+) -> dict[str, str]:
     """memo исходящих казначея → реальный хеш (TonAPI v2), страницами вглубь.
 
     Одна страница (128 tx) — слишком мелкое окно: в длинной очереди слово
@@ -167,6 +227,8 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
     targets — кому это нужно: жадный полный скан (12 страниц) заменяется
     проходом до момента, когда ВСЕ цели найдены. Отсутствующая цель при этом
     вынуждает дойти до конца окна — отрицательный ответ остаётся честным.
+    cutoff — дополнительная граница по возрасту выплат (scan_cutoff_for):
+    глубже неё скан не идёт.
     """
     import app.ton_pay as _tp
 
@@ -210,18 +272,21 @@ async def _tx_map_via_tonapi(targets: set[str] | None = None) -> dict[str, str]:
         fetch_page=fetch_page,
         max_pages=max_pages,
         page_limit=page_limit,
-        cutoff=time.time() - settings.payout_reconcile_history_seconds,
+        cutoff=_resolve_scan_cutoff(cutoff),
         next_token=next_token,
         error_context="TonAPI истории казначея",
     )
 
 
-async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, str]:
+async def _tx_map_via_toncenter(
+    targets: set[str] | None = None, *, cutoff: float | None = None
+) -> dict[str, str]:
     """memo исходящих казначея → реальный хеш (Toncenter v3), страницами вглубь.
 
     То же глубокое окно, что в _tx_map_via_tonapi, но через параметр offset
     резервного провайдера: анти-дубль не должен слепнуть там, где TonAPI молчит.
     targets — см. _tx_map_via_tonapi: досрочный стоп после нахождения всех целей.
+    cutoff — граница по возрасту выплат: глубже неё скан не идёт.
     """
     import app.ton_pay as _tp
 
@@ -266,13 +331,15 @@ async def _tx_map_via_toncenter(targets: set[str] | None = None) -> dict[str, st
         fetch_page=fetch_page,
         max_pages=max_pages,
         page_limit=page_limit,
-        cutoff=time.time() - settings.payout_reconcile_history_seconds,
+        cutoff=_resolve_scan_cutoff(cutoff),
         next_token=next_token,
         error_context="Toncenter истории казначея",
     )
 
 
-async def fetch_broadcast_tx_map(targets: set[str] | None = None) -> dict[str, str]:
+async def fetch_broadcast_tx_map(
+    targets: set[str] | None = None, *, cutoff: float | None = None
+) -> dict[str, str]:
     """memo последних исходящих казначея → реальный хеш транзакции.
 
     TonAPI → фолбэк Toncenter. Пустой результат при сбое сети значит
@@ -283,6 +350,11 @@ async def fetch_broadcast_tx_map(targets: set[str] | None = None) -> dict[str, s
     скан останавливается, как только все цели найдены. Кому-то ещё нужен
     полный скан окна — зовут без targets и получают прежнее поведение.
 
+    cutoff (необязательно) — верхняя граница окна по возрасту выплат
+    (scan_cutoff_for). Диспетчер передаёт её через
+    state.RECONCILE_CUTOFF_OVERRIDE: подменяемые тестами фейки
+    fetch_broadcast_markers не принимают аргументов.
+
     Полнота покрытия окна пишется в _state._RECONCILE_WINDOW_COMPLETE:
     усечённый скан (payout_reconcile_max_pages) — «не знаю» для отрицательных
     ответов, и потребители (confirm, диспетчер) обязаны это проверять.
@@ -291,7 +363,7 @@ async def fetch_broadcast_tx_map(targets: set[str] | None = None) -> dict[str, s
 
     for fetch in (_tp._tx_map_via_tonapi, _tp._tx_map_via_toncenter):
         try:
-            result = await fetch(targets)
+            result = await fetch(targets, cutoff=cutoff)
             _state._RECONCILE_HISTORY_OK = True
             return result
         except Exception as exc:
@@ -351,6 +423,10 @@ async def fetch_broadcast_markers() -> set[str]:
     вещания). Повтор такой выплаты — реальные чужие деньги дважды. Пустой
     результат при сбое сети значит «не знаю»: ведём себя как раньше и
     пытаемся отправить — узкое окно риска лучше постоянной блокировки очереди.
+
+    Диспетчер ограничивает окно возрастом своих выплат через
+    state.RECONCILE_CUTOFF_OVERRIDE (ContextVar, а не аргумент: тесты и
+    соседние контуры подменяют эту функцию без параметров).
     """
     import app.ton_pay as _tp
 

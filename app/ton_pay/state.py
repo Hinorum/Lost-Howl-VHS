@@ -54,6 +54,17 @@ _RECONCILE_PAGE_LIMIT = 256
 RECONCILE_SCAN_OVERRIDE: ContextVar[tuple[int, int] | None] = ContextVar(
     "reconcile_scan_override", default=None
 )
+# Дополнительная верхняя граница окна сверки (unix-время, ближе к «сейчас»):
+# транзакция с memo выплаты не может лежать в цепочке раньше её created_at,
+# поэтому читать историю глубже (created_at - запас) незачем. ContextVar, а не
+# аргумент fetch-функции: диспетчер обязан передать границу, но тесты и
+# соседние контуры подменяют fetch_broadcast_markers без аргументов. None —
+# прежнее полное окно payout_reconcile_history_seconds. Эффективная граница
+# считается как max(полное окно, эта): глубже настроенного окна история не
+# читается ни при каких условиях.
+RECONCILE_CUTOFF_OVERRIDE: ContextVar[float | None] = ContextVar(
+    "reconcile_cutoff_override", default=None
+)
 # Шаг пагинации: страница шагает НЕ на весь лимит, а с перекрытием хвоста
 # (16 записей). В живой казне между двумя запросами может прийти новая
 # транзакция, и граница ровно «128...256» сползут: memo на стыке уедет за край

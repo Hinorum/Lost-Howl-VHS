@@ -8,6 +8,7 @@ bcast, отсутствующее дольше окна → обратно в о
 """
 
 import os
+import time
 from datetime import UTC, datetime, timedelta
 
 from conftest import ensure_player, ensure_round
@@ -163,6 +164,36 @@ async def test_confirm_skips_when_history_empty(monkeypatch) -> None:
             row = await session.get(Payout, payout_id)
         assert row.status == "sent"
         assert row.tx_hash == "bcast:1789470019"
+    finally:
+        await _cleanup(payout_id)
+
+
+async def test_confirm_bounds_scan_by_payout_creation(monkeypatch) -> None:
+    """Сверка передаёт в скан границу по created_at, а не полное окно.
+
+    Неподтверждённая строка создана только что: транзакция с её memo не может
+    быть старше created_at, и чтение 7-суточной истории — трафик впустую.
+    """
+    payout_id = await _seed_sent_payout()
+    captured: dict[str, object] = {}
+
+    async def fake_tx_map(**kwargs) -> dict[str, str]:
+        captured.update(kwargs)
+        return {"way:64:prize#999": "0" * 64}
+
+    monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", fake_tx_map)
+
+    before = time.time()
+    try:
+        await ton_pay.confirm_broadcast_payouts(bot=None)
+        cutoff = captured.get("cutoff")
+        assert isinstance(cutoff, float), "сверка не передала границу окна"
+        # created_at строки ~сейчас: граница на запас раньше, но не полное окно.
+        assert before - 1100 <= cutoff <= time.time() - 800
+        assert cutoff > time.time() - settings.payout_reconcile_history_seconds
+        # Цели по-прежнему передаются: граница не подменяет точечный поиск.
+        targets = captured.get("targets")
+        assert isinstance(targets, set) and targets
     finally:
         await _cleanup(payout_id)
 

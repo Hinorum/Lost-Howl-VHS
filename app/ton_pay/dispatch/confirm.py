@@ -17,6 +17,7 @@ from app.db import SessionLocal
 from app.models import Payout
 
 from .. import state as _state
+from ..reconcile import scan_cutoff_for
 from .memo import _payout_comment_candidates
 
 logger = logging.getLogger(__name__)
@@ -201,6 +202,9 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
         «не знаю» не имеет права ни подтвердить, ни возвращать в очередь;
       • скан окна усечён (payout_reconcile_max_pages) → «memo не найдено»
         тоже «не знаю»: строки не трогаем, пока скан не станет полным;
+      • окно скана ограничено возрастом выплат (min(created_at) - запас):
+        транзакция с memo не может быть старше самой выплаты, поэтому промах
+        не читает всю 7-суточную историю; полнота такого окна честная;
       • пачка v5r1 (несколько выплат в одной транзакции) → хеш транзакции
         достаётся ровно одной строке, остальные помечаются хешем с суффиксом
         «#<id>»: индекс (tx_hash, network) не даёт двум строкам хранить один
@@ -222,12 +226,16 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
             # запросов в квартал провайдера минимум, а «нет в истории» остаётся
             # правдивым (отсутствующая цель дожимает скан до конца окна).
             targets = {candidate for payout in rows for candidate in _payout_comment_candidates(payout)}
+            # Окно скана сужаем возрастом самих выплат: транзакция с их memo не
+            # может быть старше created_at. Иначе каждый промах читал бы всё
+            # 7-суточное окно (12×256 tx, ~8.6 МБ) — трафик впустую.
+            cutoff = scan_cutoff_for(row.created_at for row in rows)
             # Полнота окна — как и в диспетчере, считается ЗАНОВО на цикл:
             # реальный fetch перепишет флаг по факту прохода (усечение по
             # payout_reconcile_max_pages → False), а протухшее False прошлого
             # цикла не имеет права блокировать решения этого.
             _state._RECONCILE_WINDOW_COMPLETE = True
-            tx_map = await _tp.fetch_broadcast_tx_map(targets=targets)
+            tx_map = await _tp.fetch_broadcast_tx_map(targets=targets, cutoff=cutoff)
             if not tx_map:
                 logger.warning("История казначея недоступна — сверка sent-выплат пропущена")
                 return 0
