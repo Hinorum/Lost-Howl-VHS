@@ -479,6 +479,37 @@ async def _handle_auto_grant(
     return None
 
 
+def _stake_refund_note(result: str, transfer: Transfer, amount: str) -> str:
+    """Текст персонального уведомления о возврате ставки."""
+    if (
+        result == "already_staked"
+        and transfer.value_nanotons < to_nano(settings.stake_min_ton)
+    ):
+        # Ставка — от stake_min_ton, а плата за смену пути (revote_ton) —
+        # ниже минимума. Значит повторный «ставкоподобный» перевод за того,
+        # кто уже поставил и чья сумма не дотягивает до минимума, — это
+        # почти наверняка «недоехавший» revote: кошелёк не приложил rv:-мемо
+        # или исказил его. Объясняем внятно, а не путанным «ставка уже есть».
+        return (
+            f"↩️ Перевод {amount} Gram возвращается: эта сумма ниже минимума "
+            f"ставки ({settings.stake_min_ton:g} Gram). Если ты менял путь — "
+            "бот не распознал комментарий rv:… за переводом. Переведи снова "
+            "без мемо (сумма из вилки зачтётся автоматически) либо с "
+            "<code>rv:день</code> в комментарии."
+        )
+    if result == "money_off":
+        return (
+            f"↩️ Перевод {amount} Gram возвращается: сегодня версия без ставок — "
+            "ставки не принимаются. Поставить можно в день со ставками."
+        )
+    reason = (
+        "ставка на этот день уже есть"
+        if result == "already_staked"
+        else "день уже закрылся"
+    )
+    return f"↩️ Перевод {amount} Gram возвращается: {reason}."
+
+
 async def _finalize_stake_refund(
     session, transfer, round_row, player, bot, result: str, amount: str
 ) -> None:
@@ -494,42 +525,12 @@ async def _finalize_stake_refund(
         ledger_result=f"stake:{result}",
         ledger_player_id=player.id,
     )
-    suspected_revote = (
-        result == "already_staked"
-        and transfer.value_nanotons < to_nano(settings.stake_min_ton)
+    await _dm_refund_queued(
+        bot,
+        player.id,
+        refund_status,
+        _stake_refund_note(result, transfer, amount),
     )
-    if suspected_revote:
-        # Ставка — от stake_min_ton, а плата за смену пути (revote_ton) —
-        # ниже минимума. Значит повторный «ставкоподобный» перевод за того,
-        # кто уже поставил и чья сумма не дотягивает до минимума, — это
-        # почти наверняка «недоехавший» revote: кошелёк не приложил rv:-мемо
-        # или исказил его. Объясняем внятно, а не путанным «ставка уже есть».
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {amount} Gram возвращается: эта сумма ниже минимума "
-            f"ставки ({settings.stake_min_ton:g} Gram). Если ты менял путь — "
-            "бот не распознал комментарий rv:… за переводом. Переведи снова "
-            "без мемо (сумма из вилки зачтётся автоматически) либо с "
-            "<code>rv:день</code> в комментарии.",
-        )
-    elif result == "money_off":
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {amount} Gram возвращается: сегодня версия без ставок — "
-            "ставки не принимаются. Поставить можно в день со ставками.",
-        )
-    else:
-        reason = "ставка на этот день уже есть" if result == "already_staked" else "день уже закрылся"
-        await _dm_refund_queued(
-            bot,
-            player.id,
-            refund_status,
-            f"↩️ Перевод {amount} Gram возвращается: {reason}.",
-        )
 
 
 async def _finalize_stake_rejected(bot, player, result: str, amount: str) -> None:
