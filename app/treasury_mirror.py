@@ -435,6 +435,83 @@ async def _set_state(session, key: str, value: str) -> None:
 # ---------- Чтение истории (TonAPI → фолбэк Toncenter) ----------
 
 
+def _mirror_candidates(treasury: str) -> list[tuple[str, str, str]]:
+    """Провайдеры истории казначея: TonAPI — основной, Toncenter — фолбэк."""
+    return [
+        (
+            "tonapi",
+            f"{settings.active_ton_api_base.rstrip('/')}/v2/blockchain/accounts/{treasury}/transactions",
+            settings.ton_api_key,
+        ),
+        (
+            "toncenter",
+            f"{settings.active_toncenter_api_base.rstrip('/')}/api/v3/transactions",
+            settings.toncenter_api_key,
+        ),
+    ]
+
+
+async def _fetch_candidate_page(
+    client,
+    kind: str,
+    url: str,
+    api_key: str,
+    treasury: str,
+    network: str,
+    before_lt: int | None,
+    offset: int | None,
+    limit: int,
+) -> tuple[list[MirrorMove], str] | None:
+    """Одна страница истории казначея у одного провайдера.
+
+    Возвращает (moves, kind) при успехе; None — провайдер недоступен
+    (история недоступна у обоих — _fetch_page отдаёт пустоту «none»).
+    """
+    try:
+        params: dict[str, Any] = {"limit": limit, "sort_order": "desc"}
+        if kind == "toncenter":
+            params["account"] = treasury
+            params["sort"] = "desc"
+            if offset is not None:
+                params["offset"] = offset
+            # before_lt провайдеру не шлём: он его молча игнорирует, а
+            # стратегия «спускаться к генезису» на нём не работает вовсе.
+        elif before_lt is not None:
+            params["before_lt"] = str(before_lt)
+        # Заголовок — по провайдеру: TonAPI ждёт Bearer, Toncenter X-API-Key.
+        # Общий api_headers() слал обоим X-API-Key, и TonAPI тихо уходил в
+        # анонимный режим, где /v2/blockchain режет страницу до 100 записей:
+        # бутстрап зеркала, спускающийся от головы к генезису, обрывался на
+        # глубине 100 переводов и тишина выглядела как «истории больше нет».
+        headers = tonapi_headers(api_key) if kind == "tonapi" else api_headers(api_key)
+        response = await http_get_with_retry(client, url, params=params, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+        items = payload.get("transactions") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            # 200 БЕЗ списка транзакций — это не «история пуста», а сбой формы
+            # ответа: честный пустой кошелёк приходит ключом с пустым
+            # списком. Иначе один битый ответ навсегда объявил бы зеркало
+            # выстроенным на нулевых строках, тождество показало бы
+            # расхождение на всю казну и ежедневная автосверка подняла бы
+            # тревогу до ручного /mirror reset. Считаем провайдера
+            # недоступным и пробуем следующего.
+            raise ValueError("в ответе нет списка transactions")
+        moves: list[MirrorMove] = []
+        for item in items:
+            move = (
+                parse_toncenter_move(item, network, treasury)
+                if kind == "toncenter"
+                else parse_tonapi_move(item, network, treasury)
+            )
+            if move is not None:
+                moves.append(move)
+        return moves, kind
+    except Exception as exc:
+        logger.warning("Зеркало: история (%s) недоступна: %s", kind, exc)
+    return None
+
+
 async def _fetch_page(
     before_lt: int | None = None,
     offset: int | None = None,
@@ -463,61 +540,21 @@ async def _fetch_page(
     network = settings.active_network
     treasury = settings.active_treasury_address
     client = get_http_client()
-    candidates = (
-        (
-            "tonapi",
-            f"{settings.active_ton_api_base.rstrip('/')}/v2/blockchain/accounts/{treasury}/transactions",
-            settings.ton_api_key,
-        ),
-        (
-            "toncenter",
-            f"{settings.active_toncenter_api_base.rstrip('/')}/api/v3/transactions",
-            settings.toncenter_api_key,
-        ),
-    )
-    for kind, url, api_key in candidates:
-        try:
-            params: dict[str, Any] = {"limit": limit, "sort_order": "desc"}
-            if kind == "toncenter":
-                params["account"] = treasury
-                params["sort"] = "desc"
-                if offset is not None:
-                    params["offset"] = offset
-                # before_lt провайдеру не шлём: он его молча игнорирует, а
-                # стратегия «спускаться к генезису» на нём не работает вовсе.
-            elif before_lt is not None:
-                params["before_lt"] = str(before_lt)
-            # Заголовок — по провайдеру: TonAPI ждёт Bearer, Toncenter X-API-Key.
-            # Общий api_headers() слал обоим X-API-Key, и TonAPI тихо уходил в
-            # анонимный режим, где /v2/blockchain режет страницу до 100 записей:
-            # бутстрап зеркала, спускающийся от головы к генезису, обрывался на
-            # глубине 100 переводов и тишина выглядела как «истории больше нет».
-            headers = tonapi_headers(api_key) if kind == "tonapi" else api_headers(api_key)
-            response = await http_get_with_retry(client, url, params=params, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
-            items = payload.get("transactions") if isinstance(payload, dict) else None
-            if not isinstance(items, list):
-                # 200 БЕЗ списка транзакций — это не «история пуста», а сбой формы
-                # ответа: честный пустой кошелёк приходит ключом с пустым
-                # списком. Иначе один битый ответ навсегда объявил бы зеркало
-                # выстроенным на нулевых строках, тождество показало бы
-                # расхождение на всю казну и ежедневная автосверка подняла бы
-                # тревогу до ручного /mirror reset. Считаем провайдера
-                # недоступным и пробуем следующего.
-                raise ValueError("в ответе нет списка transactions")
-            moves: list[MirrorMove] = []
-            for item in items:
-                move = (
-                    parse_toncenter_move(item, network, treasury)
-                    if kind == "toncenter"
-                    else parse_tonapi_move(item, network, treasury)
-                )
-                if move is not None:
-                    moves.append(move)
-            return moves, kind, True
-        except Exception as exc:
-            logger.warning("Зеркало: история (%s) недоступна: %s", kind, exc)
+    for kind, url, api_key in _mirror_candidates(treasury):
+        fetched = await _fetch_candidate_page(
+            client,
+            kind,
+            url,
+            api_key,
+            treasury,
+            network,
+            before_lt,
+            offset,
+            limit,
+        )
+        if fetched is not None:
+            moves, source = fetched
+            return moves, source, True
     return [], "none", False
 
 
