@@ -828,6 +828,68 @@ def _mark_payout_unsent(payout: Payout) -> None:
         payout.status = "pending"
 
 
+async def _payout_single_pass(
+    payout: Payout,
+    markers: set[str],
+    candidates: list[str],
+    prev_memo: set[str] | None,
+    prior_attempts: dict[int, int],
+) -> str:
+    """Один поштучный проход строки: skip / already / sent / stop.
+
+    already — memo уже в истории казначея: помечаем sent без повтора, но
+    prev_memo НЕ взводим (в этом цикле ничего не вещали). sent — перевод
+    реально ушёл, следующий ждёт memo в блоке. stop — предыдущий перевод
+    цикла не подтвердился: пачка встаёт до следующего цикла.
+    """
+    if any(candidate in markers for candidate in candidates):
+        _mark_already_broadcast(payout)
+        return "already"
+    if _needs_defer_unconfirmed(payout, candidates, markers):
+        # Откладываем только СВОЮ строку: клейм мог уйти другому
+        # циклу, и его sending перетирать pending'ом нельзя.
+        if await _renew_claim(payout):
+            _defer_unconfirmed_history(payout, prior_attempts)
+        return "skip"
+    if prev_memo:
+        # Гонка двух быстрых переводов: следующий seqno подписываем,
+        # только когда предыдущий перевод этого цикла подтверждён в
+        # блоке. Канал тут ни при чём — окно нужно на ЛЮБОМ пути,
+        # лайтсерном в том числе: подписанный seqno+1 может ещё
+        # лежать в мемпуле узла, и следующий внешний месседж с
+        # seqno+2 сражается с ним за место (второй молча теряется,
+        # ловим только 2-часовой сверкой). Условие на
+        # _http_channel_engaged_at было оптимизацией, которая
+        # осталась после того, как seqno начали переиспользовать и
+        # на лайтсерном пути (до этого каждый перевод брал
+        # свежий get_seqno и ждать было нечего).
+        if not await _wait_prev_memo(payout, prev_memo):
+            # За окно подтверждения перевод не пришёл: он в пути или
+            # потерян. Пачку на этом цикле останавливаем, и это не
+            # перестраховка, а требование корректности: сброс
+            # _batch_seqno заставил бы следующий перевод взять seqno
+            # из сети, а там всё ещё старая (предыдущая) величина —
+            # второй перевод подписался бы тем же номером и молча
+            # потерялся бы, как уже ушедший. Живой seqno можно
+            # прочитать только после того, как предыдущий перевод
+            # встанет в блок; до этого — пауза. Оставшиеся строки
+            # вернёт _reset_retriable следующим циклом, а судьбу
+            # неподтверждённого перевода дожмёт confirm_broadcast_payouts.
+            _state._batch_seqno = None
+            return "stop"
+    # Lease продлеваем непосредственно перед вещанием: окно
+    # send_timeout + confirm_seconds должно укладываться в cutoff
+    # сброса (send_timeout + 30), иначе другой цикл вправе вернуть
+    # строку в очередь, пока наш перевод ещё в пути.
+    if not await _renew_claim(payout):
+        return "skip"
+    sent_now, _tx_hash = await _send_payout_tx(payout, candidates[0])
+    if not sent_now:
+        _mark_payout_unsent(payout)
+        return "skip"
+    return "sent"
+
+
 async def _run_payout_pass(
     payouts: list[Payout],
     markers: set[str],
@@ -864,57 +926,19 @@ async def _run_payout_pass(
             # служебным суффиксом «way:<день>:<тип>#<id>», чтобы анти-дубль
             # не спотыкался на одинаковом тексте разных возвратов.
             candidates = _payout_comment_candidates(payout)
-            comment = candidates[0]
-            if any(candidate in markers for candidate in candidates):
-                _mark_already_broadcast(payout)
+            outcome = await _payout_single_pass(
+                payout, markers, candidates, prev_memo, prior_attempts
+            )
+            if outcome == "stop":
+                deferred = True
+                break
+            if outcome == "already":
                 sent += 1
                 continue
-            if _needs_defer_unconfirmed(payout, candidates, markers):
-                # Откладываем только СВОЮ строку: клейм мог уйти другому
-                # циклу, и его sending перетирать pending'ом нельзя.
-                if await _renew_claim(payout):
-                    _defer_unconfirmed_history(payout, prior_attempts)
-                continue
-            if prev_memo:
-                # Гонка двух быстрых переводов: следующий seqno подписываем,
-                # только когда предыдущий перевод этого цикла подтверждён в
-                # блоке. Канал тут ни при чём — окно нужно на ЛЮБОМ пути,
-                # лайтсерном в том числе: подписанный seqno+1 может ещё
-                # лежать в мемпуле узла, и следующий внешний месседж с
-                # seqno+2 сражается с ним за место (второй молча теряется,
-                # ловим только 2-часовой сверкой). Условие на
-                # _http_channel_engaged_at было оптимизацией, которая
-                # осталась после того, как seqno начали переиспользовать и
-                # на лайтсерном пути (до этого каждый перевод брал
-                # свежий get_seqno и ждать было нечего).
-                if not await _wait_prev_memo(payout, prev_memo):
-                    # За окно подтверждения перевод не пришёл: он в пути или
-                    # потерян. Пачку на этом цикле останавливаем, и это не
-                    # перестраховка, а требование корректности: сброс
-                    # _batch_seqno заставил бы следующий перевод взять seqno
-                    # из сети, а там всё ещё старая (предыдущая) величина —
-                    # второй перевод подписался бы тем же номером и молча
-                    # потерялся бы, как уже ушедший. Живой seqno можно
-                    # прочитать только после того, как предыдущий перевод
-                    # встанет в блок; до этого — пауза. Оставшиеся строки
-                    # вернёт _reset_retriable следующим циклом, а судьбу
-                    # неподтверждённого перевода дожмёт confirm_broadcast_payouts.
-                    _state._batch_seqno = None
-                    deferred = True
-                    break
-            # Lease продлеваем непосредственно перед вещанием: окно
-            # send_timeout + confirm_seconds должно укладываться в cutoff
-            # сброса (send_timeout + 30), иначе другой цикл вправе вернуть
-            # строку в очередь, пока наш перевод ещё в пути.
-            if not await _renew_claim(payout):
-                continue
-            sent_now, _tx_hash = await _send_payout_tx(payout, comment)
-            if sent_now:
+            if outcome == "sent":
                 sent += 1
                 # Следующий перевод пачки дождётся подтверждения ЭТОГО в блоке.
                 prev_memo = set(candidates)
-                continue
-            _mark_payout_unsent(payout)
     finally:
         _state._batch_seqno = None
 
