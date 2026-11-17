@@ -17,6 +17,14 @@ Render. Бот умеет ходить в свой же хостинг по API 
 - не пишет ничего в лог, кроме счётчиков: проверяемый секрет не должен
   попасть в проверяющие логи.
 
+Чтение инкрементальное: первый проход (и страховочный раз в
+render_logs_full_rescan_hours) читает всё окно, остальные — только строки
+новее сохранённой позиции с перекрытием. Позиция не перепрыгивает дыру:
+она двигается, только когда проход покрыл отрезок после прошлой позиции.
+Ошибка, таймаут или обрыв пагинации оставляют её на месте. Полнота всего
+окна — отдельный вопрос: при потоке выше render_logs_limit полный проход
+физически не закрывает все часы, и вердикт говорит об этом прямо.
+
 Ключ RENDER_API_KEY — учётные данные всего аккаунта Render, поэтому бот
 пользуется им ТОЛЬКО на чтение (GET) и никогда не пишет им в логи.
 """
@@ -31,7 +39,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.config import settings
-from app.core.registry import RENDER_LOGS_CHECK_KEY
+from app.core.registry import RENDER_LOGS_CHECK_KEY, RENDER_LOGS_CURSOR_KEY
 from app.http_utils import get_http_client, http_get_with_retry
 
 logger = logging.getLogger(__name__)
@@ -44,6 +52,12 @@ _RENDER_API_BASE = "https://api.render.com/v1"
 # аномалий молчал. Теперь у проверки своя джоба, но потолок по времени нужен
 # всё равно: зависший HTTP-запрос не должен держать джобу вечно.
 _SCAN_TIMEOUT_SECONDS = 300
+
+# Перекрытие инкрементального окна с сохранённой позицией. API округляет
+# границы до секунд, а запись, попавшая в хвост прошлого прохода, могла не
+# успеть появиться в выдаче. Пяти минут хватает с запасом; строки из
+# перекрытия дедуплицируются по id внутри прохода.
+_CURSOR_OVERLAP_SECONDS = 300
 
 # Секреты окружения: имя категории → (где лежит, имя поля).
 # Часть секретов живёт в Settings, часть — просто переменные окружения Render
@@ -135,7 +149,10 @@ def scan_messages(messages: list[str]) -> dict[str, Any]:
 
 
 def _entry_time(raw: Any) -> datetime | None:
-    """Время записи лога (RFC3339) — для постраничного обхода."""
+    """Момент из RFC3339 (`Z` или смещение); naive-время считается UTC.
+
+    Годится и для штампов записей лога, и для позиции курсора.
+    """
     if not isinstance(raw, str) or not raw:
         return None
     try:
@@ -143,6 +160,119 @@ def _entry_time(raw: Any) -> datetime | None:
     except ValueError:
         return None
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def _scan_plan(
+    cursor: dict[str, Any] | None, now: datetime
+) -> tuple[datetime, datetime, str]:
+    """Границы прохода: (since, until, режим full/incremental).
+
+    Полный проход читает всё окно render_logs_lookback_hours. Инкрементальный
+    — от сохранённой позиции минус перекрытие, поэтому уже прочитанные строки
+    не скачиваются заново. Полный нужен на первом проходе, после сброса или
+    порчи позиции и раз в render_logs_full_rescan_hours: он ловит то, что
+    инкремент мог пропустить из-за сбоя API или расхождения часов.
+
+    Позиция из будущего (часы сервера ушли назад) не используется: вместо
+    дыры читаем всё окно.
+    """
+    lookback_hours = max(1, int(settings.render_logs_lookback_hours))
+    full_since = now - timedelta(hours=lookback_hours)
+    until = _entry_time((cursor or {}).get("until"))
+    full_at = _entry_time((cursor or {}).get("full_at"))
+    rescan_hours = max(1, int(settings.render_logs_full_rescan_hours))
+    full_due = (
+        until is None
+        or full_at is None
+        or until > now
+        or (now - full_at).total_seconds() >= rescan_hours * 3600
+    )
+    if full_due:
+        return full_since, now, "full"
+    # full_due уже отсеял None, но анализатору типов это не видно.
+    assert until is not None
+    since = until - timedelta(seconds=_CURSOR_OVERLAP_SECONDS)
+    if since <= full_since:
+        # Позиция старше окна: инкремент всё равно прочитал бы его целиком,
+        # значит это полный проход и full_at пора обновить.
+        return full_since, now, "full"
+    return since, now, "incremental"
+
+
+async def _load_cursor() -> dict[str, Any] | None:
+    """Сохранённая позиция чтения логов; порча/сбой БД = полный проход."""
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, RENDER_LOGS_CURSOR_KEY)
+            if row is None:
+                return None
+            data = json.loads(row.value)
+            return data if isinstance(data, dict) else None
+    except Exception:
+        # Позиция — оптимизация трафика, а не деньги: без неё проверка просто
+        # читает всё окно, как раньше. Ронять из-за неё проход нельзя.
+        return None
+
+
+def _cursor_can_advance(
+    cursor: dict[str, Any] | None,
+    summary: dict[str, Any],
+    error: str | None,
+) -> bool:
+    """Не оставит ли сдвиг позиции непрочитанную дыру.
+
+    Позиция — это обещание «всё новее неё прочитано». Поэтому:
+    - ошибка/таймаут — не двигаем никогда;
+    - дошли до дна окна (пустая/короткая страница, штамп на границе) — можно;
+    - прошлая позиция есть — нужно покрыть хотя бы её: самый старый
+      прочитанный штамп не новее неё. Иначе между старой позицией и
+      прочитанным куском осталась бы дыра;
+    - прошлой позиции нет — можно, если пагинация кончилась сама или
+      упёрлась в НАСТРОЕННЫЙ потолок (строки/страницы). Первый проход и так
+      читает только новейший кусок, как до курсора; держать его вечно из-за
+      потолка — значит навсегда остаться без инкремента.
+    """
+    if error:
+        return False
+    if summary.get("reached_floor"):
+        return True
+    previous = _entry_time((cursor or {}).get("until"))
+    oldest = _entry_time(summary.get("oldest"))
+    if previous is not None:
+        return oldest is not None and oldest <= previous
+    return bool(summary.get("capped"))
+
+
+async def _save_cursor(
+    until: str, *, full: bool, cursor: dict[str, Any] | None
+) -> None:
+    """Сохраняет позицию после прохода без дыры (см. _cursor_can_advance).
+
+    full_at при инкременте не меняется: он отвечает на другой вопрос — когда
+    последний раз проверялось всё окно, а не только новые строки.
+    """
+    from app.db import SessionLocal
+    from app.models import WatcherState
+
+    full_at = until
+    if not full:
+        previous_full = _entry_time((cursor or {}).get("full_at"))
+        if previous_full is not None:
+            full_at = previous_full.isoformat()
+    payload = json.dumps({"until": until, "full_at": full_at})
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, RENDER_LOGS_CURSOR_KEY)
+            if row is None:
+                session.add(WatcherState(key=RENDER_LOGS_CURSOR_KEY, value=payload))
+            else:
+                row.value = payload
+            await session.commit()
+    except Exception:
+        logger.warning("Позиция проверки логов не сохранилась", exc_info=True)
 
 
 async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
@@ -286,6 +416,7 @@ async def fetch_logs(
     owner_id: str,
     since: datetime,
     limit: int,
+    until: datetime | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Забирает тексты логов сервиса за окно назад — постранично НАЗАД.
 
@@ -295,10 +426,15 @@ async def fetch_logs(
     окна: проверять надо СВЕЖИЕ логи (утечка в первых строках только что
     поднявшегося процесса), а не вчерашнее утро.
 
+    until — верх окна (по умолчанию «сейчас»). Проверка передаёт момент
+    старта прохода, чтобы сохранённая позиция не зависела от того, сколько
+    шёл скан.
+
     Возвращает (тексты, сводка): сколько строк, какое окно реально покрыто
-    и доводилось ли окно до конца. Если страницы кончились, а окно — нет,
-    вердикт говорит об этом прямо: молчаливая частичная проверка хуже
-    явной.
+    и доводилось ли окно до конца. `reached_floor` — доказательство, что
+    пагинация дошла до нижней границы: пустая/короткая страница или штамп
+    на самой границе. Для инкремента это важнее доли времени: при тихих
+    логах записей у границы может не быть вовсе.
     """
     last_error: Exception | None = None
     for candidate in _log_query_shapes(since):
@@ -314,8 +450,11 @@ async def fetch_logs(
         messages: list[str] = []
         stamps: list[datetime] = []
         seen_ids: set[str] = set()
-        upper = datetime.now(UTC)
+        scan_until = until or datetime.now(UTC)
+        upper = scan_until
         pages = 0
+        reached_floor = False
+        provider_stalled = False
         try:
             while pages < max_pages and len(messages) < total_limit:
                 page_messages, page_stamps, fresh, page_len = await _fetch_log_page(
@@ -323,19 +462,37 @@ async def fetch_logs(
                 )
                 pages += 1
                 if not page_len:
+                    # Пустая страница — история в окне кончилась.
+                    reached_floor = True
                     break
                 messages.extend(page_messages)
+                if page_stamps and min(page_stamps) <= since + timedelta(seconds=1):
+                    reached_floor = True
                 if not page_stamps or not fresh:
+                    # Провайдер повторил страницу или не дал штампов: это не
+                    # конец истории, а повод не доверять покрытию.
+                    provider_stalled = True
                     break
                 stamps.extend(page_stamps)
                 upper = min(page_stamps) - timedelta(seconds=1)
                 if page_len < page_limit:
-                    break
+                    # Короткая страница обычно значит «история кончилась»:
+                    # окно пройдено до дна, даже если записей у дна не было.
+                    # Для запроса на 1000 строк провайдер мог урезать ответ
+                    # до 100, поэтому там полноту докажет только пустая
+                    # страница: один лишний запрос дешевле потери строк.
+                    if page_limit <= 100:
+                        reached_floor = True
+                        break
+                    continue
         except Exception as exc:
             # Форма не подошла — пробуем следующую.
             last_error = exc
             continue
         now = datetime.now(UTC)
+        capped = not provider_stalled and (
+            pages >= max_pages or len(messages) >= total_limit
+        )
         if stamps:
             oldest = min(stamps)
             newest = max(stamps)
@@ -345,16 +502,25 @@ async def fetch_logs(
                 "pages": pages,
                 "oldest": oldest.isoformat(),
                 "newest": newest.isoformat(),
+                "until": scan_until.isoformat(),
                 "covered_share": round(share, 3),
-                "window_covered": share >= 0.99,
+                # Доля времени — запасной критерий: короткая/пустая страница
+                # доказывает дно точнее, чем «старейшая запись близко к since»,
+                # и не зависит от того, были ли у дна записи вообще.
+                "window_covered": share >= 0.99 or reached_floor,
+                "reached_floor": reached_floor,
+                "capped": capped,
             }
         else:
             summary = {
                 "pages": pages,
                 "oldest": None,
                 "newest": None,
+                "until": scan_until.isoformat(),
                 "covered_share": 0.0,
                 "window_covered": True,
+                "reached_floor": reached_floor,
+                "capped": capped,
             }
         summary["query"] = ",".join(
             f"{key}={value}"
@@ -369,7 +535,8 @@ async def check_render_logs() -> dict[str, Any]:
     """Проверяет логи Render на секреты и пишет вердикт в watcher_state.
 
     Вердикт: {checked_at, scanned, hits, samples, service, query, window_hours,
-    error}. Значений секретов в нём нет — только счётчики.
+    mode, cursor_from, window_start, until, error}. Значений секретов в нём
+    нет — только счётчики.
     """
     verdict: dict[str, Any] = {
         "checked_at": datetime.now(UTC).isoformat(),
@@ -381,18 +548,34 @@ async def check_render_logs() -> dict[str, Any]:
         "pages": 0,
         "oldest": None,
         "newest": None,
+        "until": None,
         "covered_share": 0.0,
         "window_covered": False,
+        "reached_floor": False,
+        "capped": False,
         "window_hours": int(settings.render_logs_lookback_hours),
+        "mode": "full",
+        "cursor_from": None,
+        "window_start": None,
         "error": None,
     }
+    cursor: dict[str, Any] | None = None
+    mode = "full"
     try:
         async with asyncio.timeout(_SCAN_TIMEOUT_SECONDS):
             service_id, owner_id = await resolve_service()
             verdict["service"] = service_id
-            since = datetime.now(UTC) - timedelta(hours=verdict["window_hours"])
+            cursor = await _load_cursor()
+            since, until, mode = _scan_plan(cursor, datetime.now(UTC))
+            verdict["mode"] = mode
+            verdict["cursor_from"] = (cursor or {}).get("until")
+            verdict["window_start"] = since.isoformat()
             messages, summary = await fetch_logs(
-                service_id, owner_id, since, int(settings.render_logs_limit)
+                service_id,
+                owner_id,
+                since,
+                int(settings.render_logs_limit),
+                until=until,
             )
             verdict.update(summary)
             verdict.update(scan_messages(messages))
@@ -407,6 +590,9 @@ async def check_render_logs() -> dict[str, Any]:
     except Exception as exc:
         verdict["error"] = f"{type(exc).__name__}: {exc}"[:300]
         logger.warning("Проверка логов Render не удалась: %s", verdict["error"])
+    until_stamp = str(verdict.get("until") or "")
+    if until_stamp and _cursor_can_advance(cursor, verdict, verdict["error"]):
+        await _save_cursor(until_stamp, full=(mode == "full"), cursor=cursor)
     await _save_verdict(verdict)
     if not verdict["error"]:
         logger.info(
@@ -462,7 +648,13 @@ def verdict_line(verdict: dict[str, Any] | None) -> str:
     window = verdict.get("window_hours")
     share = verdict.get("covered_share")
     coverage = ""
-    if share is not None and window:
+    if verdict.get("mode") == "incremental":
+        start = str(verdict.get("window_start") or "")[:16].replace("T", " ")
+        if verdict.get("window_covered"):
+            coverage = f", докачано с {start}" if start else ", докачано"
+        else:
+            coverage = f", окно с {start} не пройдено до конца" if start else ""
+    elif share is not None and window:
         if verdict.get("window_covered"):
             coverage = f", окно {window} ч пройдено целиком"
         else:

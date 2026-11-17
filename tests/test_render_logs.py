@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import delete
 
 from app.config import settings
-from app.core.registry import RENDER_LOGS_CHECK_KEY
+from app.core.registry import RENDER_LOGS_CHECK_KEY, RENDER_LOGS_CURSOR_KEY
 from app.db import SessionLocal
 from app.models import WatcherState
 from app.render_logs import (
@@ -46,19 +46,45 @@ MNEMONIC = " ".join(
 )
 
 
+_STATE_KEYS = (RENDER_LOGS_CHECK_KEY, RENDER_LOGS_CURSOR_KEY)
+
+_SERVICE = [
+    {"service": {"id": "srv-1", "name": "bot", "type": "web", "ownerId": "own-1"}}
+]
+
+
 @pytest.fixture(autouse=True)
 async def _clean_marker():
     async with SessionLocal() as session:
-        await session.execute(
-            delete(WatcherState).where(WatcherState.key == RENDER_LOGS_CHECK_KEY)
-        )
+        await session.execute(delete(WatcherState).where(WatcherState.key.in_(_STATE_KEYS)))
         await session.commit()
     yield
     async with SessionLocal() as session:
-        await session.execute(
-            delete(WatcherState).where(WatcherState.key == RENDER_LOGS_CHECK_KEY)
-        )
+        await session.execute(delete(WatcherState).where(WatcherState.key.in_(_STATE_KEYS)))
         await session.commit()
+
+
+async def _cursor_state() -> dict[str, str] | None:
+    async with SessionLocal() as session:
+        row = await session.get(WatcherState, RENDER_LOGS_CURSOR_KEY)
+        if row is None:
+            return None
+        data = json.loads(row.value)
+        return data if isinstance(data, dict) else None
+
+
+async def _seed_cursor(until: datetime, full_at: datetime) -> None:
+    await _seed_raw_cursor(json.dumps({"until": until.isoformat(), "full_at": full_at.isoformat()}))
+
+
+async def _seed_raw_cursor(value: str) -> None:
+    async with SessionLocal() as session:
+        session.add(WatcherState(key=RENDER_LOGS_CURSOR_KEY, value=value))
+        await session.commit()
+
+
+def _stamp(raw: str) -> datetime:
+    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
 @pytest.fixture
@@ -357,6 +383,10 @@ async def test_check_reports_uncovered_window(monkeypatch, secrets) -> None:
     monkeypatch.setattr(settings, "render_service_id", "srv-1")
     monkeypatch.setattr(settings, "render_logs_max_pages", 1)
     monkeypatch.setattr(settings, "render_logs_lookback_hours", 24)
+    # Страница ровно в лимит: скан упирается в потолок страниц, а не в дно
+    # истории. Короткая страница означала бы «история кончилась» — тогда окно
+    # честно считается покрытым.
+    monkeypatch.setattr("app.render_logs._log_query_shapes", lambda since: [{"limit": 1}])
     halfway = (datetime.now(UTC) - timedelta(hours=12)).isoformat()
 
     async def fake_get(path, params=None):
@@ -376,3 +406,361 @@ async def test_check_reports_uncovered_window(monkeypatch, secrets) -> None:
     assert verdict["scanned"] == 1
     assert verdict["covered_share"] < 1.0
     assert verdict["window_covered"] is False
+
+
+async def test_first_scan_reads_full_window_and_saves_cursor(monkeypatch, secrets) -> None:
+    """Первый проход читает всё окно и запоминает его верх.
+
+    Пока позиции нет, экономить не на чем: прочитать надо всё
+    render_logs_lookback_hours, как до курсора.
+    """
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_lookback_hours", 8)
+    monkeypatch.setattr(settings, "render_logs_max_pages", 5)
+    now = datetime.now(UTC)
+    seen: list[dict] = []
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        seen.append(dict(params or {}))
+        stamp = now - timedelta(hours=8) + timedelta(seconds=30)
+        return [{"id": "1", "message": "чисто", "timestamp": stamp.isoformat()}]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    before = datetime.now(UTC)
+    verdict = await check_render_logs()
+    after = datetime.now(UTC)
+
+    assert verdict["mode"] == "full"
+    assert verdict["error"] is None
+    assert verdict["window_covered"] is True
+    start = _stamp(seen[0]["startTime"])
+    assert abs((start - (before - timedelta(hours=8))).total_seconds()) <= 5
+    cursor = await _cursor_state()
+    assert cursor is not None
+    until = _stamp(cursor["until"])
+    assert before <= until <= after
+    assert cursor["full_at"] == cursor["until"]
+
+
+async def test_incremental_scan_overlaps_cursor_without_gap(monkeypatch, secrets) -> None:
+    """Повторный проход читает только новые строки, но с перекрытием.
+
+    Начало окна — позиция минус пять минут: запись на стыке проходов не
+    теряется, а уже прочитанные часы не скачиваются заново.
+    """
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_full_rescan_hours", 24)
+    now = datetime.now(UTC).replace(microsecond=0)
+    cursor_until = now - timedelta(hours=3)
+    full_at = now - timedelta(hours=1)
+    await _seed_cursor(cursor_until, full_at)
+    seen: list[dict] = []
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        seen.append(dict(params or {}))
+        return [
+            {
+                "id": "new",
+                "message": "чисто",
+                "timestamp": (now - timedelta(minutes=1)).isoformat(),
+            }
+        ]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["mode"] == "incremental"
+    assert verdict["cursor_from"] == cursor_until.isoformat()
+    assert verdict["error"] is None
+    assert verdict["window_covered"] is True
+    start = _stamp(seen[0]["startTime"])
+    expected = cursor_until - timedelta(seconds=300)
+    assert abs((start - expected).total_seconds()) <= 1
+    assert _stamp(seen[0]["endTime"]) >= now
+    cursor = await _cursor_state()
+    assert cursor is not None
+    assert _stamp(cursor["until"]) > cursor_until
+    assert cursor["full_at"] == full_at.isoformat()
+
+
+async def test_scan_error_keeps_cursor(monkeypatch) -> None:
+    """Сбой API не двигает позицию: непрочитанное повторит следующий проход."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    now = datetime.now(UTC).replace(microsecond=0)
+    cursor_until = now - timedelta(hours=2)
+    full_at = now - timedelta(hours=1)
+    await _seed_cursor(cursor_until, full_at)
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        raise RuntimeError("401 Unauthorized")
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["error"] and "401" in verdict["error"]
+    assert await _cursor_state() == {
+        "until": cursor_until.isoformat(),
+        "full_at": full_at.isoformat(),
+    }
+
+
+async def test_scan_timeout_keeps_cursor(monkeypatch) -> None:
+    """Таймаут не двигает позицию: окно не доказано пройденным."""
+    import asyncio
+
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr("app.render_logs._SCAN_TIMEOUT_SECONDS", 0.05)
+    now = datetime.now(UTC).replace(microsecond=0)
+    cursor_until = now - timedelta(hours=2)
+    full_at = now - timedelta(hours=1)
+    await _seed_cursor(cursor_until, full_at)
+
+    async def hang(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        await asyncio.sleep(5)
+        return []
+
+    monkeypatch.setattr("app.render_logs._api_get", hang)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["error"] and "TimeoutError" in verdict["error"]
+    assert await _cursor_state() == {
+        "until": cursor_until.isoformat(),
+        "full_at": full_at.isoformat(),
+    }
+
+
+async def test_partial_incremental_window_keeps_cursor(monkeypatch) -> None:
+    """Если пагинация упёрлась в потолок страниц, позиция стоит на месте."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_max_pages", 1)
+    monkeypatch.setattr("app.render_logs._log_query_shapes", lambda since: [{"limit": 2}])
+    now = datetime.now(UTC).replace(microsecond=0)
+    cursor_until = now - timedelta(hours=3)
+    full_at = now - timedelta(hours=1)
+    await _seed_cursor(cursor_until, full_at)
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        return [
+            {"id": "1", "message": "a", "timestamp": (now - timedelta(minutes=9)).isoformat()},
+            {"id": "2", "message": "b", "timestamp": (now - timedelta(minutes=10)).isoformat()},
+        ]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["mode"] == "incremental"
+    assert verdict["error"] is None
+    assert verdict["window_covered"] is False
+    assert await _cursor_state() == {
+        "until": cursor_until.isoformat(),
+        "full_at": full_at.isoformat(),
+    }
+
+
+async def test_first_capped_scan_still_saves_cursor(monkeypatch) -> None:
+    """Первый проход упёрся в потолок — позицию всё равно сохраняем.
+
+    При потоке выше render_logs_limit полное окно не покрывается никогда.
+    Если в этом случае не двигать позицию, инкремент не включится: каждый
+    проход будет перечитывать те же самые строки. Дыры после прошлой позиции
+    нет — позиции ещё нет, а старый код читал ровно этот новейший кусок.
+    """
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_max_pages", 1)
+    monkeypatch.setattr("app.render_logs._log_query_shapes", lambda since: [{"limit": 2}])
+    now = datetime.now(UTC).replace(microsecond=0)
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        return [
+            {"id": "1", "message": "a", "timestamp": (now - timedelta(minutes=1)).isoformat()},
+            {"id": "2", "message": "b", "timestamp": (now - timedelta(minutes=2)).isoformat()},
+        ]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["mode"] == "full"
+    assert verdict["error"] is None
+    assert verdict["window_covered"] is False
+    assert verdict["capped"] is True
+    cursor = await _cursor_state()
+    assert cursor is not None and cursor["until"]
+
+
+async def test_full_rescan_missing_previous_cursor_keeps_it(monkeypatch) -> None:
+    """Перескан не дошёл до прошлой позиции — сдвиг оставил бы дыру."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_lookback_hours", 8)
+    monkeypatch.setattr(settings, "render_logs_full_rescan_hours", 24)
+    monkeypatch.setattr(settings, "render_logs_max_pages", 1)
+    monkeypatch.setattr("app.render_logs._log_query_shapes", lambda since: [{"limit": 2}])
+    now = datetime.now(UTC).replace(microsecond=0)
+    cursor_until = now - timedelta(hours=6)
+    full_at = now - timedelta(hours=25)
+    await _seed_cursor(cursor_until, full_at)
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        return [
+            {"id": "1", "message": "a", "timestamp": (now - timedelta(minutes=1)).isoformat()},
+            {"id": "2", "message": "b", "timestamp": (now - timedelta(minutes=2)).isoformat()},
+        ]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["mode"] == "full"
+    assert verdict["error"] is None
+    assert verdict["capped"] is True
+    assert await _cursor_state() == {
+        "until": cursor_until.isoformat(),
+        "full_at": full_at.isoformat(),
+    }
+
+
+async def test_periodic_full_rescan_ignores_cursor(monkeypatch) -> None:
+    """Раз в render_logs_full_rescan_hours читается всё окно, а не хвост."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_lookback_hours", 8)
+    monkeypatch.setattr(settings, "render_logs_full_rescan_hours", 24)
+    now = datetime.now(UTC).replace(microsecond=0)
+    cursor_until = now - timedelta(hours=3)
+    full_at = now - timedelta(hours=25)
+    await _seed_cursor(cursor_until, full_at)
+    seen: list[dict] = []
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        seen.append(dict(params or {}))
+        stamp = now - timedelta(hours=8) + timedelta(seconds=30)
+        return [{"id": "1", "message": "чисто", "timestamp": stamp.isoformat()}]
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["mode"] == "full"
+    assert verdict["error"] is None
+    start = _stamp(seen[0]["startTime"])
+    expected = now - timedelta(hours=8)
+    assert abs((start - expected).total_seconds()) <= 5
+    cursor = await _cursor_state()
+    assert cursor is not None
+    assert _stamp(cursor["until"]) > cursor_until
+    assert _stamp(cursor["full_at"]) > full_at
+
+
+async def test_cursor_older_than_lookback_reads_full_window(monkeypatch) -> None:
+    """Позиция старше окна не заставляет читать глубже настроенной глубины."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    monkeypatch.setattr(settings, "render_logs_lookback_hours", 8)
+    now = datetime.now(UTC).replace(microsecond=0)
+    cursor_until = now - timedelta(hours=10)
+    full_at = now - timedelta(hours=1)
+    await _seed_cursor(cursor_until, full_at)
+    seen: list[dict] = []
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        seen.append(dict(params or {}))
+        return []
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["mode"] == "full"
+    assert verdict["error"] is None
+    assert verdict["window_covered"] is True
+    start = _stamp(seen[0]["startTime"])
+    expected = now - timedelta(hours=8)
+    assert abs((start - expected).total_seconds()) <= 5
+
+
+async def test_broken_cursor_falls_back_to_full_scan(monkeypatch) -> None:
+    """Порча позиции — не повод пропустить окно: читаем всё, как в первый раз."""
+    monkeypatch.setattr(settings, "render_api_key", "KEY")
+    monkeypatch.setattr(settings, "render_service_id", "srv-1")
+    await _seed_raw_cursor("{not json")
+
+    async def fake_get(path, params=None):
+        if path != "/logs":
+            return _SERVICE
+        return []
+
+    monkeypatch.setattr("app.render_logs._api_get", fake_get)
+    from app.render_logs import check_render_logs
+
+    verdict = await check_render_logs()
+
+    assert verdict["mode"] == "full"
+    assert verdict["error"] is None
+    assert verdict["window_covered"] is True
+    cursor = await _cursor_state()
+    assert cursor is not None and cursor["until"]
+
+
+def test_verdict_line_reports_incremental_position() -> None:
+    """Строка /ops при инкременте говорит, с какого места докачано."""
+    complete = verdict_line(
+        {
+            "scanned": 5,
+            "hits": {},
+            "mode": "incremental",
+            "window_start": "2026-11-17T09:00:00+00:00",
+            "window_covered": True,
+            "checked_at": "2026-11-17T12:00:00+00:00",
+        }
+    )
+    assert "докачано с 2026-11-17 09:00" in complete
+    incomplete = verdict_line(
+        {
+            "scanned": 5,
+            "hits": {},
+            "mode": "incremental",
+            "window_start": "2026-11-17T09:00:00+00:00",
+            "window_covered": False,
+            "checked_at": "2026-11-17T12:00:00+00:00",
+        }
+    )
+    assert "не пройдено до конца" in incomplete
