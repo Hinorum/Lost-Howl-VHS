@@ -66,6 +66,74 @@ async def _taken_payout_hashes(session, network: str) -> set[str]:
     )
 
 
+def _assign_real_hash(
+    payout: Payout, real_hash: str, taken_hashes: set[str]
+) -> None:
+    """Пишет реальный хеш перевода; в пачке v5r1 хеш достаётся одной строке."""
+    if real_hash in taken_hashes:
+        # Пачка: хеш транзакции уже занят другой строкой.
+        # Свой суффикс — иначе индекс уронил бы коммит.
+        suffix = f"#{payout.id}"
+        payout.tx_hash = f"{real_hash[: 80 - len(suffix)]}{suffix}"
+        return
+    taken_hashes.add(real_hash)
+    payout.tx_hash = real_hash
+
+
+def _reconcile_sent_row(
+    payout: Payout, tx_map, taken_hashes: set[str], cutoff, window_cutoff
+) -> str:
+    """Разбор одной sent-строки: confirmed / requeued / window_lost / skip."""
+    real_hash = next(
+        (
+            tx_map[candidate]
+            for candidate in _payout_comment_candidates(payout)
+            if candidate in tx_map
+        ),
+        None,
+    )
+    if real_hash:
+        _assign_real_hash(payout, real_hash, taken_hashes)
+        return "confirmed"
+    sent_at = payout.sent_at.replace(tzinfo=None) if payout.sent_at is not None else None
+    if sent_at is not None and sent_at > cutoff:
+        # Свежая вещация: блокчейн мог ещё не успеть — даём время.
+        return "skip"
+    if sent_at is not None and sent_at <= window_cutoff:
+        # За окном сверки: невозможно ни подтвердить, ни опровергнуть.
+        # Возвращать в pending = риск дубля (memo может жить в цепочке
+        # за пределами нашего покрытия). В failed с понятной причиной:
+        # ручной разбор через /payouts → retry при подтверждённой доле.
+        # Сжигаем остаток попыток: failed с attempts < max — корм гигиены
+        # _reset_retriable, а она оживила бы строку уже в следующем цикле,
+        # и тот же memo ушёл бы в цепочку повторно. attempts == max делает
+        # решение окончательным до ручного вердикта: resolve_dead_payout
+        # счётчик не сбрасывает, и ручной retry по-прежнему пройдёт
+        # анти-дубль по истории.
+        payout.status = "failed"
+        payout.attempts = settings.payout_max_attempts
+        payout.last_error = (
+            f"memo «{_payout_comment_candidates(payout)[0][:40]}…» за окном сверки "
+            f"{settings.payout_reconcile_history_seconds} с — нельзя подтвердить "
+            "или опровергнуть, ручной разбор"
+        )
+        return "window_lost"
+    # memo нет в истории, окно верификации истекло — перевод не ушёл.
+    if not _state._RECONCILE_WINDOW_COMPLETE:
+        # ...но скан мог не покрыть окно сверки целиком (упёрся в
+        # payout_reconcile_max_pages): «не найдено» здесь — «не знаю». Ждём
+        # полного скана; строка либо подтвердится, либо дойдёт до ветки
+        # «за окном сверки» и уйдёт на ручной разбор.
+        return "skip"
+    payout.status = "pending"
+    payout.attempts += 1
+    payout.last_error = (
+        f"memo «{_payout_comment_candidates(payout)[0][:40]}» не найдено в блокчейне "
+        f"за {settings.payout_confirm_timeout_seconds} с после вещания — повторная отправка"
+    )
+    return "requeued"
+
+
 async def _reconcile_sent(
     session, rows: list[Payout], tx_map, taken_hashes
 ) -> tuple[int, int, int]:
@@ -97,63 +165,15 @@ async def _reconcile_sent(
         seconds=settings.payout_reconcile_history_seconds
     )
     for payout in rows:
-        real_hash = next(
-            (
-                tx_map[candidate]
-                for candidate in _payout_comment_candidates(payout)
-                if candidate in tx_map
-            ),
-            None,
+        outcome = _reconcile_sent_row(
+            payout, tx_map, taken_hashes, cutoff, window_cutoff
         )
-        if real_hash:
-            if real_hash in taken_hashes:
-                # Пачка: хеш транзакции уже занят другой строкой.
-                # Свой суффикс — иначе индекс уронил бы коммит.
-                suffix = f"#{payout.id}"
-                payout.tx_hash = f"{real_hash[: 80 - len(suffix)]}{suffix}"
-            else:
-                taken_hashes.add(real_hash)
-                payout.tx_hash = real_hash
+        if outcome == "confirmed":
             confirmed += 1
-            continue
-        sent_at = payout.sent_at.replace(tzinfo=None) if payout.sent_at is not None else None
-        if sent_at is not None and sent_at > cutoff:
-            # Свежая вещация: блокчейн мог ещё не успеть — даём время.
-            continue
-        if sent_at is not None and sent_at <= window_cutoff:
-            # За окном сверки: невозможно ни подтвердить, ни опровергнуть.
-            # Возвращать в pending = риск дубля (memo может жить в цепочке
-            # за пределами нашего покрытия). В failed с понятной причиной:
-            # ручной разбор через /payouts → retry при подтверждённой доле.
-            # Сжигаем остаток попыток: failed с attempts < max — корм гигиены
-            # _reset_retriable, а она оживила бы строку уже в следующем цикле,
-            # и тот же memo ушёл бы в цепочку повторно. attempts == max делает
-            # решение окончательным до ручного вердикта: resolve_dead_payout
-            # счётчик не сбрасывает, и ручной retry по-прежнему пройдёт
-            # анти-дубль по истории.
-            payout.status = "failed"
-            payout.attempts = settings.payout_max_attempts
-            payout.last_error = (
-                f"memo «{_payout_comment_candidates(payout)[0][:40]}…» за окном сверки "
-                f"{settings.payout_reconcile_history_seconds} с — нельзя подтвердить "
-                "или опровергнуть, ручной разбор"
-            )
+        elif outcome == "requeued":
+            requeued += 1
+        elif outcome == "window_lost":
             window_lost += 1
-            continue
-        # memo нет в истории, окно верификации истекло — перевод не ушёл.
-        if not _state._RECONCILE_WINDOW_COMPLETE:
-            # ...но скан мог не покрыть окно сверки целиком (упёрся в
-            # payout_reconcile_max_pages): «не найдено» здесь — «не знаю». Ждём
-            # полного скана; строка либо подтвердится, либо дойдёт до ветки
-            # «за окном сверки» и уйдёт на ручной разбор.
-            continue
-        payout.status = "pending"
-        payout.attempts += 1
-        payout.last_error = (
-            f"memo «{_payout_comment_candidates(payout)[0][:40]}» не найдено в блокчейне "
-            f"за {settings.payout_confirm_timeout_seconds} с после вещания — повторная отправка"
-        )
-        requeued += 1
     return confirmed, requeued, window_lost
 
 
