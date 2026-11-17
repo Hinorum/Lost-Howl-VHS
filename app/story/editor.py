@@ -214,6 +214,97 @@ def is_safe_cassette_name(file_name: str) -> bool:
     return file_name.endswith(".json")
 
 
+def _validate_edit_name(file_name: str) -> str | None:
+    """Имя файла кассеты приходит извне (callback_data/CLI) — проверяется здесь.
+
+    Требование строгое: только базовое имя, только «.json», без «..». Имя
+    `<new>` — плейсхолдер режима «новая кассета», пропускаем. Без этой
+    проверки `../../../../etc/passwd` читал бы любой файл контейнера.
+    """
+    if file_name != "<new>" and not is_safe_cassette_name(file_name):
+        return f"Недопустимое имя файла: {file_name}"
+    return None
+
+
+def _validate_new_cassette(
+    text: str,
+    directory: Path,
+) -> tuple[bool, list[str], str | None, Cassette | None]:
+    """Режим new: новая кассета целиком; имя из cassette_id+месяца."""
+    result = scenario_from_text(text)
+    if result.cassette is None:
+        lines = ["Новая кассета не принят:", *(_bullet(e) for e in result.errors)]
+        return False, lines, None, None
+    cassette = result.cassette
+    final_name = _derive_name(cassette)
+    # Имя выводится из сценария, то есть из загруженного документа, и
+    # потому требует той же гарантии, что и имя из callback_data.
+    if not is_safe_cassette_name(final_name or ""):
+        return (
+            False,
+            [f"Недопустимое имя файла по сценарию: {final_name}"],
+            None,
+            None,
+        )
+    if (directory / final_name).is_file():
+        return (
+            False,
+            [f"Файл {final_name} уже есть — существующую плёнку не перезаписываем.",],
+            final_name,
+            None,
+        )
+    lines = [
+        f"Новая кассета готова: {cassette.title} · {cassette.month} · "
+        f"{len(cassette.days)} дней → {final_name}.",
+        *_warnings(result),
+    ]
+    return True, lines, final_name, cassette
+
+
+def _validate_month_cassette(
+    text: str, file_name: str
+) -> tuple[bool, list[str], str | None, Cassette | None]:
+    """Режим month: целый сценарий поверх существующей кассеты."""
+    result = scenario_from_text(text)
+    if result.cassette is None:
+        lines = [f"Сценарий {file_name} не принят:", *(_bullet(e) for e in result.errors)]
+        return False, lines, file_name, None
+    cassette = result.cassette
+    lines = [
+        f"Сценарий {file_name} принят: {cassette.title} · {cassette.month} · "
+        f"{len(cassette.days)} дней.",
+        *_warnings(result),
+    ]
+    return True, lines, file_name, cassette
+
+
+def _validate_day_fragment(
+    text: str, path: Path, file_name: str
+) -> tuple[bool, list[str], str | None, Cassette | None]:
+    """Режим day: фрагмент одного дня (дорога и день читаются из текста)."""
+    try:
+        road, day = day_from_text(text)
+    except ValueError as exc:
+        return False, ["Фрагмент дня не принят:", f"  - {exc}"], file_name, None
+    base = validate_file(path)
+    if base.cassette is None:
+        lines = [f"Кассета {file_name} сейчас не читается:", *(_bullet(e) for e in base.errors)]
+        return False, lines, file_name, None
+    result = patch_cassette(base.cassette, road, day)
+    if result.cassette is None:
+        lines = [
+            f"Правка дня {day.day_index} дороги {road} не принята:",
+            *(_bullet(e) for e in result.errors),
+        ]
+        return False, lines, file_name, None
+    lines = [
+        f"День {day.day_index} дороги {road} готов к записи в {file_name} · "
+        f"{day.chapter_title}.",
+        *_warnings(result),
+    ]
+    return True, lines, file_name, result.cassette
+
+
 def validate_edit(
     data: bytes,
     file_name: str,
@@ -229,80 +320,19 @@ def validate_edit(
     """
     # Имя кассеты приходит извне, поэтому проверяется здесь, а не в
     # вызывающем коде: этот модуль используется и из CLI-инструмента.
-    if file_name != "<new>" and not is_safe_cassette_name(file_name):
-        return False, [f"Недопустимое имя файла: {file_name}"], None, None
+    name_error = _validate_edit_name(file_name)
+    if name_error is not None:
+        return False, [name_error], None, None
     text = data.decode("utf-8-sig")
-
     if mode == "new":
-        result = scenario_from_text(text)
-        if result.cassette is None:
-            lines = ["Новая кассета не принята:", *(_bullet(e) for e in result.errors)]
-            return False, lines, None, None
-        cassette = result.cassette
-        final_name = _derive_name(cassette)
-        # Имя выводится из сценария, то есть из загруженного документа, и
-        # потому требует той же гарантии, что и имя из callback_data.
-        if not is_safe_cassette_name(final_name or ""):
-            return (
-                False,
-                [f"Недопустимое имя файла по сценарию: {final_name}"],
-                None,
-                None,
-            )
-        if (directory / final_name).is_file():
-            return (
-                False,
-                [f"Файл {final_name} уже есть — существующую плёнку не перезаписываем.",],
-                final_name,
-                None,
-            )
-        lines = [
-            f"Новая кассета готова: {cassette.title} · {cassette.month} · "
-            f"{len(cassette.days)} дней → {final_name}.",
-            *_warnings(result),
-        ]
-        return True, lines, final_name, cassette
-
+        return _validate_new_cassette(text, directory)
     path = directory / file_name
     if not path.is_file():
         return False, [f"Кассеты {file_name} нет в библиотеке."], file_name, None
-
     if mode == "month":
-        result = scenario_from_text(text)
-        if result.cassette is None:
-            lines = [f"Сценарий {file_name} не принят:", *(_bullet(e) for e in result.errors)]
-            return False, lines, file_name, None
-        cassette = result.cassette
-        lines = [
-            f"Сценарий {file_name} принят: {cassette.title} · {cassette.month} · "
-            f"{len(cassette.days)} дней.",
-            *_warnings(result),
-        ]
-        return True, lines, file_name, cassette
-
+        return _validate_month_cassette(text, file_name)
     if mode == "day":
-        try:
-            road, day = day_from_text(text)
-        except ValueError as exc:
-            return False, ["Фрагмент дня не принят:", f"  - {exc}"], file_name, None
-        base = validate_file(path)
-        if base.cassette is None:
-            lines = [f"Кассета {file_name} сейчас не читается:", *(_bullet(e) for e in base.errors)]
-            return False, lines, file_name, None
-        result = patch_cassette(base.cassette, road, day)
-        if result.cassette is None:
-            lines = [
-                f"Правка дня {day.day_index} дороги {road} не принята:",
-                *(_bullet(e) for e in result.errors),
-            ]
-            return False, lines, file_name, None
-        lines = [
-            f"День {day.day_index} дороги {road} готов к записи в {file_name} · "
-            f"{day.chapter_title}.",
-            *_warnings(result),
-        ]
-        return True, lines, file_name, result.cassette
-
+        return _validate_day_fragment(text, path, file_name)
     return False, [f"Неизвестный режим правки: {mode!r}."], file_name, None
 
 
