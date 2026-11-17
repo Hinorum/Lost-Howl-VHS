@@ -199,6 +199,48 @@ async def _book_refund_payout(
             )
 
 
+async def _stash_capped_refund(
+    session, transfer: Transfer, ledger_player_id: int | None, capped: str
+) -> str:
+    """Потолок авто-возвратов: деньги остаются в казне до ручного возврата."""
+    logger.warning(
+        "Перевод %s на %s Gram не возвращён автоматически: %s. Деньги в казне, "
+        "верни вручную (/incoming, /adjust).",
+        transfer.tx_hash[:16],
+        f"{from_nano(transfer.value_nanotons):g}",
+        capped,
+    )
+    await _ledger_stuck_incoming(
+        session, transfer, ledger_player_id, capped.split(":")[0]
+    )
+    return "refund_capped"
+
+
+async def _queue_refund(
+    session,
+    transfer: Transfer,
+    round_id: int | None,
+    comment: str | None,
+    *,
+    refund_amount: int,
+    ledger_result: str | None,
+    ledger_player_id: int | None,
+) -> str:
+    """Создаёт выплату-возврат с доходом в ledger и коммитит одним разом."""
+    await _book_refund_payout(
+        session,
+        transfer,
+        round_id,
+        comment,
+        refund_amount=refund_amount,
+        ledger_result=ledger_result,
+        ledger_player_id=ledger_player_id,
+    )
+    await session.commit()
+    logger.info("Перевод %s возвращён отправителю", transfer.tx_hash[:16])
+    return "refund_queued"
+
+
 async def _stash_refund(
     session,
     transfer: Transfer,
@@ -245,17 +287,7 @@ async def _stash_refund(
     # потолок перевод уходит в ledger и ждёт ручного возврата, а не исчезает.
     capped = await _refund_cap_reason(session, transfer.source or "")
     if capped is not None:
-        logger.warning(
-            "Перевод %s на %s Gram не возвращён автоматически: %s. Деньги в казне, "
-            "верни вручную (/incoming, /adjust).",
-            transfer.tx_hash[:16],
-            f"{from_nano(transfer.value_nanotons):g}",
-            capped,
-        )
-        await _ledger_stuck_incoming(
-            session, transfer, ledger_player_id, capped.split(":")[0]
-        )
-        return "refund_capped"
+        return await _stash_capped_refund(session, transfer, ledger_player_id, capped)
     refund_amount = await _refund_net_amount(session, transfer)
     if refund_amount <= 0:
         # Газ дороже самого перевода: возвращать нечего, перевод остаётся в
@@ -277,7 +309,7 @@ async def _stash_refund(
         transfer.value_nanotons,
     ):
         return "refund_duplicated"
-    await _book_refund_payout(
+    return await _queue_refund(
         session,
         transfer,
         round_id,
@@ -286,6 +318,3 @@ async def _stash_refund(
         ledger_result=ledger_result,
         ledger_player_id=ledger_player_id,
     )
-    await session.commit()
-    logger.info("Перевод %s возвращён отправителю", transfer.tx_hash[:16])
-    return "refund_queued"
