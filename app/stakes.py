@@ -1055,6 +1055,102 @@ async def refundable_stakes(session, limit: int = 25) -> list[tuple[Stake, Playe
     ).all()
 
 
+async def _manual_refund_stake(session, stake_id: int) -> tuple[Stake | None, str]:
+    """Загружает ставку и проверяет пригодность к ручному возврату.
+
+    Подтверждённые (confirmed) ставки само собой разберутся при финализации
+    дня — ручной возврат туда не подаёт (там уже был бы класс двойной
+    выплаты). Возвращает (stake, ""): успех или (None, причина отказа).
+    """
+    stake = await session.get(Stake, stake_id)
+    if stake is None:
+        return None, "нет такой ставки"
+    if stake.network != current_network():
+        return None, "ставка из другого контура сети"
+    if stake.status == "refunded":
+        return None, "возврат этой ставки уже оформлен ранее"
+    if stake.status not in ("pending", "rejected"):
+        return None, (
+            "ставка уже засчитана (confirmed) — она разберётся при итогах дня сама. "
+            "Ручной возврат не нужен."
+        )
+    return stake, ""
+
+
+async def _manual_refund_dup_payout(
+    session, round_id: int, player_id: int
+) -> Payout | None:
+    """Незакрытый refund-выплата для (round_id, player_id) уже существует?"""
+    return (
+        await session.execute(
+            select(Payout).where(
+                Payout.kind == "refund",
+                Payout.round_id == round_id,
+                Payout.player_id == player_id,
+                Payout.status.notin_(["sent", "dismissed"]),
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _manual_refund_wallet(session, stake: Stake) -> tuple[str, str]:
+    """Возвращает (wallet_address, error): адрес игрока и причина отказа
+    (пустая строка — возврат возможен).
+
+    Тот же класс, что у приза (finalize_day_payouts: игроки с
+    wallet_verified не попадают в очередь выплаты): адрес без bv:-подтверждения
+    ещё не доказан как свой, возврат ушёл бы в необработанный bounce.
+    """
+    player = await session.get(Player, stake.player_id)
+    wallet = player.wallet_address if player is not None else ""
+    error = ""
+    if not wallet:
+        error = "у игрока не привязан кошелёк — возврат невозможен"
+    elif player is not None and not player.wallet_verified:
+        error = (
+            "кошелёк игрока не подтверждён (bv:) — возврат невозможен: "
+            "привязанный адрес ещё не доказан микро-переводом. Пусть игрок "
+            "подтвердит кошелёк в /wallet."
+        )
+    return wallet, error
+
+
+async def _manual_refund_claim(session, stake: Stake, refund: int, wallet: str) -> bool:
+    """Атомарный UPDATE-claim по ставке + создание refund-выплаты.
+
+    Тот же приём, что в confirm_stake и confirm_aged_pending: проверки живут в
+    НАШЕЙ транзакции, а финализация дня читает ставки своим снапшотом и по своим
+    pending/rejected строкам создаёт такую же refund-выплату; метка claim_once
+    её не держит, потому что берётся только нами. Кто первым перевёл строку в
+    refunded — тот и заплатил: второй получает rowcount=0 и выходит без выплаты.
+    Ставим claim ПЕРЕД созданием выплаты, а не после: всё окно между чтением
+    статуса и записью должно закрываться.
+
+    Возвращает True, если выплата создана; False — ставка уже разобрана
+    параллельной операцией (итоги дня или другой возврат).
+    """
+    claimed = await session.execute(
+        update(Stake)
+        .where(Stake.id == stake.id, Stake.status.in_(["pending", "rejected"]))
+        .values(status="refunded")
+    )
+    if cast(CursorResult[Any], claimed).rowcount != 1:
+        # Откат снимает и claim_once, и claim по ставке: «полу-меток» нет,
+        # повторная попытка возможна — но статус уже не pending, так что
+        # хендлер получит внятный отказ вместо второй выплаты.
+        return False
+    _create_payout(
+        session,
+        stake.round_id,
+        stake.player_id,
+        "refund",
+        refund,
+        wallet,
+        current_network(),
+    )
+    return True
+
+
 async def create_manual_refund(session, stake_id: int) -> str:
     """Ручной возврат ставки хранителем (см. /panel → «Возвраты»).
 
@@ -1066,81 +1162,29 @@ async def create_manual_refund(session, stake_id: int) -> str:
     финализация дня претендует на неё тем же способом. Деньги уходят обычной
     очередью выплат (dispatch_pending_payouts).
     """
-    stake = await session.get(Stake, stake_id)
+    stake, error = await _manual_refund_stake(session, stake_id)
     if stake is None:
-        return "нет такой ставки"
-    if stake.network != current_network():
-        return "ставка из другого контура сети"
-    if stake.status == "refunded":
-        return "возврат этой ставки уже оформлен ранее"
-    if stake.status not in ("pending", "rejected"):
-        return (
-            "ставка уже засчитана (confirmed) — она разберётся при итогах дня сама. "
-            "Ручной возврат не нужен."
-        )
-    dup = (
-        await session.execute(
-            select(Payout).where(
-                Payout.kind == "refund",
-                Payout.round_id == stake.round_id,
-                Payout.player_id == stake.player_id,
-                Payout.status.notin_(["sent", "dismissed"]),
-            )
-        )
-    ).scalar_one_or_none()
+        return error
+    dup = await _manual_refund_dup_payout(session, stake.round_id, stake.player_id)
     if dup is not None:
         return f"возврат уже создан (выплата #{dup.id})"
     # Cross-process маркер «возврат по паре round:player беру я»: двойной тап
     # хранителя по двум копиям бота не создаёт второй refund-выплаты.
     if not await claim_once(session, f"manual_refund:{stake.round_id}:{stake.player_id}"):
         return "возврат уже создан (другой процесс оформил первым)"
-    player = await session.get(Player, stake.player_id)
-    wallet = player.wallet_address if player is not None else ""
-    if not wallet:
-        return "у игрока не привязан кошелёк — возврат невозможен"
-    if not player.wallet_verified:
-        # Тот же класс, что у приза (finalize_day_payouts: игроки с
-        # wallet_verified не попадают в очередь выплаты): адрес без
-        # bv:-подтверждения ещё не доказан как свой, возврат ушёл бы в
-        # необработанный bounce.
-        return (
-            "кошелёк игрока не подтверждён (bv:) — возврат невозможен: "
-            "привязанный адрес ещё не доказан микро-переводом. Пусть игрок "
-            "подтвердит кошелёк в /wallet."
-        )
+    wallet, wallet_error = await _manual_refund_wallet(session, stake)
+    if wallet_error:
+        return wallet_error
     refund = refund_net_amount(
         stake.amount_nanotons, fee_nanotons=await fee_estimate_nano(session)
     )
     if refund <= 0:
         return "сумма ставки не покрывает газ сети — возвращать нечего"
-    # Атомарный UPDATE-claim по самой ставке — тот же приём, что в
-    # confirm_stake и confirm_aged_pending. Проверки выше живут в НАШЕЙ
-    # транзакции, а финализация дня читает ставки своим снапшотом и по своим
-    # pending/rejected строкам создаёт такую же refund-выплату; метка
-    # claim_once её не держит, потому что берётся только нами. Кто первым
-    # перевёл строку в refunded — тот и заплатил: второй получает rowcount=0 и
-    # выходит вовсе без выплаты. Ставим claim ПЕРЕД созданием выплаты, а не
-    # после: всё окно между чтением статуса и записью должно закрываться.
-    claimed = await session.execute(
-        update(Stake)
-        .where(Stake.id == stake.id, Stake.status.in_(["pending", "rejected"]))
-        .values(status="refunded")
-    )
-    if cast(CursorResult[Any], claimed).rowcount != 1:
+    if not await _manual_refund_claim(session, stake, refund, wallet):
         # Откат снимает и claim_once, и claim по ставке: «полу-меток» нет,
         # повторная попытка возможна — но статус уже не pending, так что
         # хендлер получит внятный отказ вместо второй выплаты.
         return "ставка уже разобрана параллельной операцией (итоги дня или другой возврат) — выплата не создана"
-    session.add(
-        Payout(
-            round_id=stake.round_id,
-            player_id=stake.player_id,
-            kind="refund",
-            amount_nanotons=refund,
-            dest_address=wallet,
-            network=current_network(),
-        )
-    )
     await session.commit()
     return f"возврат {from_nano(refund):.4g} Gram поставлен в очередь (выплата создана)"
 
