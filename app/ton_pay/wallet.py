@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from app.config import settings
 from app.ton_utils import normalize_address
@@ -517,6 +518,64 @@ async def cold_start_seqno_check(wallet) -> None:
         logger.info("Cold-start сверка seqno: лайт=%d, http=%d — совпадает", lite_seqno, http_seqno)
 
 
+def _offline_wallet_keys(mnemonic: str) -> tuple[bytes, bytes]:
+    """Приватный и публичный ключи из мнемоники (без сети)."""
+    from pytoniq_core.crypto.keys import mnemonic_to_private_key, private_key_to_public_key
+
+    words = mnemonic.replace("\n", " ").split()
+    if len(words) < 12:
+        raise ValueError("Мнемоника неполная (нужно 24 слова)")
+    _, private_key = mnemonic_to_private_key(words)
+    return private_key, private_key_to_public_key(private_key)
+
+
+def _resolve_wallet_version(
+    public_key: bytes, address: str, network_global_id: int, forced_version: str | None
+) -> str:
+    """Версия контракта: принудительная (с проверкой пары) либо авто-детект."""
+    requested = (forced_version or "").strip().lower()
+    if requested in WALLET_VERSIONS:
+        derived = wallet_address(requested, public_key, network_global_id)
+        if normalize_address(derived) != normalize_address(address):
+            raise ValueError(
+                f"Адрес не совпадает с производным от мнемоники "
+                f"(версия {requested}): {derived}. Проверь пару мнемоника/адрес "
+                "или верни auto."
+            )
+        return requested
+    detected, candidates = detect_wallet_version(public_key, address, network_global_id)
+    if detected is None:
+        raise ValueError(
+            "Адрес не совпадает ни с одной поддерживаемой версией кошелька "
+            f"для этой мнемоники: {candidates}. Проверь адрес и мнемонику, "
+            "либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
+        )
+    return detected
+
+
+def _offline_state_init(
+    version: str, public_key: bytes, network_global_id: int
+) -> tuple[Any, Any]:
+    """StateInit и класс контракта по версии кошелька (локальная сборка)."""
+    from pytoniq.contract.wallets.wallet import WALLET_V4_R2_CODE, WalletV4R2
+    from pytoniq.contract.wallets.wallet_v5 import WALLET_V5_R1_CODE, WalletV5R1
+    from pytoniq_core import StateInit
+
+    if version == "v5r1":
+        data = WalletV5R1.create_data_cell(
+            public_key=public_key, wc=0, network_global_id=network_global_id
+        )
+        code = WALLET_V5_R1_CODE
+        wallet_class: Any = WalletV5R1
+    else:
+        data = WalletV4R2.create_data_cell(
+            public_key=public_key, wc=0, wallet_id=_V4R2_WALLET_ID
+        )
+        code = WALLET_V4_R2_CODE
+        wallet_class = WalletV4R2
+    return StateInit(code=code, data=data), wallet_class
+
+
 def build_offline_wallet(
     mnemonic: str,
     address: str,
@@ -532,68 +591,26 @@ def build_offline_wallet(
     forced_version — «v4r2»|«v5r1» принудительно (как TREASURY_WALLET_VERSION);
     иначе авто-детект.
     """
-    from pytoniq.contract.wallets.wallet import WALLET_V4_R2_CODE, WalletV4R2
-    from pytoniq.contract.wallets.wallet_v5 import WALLET_V5_R1_CODE, WalletV5R1
-    from pytoniq_core import Address, StateInit
-    from pytoniq_core.crypto.keys import mnemonic_to_private_key, private_key_to_public_key
+    from pytoniq_core import Address
 
-    words = mnemonic.replace("\n", " ").split()
-    if len(words) < 12:
-        raise ValueError("Мнемоника неполная (нужно 24 слова)")
-    _, private_key = mnemonic_to_private_key(words)
-    public_key = private_key_to_public_key(private_key)
-
-    requested = (forced_version or "").strip().lower()
-    if requested in WALLET_VERSIONS:
-        derived = wallet_address(requested, public_key, network_global_id)
-        if normalize_address(derived) != normalize_address(address):
-            raise ValueError(
-                f"Адрес не совпадает с производным от мнемоники "
-                f"(версия {requested}): {derived}. Проверь пару мнемоника/адрес "
-                "или верни auto."
-            )
-        version = requested
-    else:
-        detected, candidates = detect_wallet_version(public_key, address, network_global_id)
-        if detected is None:
-            raise ValueError(
-                "Адрес не совпадает ни с одной поддерживаемой версией кошелька "
-                f"для этой мнемоники: {candidates}. Проверь адрес и мнемонику, "
-                "либо задай TREASURY_WALLET_VERSION=v4r2|v5r1 явно."
-            )
-        version = detected
-
-    wallet_class: type[WalletV5R1] | type[WalletV4R2]
-    if version == "v5r1":
-        data = WalletV5R1.create_data_cell(public_key=public_key, wc=0, network_global_id=network_global_id)
-        code = WALLET_V5_R1_CODE
-        wallet_class = WalletV5R1
-    else:
-        data = WalletV4R2.create_data_cell(public_key=public_key, wc=0, wallet_id=_V4R2_WALLET_ID)
-        code = WALLET_V4_R2_CODE
-        wallet_class = WalletV4R2
-    state_init = StateInit(code=code, data=data)
+    private_key, public_key = _offline_wallet_keys(mnemonic)
+    version = _resolve_wallet_version(
+        public_key, address, network_global_id, forced_version
+    )
+    state_init, wallet_class = _offline_state_init(
+        version, public_key, network_global_id
+    )
     address_obj = Address((0, state_init.serialize().hash))
-    if version == "v5r1":
-        # wallet_id — свойство, читающее data из self.state; кода на аккаунте
-        # для этого не нужно, но self.state обязан быть заполнен.
-        wallet = wallet_class(
-            provider=None,  # type: ignore[arg-type]  # оффлайн: провайдер не нужен
-            address=address_obj,
-            state_init=state_init,
-            private_key=private_key,
-        )
-        wallet.state = state_init
-    else:
-        # v4: wallet_id — read-only свойство, читающее data из self.state
-        # (константа контракта внутри data-ячейки); kwarg'ом задать нельзя.
-        wallet = wallet_class(
-            provider=None,  # type: ignore[arg-type]  # оффлайн: провайдер не нужен
-            address=address_obj,
-            state_init=state_init,
-            private_key=private_key,
-        )
-        wallet.state = state_init
+    # wallet_id — свойство, читающее data из self.state: у v5 там
+    # network_global_id, у v4 — константа контракта. Кода на аккаунте для
+    # этого не нужно, но self.state обязан быть заполнен.
+    wallet = wallet_class(
+        provider=None,  # оффлайн: провайдер не нужен
+        address=address_obj,
+        state_init=state_init,
+        private_key=private_key,
+    )
+    wallet.state = state_init
     return wallet, version
 
 
