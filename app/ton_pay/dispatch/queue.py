@@ -15,6 +15,36 @@ logger = logging.getLogger(__name__)
 
 _TREASURY_KINDS = {"rake", "leaderboard"}
 
+def _stale_send_cutoff(session) -> datetime:
+    """Граница «мёртвого» клейма: окно вещания + 30 с в TZ, понятной драйверу."""
+    cutoff_dt = datetime.now(UTC) - timedelta(
+        seconds=settings.payout_send_timeout_seconds + 30
+    )
+    # На Postgres колонка timezone=True сравнивается с aware-значением; naive
+    # cutoff там трактуется в TZ сессии, и на сервере не в UTC «мёртвый» клейм
+    # выглядел бы живым. SQLite хранит naive UTC — ему aware-параметр не годится.
+    if session.get_bind().dialect.name == "postgresql":
+        return cutoff_dt
+    return cutoff_dt.replace(tzinfo=None)
+
+
+def _retriable_predicates(network: str):
+    """Базовые условия оживления: сеть, неисчерпанный лимит, есть получатель."""
+    return (
+        Payout.network == network,
+        Payout.attempts < settings.payout_max_attempts,
+        Payout.dest_address != "",
+    )
+
+
+def _dead_claim_predicate(cutoff):
+    """Клейм мёртв: сирота до claimed_at либо старше окна вещания + 30 с."""
+    return or_(
+        Payout.claimed_at.is_(None),
+        Payout.claimed_at <= cutoff,
+    )
+
+
 async def _reset_retriable(session, network: str) -> None:
     """Оживляем зависшие sending/failed, пока не исчерпан лимит попыток.
 
@@ -42,19 +72,8 @@ async def _reset_retriable(session, network: str) -> None:
     (WHERE status='pending' перед переводом в sending): двойная отправка
     закрывается целиком (атомарный клейм + атомарный reset).
     """
-    cutoff_dt = datetime.now(UTC) - timedelta(
-        seconds=settings.payout_send_timeout_seconds + 30
-    )
-    # На Postgres колонка timezone=True сравнивается с aware-значением; naive
-    # cutoff там трактуется в TZ сессии, и на сервере не в UTC «мёртвый» клейм
-    # выглядел бы живым. SQLite хранит naive UTC — ему aware-параметр не годится.
-    is_postgres = session.get_bind().dialect.name == "postgresql"
-    cutoff = cutoff_dt if is_postgres else cutoff_dt.replace(tzinfo=None)
-    base_predicates = (
-        Payout.network == network,
-        Payout.attempts < settings.payout_max_attempts,
-        Payout.dest_address != "",
-    )
+    cutoff = _stale_send_cutoff(session)
+    base_predicates = _retriable_predicates(network)
     # failed оживает сразу — никакого среза по времени: «мёртвая» строка.
     await session.execute(
         update(Payout)
@@ -68,10 +87,7 @@ async def _reset_retriable(session, network: str) -> None:
         .where(
             Payout.status == "sending",
             *base_predicates,
-            or_(
-                Payout.claimed_at.is_(None),
-                Payout.claimed_at <= cutoff,
-            ),
+            _dead_claim_predicate(cutoff),
         )
         .values(status="pending")
     )
@@ -88,10 +104,7 @@ async def _reset_retriable(session, network: str) -> None:
             Payout.network == network,
             Payout.attempts >= settings.payout_max_attempts,
             Payout.dest_address != "",
-            or_(
-                Payout.claimed_at.is_(None),
-                Payout.claimed_at <= cutoff,
-            ),
+            _dead_claim_predicate(cutoff),
         )
         .values(
             status="failed",
@@ -101,6 +114,7 @@ async def _reset_retriable(session, network: str) -> None:
             ),
         )
     )
+
 
 async def _hydrate_player_dests(session, network: str) -> int:
     """Оживляет выплаты без получателя, когда кошелёк уже привязан.
