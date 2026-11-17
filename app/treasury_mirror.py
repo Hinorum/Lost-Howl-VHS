@@ -633,6 +633,63 @@ async def _resolve_kinds_batch(session, moves: list[MirrorMove]) -> dict[str, tu
     return result
 
 
+def _new_move_row(
+    move: MirrorMove, kind: str, linked: int | None, address: str
+) -> TreasuryMove:
+    """Новая строка зеркала по движению цепочки."""
+    return TreasuryMove(
+        tx_hash=move.tx_hash,
+        network=move.network,
+        address=address,
+        utime=move.utime,
+        lt=move.lt,
+        direction=move.direction,
+        kind=kind,
+        value_nanotons=move.value_nanotons,
+        out_msgs_count=move.out_msgs_count,
+        fee_nanotons=move.fee_nanotons,
+        balance_delta_nanotons=move.balance_delta_nanotons,
+        counterparty=move.counterparty,
+        comment=move.comment[:200],
+        linked_id=linked,
+        success=move.success,
+    )
+
+
+def _refresh_move_row(
+    row: TreasuryMove, move: MirrorMove, kind: str, linked: int | None, address: str
+) -> bool:
+    """Перезапись существующей строки под текущее состояние цепочки.
+
+    Возвращает True, если изменилось хоть что-то, что видно в отчёте
+    (lt/utime/дельта/направление/адрес/число исходящих) — счётчик updated.
+    """
+    changed = (
+        row.lt != move.lt
+        or row.utime != move.utime
+        or row.balance_delta_nanotons != move.balance_delta_nanotons
+        or row.direction != move.direction
+        or row.address != address
+        or row.out_msgs_count != move.out_msgs_count
+    )
+    row.lt = move.lt
+    row.utime = move.utime
+    row.address = address
+    row.balance_delta_nanotons = move.balance_delta_nanotons
+    row.direction = move.direction
+    row.out_msgs_count = move.out_msgs_count
+    row.kind = kind
+    row.linked_id = linked
+    row.counterparty = move.counterparty or row.counterparty
+    row.comment = move.comment[:200] or row.comment
+    row.success = move.success
+    if move.value_nanotons:
+        row.value_nanotons = move.value_nanotons
+    if move.fee_nanotons:
+        row.fee_nanotons = move.fee_nanotons
+    return changed
+
+
 async def _apply_page(
     session, moves: list[MirrorMove], kinds: dict[str, tuple[str, int | None]]
 ) -> tuple[int, int]:
@@ -660,51 +717,10 @@ async def _apply_page(
         kind, linked = kinds[move.tx_hash]
         row = by_hash.get(move.tx_hash)
         if row is None:
-            session.add(
-                TreasuryMove(
-                    tx_hash=move.tx_hash,
-                    network=move.network,
-                    address=address,
-                    utime=move.utime,
-                    lt=move.lt,
-                    direction=move.direction,
-                    kind=kind,
-                    value_nanotons=move.value_nanotons,
-                    out_msgs_count=move.out_msgs_count,
-                    fee_nanotons=move.fee_nanotons,
-                    balance_delta_nanotons=move.balance_delta_nanotons,
-                    counterparty=move.counterparty,
-                    comment=move.comment[:200],
-                    linked_id=linked,
-                    success=move.success,
-                )
-            )
+            session.add(_new_move_row(move, kind, linked, address))
             added += 1
             continue
-        changed = (
-            row.lt != move.lt
-            or row.utime != move.utime
-            or row.balance_delta_nanotons != move.balance_delta_nanotons
-            or row.direction != move.direction
-            or row.address != address
-            or row.out_msgs_count != move.out_msgs_count
-        )
-        row.lt = move.lt
-        row.utime = move.utime
-        row.address = address
-        row.balance_delta_nanotons = move.balance_delta_nanotons
-        row.direction = move.direction
-        row.out_msgs_count = move.out_msgs_count
-        row.kind = kind
-        row.linked_id = linked
-        row.counterparty = move.counterparty or row.counterparty
-        row.comment = move.comment[:200] or row.comment
-        row.success = move.success
-        if move.value_nanotons:
-            row.value_nanotons = move.value_nanotons
-        if move.fee_nanotons:
-            row.fee_nanotons = move.fee_nanotons
-        updated += int(changed)
+        updated += int(_refresh_move_row(row, move, kind, linked, address))
     await session.flush()
     return added, updated
 
