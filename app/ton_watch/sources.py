@@ -155,6 +155,80 @@ def _raw_oldest_utime(items: list[dict]) -> int | None:
     stamps = [stamp for item in items if (stamp := _safe_utime(item)) > 0]
     return min(stamps) if stamps else None
 
+def _tonapi_headers() -> dict:
+    """Заголовки TonAPI: свежее имя сначала, старые — фолбэком."""
+    get_headers = getattr(
+        _pkg, "_tonapi_headers", getattr(_pkg, "_api_headers_tonapi", _pkg._api_headers)
+    )
+    return get_headers(settings.ton_api_key)
+
+
+async def _tonapi_page_items(
+    url: str, headers: dict, before_lt: str | None, since_utime: int
+) -> tuple[list[dict], Page | None]:
+    """Сырые транзакции страницы; не-None Page — готовый ранний ответ.
+
+    Сеть/HTTP-сбой → degraded-страница: цикл знает, что проверка не
+    состоялась, и не ставит сердцебиение. 404 разбирается честно: пустая
+    история бывает и у правда молчащего кошелька, и у потерявшего историю
+    индексатора.
+    """
+    try:
+        client = _pkg.get_http_client()
+        response = await http_get_with_retry(
+            client,
+            url,
+            params={
+                "limit": _PAGE_LIMIT,
+                "sort_order": "desc",
+                **({"before_lt": before_lt} if before_lt else {}),
+            },
+            headers=headers,
+        )
+        if response.status_code == 404:
+            empty_transfers, ok = await _resolve_tonapi_empty_history(since_utime)
+            return [], Page(
+                empty_transfers, _PAGE_OK if ok else _PAGE_DEGRADED, 0, 0
+            )
+        response.raise_for_status()
+        return response.json().get("transactions", []), None
+    except Exception as exc:
+        logger.warning("TonAPI недоступен: %s", exc)
+        return [], Page([], _PAGE_DEGRADED, 0, 0)
+
+
+def _parse_page_items(
+    items: list[dict], since_utime: int
+) -> tuple[list[Transfer], int]:
+    """Разбор сырых строк: (переводы, число сбоев парсера).
+
+    Парсер уже отписался в лог с traceback + хешем. Здесь — только счётчик:
+    одна потерянная запись не валит страницу (как было бы при пробросе
+    наверх), но и не растворяется в фильтрах (как было бы при глушении
+    внутри парсера). Sample с хешем/utime уезжает в PassResult через
+    _deep_collect — последний случай цикла нужен в watcher_state как
+    «на что смотреть» в /blockchain.
+    """
+    transfers: list[Transfer] = []
+    failures = 0
+    for item in items:
+        try:
+            transfer = _parse_tx_item(item, since_utime)
+        except _ParseFailure:
+            failures += 1
+            continue
+        if transfer is not None:
+            transfers.append(transfer)
+    return transfers, failures
+
+
+def _next_page_cursor(items: list[dict]) -> str | None:
+    """Курсор вглубь — lt самой старой строки: offset API не понимает."""
+    if not items:
+        return None
+    return str(items[-1].get("lt") or "") or None
+
+
 async def fetch_recent_transfers_page(
     since_utime: int, before_lt: str | None = None
 ) -> Page:
@@ -178,54 +252,18 @@ async def fetch_recent_transfers_page(
         f"{settings.active_ton_api_base}/v2/blockchain/accounts/"
         f"{settings.active_treasury_address}/transactions"
     )
-    headers = getattr(_pkg, "_tonapi_headers", getattr(_pkg, "_api_headers_tonapi", _pkg._api_headers))(settings.ton_api_key)
-    try:
-        client = _pkg.get_http_client()
-        response = await http_get_with_retry(
-            client,
-            url,
-            params={
-                "limit": _PAGE_LIMIT,
-                "sort_order": "desc",
-                **({"before_lt": before_lt} if before_lt else {}),
-            },
-            headers=headers,
-        )
-        if response.status_code == 404:
-            # Пустая история бывает у двух причин: кошелёк правда молчал
-            # или индексатор потерял историю. Различаем честно.
-            empty_transfers, ok = await _resolve_tonapi_empty_history(since_utime)
-            return Page(empty_transfers, _PAGE_OK if ok else _PAGE_DEGRADED, 0, 0)
-        response.raise_for_status()
-        items = response.json().get("transactions", [])
-    except Exception as exc:
-        logger.warning("TonAPI недоступен: %s", exc)
-        return Page([], _PAGE_DEGRADED, 0, 0)
-    transfers: list[Transfer] = []
-    parse_fail_count = 0
-    for item in items:
-        try:
-            transfer = _parse_tx_item(item, since_utime)
-        except _ParseFailure:
-            # Парсер уже отписался в лог с traceback + хешем. Здесь — только
-            # счётчик: одна потерянная запись не валит страницу (как было бы
-            # при пробросе наверх), но и не растворяется в фильтрах (как было
-            # бы при глушении внутри парсера). Sample с хешем/utime уезжает
-            # в PassResult через _deep_collect — последний случай цикла нужен
-            # в watcher_state как «на что смотреть» в /blockchain.
-            parse_fail_count += 1
-            continue
-        if transfer is not None:
-            transfers.append(transfer)
-    # Курсор следующей страницы — lt самой старой строки: /v2/blockchain/...
-    # offset не понимает и режет выборку только before_lt.
-    next_cursor = str(items[-1].get("lt") or "") if items else None
+    items, early = await _tonapi_page_items(
+        url, _tonapi_headers(), before_lt, since_utime
+    )
+    if early is not None:
+        return early
+    transfers, parse_fail_count = _parse_page_items(items, since_utime)
     return Page(
         transfers,
         _PAGE_OK,
         len(items),
         _PAGE_LIMIT,
-        next_cursor or None,
+        _next_page_cursor(items),
         parse_fail_count,
         _raw_oldest_utime(items),
     )
