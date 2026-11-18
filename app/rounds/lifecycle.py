@@ -69,6 +69,62 @@ async def _rollback_and_reraise(session: AsyncSession, error: Exception) -> NoRe
     raise error
 
 
+async def _latest_round_checked(session: AsyncSession) -> Round | None:
+    """Последний день с откатом сессии, если запрос упал."""
+    try:
+        return await get_latest_round(session)
+    except Exception as exc:
+        logger.exception("get_latest_round (1st) упал")
+        await _rollback_and_reraise(session, exc)
+
+
+def _next_round_target(latest: Round | None, base_day_index: int | None) -> int:
+    """Номер следующего дня: от явной базы либо от последнего дня в БД."""
+    if base_day_index is not None:
+        return base_day_index + 1
+    return 1 if latest is None else latest.day_index + 1
+
+
+async def _existing_round_by_day(session: AsyncSession, day_index: int) -> Round | None:
+    """День с нужным номером, если он уже открыт (ранний выход из гонки)."""
+    try:
+        return (
+            await session.execute(
+                select(Round).where(Round.day_index == day_index).limit(1)
+            )
+        ).scalar_one_or_none()
+    except Exception as exc:
+        logger.exception("Запрос Round.day_index упал (target_day=%s)", day_index)
+        await _rollback_and_reraise(session, exc)
+
+
+async def _drop_stale_prepared_day(session: AsyncSession, day_index: int) -> None:
+    """Убирает устаревшую прегенерацию, чтобы открытый день не перезаписался."""
+    try:
+        stale = await session.get(PreparedDay, day_index)
+    except Exception as exc:
+        logger.exception("Запрос PreparedDay упал (target_day=%s)", day_index)
+        await _rollback_and_reraise(session, exc)
+    if stale is None:
+        return
+    await session.delete(stale)
+    try:
+        await session.commit()
+    except Exception as exc:
+        logger.exception("Commit удаления устаревшего PreparedDay упал")
+        await _rollback_and_reraise(session, exc)
+
+
+async def _round_after_integrity_race(
+    session: AsyncSession, error: IntegrityError
+) -> Round:
+    """День создан параллельным процессом: отдаём его, иначе пробрасываем ошибку."""
+    existing = await get_latest_round(session)
+    if existing is None:
+        raise error
+    return existing
+
+
 async def create_next_round_detailed(
     session: AsyncSession, base_day_index: int | None = None
 ) -> tuple[Round, bool]:
@@ -78,39 +134,12 @@ async def create_next_round_detailed(
     шаблонный заголовок + три дороги; метод оставляет привычную сигнатуру
     для тика планировщика и /advance.
     """
-    try:
-        latest = await get_latest_round(session)
-    except Exception as exc:
-        logger.exception("get_latest_round (1st) упал")
-        await _rollback_and_reraise(session, exc)
-    target_day = (
-        base_day_index + 1
-        if base_day_index is not None
-        else (1 if latest is None else latest.day_index + 1)
-    )
-    # Ранний выход из гонки: нужный день уже открыт — отдаём его без рендера.
-    try:
-        already = (
-            await session.execute(select(Round).where(Round.day_index == target_day).limit(1))
-        ).scalar_one_or_none()
-    except Exception as exc:
-        logger.exception("Запрос Round.day_index упал (target_day=%s)", target_day)
-        await _rollback_and_reraise(session, exc)
+    latest = await _latest_round_checked(session)
+    target_day = _next_round_target(latest, base_day_index)
+    already = await _existing_round_by_day(session, target_day)
     if already is not None:
         return already, False
-    # Устаревшая прегенерация — чистим, чтобы открытый день не перезаписался.
-    try:
-        stale = await session.get(PreparedDay, target_day)
-    except Exception as exc:
-        logger.exception("Запрос PreparedDay упал (target_day=%s)", target_day)
-        await _rollback_and_reraise(session, exc)
-    if stale is not None:
-        await session.delete(stale)
-        try:
-            await session.commit()
-        except Exception as exc:
-            logger.exception("Commit удаления устаревшего PreparedDay упал")
-            await _rollback_and_reraise(session, exc)
+    await _drop_stale_prepared_day(session, target_day)
 
     day_index = target_day
     opens_hint = (
@@ -128,20 +157,14 @@ async def create_next_round_detailed(
     try:
         round_row = await _materialize_round(session, payload, latest)
         await _stamp_day_money_mode(session, round_row)
-    except IntegrityError:
+    except IntegrityError as exc:
         await session.rollback()
-        existing = await get_latest_round(session)
-        if existing is None:
-            raise
-        return existing, False
+        return await _round_after_integrity_race(session, exc), False
     try:
         await session.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await session.rollback()
-        existing = await get_latest_round(session)
-        if existing is None:
-            raise
-        return existing, False
+        return await _round_after_integrity_race(session, exc), False
     return round_row, True
 
 
