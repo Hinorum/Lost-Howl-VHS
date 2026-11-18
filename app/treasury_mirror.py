@@ -1215,6 +1215,71 @@ async def _mirror_finalize(
     return summary
 
 
+def _mirror_empty_summary() -> dict:
+    """Сводка цикла до первого шага: всё пусто, сверка ещё не считалась."""
+    return {
+        "pages": 0,
+        "added": 0,
+        "updated": 0,
+        "source": "none",
+        "bootstrapped": False,
+        "exact": None,
+        "diff_nanotons": None,
+        "mirror_balance": None,
+        "chain_balance": None,
+    }
+
+
+async def _mirror_is_bootstrapped(session: AsyncSession) -> bool:
+    """Зеркало уже спускалось до генезиса (метка BOOTSTRAP_KEY в БД)."""
+    return (
+        await session.get(WatcherState, TREASURY_MIRROR_BOOTSTRAP_KEY)
+    ) is not None
+
+
+async def _mirror_bootstrap_pass(
+    session: AsyncSession, network: str, max_pages: int, summary: dict
+) -> dict:
+    """Первый спуск к генезису и финализация прохода."""
+    pages, added, updated, source, bootstrapped, page_ok = await _bootstrap_sync(
+        session, network, max_pages
+    )
+    return await _mirror_finalize(
+        session,
+        summary,
+        network,
+        source,
+        page_ok,
+        bootstrapped,
+        pages,
+        added,
+        updated,
+    )
+
+
+async def _mirror_increment_pass(
+    session: AsyncSession, network: str, max_pages: int, summary: dict
+) -> dict:
+    """Догон головы; та же голова — цикл завершается без чтения страницы."""
+    probe, done = await _mirror_probe_head(session, summary, network)
+    if done:
+        return summary
+    pages, added, updated, source, page_ok = await _mirror_increment(
+        session, network, max_pages, probe
+    )
+    return await _mirror_finalize(
+        session,
+        summary,
+        network,
+        source,
+        page_ok,
+        True,
+        pages,
+        added,
+        updated,
+    )
+
+
 async def sync_treasury_mirror() -> dict:
     """Один цикл синка зеркала. Возвращает сводку для лога/отчёта.
 
@@ -1232,56 +1297,15 @@ async def sync_treasury_mirror() -> dict:
     проверяет тождество «Σ balance_delta = живой баланс» и кладёт результат
     в CHECK (читается автосверкой без лишнего запроса к индексатору).
     """
-    summary = {
-        "pages": 0,
-        "added": 0,
-        "updated": 0,
-        "source": "none",
-        "bootstrapped": False,
-        "exact": None,
-        "diff_nanotons": None,
-        "mirror_balance": None,
-        "chain_balance": None,
-    }
+    summary = _mirror_empty_summary()
     if not settings.ton_enabled or not settings.active_treasury_address:
         return summary
     max_pages = max(1, settings.treasury_mirror_max_pages_per_sync)
     network = _active_network()
-
     async with SessionLocal() as session:
-        bootstrapped = (
-            await session.get(WatcherState, TREASURY_MIRROR_BOOTSTRAP_KEY)
-        ) is not None
-        pages = added = updated = 0
-        source = "none"
-        page_ok = False
-        if not bootstrapped:
-            (
-                pages,
-                added,
-                updated,
-                source,
-                bootstrapped,
-                page_ok,
-            ) = await _bootstrap_sync(session, network, max_pages)
-        else:
-            probe, done = await _mirror_probe_head(session, summary, network)
-            if done:
-                return summary
-            pages, added, updated, source, page_ok = await _mirror_increment(
-                session, network, max_pages, probe
-            )
-        return await _mirror_finalize(
-            session,
-            summary,
-            network,
-            source,
-            page_ok,
-            bootstrapped,
-            pages,
-            added,
-            updated,
-        )
+        if not await _mirror_is_bootstrapped(session):
+            return await _mirror_bootstrap_pass(session, network, max_pages, summary)
+        return await _mirror_increment_pass(session, network, max_pages, summary)
 
 
 async def reset_treasury_mirror() -> str:
