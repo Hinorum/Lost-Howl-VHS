@@ -561,27 +561,30 @@ async def _fetch_page(
 # ---------- Применение движений (идемпотентный upsert по tx_hash) ----------
 
 
-async def _resolve_kinds_batch(session, moves: list[MirrorMove]) -> dict[str, tuple[str, int | None]]:
-    """Классификация пачки движений батчем: tx_hash → (kind, linked_id).
-
-    По одному запросу на таблицу, а не N запросов на движение: страница в
-    сто транзакций обрабатывается без сотни round-trip'ов к SQLite/Postgres.
-    """
-    result: dict[str, tuple[str, int | None]] = {}
-    in_moves = [m for m in moves if m.direction == "in"]
-    out_moves = [m for m in moves if m.direction == "out"]
+async def _incoming_kind_maps(
+    session, in_moves: list[MirrorMove]
+) -> tuple[dict[str, Income], dict[str, Stake]]:
+    """Один запрос на таблицу: движения «in» → доход/ставка по хешу."""
     income_by_ref: dict[str, Income] = {}
     stake_by_hash: dict[str, Stake] = {}
-    if in_moves:
-        hashes = [m.tx_hash for m in in_moves]
-        for income in (
-            await session.execute(select(Income).where(Income.unit_ref.in_(hashes)))
-        ).scalars():
-            income_by_ref[income.unit_ref] = income
-        for stake in (
-            await session.execute(select(Stake).where(Stake.tx_hash.in_(hashes)))
-        ).scalars():
-            stake_by_hash.setdefault(stake.tx_hash, stake)
+    if not in_moves:
+        return income_by_ref, stake_by_hash
+    hashes = [m.tx_hash for m in in_moves]
+    for income in (
+        await session.execute(select(Income).where(Income.unit_ref.in_(hashes)))
+    ).scalars():
+        income_by_ref[income.unit_ref] = income
+    for stake in (
+        await session.execute(select(Stake).where(Stake.tx_hash.in_(hashes)))
+    ).scalars():
+        stake_by_hash.setdefault(stake.tx_hash, stake)
+    return income_by_ref, stake_by_hash
+
+
+async def _payout_kind_maps(
+    session, out_moves: list[MirrorMove]
+) -> tuple[dict[int, Payout], dict[str, Payout]]:
+    """Две карты исходящих: по memo-id и по хешу tx — без N запросов."""
     payout_by_id: dict[int, Payout] = {}
     payout_by_hash: dict[str, Payout] = {}
     wanted_ids: set[int] = set()
@@ -602,35 +605,62 @@ async def _resolve_kinds_batch(session, moves: list[MirrorMove]) -> dict[str, tu
             await session.execute(select(Payout).where(Payout.tx_hash.in_(leftover)))
         ).scalars():
             payout_by_hash.setdefault(payout.tx_hash, payout)
-    for move in moves:
-        if move.direction == "self":
-            result[move.tx_hash] = ("self", None)
-        elif move.direction == "other":
-            result[move.tx_hash] = ("other", None)
-        elif move.direction == "in":
-            income = income_by_ref.get(move.tx_hash)
-            if income is not None:
-                result[move.tx_hash] = (_incoming_kind_from_income(income), income.id)
-                continue
-            stake = stake_by_hash.get(move.tx_hash)
-            if stake is not None:
-                result[move.tx_hash] = ("stake", stake.id)
-                continue
-            result[move.tx_hash] = ("unknown_in", None)
-        else:
-            parsed = parse_way_memo(move.comment)
-            if parsed is not None and parsed[1] in payout_by_id:
-                payout = payout_by_id[parsed[1]]
-                tag = "refund" if parsed[0] == "refund" else f"payout:{parsed[0]}"
-                result[move.tx_hash] = (tag, payout.id)
-                continue
-            payout = payout_by_hash.get(move.tx_hash)
-            if payout is not None:
-                tag = "refund" if payout.kind == "refund" else f"payout:{payout.kind}"
-                result[move.tx_hash] = (tag, payout.id)
-                continue
-            result[move.tx_hash] = ("unknown_out", None)
-    return result
+    return payout_by_id, payout_by_hash
+
+
+def _move_tag(kind: str) -> str:
+    """Тег исходящей выплаты для отчёта: refund либо payout:<kind>."""
+    return "refund" if kind == "refund" else f"payout:{kind}"
+
+
+def _classify_move(
+    move: MirrorMove,
+    income_by_ref: dict[str, Income],
+    stake_by_hash: dict[str, Stake],
+    payout_by_id: dict[int, Payout],
+    payout_by_hash: dict[str, Payout],
+) -> tuple[str, int | None]:
+    """Вид одного движения и связанная строка базы (если нашлась)."""
+    if move.direction == "self":
+        return "self", None
+    if move.direction == "other":
+        return "other", None
+    if move.direction == "in":
+        income = income_by_ref.get(move.tx_hash)
+        if income is not None:
+            return _incoming_kind_from_income(income), income.id
+        stake = stake_by_hash.get(move.tx_hash)
+        if stake is not None:
+            return "stake", stake.id
+        return "unknown_in", None
+    parsed = parse_way_memo(move.comment)
+    if parsed is not None and parsed[1] in payout_by_id:
+        payout = payout_by_id[parsed[1]]
+        return _move_tag(parsed[0]), payout.id
+    unparsed = payout_by_hash.get(move.tx_hash)
+    if unparsed is not None:
+        return _move_tag(unparsed.kind), unparsed.id
+    return "unknown_out", None
+
+
+async def _resolve_kinds_batch(
+    session, moves: list[MirrorMove]
+) -> dict[str, tuple[str, int | None]]:
+    """Классификация пачки движений батчем: tx_hash → (kind, linked_id).
+
+    По одному запросу на таблицу, а не N запросов на движение: страница в
+    сто транзакций обрабатывается без сотни round-trip'ов к SQLite/Postgres.
+    """
+    in_moves = [m for m in moves if m.direction == "in"]
+    out_moves = [m for m in moves if m.direction == "out"]
+    income_by_ref, stake_by_hash = await _incoming_kind_maps(session, in_moves)
+    payout_by_id, payout_by_hash = await _payout_kind_maps(session, out_moves)
+    return {
+        move.tx_hash: _classify_move(
+            move, income_by_ref, stake_by_hash, payout_by_id, payout_by_hash
+        )
+        for move in moves
+    }
 
 
 def _new_move_row(
