@@ -351,6 +351,20 @@ async def _snapshot_health_state(session) -> tuple[str, int, list[str], float | 
     )
 
 
+async def health_verdict() -> str:
+    """Только вердикт для /ready: без тяжёлого снимка.
+
+    /ready дёргает внешний watchdog раз в минуту. Полный snapshot() читает из
+    внешней БД всю диагностику, включая последнюю строку Round с chapter_text
+    и все id чатов/игроков ради аудитории; каждый такой ответ — исходящий
+    трафик Render. Для кода 200/503 нужны только счётчик падений тика и кэш
+    тревог, поэтому остальное здесь не читается.
+    """
+    async with SessionLocal() as session:
+        status, *_rest = await _snapshot_health_state(session)
+        return status
+
+
 async def _snapshot_round(session) -> dict | None:
     """Последний раунд для /health: id, день, статус, окно голосования."""
     latest = (
@@ -398,8 +412,14 @@ def _snapshot_env() -> dict:
     }
 
 
-async def snapshot() -> dict:
-    """Состояние игры одним словарём для /health (мониторинг Render/UptimeRobot)."""
+async def snapshot(*, light: bool = False) -> dict:
+    """Состояние игры одним словарём для /health (мониторинг Render/UptimeRobot).
+
+    light=True — только операционные gauge для /metrics: без последней строки
+    Round (с chapter_text) и без выгрузки id аудитории. Эти два чтения —
+    самые тяжёлые в снимке, а метрикам они не нужны: /metrics скрейпит
+    внешний сборщик, и каждый ответ БД уходит в трафик Render.
+    """
     async with SessionLocal() as session:
         queue_count, dead_count, pending_by_kind, dead_by_kind, pending_stakes, oldest_pending = (
             await _snapshot_counts(session)
@@ -407,8 +427,8 @@ async def snapshot() -> dict:
         health_status, tick_failures, problems, problems_age, problem_details = (
             await _snapshot_health_state(session)
         )
-        round_payload = await _snapshot_round(session)
-        announce = await _snapshot_announce(session)
+        round_payload = None if light else await _snapshot_round(session)
+        announce = None if light else await _snapshot_announce(session)
         env = _snapshot_env()
 
         oldest_payout_age: float | None = None
@@ -469,6 +489,12 @@ async def snapshot() -> dict:
             # как поломка кода.
             "announce_audience": announce,
         }
+        if light:
+            # Пустые ключи не отдаём: «лёгкий» снимок не должен выглядеть
+            # полным — иначе следующий читатель решит, что день/аудитория
+            # реально пусты.
+            payload.pop("round", None)
+            payload.pop("announce_audience", None)
         return payload
 
 

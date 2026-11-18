@@ -186,7 +186,8 @@ async def test_metrics_endpoint_serves_text(monkeypatch) -> None:
     # явно открываем эндпоинт, иначе проверка упирается в 401.
     monkeypatch.setattr("app.config.settings.health_require_token", False)
 
-    async def good_snapshot():
+    async def good_snapshot(*, light: bool = False):
+        assert light is True, "метрики должны читать лёгкий снимок"
         return {"status": "ok", "payout_queue": 1}
 
     monkeypatch.setattr("app.ops.snapshot", good_snapshot)
@@ -204,7 +205,8 @@ async def test_metrics_endpoint_survives_snapshot_failure(monkeypatch) -> None:
     недоступен — это way_snapshot_up 0, а счётчики памяти всё равно полезны."""
     monkeypatch.setattr("app.config.settings.health_require_token", False)
 
-    async def broken_snapshot():
+    async def broken_snapshot(*, light: bool = False):
+        assert light is True, "метрики должны читать лёгкий снимок"
         raise RuntimeError("cached statement plan is invalid")
 
     monkeypatch.setattr("app.ops.snapshot", broken_snapshot)
@@ -224,7 +226,8 @@ async def test_metrics_endpoint_requires_token(monkeypatch) -> None:
     """
     monkeypatch.setattr("app.config.settings.health_token", "s3cret")
 
-    async def good_snapshot():
+    async def good_snapshot(*, light: bool = False):
+        assert light is True, "метрики должны читать лёгкий снимок"
         return {"status": "ok"}
 
     monkeypatch.setattr("app.ops.snapshot", good_snapshot)

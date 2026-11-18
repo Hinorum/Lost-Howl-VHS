@@ -53,17 +53,19 @@ async def test_self_ping_disabled_without_public_url(monkeypatch) -> None:
     client.get.assert_not_awaited()
 
 
-async def test_self_ping_pings_with_token_and_stops_on_event(monkeypatch) -> None:
+async def test_self_ping_wakes_service_and_stops_on_event(monkeypatch) -> None:
     """Free plan Render засыпает без входящего трафика, а день открывается по
-    UTC-сетке: пинг самому себе держит расписание живым."""
+    UTC-сетке: пинг самому себе держит расписание живым.
+
+    Пинг идёт на /alive: для пробуждения достаточно любого входящего запроса,
+    а /health строит тяжёлый снимок и тратит трафик Render.
+    """
     monkeypatch.setattr(settings, "webhook_base_url", "https://way.example/")
-    monkeypatch.setattr(settings, "health_token", " s3cret ")
     monkeypatch.setattr(settings, "self_ping_seconds", 3600)
     stop = asyncio.Event()
 
-    async def fake_get(url, headers=None):
-        assert url == "https://way.example/health"
-        assert headers == {"Authorization": "Bearer s3cret"}
+    async def fake_get(url):
+        assert url == "https://way.example/alive"
         stop.set()
         return SimpleNamespace(status_code=200)
 

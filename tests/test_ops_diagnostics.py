@@ -154,6 +154,26 @@ async def test_snapshot_reports_announce_audience() -> None:
     assert audience["empty_day"] is None
 
 
+async def test_light_snapshot_skips_round_and_audience(monkeypatch) -> None:
+    """Снимок для /metrics не читает полный Round и id аудитории.
+
+    /metrics скрейпит внешний сборщик, а ответы внешней БД — трафик Render.
+    Метрикам не нужны ни chapter_text последнего дня, ни списки id: только
+    операционные gauge. Полный /health по-прежнему получает оба блока.
+    """
+    async def bomb(*_args, **_kwargs):
+        raise AssertionError("лёгкий снимок не должен читать тяжёлые блоки")
+
+    monkeypatch.setattr(ops, "_snapshot_round", bomb)
+    monkeypatch.setattr(ops, "_snapshot_announce", bomb)
+
+    payload = await ops.snapshot(light=True)
+
+    assert "round" not in payload
+    assert "announce_audience" not in payload
+    assert "payout_queue" in payload and "problems" in payload
+
+
 # ---------- Пульт ----------
 
 

@@ -167,10 +167,10 @@ async def test_ready_is_open_without_token(monkeypatch) -> None:
     """
     monkeypatch.setattr("app.config.settings.health_token", "s3cret")
 
-    async def good_snapshot():
-        return {"status": "ok", "problems": [], "payout_queue": 3}
+    async def good_verdict() -> str:
+        return "ok"
 
-    monkeypatch.setattr("app.ops.snapshot", good_snapshot)
+    monkeypatch.setattr("app.ops.health_verdict", good_verdict)
     response = await main_module.ready(_request())
     assert response.status == 200
     assert b'"ok"' in response.body
@@ -178,27 +178,49 @@ async def test_ready_is_open_without_token(monkeypatch) -> None:
         assert leaked not in response.body
 
 
+async def test_ready_does_not_build_full_snapshot(monkeypatch) -> None:
+    """Вердикт watchdog'а не строит полный снимок.
+
+    /ready дёргают раз в минуту. Полный snapshot() читает из внешней БД
+    последнюю строку Round с chapter_text и все id чатов/игроков ради
+    аудитории — это исходящий трафик Render, а для 200/503 он не нужен.
+    """
+    monkeypatch.setattr("app.config.settings.health_token", "s3cret")
+
+    async def bomb():
+        raise AssertionError("/ready не должен строить полный snapshot")
+
+    async def good_verdict() -> str:
+        return "ok"
+
+    monkeypatch.setattr("app.ops.snapshot", bomb)
+    monkeypatch.setattr("app.ops.health_verdict", good_verdict)
+    response = await main_module.ready(_request())
+    assert response.status == 200
+    assert response.body == b'{"status": "ok"}'
+
+
 async def test_ready_returns_503_when_degraded(monkeypatch) -> None:
     """Мёртвые тики при живом процессе:503 наружу, причина — только под токеном."""
     monkeypatch.setattr("app.config.settings.health_token", "s3cret")
 
-    async def degraded_snapshot():
-        return {"status": "degraded", "problems": ["тиков нет второй день"]}
+    async def degraded_verdict() -> str:
+        return "degraded"
 
-    monkeypatch.setattr("app.ops.snapshot", degraded_snapshot)
+    monkeypatch.setattr("app.ops.health_verdict", degraded_verdict)
     response = await main_module.ready(_request())
     assert response.status == 503
     # Вердикт без подробностей: причина тревоги остаётся под токеном в /health.
     assert response.body == b'{"status": "degraded"}'
 
 
-async def test_ready_degraded_when_snapshot_fails(monkeypatch) -> None:
-    """Снимок недоступен — не «ok»: иначе watchdog молчит ровно в тот
+async def test_ready_degraded_when_verdict_fails(monkeypatch) -> None:
+    """Вердикт недоступен — не «ok»: иначе watchdog молчит ровно в тот
     момент, когда данные пропали вместе с ним."""
-    async def broken_snapshot():
+    async def broken_verdict() -> str:
         raise RuntimeError("db down")
 
-    monkeypatch.setattr("app.ops.snapshot", broken_snapshot)
+    monkeypatch.setattr("app.ops.health_verdict", broken_verdict)
     response = await main_module.ready(_request())
     assert response.status == 503
     assert b'"degraded"' in response.body
@@ -211,10 +233,10 @@ async def test_ready_survives_locked_health_config(monkeypatch) -> None:
     monkeypatch.setattr("app.config.settings.health_require_token", True)
     monkeypatch.setattr("app.config.settings.health_token", "")
 
-    async def good_snapshot():
-        return {"status": "ok"}
+    async def good_verdict() -> str:
+        return "ok"
 
-    monkeypatch.setattr("app.ops.snapshot", good_snapshot)
+    monkeypatch.setattr("app.ops.health_verdict", good_verdict)
     response = await main_module.ready(_request())
     assert response.status == 200
     assert response.body == b'{"status": "ok"}'

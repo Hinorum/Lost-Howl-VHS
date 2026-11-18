@@ -124,14 +124,16 @@ async def ready(request: web.Request) -> web.Response:
     Поэтому здесь только вердикт: 200 при status=ok, 503 при degraded
     (включая недоступность снимка). Ни очереди выплат, ни списка тревог, ни
     возраста тика — по телу не видно ничего, кроме одного бита; подробности
-    остаются под токеном в /health и /ops.
+    остаются под токеном в /health и /ops. Полный snapshot() здесь не
+    строится: watchdog ходит раз в минуту, а снимок тянет из внешней БД
+    Round с chapter_text и все id аудитории — это трафик Render.
     """
     try:
-        from app.ops import snapshot
+        from app.ops import health_verdict
 
-        verdict = (await snapshot()).get("status")
+        verdict = await health_verdict()
     except Exception as exc:
-        log.warning("snapshot для /ready недоступен: %s", exc)
+        log.warning("вердикт для /ready недоступен: %s", exc)
         verdict = "degraded"
     payload = {"status": "ok" if verdict == "ok" else "degraded"}
     return web.json_response(payload, status=_verdict_code(payload))
@@ -144,6 +146,8 @@ async def metrics(request: web.Request) -> web.Response:
     задач не измерялись ничем, а при max_instances=1 долгий цикл тихо съедал
     следующие. Снимок БД не обязателен: при его недоступности отдаём 200 с
     way_snapshot_up 0 и счётчиками из памяти — частичные данные полезнее 500.
+    Снимок лёгкий (light=True): метрикам не нужны полная строка дня и id
+    аудитории, а /metrics скрейпит внешний сборщик, и ответы БД идут в трафик.
     """
     if not _authorized(request):
         return web.Response(status=401, text="unauthorized")
@@ -151,7 +155,7 @@ async def metrics(request: web.Request) -> web.Response:
     from app.ops import snapshot
 
     try:
-        payload = await snapshot()
+        payload = await snapshot(light=True)
     except Exception as exc:
         log.warning("снимок для /metrics недоступен: %s", exc)
         payload = None
@@ -163,20 +167,23 @@ async def metrics(request: web.Request) -> web.Response:
 
 
 async def _self_ping_loop(stop: asyncio.Event) -> None:
-    """Пингует собственный /health: free plan Render засыпает без входящего
+    """Пингует собственный /alive: free plan Render засыпает без входящего
     трафика, а каждый пинг считается входящим запросом. Расписание дней
     якорится к UTC-сетке, поэтому без пинга день открывался бы при первом
-    пробудившем запросе, а не в 11:00 UTC."""
+    пробудившем запросе, а не в 11:00 UTC.
+
+    Именно /alive, а не /health: /health строит полный снимок с последней
+    строкой дня и списком аудитории, а каждый такой ответ БД — трафик Render.
+    Для пробуждения достаточно любого входящего запроса; вердикт сторожит
+    /ready.
+    """
     if not settings.public_base_url:
         return
-    url = f"{settings.public_base_url}/health"
-    headers = {}
-    if settings.health_token:
-        headers["Authorization"] = f"Bearer {settings.health_token.strip()}"
+    url = f"{settings.public_base_url}/alive"
     while not stop.is_set():
         try:
             client = get_http_client()
-            response = await client.get(url, headers=headers)
+            response = await client.get(url)
             log.info("self-ping %s -> %s", url, response.status_code)
         except Exception as exc:
             log.warning("self-ping не удался: %s", exc)
