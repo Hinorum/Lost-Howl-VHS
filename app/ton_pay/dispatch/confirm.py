@@ -178,6 +178,48 @@ async def _reconcile_sent(
     return confirmed, requeued, window_lost
 
 
+def _reconcile_targets(rows: list[Payout]) -> set[str]:
+    """Memo-кандидаты sent-строк: ищем только их, а не историю слепо.
+
+    Как только все найдены — скан останавливается: запросов в квартал
+    провайдера минимум, а «нет в истории» остаётся правдивым (отсутствующая
+    цель дожимает скан до конца окна).
+    """
+    return {
+        candidate for payout in rows for candidate in _payout_comment_candidates(payout)
+    }
+
+
+async def _fetch_reconcile_tx_map(rows: list[Payout]):
+    """Карта memo→хеш по окну сверки, суженному возрастом самих выплат.
+
+    Транзакция с memo выплаты не может быть старше её created_at: иначе
+    каждый промах читал бы всё 7-суточное окно (12×256 tx, ~8.6 МБ).
+    Полнота окна считается ЗАНОВО на цикл: реальный fetch перепишет флаг по
+    факту прохода (усечение по payout_reconcile_max_pages → False), а
+    протухшее False прошлого цикла не имеет права блокировать решения этого.
+    """
+    import app.ton_pay as _tp
+
+    targets = _reconcile_targets(rows)
+    cutoff = scan_cutoff_for(row.created_at for row in rows)
+    _state._RECONCILE_WINDOW_COMPLETE = True
+    return await _tp.fetch_broadcast_tx_map(targets=targets, cutoff=cutoff)
+
+
+def _log_reconcile_summary(confirmed: int, requeued: int, window_lost: int) -> None:
+    """Итог цикла сверки: возвраты и ручной разбор — предупреждением."""
+    if requeued or window_lost:
+        logger.warning(
+            "Сверка: %d подтверждены, %d возвращены в очередь, %d ушли за окно сверки (ручной разбор)",
+            confirmed,
+            requeued,
+            window_lost,
+        )
+    elif confirmed:
+        logger.info("Сверка: %d выплат подтверждены реальными хешами", confirmed)
+
+
 async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
     """Сверяет «sent»-выплаты с реальным блокчейном и чинит потерю перевода.
 
@@ -210,10 +252,6 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
         «#<id>»: индекс (tx_hash, network) не даёт двум строкам хранить один
         хеш, а пачка — законный случай одной транзакции на несколько выплат.
     """
-    # Локальный импорт: карта берётся через app.ton_pay, чтобы
-    # monkeypatch.setattr(ton_pay, "fetch_broadcast_tx_map", ...) доходил.
-    import app.ton_pay as _tp
-
     network = settings.active_network
     async with _state._DISPATCH_LOCK:
         async with SessionLocal() as session:
@@ -221,35 +259,17 @@ async def confirm_broadcast_payouts(bot: Bot | None = None) -> int:
             if not rows:
                 return 0
             taken_hashes = await _taken_payout_hashes(session, network)
-            # Сверять нужно ТОЛЬКО эти memo (sent-без-реального-хеша): ищем их,
-            # а не шерстим всю историю слепо. Как только все найдены — стоп:
-            # запросов в квартал провайдера минимум, а «нет в истории» остаётся
-            # правдивым (отсутствующая цель дожимает скан до конца окна).
-            targets = {candidate for payout in rows for candidate in _payout_comment_candidates(payout)}
-            # Окно скана сужаем возрастом самих выплат: транзакция с их memo не
-            # может быть старше created_at. Иначе каждый промах читал бы всё
-            # 7-суточное окно (12×256 tx, ~8.6 МБ) — трафик впустую.
-            cutoff = scan_cutoff_for(row.created_at for row in rows)
-            # Полнота окна — как и в диспетчере, считается ЗАНОВО на цикл:
-            # реальный fetch перепишет флаг по факту прохода (усечение по
-            # payout_reconcile_max_pages → False), а протухшее False прошлого
-            # цикла не имеет права блокировать решения этого.
-            _state._RECONCILE_WINDOW_COMPLETE = True
-            tx_map = await _tp.fetch_broadcast_tx_map(targets=targets, cutoff=cutoff)
+            tx_map = await _fetch_reconcile_tx_map(rows)
             if not tx_map:
-                logger.warning("История казначея недоступна — сверка sent-выплат пропущена")
+                logger.warning(
+                    "История казначея недоступна — сверка sent-выплат пропущена"
+                )
                 return 0
-            confirmed, requeued, window_lost = await _reconcile_sent(session, rows, tx_map, taken_hashes)
+            confirmed, requeued, window_lost = await _reconcile_sent(
+                session, rows, tx_map, taken_hashes
+            )
             await session.commit()
-    if requeued or window_lost:
-        logger.warning(
-            "Сверка: %d подтверждены, %d возвращены в очередь, %d ушли за окно сверки (ручной разбор)",
-            confirmed,
-            requeued,
-            window_lost,
-        )
-    elif confirmed:
-        logger.info("Сверка: %d выплат подтверждены реальными хешами", confirmed)
+    _log_reconcile_summary(confirmed, requeued, window_lost)
     return confirmed + requeued + window_lost
 
 
