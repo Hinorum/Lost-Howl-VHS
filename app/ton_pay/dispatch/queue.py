@@ -116,6 +116,92 @@ async def _reset_retriable(session, network: str) -> None:
     )
 
 
+async def _unaddressed_pending_rows(session, network: str) -> list[Payout]:
+    """Pending-выплаты без получателя: их и оживляем при появлении адреса."""
+    return list(
+        (
+            await session.execute(
+                select(Payout).where(
+                    Payout.dest_address == "",
+                    Payout.status == "pending",
+                    Payout.network == network,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _player_wallet_maps(
+    session, player_ids: set[int]
+) -> tuple[dict[int, str], dict[int, bool]]:
+    """Карты «игрок → адрес» и «игрок → подтверждён» одним запросом."""
+    wallet_map: dict[int, str] = {}
+    verified_map: dict[int, bool] = {}
+    if not player_ids:
+        return wallet_map, verified_map
+    players = await session.execute(
+        select(Player.id, Player.wallet_address, Player.wallet_verified).where(
+            Player.id.in_(player_ids)
+        )
+    )
+    for pid, addr, verified in players.all():
+        wallet_map[pid] = addr
+        verified_map[pid] = verified
+    return wallet_map, verified_map
+
+
+def _hydrate_treasury_dest(payout: Payout) -> bool:
+    """Доля казны без игрока: адрес хранителя либо честный failed."""
+    from app.ton_utils import normalize_address
+
+    if settings.owner_wallet_address:
+        payout.dest_address = normalize_address(settings.owner_wallet_address)
+        payout.last_error = None
+        return True
+    payout.status = "failed"
+    payout.last_error = "нет адреса получателя: для доли казны задай OWNER_WALLET_ADDRESS"
+    return False
+
+
+def _hydrate_player_dest(
+    payout: Payout,
+    player_id: int,
+    wallet_map: dict[int, str],
+    verified_map: dict[int, bool],
+) -> bool:
+    """Выплата игроку: адрес подставляется только подтверждённого кошелька."""
+    addr = wallet_map.get(player_id) or ""
+    is_verified = verified_map.get(player_id, False)
+    if addr and is_verified:
+        payout.dest_address = addr
+        payout.last_error = None
+        return True
+    if addr and not is_verified:
+        payout.last_error = "кошелёк привязан, но не подтверждён (игрок должен отправить bv:<код>)"
+    else:
+        payout.last_error = "нет адреса получателя: кошелёк игрока ещё не привязан"
+    return False
+
+
+def _hydrate_payout_dest(
+    payout: Payout, wallet_map: dict[int, str], verified_map: dict[int, bool]
+) -> bool:
+    """Оживляет одну строку; False — ждёт действия игрока или админа."""
+    # Доля казны — ТОЛЬКО строки без игрока: kind="leaderboard" с
+    # player_id — это приз игрока из месячного топа, его кошелёк
+    # подставляется по карте игроков, а не адресом хранителя.
+    if payout.player_id is None and payout.kind in _TREASURY_KINDS:
+        return _hydrate_treasury_dest(payout)
+    player_id = payout.player_id
+    if player_id is None:
+        payout.status = "failed"
+        payout.last_error = "нет адреса получателя (кошелёк игрока не найден)"
+        return False
+    return _hydrate_player_dest(payout, player_id, wallet_map, verified_map)
+
+
 async def _hydrate_player_dests(session, network: str) -> int:
     """Оживляет выплаты без получателя, когда кошелёк уже привязан.
 
@@ -129,59 +215,13 @@ async def _hydrate_player_dests(session, network: str) -> int:
 
     Возвращает число оживших строк (они поедут в пик этого же цикла).
     """
-    from app.ton_utils import normalize_address
-
-    rows = list(
-        (
-            await session.execute(
-                select(Payout).where(
-                    Payout.dest_address == "",
-                    Payout.status == "pending",
-                    Payout.network == network,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    rows = await _unaddressed_pending_rows(session, network)
     if not rows:
         return 0
     player_ids = {p.player_id for p in rows if p.player_id is not None}
-    wallet_map: dict[int, str] = {}
-    verified_map: dict[int, bool] = {}
-    if player_ids:
-        players = await session.execute(
-            select(Player.id, Player.wallet_address, Player.wallet_verified).where(Player.id.in_(player_ids))
-        )
-        for pid, addr, verified in players.all():
-            wallet_map[pid] = addr
-            verified_map[pid] = verified
-    revived = 0
-    for payout in rows:
-        # Доля казны — ТОЛЬКО строки без игрока: kind="leaderboard" с
-        # player_id — это приз игрока из месячного топа, его кошелёк
-        # подставляется ниже по карте игроков, а не адресом хранителя.
-        if payout.player_id is None and payout.kind in _TREASURY_KINDS:
-            if settings.owner_wallet_address:
-                payout.dest_address = normalize_address(settings.owner_wallet_address)
-                payout.last_error = None
-                revived += 1
-            else:
-                payout.status = "failed"
-                payout.last_error = "нет адреса получателя: для доли казны задай OWNER_WALLET_ADDRESS"
-        elif payout.player_id is None:
-            payout.status = "failed"
-            payout.last_error = "нет адреса получателя (кошелёк игрока не найден)"
-        else:
-            addr = wallet_map.get(payout.player_id) or ""
-            is_verified = verified_map.get(payout.player_id, False)
-            if addr and is_verified:
-                payout.dest_address = addr
-                payout.last_error = None
-                revived += 1
-            elif addr and not is_verified:
-                payout.last_error = "кошелёк привязан, но не подтверждён (игрок должен отправить bv:<код>)"
-            else:
-                payout.last_error = "нет адреса получателя: кошелёк игрока ещё не привязан"
+    wallet_map, verified_map = await _player_wallet_maps(session, player_ids)
+    revived = sum(
+        _hydrate_payout_dest(payout, wallet_map, verified_map) for payout in rows
+    )
     await session.commit()
     return revived
