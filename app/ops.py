@@ -1035,6 +1035,79 @@ def _detail(entries: list[tuple[str, dict]]) -> list[dict]:
     ]
 
 
+def _held_seconds(entry: dict, moment: datetime) -> float:
+    """Сколько секунд проблема держится по своей метке since."""
+    since = _tracked_since(entry)
+    return (moment - since).total_seconds() if since is not None else 0.0
+
+
+def _next_alert_entry(
+    problem: str, previous: dict[str, dict], stamp: str
+) -> tuple[str, dict]:
+    """Запись трека по текущей проблеме: новая либо продолжение прежней."""
+    key = _problem_key(problem)
+    # Категория тревоги записана этой же веткой проверки (_raise). Подставляем
+    # её сюда: вердикт «проблема держалась 2 часа» должен уметь погасить
+    # кулдаун именно этой тревоги.
+    alert_key = str(_problem_entry.get(key, {}).get("alert") or "")
+    entry = previous.get(key)
+    if entry is None:
+        return key, {"text": problem, "since": stamp, "seen": 1, "alert": alert_key}
+    # Текст берём свежий: «32 мин» полезнее допотопного «31 мин».
+    return key, {
+        **entry,
+        "text": problem,
+        "seen": int(entry.get("seen") or 1) + 1,
+        "alert": alert_key or entry.get("alert", ""),
+    }
+
+
+async def _announce_recovered(
+    session, bot, previous: dict[str, dict], current: dict[str, dict], moment: datetime
+) -> None:
+    """Проблемы, ушедшие после ≥2 проверок: «аномалия ушла сама» + сброс кулдауна."""
+    for key, entry in previous.items():
+        if key in current:
+            continue
+        if int(entry.get("seen") or 1) < 2:
+            # Проблема, замеченная один раз и исчезнувшая до следующего прохода, —
+            # не «починка», а всплеск. Сообщение «ушла сама» о нём было бы шумом
+            # в личке, а кулдаун и так свежий.
+            continue
+        text = _tracked_text(entry) or key
+        await notify_admins(
+            bot,
+            f"✅ Аномалия ушла сама: {text} (держалась "
+            f"{_humanize(_held_seconds(entry, moment))}, "
+            "замечена в прошлых проверках).",
+        )
+        await _clear_alert_stamp(session, entry.get("alert"))
+
+
+async def _announce_digest(
+    session, bot, now: dict[str, dict], moment: datetime, stamp: str
+) -> None:
+    """Сводка повторов раз в час: только проблемы, пережившие >1 проверку."""
+    repeated = [
+        (key, entry)
+        for key, entry in now.items()
+        if int(entry.get("seen") or 1) > 1 and entry.get("alert")
+    ]
+    if not repeated or await _sent_within(
+        session, OPS_ALERT_DIGEST_KEY, _ALERT_COOLDOWN
+    ):
+        return
+    await _set_state(session, OPS_ALERT_DIGEST_KEY, stamp)
+    lines = [
+        f"• {_tracked_text(entry)} — держится {_humanize(_held_seconds(entry, moment))}"
+        for _key, entry in sorted(repeated, key=lambda pair: str(pair[1].get("since")))
+    ]
+    await notify_admins(
+        bot,
+        f"🔁 Аномалии без изменений ({len(repeated)}):\n" + "\n".join(lines),
+    )
+
+
 async def _settle_alerts(session, bot, problems: list[str]) -> None:
     """Восстановление и сводка: чем закончилась аномалия и как долго живёт.
 
@@ -1044,63 +1117,16 @@ async def _settle_alerts(session, bot, problems: list[str]) -> None:
     меняющимся числом минут вместо «держится второй час».
     """
     previous = _load_track(await _get_state(session, OPS_ALERT_TRACK_KEY))
-    now: dict[str, dict] = {}
     moment = _now()
     stamp = moment.isoformat()
+    now: dict[str, dict] = {}
     for problem in problems:
-        key = _problem_key(problem)
-        # Категория тревоги записана этой же веткой проверки (_raise). Подставляем
-        # её сюда: вердикт «проблема держалась 2 часа» должен уметь погасить
-        # кулдаун именно этой тревоги.
-        alert_key = str(_problem_entry.get(key, {}).get("alert") or "")
-        entry = previous.get(key)
-        if entry is None:
-            now[key] = {"text": problem, "since": stamp, "seen": 1, "alert": alert_key}
-        else:
-            # Текст берём свежий: «32 мин» полезнее допотопного «31 мин».
-            now[key] = {
-                **entry,
-                "text": problem,
-                "seen": int(entry.get("seen") or 1) + 1,
-                "alert": alert_key or entry.get("alert", ""),
-            }
-
-    for key, entry in previous.items():
-        if key in now:
-            continue
-        if int(entry.get("seen") or 1) < 2:
-            # Проблема, замеченная один раз и исчезнувшая до следующего прохода, —
-            # не «починка», а всплеск. Сообщение «ушла сама» о нём было бы шумом
-            # в личке, а кулдаун и так свежий.
-            continue
-        since = _tracked_since(entry)
-        held = (moment - since).total_seconds() if since is not None else 0.0
-        text = _tracked_text(entry) or key
-        await notify_admins(
-            bot,
-            f"✅ Аномалия ушла сама: {text} (держалась {_humanize(held)}, "
-            "замечена в прошлых проверках).",
-        )
-        await _clear_alert_stamp(session, entry.get("alert"))
-
+        key, entry = _next_alert_entry(problem, previous, stamp)
+        now[key] = entry
+    await _announce_recovered(session, bot, previous, now, moment)
     # Сводка — раз в час и только по тем, кто пережил больше одной проверки:
     # первое сообщение о новой аномалии уже отправлено веткой выше.
-    repeated = [
-        (key, entry)
-        for key, entry in now.items()
-        if int(entry.get("seen") or 1) > 1 and entry.get("alert")
-    ]
-    if repeated and not await _sent_within(session, OPS_ALERT_DIGEST_KEY, _ALERT_COOLDOWN):
-        await _set_state(session, OPS_ALERT_DIGEST_KEY, stamp)
-        lines = []
-        for _key, entry in sorted(repeated, key=lambda pair: str(pair[1].get("since"))):
-            since = _tracked_since(entry)
-            held = (moment - since).total_seconds() if since is not None else 0.0
-            lines.append(f"• {_tracked_text(entry)} — держится {_humanize(held)}")
-        await notify_admins(
-            bot,
-            f"🔁 Аномалии без изменений ({len(repeated)}):\n" + "\n".join(lines),
-        )
+    await _announce_digest(session, bot, now, moment, stamp)
     await _store_track(session, now)
 
 
