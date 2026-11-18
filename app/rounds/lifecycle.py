@@ -571,22 +571,15 @@ async def _resolve_tie_note(
     return tie_note
 
 
-async def _close_round_tally(
+async def _mark_round_closed(
     session: AsyncSession,
     round_row: Round,
-    round_id: int,
     winner: int,
-    winning_card: Card | SimpleNamespace,
     counts_json: str,
     stake_counts_json: str | None,
     tie_note: str | None,
-) -> tuple[Round, bool]:
-    """Закрывает раунд: UPDATE статуса TALLYING → CLOSED + запись канона дня.
-
-    Возвращает (round, closed): closed=False — закрытие уже сделано другой
-    параллельной операцией (задача исчерпана), round — актуальная загруженная
-    копия; closed=True — день закрыт этой операцией.
-    """
+) -> bool:
+    """Условный UPDATE TALLYING → CLOSED; False — закрыл кто-то параллельный."""
     result = await session.execute(
         update(Round)
         .where(Round.id == round_row.id, Round.status == RoundStatus.TALLYING)
@@ -598,27 +591,45 @@ async def _close_round_tally(
             status=RoundStatus.CLOSED,
         )
     )
-    if cast(CursorResult[Any], result).rowcount == 0:
-        await session.rollback()
-        loaded = await get_round(session, round_id)
-        return (loaded or round_row), False
+    return cast(CursorResult[Any], result).rowcount == 1
+
+
+def _sync_closed_round_row(
+    round_row: Round,
+    winner: int,
+    counts_json: str,
+    stake_counts_json: str | None,
+    tie_note: str | None,
+) -> None:
+    """Синхронизирует ORM-объект с только что записанным UPDATE."""
     round_row.winner_card = winner
     round_row.vote_counts_json = counts_json
     round_row.stake_counts_json = stake_counts_json
     round_row.tie_note = tie_note
     round_row.status = RoundStatus.CLOSED
-    # Канон дня — только победивший кадр. Крючка для следующей кассеты больше
-    # нет: каждая кассета — самостоятельная история, месяц не обязан ничем.
-    #
-    # Запись идёт UPSERT'ом (ON CONFLICT DO UPDATE), а не session.add():
-    # story_beats.day_index уникален, и после сброса с сохранением канона
-    # (/resetgame confirm keepstory) строка прошлого забега с тем же номером
-    # дня ещё лежит в базе. Обычный INSERT падал IntegrityError ВНУТРИ
-    # транзакции закрытия дня — откат уносил и UPDATE статуса ('closed'),
-    # и день залипал в TALLYING навсегда: heal_stale_rounds лечит только дни
-    # СТРОГО позади последнего, тик повторял тот же сбой. Канон нового
-    # забега переписывает канон прошлого за тот же номер дня — иначе эхо
-    # следующего дня рассказывало бы о событиях чужого забега.
+
+
+async def _upsert_story_beat(
+    session: AsyncSession,
+    round_row: Round,
+    winning_card: Card | SimpleNamespace,
+    counts_json: str,
+) -> None:
+    """Записывает канон дня — только победивший кадр.
+
+    Крючка для следующей кассеты больше нет: каждая кассета — самостоятельная
+    история, месяц не обязан ничем.
+
+    Запись идёт UPSERT'ом (ON CONFLICT DO UPDATE), а не session.add():
+    story_beats.day_index уникален, и после сброса с сохранением канона
+    (/resetgame confirm keepstory) строка прошлого забега с тем же номером
+    дня ещё лежит в базе. Обычный INSERT падал IntegrityError ВНУТРИ
+    транзакции закрытия дня — откат уносил и UPDATE статуса ('closed'),
+    и день залипал в TALLYING навсегда: heal_stale_rounds лечит только дни
+    СТРОГО позади последнего, тик повторял тот же сбой. Канон нового
+    забега переписывает канон прошлого за тот же номер дня — иначе эхо
+    следующего дня рассказывало бы о событиях чужого забега.
+    """
     await session.execute(
         text(
             "INSERT INTO story_beats "
@@ -638,12 +649,45 @@ async def _close_round_tally(
             "vote_counts": counts_json,
         },
     )
+
+
+async def _closed_round_lost_race(
+    session: AsyncSession, round_id: int, round_row: Round
+) -> tuple[Round, bool]:
+    """Закрытие уже сделано параллельно: отдаём актуальную копию без ошибки."""
+    await session.rollback()
+    loaded = await get_round(session, round_id)
+    return (loaded or round_row), False
+
+
+async def _close_round_tally(
+    session: AsyncSession,
+    round_row: Round,
+    round_id: int,
+    winner: int,
+    winning_card: Card | SimpleNamespace,
+    counts_json: str,
+    stake_counts_json: str | None,
+    tie_note: str | None,
+) -> tuple[Round, bool]:
+    """Закрывает раунд: UPDATE статуса TALLYING → CLOSED + запись канона дня.
+
+    Возвращает (round, closed): closed=False — закрытие уже сделано другой
+    параллельной операцией (задача исчерпана), round — актуальная загруженная
+    копия; closed=True — день закрыт этой операцией.
+    """
+    if not await _mark_round_closed(
+        session, round_row, winner, counts_json, stake_counts_json, tie_note
+    ):
+        return await _closed_round_lost_race(session, round_id, round_row)
+    _sync_closed_round_row(
+        round_row, winner, counts_json, stake_counts_json, tie_note
+    )
+    await _upsert_story_beat(session, round_row, winning_card, counts_json)
     try:
         await session.commit()
     except IntegrityError:
-        await session.rollback()
-        loaded = await get_round(session, round_id)
-        return (loaded or round_row), False
+        return await _closed_round_lost_race(session, round_id, round_row)
     return await get_round(session, round_id), True  # type: ignore[return-value]
 
 
