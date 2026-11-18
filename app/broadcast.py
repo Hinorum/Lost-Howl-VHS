@@ -520,6 +520,41 @@ async def _fanout_deactivate(
         )
 
 
+async def _fanout_denied(
+    target: int,
+    reasons: Counter[str],
+    reason: str,
+    on_forbidden: Callable[[int], Awaitable[Any]] | None,
+    label: str,
+) -> None:
+    """Считает запрет и отключает получателя (сбой хука не роняет рассылку)."""
+    reasons[reason] += 1
+    await _fanout_deactivate(target, on_forbidden, label=label)
+
+
+async def _fanout_failed(
+    target: int,
+    exc: Exception,
+    reasons: Counter[str],
+    on_failed: Callable[[int, Exception], Awaitable[Any]] | None,
+    label: str,
+    *,
+    after_retry: bool = False,
+) -> None:
+    """Считает причину сбоя и зовёт хук on_failed."""
+    logger.warning(
+        "%s не доставлен %s%s: %s: %s",
+        label,
+        target,
+        " (после ретрая)" if after_retry else "",
+        type(exc).__name__,
+        exc,
+    )
+    reasons[failure_reason(exc)] += 1
+    if on_failed is not None:
+        await on_failed(target, exc)
+
+
 async def _fanout_worker(
     target: int,
     deliver: Callable[[int], Awaitable[Any]],
@@ -545,54 +580,32 @@ async def _fanout_worker(
                 # Заблокировали МЕЖДУ флуд-ретраем: раньше этот случай
                 # тонул в общем except, и получатель оставался в базе
                 # навсегда.
-                reasons[forbidden_reason] += 1
-                await _fanout_deactivate(target, on_forbidden, label=label)
+                await _fanout_denied(target, reasons, forbidden_reason, on_forbidden, label)
                 return False
             except Exception as exc2:
-                logger.warning(
-                    "%s не доставлен %s (после ретрая): %s: %s",
-                    label,
-                    target,
-                    type(exc2).__name__,
-                    exc2,
+                await _fanout_failed(
+                    target, exc2, reasons, on_failed, label, after_retry=True
                 )
-                reasons[failure_reason(exc2)] += 1
-                if on_failed is not None:
-                    await on_failed(target, exc2)
                 return False
         except TelegramForbiddenError:
-            reasons[forbidden_reason] += 1
-            await _fanout_deactivate(target, on_forbidden, label=label)
+            await _fanout_denied(target, reasons, forbidden_reason, on_forbidden, label)
             return False
         except TelegramBadRequest as exc:
             if "USER_BOT_TO_BOT_DISABLED" in str(exc):
                 # Аккаунт-бот: Telegram запрещает боту писать боту в ЛС.
                 # Деактивируем — доставка невозможна в принципе.
-                reasons["аккаунт-бот (нельзя писать боту)"] += 1
-                await _fanout_deactivate(target, on_forbidden, label=label)
+                await _fanout_denied(
+                    target,
+                    reasons,
+                    "аккаунт-бот (нельзя писать боту)",
+                    on_forbidden,
+                    label,
+                )
                 return False
-            logger.warning(
-                "%s не доставлен %s: %s: %s",
-                label,
-                target,
-                type(exc).__name__,
-                exc,
-            )
-            reasons[failure_reason(exc)] += 1
-            if on_failed is not None:
-                await on_failed(target, exc)
+            await _fanout_failed(target, exc, reasons, on_failed, label)
             return False
         except Exception as exc:
-            logger.warning(
-                "%s не доставлен %s: %s: %s",
-                label,
-                target,
-                type(exc).__name__,
-                exc,
-            )
-            reasons[failure_reason(exc)] += 1
-            if on_failed is not None:
-                await on_failed(target, exc)
+            await _fanout_failed(target, exc, reasons, on_failed, label)
             return False
 
 
