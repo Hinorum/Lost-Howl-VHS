@@ -172,6 +172,51 @@ async def test_active_player_ids_respects_flag() -> None:
             await _cleanup_player(pid)
 
 
+async def test_announce_audience_size_counts_without_loading_ids(monkeypatch) -> None:
+    """Размер аудитории — COUNT, а не выгрузка всех id чатов и игроков.
+
+    Функция висит на восстановителе анонса и спрашивается на каждом тике.
+    Прежняя реализация звала active_chat_ids/active_player_ids и тянула из
+    внешней БД полные списки id только ради знака «> 0» — каждый ответ СУБД
+    уходит с Render наружу и съедает месячный лимит трафика.
+    """
+    from sqlalchemy import func, select
+
+    from app import broadcast as bc
+    from app.models import Chat
+
+    async def bomb(*_args, **_kwargs):
+        raise AssertionError("счётчик не должен тянуть все id")
+
+    monkeypatch.setattr(bc, "active_chat_ids", bomb)
+    monkeypatch.setattr(bc, "active_player_ids", bomb)
+    monkeypatch.setattr(settings, "player_dm", True)
+
+    crafted_chat = 88_301
+    async with SessionLocal() as db:
+        db.add(Chat(id=crafted_chat, type="group", active=True))
+        await db.commit()
+        chats = (
+            await db.execute(
+                select(func.count(Chat.id)).where(Chat.active.is_(True))
+            )
+        ).scalar_one()
+        dm = (
+            await db.execute(
+                select(func.count(Player.id)).where(Player.dm_subscribed.is_(True))
+            )
+        ).scalar_one()
+    try:
+        assert await bc.announce_audience_size() == int(chats) + int(dm)
+        # Выключенная личка не считает игроков вовсе — как и раньше.
+        monkeypatch.setattr(settings, "player_dm", False)
+        assert await bc.announce_audience_size() == int(chats)
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(Chat.__table__.delete().where(Chat.id == crafted_chat))
+            await db.commit()
+
+
 async def test_blocked_player_is_unsubscribed_like_a_chat() -> None:
     """Заблокировавший бота отписывается — ровно как чат без прав.
 

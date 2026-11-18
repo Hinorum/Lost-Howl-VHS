@@ -487,6 +487,53 @@ async def test_tick_announces_first_round(monkeypatch) -> None:
     assert announced == [current]
 
 
+async def test_quiet_tick_reads_only_round_meta(monkeypatch) -> None:
+    """Обычный тик не грузит полную строку дня: только мету без chapter_text.
+
+    До оптимизации каждый тик (15 секунд) читал Round целиком вместе с
+    картами несколько раз. На внешней БД это заметная доля месячного трафика
+    Render: полная строка с главой и последствиями карт весит килобайты, а
+    нужна только в момент закрытия/анонса.
+    """
+    from app import scheduler as sched
+
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    meta = SimpleNamespace(
+        id=5,
+        day_index=5,
+        status=RoundStatus.OPEN,
+        voting_ends_at=now + timedelta(hours=1),
+        tally_ends_at=now + timedelta(hours=2),
+    )
+    monkeypatch.setattr(sched, "_now", lambda: now)
+    monkeypatch.setattr("app.ops.mark_tick", AsyncMock())
+    monkeypatch.setattr("app.ops.is_game_paused", AsyncMock(return_value=False))
+    monkeypatch.setattr(sched, "get_latest_round_meta", AsyncMock(return_value=meta))
+    monkeypatch.setattr(
+        sched, "ensure_current_round_meta", AsyncMock(return_value=(meta, None))
+    )
+    heal = AsyncMock(return_value=0)
+    monkeypatch.setattr("app.rounds.heal_stale_rounds", heal)
+    monkeypatch.setattr("app.rounds.get_run_anchor", AsyncMock(return_value={}))
+    # Догон очков/выплат и фоновые восстановители — не предмет этого теста.
+    monkeypatch.setattr(sched, "_tick_catch_up", AsyncMock())
+    monkeypatch.setattr(
+        sched,
+        "get_round",
+        AsyncMock(side_effect=AssertionError("полный Round на тихом тике не нужен")),
+    )
+    monkeypatch.setattr(
+        sched,
+        "close_voting",
+        AsyncMock(side_effect=AssertionError("закрывать нечего")),
+    )
+
+    await sched.tick()
+    # Граница самолечения — самый поздний день из уже прочитанной меты,
+    # а не второй полный Round.
+    assert heal.await_args.kwargs["latest_day_index"] == 5
+
+
 async def test_tick_swallows_internal_error_and_rolls_back(monkeypatch) -> None:
     """Исключение внутри тика глотается (журналируется), наружу не летит."""
     from app import scheduler as sched
@@ -1276,6 +1323,29 @@ async def test_retry_new_day_job_respects_pause(monkeypatch) -> None:
         assert seen == []
     finally:
         await _cleanup(missing)
+
+
+async def test_retry_new_day_job_without_pending_skips_pause_and_audience(
+    monkeypatch,
+) -> None:
+    """Нет неанонсированных дней — нет чтения паузы и состава аудитории.
+
+    Джоба висит на каждом тике (15 секунд). Прежний порядок сначала читал
+    паузу и считал аудиторию, и только потом видел, что досылать нечего;
+    каждый такой ответ внешней БД уходил в трафик Render.
+    """
+    from app import scheduler as sched
+
+    await _clear_rounds()
+    paused = AsyncMock(return_value=False)
+    audience = AsyncMock(return_value=1)
+    monkeypatch.setattr("app.ops.is_game_paused", paused)
+    monkeypatch.setattr(sched, "announce_audience_size", audience)
+
+    await sched._retry_new_day_job()
+
+    assert paused.await_count == 0
+    assert audience.await_count == 0
 
 
 async def test_retry_new_day_job_waits_for_first_recipient(monkeypatch) -> None:

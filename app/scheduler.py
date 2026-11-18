@@ -494,14 +494,10 @@ async def _retry_new_day_job() -> None:
         from app.rounds import catchup_cutoff, get_round
 
         async with SessionLocal() as session:
-            if await is_game_paused(session):
-                return
-            if await announce_audience_size() == 0:
-                # Получателей нет (чаты не привязаны, личка не подписана):
-                # claim снимает announce_new_day, но досылка без аудитории —
-                # это пустая гонка каждые 15 секунд. Ждём первого получателя,
-                # день уйдёт на ближайшем же тике после его появления.
-                return
+            # Дешёвый отбор первым: в обычном тике досылать нечего, и тогда
+            # не нужно ни читать паузу, ни считать аудиторию — это лишние
+            # запросы к внешней БД каждые 15 секунд, а её ответы идут в
+            # трафик Render.
             pending = (
                 await session.execute(
                     select(Round.id)
@@ -517,6 +513,16 @@ async def _retry_new_day_job() -> None:
                     .limit(5)
                 )
             ).all()
+            if not pending:
+                return
+            if await is_game_paused(session):
+                return
+            if await announce_audience_size() == 0:
+                # Получателей нет (чаты не привязаны, личка не подписана):
+                # claim снимает announce_new_day, но досылка без аудитории —
+                # это пустая гонка каждые 15 секунд. Ждём первого получателя,
+                # день уйдёт на ближайшем же тике после его появления.
+                return
             for (round_id,) in pending:
                 # С картами (selectinload): пустая коллекция из session.get
                 # роняла бы пакет дня на MissingGreenlet — см. _ensure_cards.

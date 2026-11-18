@@ -14,8 +14,8 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import func, select
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import NO_VALUE
 
@@ -705,9 +705,31 @@ async def announce_audience() -> dict[str, int]:
 
 
 async def announce_audience_size() -> int:
-    """Сколько получателей было бы у анонса нового дня прямо сейчас."""
-    parts = await announce_audience()
-    return parts["chats"] + parts["dm"]
+    """Сколько получателей было бы у анонса нового дня прямо сейчас.
+
+    Только COUNT: восстановитель анонса зовёт функцию, как только появился
+    неанонсированный день, — то есть она может спрашиваться каждые 15 секунд.
+    Вытягивать из БД все id чатов и игроков ради знака «> 0» нельзя: ответ
+    СУБД живёт за пределами Render и целиком идёт в месячный лимит трафика.
+    Разбивка по видам остаётся в announce_audience() для /health, где она
+    нужна один раз по запросу.
+    """
+    from app.models import Player
+
+    async with SessionLocal() as session:
+        chats = (
+            await session.execute(
+                select(func.count(Chat.id)).where(Chat.active.is_(True))
+            )
+        ).scalar_one()
+        if not settings.player_dm:
+            return int(chats)
+        dm = (
+            await session.execute(
+                select(func.count(Player.id)).where(Player.dm_subscribed.is_(True))
+            )
+        ).scalar_one()
+    return int(chats) + int(dm)
 
 
 async def set_announce_empty_marker(day_index: int | None) -> None:
