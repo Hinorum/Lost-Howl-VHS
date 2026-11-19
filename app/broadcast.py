@@ -1181,8 +1181,10 @@ async def _mark_announce_delivered(day_index: int) -> None:
     успеха снимается только при ошибке вещателя (unclaim) или при пустой
     аудитории. Доставленный день после окна claim от этого не должен
     объявляться повторно: иначе retry-джоба воспринимает его как «брошенный
-    claim» и день уходит в чаты заново (у пользователя — каждые три часа,
-    ровно после истечения announce_claim_timeout_seconds).
+    claim» и день уходит в чаты и личку заново (у пользователя — каждые три
+    часа, ровно после истечения announce_claim_timeout_seconds). Маркер
+    ставится при доставке хотя бы в один чат ИЛИ хотя бы одному игроку в
+    личку: игра без групп получает анонс только личными сообщениями.
 
     Маркер пишется в телеметрии-стиле: сбой записи не роняет рассылку, он
     лишь оставит claim живым — день будет пере-отправлен по окну, что
@@ -1192,12 +1194,23 @@ async def _mark_announce_delivered(day_index: int) -> None:
     from app.models import WatcherState
 
     key = f"{ANNOUNCE_DELIVERED_PREFIX}{day_index}"
-    async with SessionLocal() as session:
-        row = await session.get(WatcherState, key)
-        if row is None:
-            row = WatcherState(key=key, value=str(day_index))
-        row.value = str(day_index)
-        await session.commit()
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(WatcherState, key)
+            if row is None:
+                row = WatcherState(key=key, value=str(day_index))
+            row.value = str(day_index)
+            # Новая строка обязана попасть в сессию: без add() commit не делал
+            # INSERT, и маркер не появлялся ни у одного дня — та самая причина,
+            # по которой retry объявлял доставленный день заново каждые три часа.
+            session.add(row)
+            await session.commit()
+    except Exception as exc:
+        # Ронять уже прошедшую рассылку из-за телеметрии нельзя: исключение
+        # снимет claim в _announce_round, и день пойдёт заново каждым тиком.
+        logger.warning(
+            "Маркер доставленного анонса дня %s не записан: %s", day_index, exc
+        )
 
 
 async def _deliver_announcement_to_chat(
@@ -1317,11 +1330,15 @@ async def announce_new_day(
     delivered = await _deliver_day_announcements(
         bot, chat_ids, round_row, finished, results_text
     )
-    await _deliver_personal_dms(bot, round_row, finished, results_text)
-    if delivered:
+    delivered_dm = await _deliver_personal_dms(
+        bot, round_row, finished, results_text
+    )
+    if delivered or delivered_dm:
         # Досылка прошла: ставим маркер, чтобы retry не объявлял день заново
         # по истечении окна claim (там, где раньше начиналось «каждые три
-        # часа» — повторный пост уже доставленного дня).
+        # часа» — повторный пост уже доставленного дня). Личка считается
+        # наравне с чатами: при игре без групп пост уходит только DM, и без
+        # этого маркера retry-джоба повторяла его каждые три часа.
         await _mark_announce_delivered(round_row.day_index)
     return delivered
 

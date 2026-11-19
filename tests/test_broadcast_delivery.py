@@ -915,6 +915,107 @@ async def test_announce_without_audience_leaves_a_trace(monkeypatch, caplog) -> 
             await db.commit()
 
 
+async def test_announce_marks_delivered_after_chat_delivery(monkeypatch) -> None:
+    """Успешная доставка в чат обязана записать маркер доставленного дня.
+
+    Регрессия: новая строка WatcherState создавалась, но не добавлялась в
+    сессию — commit не выполнял INSERT, маркер отсутствовал у каждого дня,
+    и retry объявлял уже доставленный день заново после окна claim
+    (каждые три часа).
+    """
+    from app.core.registry import ANNOUNCE_DELIVERED_PREFIX
+
+    monkeypatch.setattr(settings, "player_dm", False)
+    await _wipe(Chat)
+    chat = 777_802
+    async with SessionLocal() as db:
+        db.add(Chat(id=chat, type="group", active=True))
+        await db.commit()
+    round_row = _round(9311)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+    key = f"{ANNOUNCE_DELIVERED_PREFIX}9311"
+    try:
+        assert await bc.announce_new_day(_flaky_bot({}), round_row, finished=None) == [chat]
+        async with SessionLocal() as db:
+            marker = await db.get(WatcherState, key)
+        assert marker is not None and marker.value == "9311"
+    finally:
+        await _wipe(Chat, StatusPost, Card, Round)
+        async with SessionLocal() as db:
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key.in_([key, "delivery:day:9311"])
+                )
+            )
+            await db.commit()
+
+
+async def test_announce_marks_delivered_after_dm_only_delivery(monkeypatch) -> None:
+    """Личка — тоже доставка: без чатов маркер ставится по успешным DM.
+
+    Регрессия: маркер «анонс дня доставлен» писался только при непустом
+    списке чатов. В конфигурации без групп (игра в личке, dm_subscribed)
+    анонс уходил игроку, маркера не было — и через
+    announce_claim_timeout_seconds retry-джоба считала claim брошенным и
+    объявляла день заново. Игрок получал пост дня каждые три часа.
+    """
+    from app.core.registry import ANNOUNCE_DELIVERED_PREFIX
+
+    monkeypatch.setattr(settings, "player_dm", True)
+    await _wipe(Chat)
+    pid = 777_801
+    async with SessionLocal() as db:
+        db.add(Player(id=pid, username=f"p{pid}", dm_subscribed=True))
+        await db.commit()
+    round_row = _round(9310)
+    async with SessionLocal() as db:
+        db.add(round_row)
+        await db.commit()
+    key = f"{ANNOUNCE_DELIVERED_PREFIX}9310"
+    try:
+        bot = _flaky_bot({})
+        assert await bc.announce_new_day(bot, round_row, finished=None) == []
+        bot.send_message.assert_awaited()
+        async with SessionLocal() as db:
+            marker = await db.get(WatcherState, key)
+        assert marker is not None
+    finally:
+        await _wipe(Chat, Player, StatusPost, Card, Round)
+        async with SessionLocal() as db:
+            await db.execute(delete(WatcherState).where(WatcherState.key == key))
+            await db.execute(
+                delete(WatcherState).where(
+                    WatcherState.key == "delivery:dm:Личный пакет дня 9310"
+                )
+            )
+            await db.commit()
+
+
+async def test_announce_delivered_marker_failure_does_not_raise(
+    monkeypatch, caplog
+) -> None:
+    """Сбой записи маркера — телеметрия: рассылка уже прошла, падать нельзя.
+
+    Исключение из _mark_announce_delivered сняло бы claim в _announce_round,
+    и retry-джоба отправила бы день заново каждым тиком (а не через окно
+    claim) — спам вместо редкого дубля.
+    """
+
+    class _BrokenSession:
+        async def __aenter__(self):
+            raise RuntimeError("db down")
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr("app.db.SessionLocal", lambda: _BrokenSession())
+    with caplog.at_level(logging.WARNING, logger="app.broadcast"):
+        await bc._mark_announce_delivered(9399)
+    assert "Маркер доставленного анонса дня 9399 не записан" in caplog.text
+
+
 async def test_announce_clears_empty_marker_when_audience_returns(monkeypatch) -> None:
     """Получатель появился — метка пустоты гаснет сама.
 
@@ -938,7 +1039,15 @@ async def test_announce_clears_empty_marker_when_audience_returns(monkeypatch) -
         await _wipe(Chat, StatusPost, Card, Round)
         async with SessionLocal() as db:
             await db.execute(
-                delete(WatcherState).where(WatcherState.key == ANNOUNCE_EMPTY_DAY_KEY)
+                delete(WatcherState).where(
+                    WatcherState.key.in_(
+                        [
+                            ANNOUNCE_EMPTY_DAY_KEY,
+                            "announce_delivered:9306",
+                            "delivery:day:9306",
+                        ]
+                    )
+                )
             )
             await db.commit()
 
