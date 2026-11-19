@@ -19,7 +19,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, NoInspectionAvailable
 
 from app.config import settings
-from app.core.registry import RUN_START_KEY
+from app.core.registry import ANNOUNCE_DELIVERED_PREFIX, RUN_START_KEY
 from app.db import SessionLocal
 from app.handlers import admin as admin_mod
 from app.handlers import cmd_advance, cmd_resetgame
@@ -930,9 +930,15 @@ async def test_reset_game_full_wipe_rewrites_anchor(offline_all, session) -> Non
         )
     )
     await session.commit()
+    delivered_key = f"{ANNOUNCE_DELIVERED_PREFIX}9902"
+    session.add(WatcherState(key=delivered_key, value="9902"))
+    await session.commit()
     first = await lifecycle_mod.reset_game(session)  # строка 165: delete(StoryBeat)
     assert first.day_index == 1
     assert (await session.execute(select(StoryBeat))).scalar_one_or_none() is None
+    # Номера дней начинаются заново: маркер старого забега не должен
+    # заставлять досылку нового дня считать себя уже доставленной.
+    assert await session.get(WatcherState, delivered_key) is None
     row = await session.get(WatcherState, RUN_START_KEY)
     first_anchor = row.value if row is not None else None
     assert first_anchor  # якорь свежего забега записан (строка 176)

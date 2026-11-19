@@ -186,7 +186,7 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
 
     Защита: пока в очереди есть неотправленная выплата — сброс запрещён.
     """
-    from app.core.registry import RUN_START_KEY
+    from app.core.registry import ANNOUNCE_DELIVERED_PREFIX, RUN_START_KEY
     from app.ton_pay import pending_payout_count
 
     owed = await pending_payout_count(session)
@@ -203,6 +203,15 @@ async def reset_game(session: AsyncSession, keep_story: bool = False) -> Round:
     await session.execute(delete(Income))
     await session.execute(delete(Card))
     await session.execute(delete(PreparedDay))
+    # Дни нумеруются заново с 1. Маркеры «анонс дня доставлен» привязаны к
+    # номеру дня, а не к забегу: оставленный маркер старой игры (например,
+    # announce_delivered:7) заставил бы досылку нового дня 7 считать его уже
+    # объявленным и молча пропустить пост.
+    await session.execute(
+        delete(WatcherState).where(
+            WatcherState.key.startswith(ANNOUNCE_DELIVERED_PREFIX, autoescape=True)
+        )
+    )
     if not keep_story:
         await session.execute(delete(StoryBeat))
     await session.execute(delete(Round))
